@@ -18,9 +18,6 @@ class Settings(BaseSettings):
   magic_number: int = 123456
   slippage_deviation: int = 20
 
-  # Symbol
-  symbol_suffix: str = "c"  # m: demo, c: standard cent
-
   # Optional Notifications
   telegram_enabled: bool = False
   telegram_bot_token: Optional[str] = None

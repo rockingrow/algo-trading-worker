@@ -5,8 +5,8 @@ from fastapi import FastAPI
 
 from worker.db import init_db
 from worker.logger import get_logger
-from worker.mt5.mt5_bridge import MT5Bridge
-from worker.mt5.trading_logic import TradingExecutor
+from worker.mt5.mt5 import MT5
+from worker.mt5.executor import MT5Executor
 from worker.router import get_core_router
 from worker.services.worker_service import run_worker_loop
 from worker.services.zmq_service import ZMQ
@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
   init_db()
 
   # 2. Initialize MT5
-  bridge = MT5Bridge(
+  bridge = MT5(
     server=settings.mt5_server,
     login=settings.mt5_login,
     password=settings.mt5_password,
@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):
   subscriber.connect()
 
   # 4. Initialize Trading Logic
-  executor = TradingExecutor(
+  executor = MT5Executor(
     magic_number=settings.magic_number, slippage_deviation=settings.slippage_deviation
   )
 

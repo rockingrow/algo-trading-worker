@@ -1,15 +1,15 @@
 import asyncio
 from worker.db import log_order
 from worker.logger import get_logger
-from worker.mt5.mt5_bridge import MT5Bridge
-from worker.mt5.trading_logic import TradingExecutor
+from worker.mt5.mt5 import MT5
+from worker.mt5.executor import MT5Executor
 from worker.services.notifications_service import TelegramNotification
 from worker.services.zmq_service import ZMQ
 
 log = get_logger("worker.services.worker_service")
 
 
-async def run_worker_loop(subscriber: ZMQ, executor: TradingExecutor, bridge: MT5Bridge):
+async def run_worker_loop(subscriber: ZMQ, executor: MT5Executor, bridge: MT5):
   notifier = TelegramNotification()
   footer = bridge.get_account_footer()
 

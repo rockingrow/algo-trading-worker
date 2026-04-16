@@ -3,10 +3,10 @@ from typing import Any, Dict, Optional
 import MetaTrader5 as mt5
 from worker.logger import get_logger
 
-logger = get_logger("worker.mt5_bridge")
+logger = get_logger("worker.mt5")
 
 
-class MT5Bridge:
+class MT5:
   def __init__(
     self, server: str, login: int, password: str, path: Optional[str] = None
   ):

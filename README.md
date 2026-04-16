@@ -20,8 +20,8 @@ worker/
 │   └── api.py           # Health & system routes
 ├── helpers/             # Utility & mapping helpers
 ├── mt5/                 # MetaTrader 5 integration
-│   ├── mt5_bridge.py    # MT5 terminal connection bridge
-│   └── trading_logic.py # Core trade execution logic
+│   ├── mt5.py    # MT5 terminal connection bridge
+│   └── executor.py # Core trade execution logic
 ├── schemas/             # Pydantic data schemas
 │   └── broker_schema.py # Signal & position validation schemas
 ├── services/            # Business & Infrastructure services

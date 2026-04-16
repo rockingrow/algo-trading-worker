@@ -3,18 +3,40 @@ from typing import Any, Dict
 import MetaTrader5 as mt5
 from worker.logger import get_logger
 from worker.schemas.broker_schema import SignalSchema
-from worker.settings import settings
 
-logger = get_logger("worker.trading")
+logger = get_logger("worker.mt5_executor")
 
 
-class TradingExecutor:
+class MT5Executor:
   def __init__(self, magic_number: int, slippage_deviation: int):
     self.magic_number = magic_number
     self.deviation = slippage_deviation
+    self._symbol_cache = {}
 
-  def get_symbol(self, symbol: str) -> str:
-    return symbol + settings.symbol_suffix
+  def get_symbol(self, base_symbol: str) -> str:
+    """Dynamically find the tradeable symbol name (e.g., XAUUSD -> XAUUSDc)."""
+    if base_symbol in self._symbol_cache:
+      return self._symbol_cache[base_symbol]
+
+    symbols = mt5.symbols_get(group=f"*{base_symbol}*")
+    if not symbols:
+      logger.warning(f"No symbols found matching {base_symbol}")
+      return base_symbol
+
+    for sym in symbols:
+      # Check if name starts with base_symbol and is tradeable
+      if (
+        sym.name.startswith(base_symbol)
+        and sym.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED
+      ):
+        if not sym.visible:
+          mt5.symbol_select(sym.name, True)
+
+        logger.info(f"Resolved symbol: {base_symbol} -> {sym.name}")
+        self._symbol_cache[base_symbol] = sym.name
+        return sym.name
+
+    return base_symbol
 
   def calculate_lot_size(
     self, symbol: str, entry_price: float, sl_price: float, risk_percent: float
@@ -152,7 +174,7 @@ class TradingExecutor:
 
   def close_position(self, signal: SignalSchema) -> Dict[str, Any]:
     """Close an existing position based on signal symbol and magic number."""
-    symbol = signal.symbol
+    symbol = self.get_symbol(signal.symbol)
     positions = mt5.positions_get(symbol=symbol)
 
     if positions is None or len(positions) == 0:
