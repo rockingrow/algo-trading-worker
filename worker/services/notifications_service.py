@@ -1,4 +1,5 @@
 import requests
+
 from worker.logger import get_logger
 from worker.settings import settings
 

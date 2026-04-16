@@ -1,4 +1,6 @@
-name: Local
+name: Localhost
 variables:
   - name: url
     value: http://localhost:8000
+  - name: simulator_url
+    value: http://localhost:8001

@@ -3,13 +3,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from worker.db import init_db
 from worker.logger import get_logger
-from worker.mt5.mt5 import MT5
-from worker.mt5.executor import MT5Executor
-from worker.router import get_core_router
-from worker.services.worker_service import run_worker_loop
-from worker.services.zmq_service import ZMQ
+from worker.services.db_service import DBService
+from worker.services.mt5_process import MT5ProcessManager
 from worker.settings import settings
 
 log = get_logger("worker.app")
@@ -17,44 +13,42 @@ log = get_logger("worker.app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-  # 1. Initialize Database
-  init_db()
+  # 1. Initialize Database (fast, local SQLite)
+  db_service = DBService()
+  db_service.initialize()
+  log.info("Database initialized.")
 
-  # 2. Initialize MT5
-  bridge = MT5(
-    server=settings.mt5_server,
-    login=settings.mt5_login,
-    password=settings.mt5_password,
-    path=settings.mt5_path,
+  # 2. Build the settings dict passed to the child process.
+  #    The child process imports MetaTrader5 — the parent (this process) never does.
+  #    This is the key fix: the MT5 C extension's GIL-holding calls only happen
+  #    in the child process, so the FastAPI event loop is never frozen.
+  settings_dict = {
+    "mt5_server": settings.mt5_server,
+    "mt5_login": settings.mt5_login,
+    "mt5_password": settings.mt5_password,
+    "mt5_path": settings.mt5_path,
+    "zmq_sub_host": settings.zmq_sub_host,
+    "magic_number": settings.magic_number,
+    "slippage_deviation": settings.slippage_deviation,
+  }
+
+  manager = MT5ProcessManager(settings_dict)
+  app.state.mt5_manager = manager
+
+  # 3. Spawn child process in a thread so lifespan can yield immediately.
+  #    Process.start() itself is fast (fork/spawn), but we offload it anyway
+  #    to keep the event loop fully responsive from the first millisecond.
+  await asyncio.to_thread(manager.start)
+
+  log.info(
+    "FastAPI lifespan started. MT5 worker running in subprocess. API is now accepting requests."
   )
-  if not bridge.connect():
-    log.error("Could not connect to MT5. Worker logic will not run.")
-    yield
-    return
-
-  # 3. Initialize Event Subscriber
-  subscriber = ZMQ(host=settings.zmq_sub_host)
-  subscriber.connect()
-
-  # 4. Initialize Trading Logic
-  executor = MT5Executor(
-    magic_number=settings.magic_number, slippage_deviation=settings.slippage_deviation
-  )
-
-  # Start the background task
-  worker_task = asyncio.create_task(run_worker_loop(subscriber, executor, bridge))
-
   yield
 
-  # Shutdown logic
-  worker_task.cancel()
-  try:
-    await worker_task
-  except asyncio.CancelledError:
-    pass
-
-  bridge.shutdown()
-  log.info("MT5 Bridge shut down.")
+  # 4. Shutdown: stop the child process.
+  log.info("Shutting down MT5 worker subprocess...")
+  await asyncio.to_thread(manager.stop)
+  log.info("MT5 worker subprocess stopped.")
 
 
 def create_app() -> FastAPI:
@@ -65,8 +59,5 @@ def create_app() -> FastAPI:
     version="2.0.0",
     lifespan=lifespan,
   )
-
-  # Include Core Router
-  app.include_router(get_core_router())
 
   return app

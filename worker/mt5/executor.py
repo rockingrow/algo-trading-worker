@@ -1,6 +1,8 @@
-from typing import Any, Dict
+import math
+from typing import Any, Dict, List, Optional
 
 import MetaTrader5 as mt5
+
 from worker.logger import get_logger
 from worker.schemas.broker_schema import SignalSchema
 
@@ -90,37 +92,86 @@ class MT5Executor:
 
     return round(final_lot, 2) if symbol_info.volume_step >= 0.01 else final_lot
 
-  def execute_signal(self, signal: SignalSchema) -> Dict[str, Any]:
-    """Execute trade on MetaTrader5."""
-    action_str = signal.position.action.upper()
+  def convert_quantity_to_lots(self, symbol: str, quantity: float) -> float:
+    """Convert raw quantity (units/contracts) from signal to MT5 lot size."""
 
-    if action_str in ["SL", "TP1", "TP2", "R_SL", "CLOSE"]:
-      return self.close_position(signal)
+    symbol_info = mt5.symbol_info(self.get_symbol(symbol))
+    if not symbol_info:
+      logger.error(f"Cannot get symbol info for {symbol}")
+      return 0.01
 
+    contract_size = symbol_info.trade_contract_size
+    if contract_size <= 0:
+      logger.warning(
+        f"Invalid contract size for {symbol}: {contract_size}. Using raw quantity."
+      )
+      return quantity
+
+    step = symbol_info.volume_step
+    calculated_lot = quantity / contract_size
+
+    # 1. Round down to the nearest multiple of the step for strict risk management.
+    # Add 1e-9 to prevent Python's floating-point precision issues
+    # (e.g., 0.14999999999 / 0.01 being floored down an extra step).
+    rounded_lot = math.floor((calculated_lot + 1e-9) / step) * step
+
+    # 2. Clamp the lot size within the broker's allowed limits.
+    final_lot = max(symbol_info.volume_min, min(rounded_lot, symbol_info.volume_max))
+
+    # 3. Dynamically calculate the number of decimal places instead of hardcoding to 2.
+    # This prevents floating-point artifacts like 0.020000000000000004 from causing MT5 errors.
+    decimals = 0
+    if step < 1.0:
+      # Convert step to string, strip trailing zeros, and count the length of the fractional part.
+      decimals = len(str(step).rstrip("0").split(".")[1])
+
+    final_lot = round(final_lot, decimals)
+
+    logger.debug(
+      f"[Quantity Conversion] Units: {quantity}, Contract Size: {contract_size}, "
+      f"Calculated Lot: {final_lot} (Step: {step})"
+    )
+
+    return final_lot
+
+  # ------------------------------------------------------------------ #
+  #  Position Query Helpers                                              #
+  # ------------------------------------------------------------------ #
+
+  def get_open_positions(self, symbol: str) -> List[Any]:
+    """Return all open positions for the resolved symbol (filtered by magic)."""
+    resolved = self.get_symbol(symbol)
+    positions = mt5.positions_get(symbol=resolved)
+    if positions is None:
+      return []
+    return [p for p in positions if p.magic == self.magic_number]
+
+  # ------------------------------------------------------------------ #
+  #  Entry: Open a new LONG / SHORT position                             #
+  # ------------------------------------------------------------------ #
+
+  def open_position(self, signal: SignalSchema) -> Dict[str, Any]:
+    """Open a new market order (LONG → BUY, SHORT → SELL)."""
     action_map = {"LONG": mt5.ORDER_TYPE_BUY, "SHORT": mt5.ORDER_TYPE_SELL}
+    action_str = signal.action.value  # already validated upstream
 
     if action_str not in action_map:
-      logger.warning(f"Action '{action_str}' currently not mapped for execution.")
+      logger.warning(f"open_position called with unsupported action: '{action_str}'")
       return {"success": False, "retcode": -1, "comment": "Action Mapping Failed"}
 
     order_type = action_map[action_str]
     symbol = self.get_symbol(signal.symbol)
-    price = (
-      mt5.symbol_info_tick(symbol).ask
-      if order_type == mt5.ORDER_TYPE_BUY
-      else mt5.symbol_info_tick(symbol).bid
-    )
+    tick = mt5.symbol_info_tick(symbol)
+    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
-    # Calculate Volume instead of taking it from signal (per Roadmap requirements)
-    risk_pct = signal.inputs.risk_percent if signal.inputs else 1.0
-
-    if signal.position.sl:
-      volume = self.calculate_lot_size(symbol, price, signal.position.sl, risk_pct)
+    # Calculate position size from risk % + SL distance if available
+    risk_pct = signal.risk_percent
+    if signal.sl:
+      volume = self.calculate_lot_size(symbol, price, signal.sl, risk_pct)
     else:
-      # If no SL, fall back to signal quantity
-      volume = signal.position.quantity
+      volume = self.convert_quantity_to_lots(symbol, signal.quantity)
 
-    request = {
+    request: Dict[str, Any] = {
       "action": mt5.TRADE_ACTION_DEAL,
       "symbol": symbol,
       "volume": float(volume),
@@ -128,32 +179,29 @@ class MT5Executor:
       "price": float(price),
       "deviation": self.deviation,
       "magic": self.magic_number,
-      "comment": f"TV Signal {signal.timeframe}",
+      "comment": f"TV {signal.action.value}",
       "type_time": mt5.ORDER_TIME_GTC,
-      "type_filling": mt5.ORDER_FILLING_IOC,  # or ORDER_FILLING_FOK
+      "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
-    # Assign SL/TP if provided
-    if hasattr(signal.position, "sl") and signal.position.sl is not None:
-      request["sl"] = float(signal.position.sl)
+    # Hard SL on server to protect against connectivity loss
+    if signal.sl is not None:
+      request["sl"] = float(signal.sl)
 
-    if hasattr(signal.position, "tp1") and signal.position.tp1 is not None:
-      request["tp"] = float(signal.position.tp1)
+    if signal.tp1 is not None:
+      request["tp"] = float(signal.tp1)
 
-    logger.info(f"Sending Order: {request}")
-
+    logger.info(f"[open_position] Sending Order: {request}")
     result = mt5.order_send(request)
 
     if result is None:
-      logger.error(f"order_send failed immediately. error code: {mt5.last_error()}")
-      return {
-        "success": False,
-        "retcode": mt5.last_error(),
-        "comment": "Send Failed Server-Side",
-      }
+      logger.error(f"order_send failed. error code: {mt5.last_error()}")
+      return {"success": False, "retcode": mt5.last_error(), "comment": "Send Failed"}
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:  # 10009
-      logger.error(f"Order failed, retcode={result.retcode}, comment: {result.comment}")
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+      logger.error(
+        f"Order rejected, retcode={result.retcode}, comment: {result.comment}"
+      )
       return {
         "success": False,
         "retcode": result.retcode,
@@ -162,7 +210,7 @@ class MT5Executor:
       }
 
     logger.info(
-      f"Execution Successful! Ticket: {result.order}, Price: {result.price}, Vol: {result.volume}"
+      f"[open_position] Filled! Ticket: {result.order}, Price: {result.price}, Vol: {result.volume}"
     )
     return {
       "success": True,
@@ -172,52 +220,186 @@ class MT5Executor:
       "volume": result.volume,
     }
 
-  def close_position(self, signal: SignalSchema) -> Dict[str, Any]:
-    """Close an existing position based on signal symbol and magic number."""
-    symbol = self.get_symbol(signal.symbol)
-    positions = mt5.positions_get(symbol=symbol)
+  # ------------------------------------------------------------------ #
+  #  TP1: Partial close + move SL to breakeven                           #
+  # ------------------------------------------------------------------ #
 
-    if positions is None or len(positions) == 0:
-      logger.warning(f"No open positions found to close for {symbol}")
+  def partial_close_position(
+    self, symbol: str, close_volume: float, position_ticket: Optional[int] = None
+  ) -> Dict[str, Any]:
+    """
+    Partially close a position by sending a counter-direction market order
+    with the specified volume. If *position_ticket* is given it targets that
+    specific ticket; otherwise closes the first matching magic-number position.
+    """
+    resolved = self.get_symbol(symbol)
+    positions = self.get_open_positions(symbol)
+
+    if not positions:
+      logger.warning(f"[partial_close] No open positions found for {resolved}")
+      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+
+    # Target a specific ticket or fall back to the first open position
+    pos = (
+      next((p for p in positions if p.ticket == position_ticket), positions[0])
+      if position_ticket
+      else positions[0]
+    )
+
+    close_type = (
+      mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    )
+    tick = mt5.symbol_info_tick(resolved)
+    price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+
+    # Clamp close_volume so we never exceed what is actually open
+    safe_volume = min(close_volume, pos.volume)
+
+    request: Dict[str, Any] = {
+      "action": mt5.TRADE_ACTION_DEAL,
+      "symbol": resolved,
+      "volume": float(safe_volume),
+      "type": close_type,
+      "position": pos.ticket,  # CRITICAL: links close to specific ticket
+      "price": float(price),
+      "deviation": self.deviation,
+      "magic": self.magic_number,
+      "comment": "Partial Close TP1",
+      "type_time": mt5.ORDER_TIME_GTC,
+      "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    logger.info(f"[partial_close] Sending partial close: {request}")
+    result = mt5.order_send(request)
+
+    if result is None:
+      logger.error(f"partial_close order_send failed. error: {mt5.last_error()}")
+      return {"success": False, "retcode": mt5.last_error(), "comment": "Send Failed"}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+      logger.error(
+        f"Partial close failed, retcode={result.retcode}, comment: {result.comment}"
+      )
+      return {"success": False, "retcode": result.retcode, "comment": result.comment}
+
+    logger.info(
+      f"[partial_close] OK. Ticket: {result.order}, Closed Vol: {result.volume}, Price: {result.price}"
+    )
+    return {
+      "success": True,
+      "retcode": result.retcode,
+      "ticket": result.order,
+      "price": result.price,
+      "volume": result.volume,
+      "source_ticket": pos.ticket,
+    }
+
+  def update_position_sl(
+    self, symbol: str, new_sl: float, position_ticket: Optional[int] = None
+  ) -> Dict[str, Any]:
+    """
+    Update the Stop Loss of an open position to *new_sl* using
+    TRADE_ACTION_SLTP. Targets a specific ticket or the first magic-number
+    position found for the symbol.
+    """
+    resolved = self.get_symbol(symbol)
+    positions = self.get_open_positions(symbol)
+
+    if not positions:
+      logger.warning(f"[update_sl] No open positions found for {resolved}")
+      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+
+    pos = (
+      next((p for p in positions if p.ticket == position_ticket), positions[0])
+      if position_ticket
+      else positions[0]
+    )
+
+    request: Dict[str, Any] = {
+      "action": mt5.TRADE_ACTION_SLTP,
+      "symbol": resolved,
+      "position": pos.ticket,
+      "sl": float(new_sl),
+      "tp": float(pos.tp),  # preserve existing TP
+    }
+
+    logger.info(f"[update_sl] Updating SL for ticket {pos.ticket} → {new_sl}")
+    result = mt5.order_send(request)
+
+    if result is None:
+      logger.error(f"update_sl order_send failed. error: {mt5.last_error()}")
+      return {
+        "success": False,
+        "retcode": mt5.last_error(),
+        "comment": "SL Update Failed",
+      }
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+      logger.error(
+        f"SL update rejected, retcode={result.retcode}, comment: {result.comment}"
+      )
+      return {"success": False, "retcode": result.retcode, "comment": result.comment}
+
+    logger.info(f"[update_sl] SL updated successfully for ticket {pos.ticket}")
+    return {
+      "success": True,
+      "retcode": result.retcode,
+      "ticket": pos.ticket,
+      "new_sl": new_sl,
+    }
+
+  # ------------------------------------------------------------------ #
+  #  TP2 / SL / R_SL: Full close using MT5 actual volume                #
+  # ------------------------------------------------------------------ #
+
+  def close_all_positions(self, symbol: str, reason: str = "CLOSE") -> Dict[str, Any]:
+    """
+    Close ALL open positions for the symbol at actual MT5 volume.
+    Webhook quantity is intentionally ignored to avoid dust-lot errors.
+    """
+    resolved = self.get_symbol(symbol)
+    positions = self.get_open_positions(symbol)
+
+    if not positions:
+      logger.warning(f"[close_all] No open positions found for {resolved}")
       return {"success": False, "retcode": -1, "comment": "No Positions Found"}
 
     success_count = 0
     last_result = None
 
     for pos in positions:
-      if pos.magic == self.magic_number:
-        # Opposite order type
-        close_type = (
-          mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        )
-        price = (
-          mt5.symbol_info_tick(symbol).bid
-          if close_type == mt5.ORDER_TYPE_SELL
-          else mt5.symbol_info_tick(symbol).ask
-        )
+      close_type = (
+        mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+      )
+      tick = mt5.symbol_info_tick(resolved)
+      price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
 
-        request = {
-          "action": mt5.TRADE_ACTION_DEAL,
-          "symbol": symbol,
-          "volume": pos.volume,
-          "type": close_type,
-          "position": pos.ticket,
-          "price": price,
-          "deviation": self.deviation,
-          "magic": self.magic_number,
-          "comment": f"Close {signal.position.action.upper()}",
-          "type_time": mt5.ORDER_TIME_GTC,
-          "type_filling": mt5.ORDER_FILLING_IOC,
-        }
+      request: Dict[str, Any] = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": resolved,
+        "volume": float(pos.volume),  # Use ACTUAL MT5 volume, never webhook quantity
+        "type": close_type,
+        "position": pos.ticket,
+        "price": float(price),
+        "deviation": self.deviation,
+        "magic": self.magic_number,
+        "comment": f"Full Close {reason}",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+      }
 
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-          logger.info(f"Position Closed: Ticket {pos.ticket}")
-          success_count += 1
-          last_result = result
-        else:
-          err_msg = result.comment if result else mt5.last_error()
-          logger.error(f"Failed to close position {pos.ticket}. Error: {err_msg}")
+      logger.info(
+        f"[close_all] Closing ticket {pos.ticket}, vol={pos.volume}, reason={reason}"
+      )
+      result = mt5.order_send(request)
+
+      if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        logger.info(f"[close_all] Closed ticket {pos.ticket} successfully")
+        success_count += 1
+        last_result = result
+      else:
+        err = result.comment if result else mt5.last_error()
+        logger.error(f"[close_all] Failed to close ticket {pos.ticket}. Error: {err}")
 
     if success_count > 0:
       return {
@@ -226,11 +408,39 @@ class MT5Executor:
         "ticket": last_result.order,
         "price": last_result.price,
         "volume": last_result.volume,
-        "comment": f"Closed {success_count} positions",
+        "comment": f"Closed {success_count} position(s) [{reason}]",
       }
 
     return {
       "success": False,
       "retcode": -1,
-      "comment": "Failed to close matched positions",
+      "comment": f"Failed to close positions [{reason}]",
     }
+
+  # ------------------------------------------------------------------ #
+  #  Legacy / Convenience: keep execute_signal + close_position intact   #
+  # ------------------------------------------------------------------ #
+
+  def execute_signal(self, signal: SignalSchema) -> Dict[str, Any]:
+    """
+    Legacy single-entry dispatcher kept for backward compatibility.
+    Prefer using SignalHandler which applies full action-specific logic.
+    """
+    action_str = signal.action.value
+
+    if action_str in ("TP2", "SL", "R_SL"):
+      return self.close_all_positions(signal.symbol, reason=action_str)
+
+    if action_str == "TP1":
+      close_vol = self.convert_quantity_to_lots(signal.symbol, signal.quantity)
+      return self.partial_close_position(signal.symbol, close_vol)
+
+    # LONG / SHORT
+    return self.open_position(signal)
+
+  def close_position(self, signal: SignalSchema) -> Dict[str, Any]:
+    """
+    Backward-compatible wrapper. Delegates to close_all_positions which
+    uses actual MT5 volume — not the webhook quantity.
+    """
+    return self.close_all_positions(signal.symbol, reason=signal.action.value)

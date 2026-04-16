@@ -1,0 +1,10 @@
+{
+  "signal_id": "8b6aac4d-da0d-41a3-9798-14d0d23d3f68",
+  "timestamp": "2026-04-11T16:15:00Z",
+  "action": "R_SL",
+  "symbol": "XAUUSD",
+  "price": 4858.00,
+  "quantity": 4.2000,
+  "is_running": false,
+  "risk_percent": 3.0
+}

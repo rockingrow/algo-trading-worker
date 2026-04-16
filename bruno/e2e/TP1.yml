@@ -1,0 +1,28 @@
+info:
+  name: 💰 TP1 - Partial Close (XAUUSD)
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: "{{simulator_url}}/simulator/publish"
+  body:
+    type: json
+    data: |-
+      {
+        "signal_id": "5b6aac4d-da0d-41a3-9798-14d0d23d3f65",
+        "timestamp": "2026-04-11T15:05:00Z",
+        "action": "TP1",
+        "symbol": "XAUUSD",
+        "price": 4850.00,
+        "quantity": 1.8000,
+        "is_running": true,
+        "risk_percent": 3.0
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

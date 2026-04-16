@@ -1,0 +1,13 @@
+{
+  "signal_id": "be6aac4d-da0d-41a3-9798-14d0d23d3f63",
+  "timestamp": "2026-04-10T22:55:00Z",
+  "action": "LONG",
+  "symbol": "XAUUSD",
+  "price": 4858.50,
+  "quantity": 6.0000,
+  "sl": 4850.00,
+  "tp1": 4865.00,
+  "tp2": 4870.00,
+  "is_running": true,
+  "risk_percent": 3.0
+}

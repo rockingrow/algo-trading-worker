@@ -1,11 +1,19 @@
+from enum import Enum
 from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class MarketTypeEnum(str, Enum):
+  FOREX = "FOREX"
+  CRYPTO = "CRYPTO"
+
+
 class Settings(BaseSettings):
   # ZeroMQ
   zmq_sub_host: str
+
+  market_type: MarketTypeEnum = MarketTypeEnum.FOREX
 
   # MT5 Credentials
   mt5_server: str

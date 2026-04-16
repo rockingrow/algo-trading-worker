@@ -1,6 +1,8 @@
+import time
 from typing import Any, Dict, Optional
 
 import MetaTrader5 as mt5
+
 from worker.logger import get_logger
 
 logger = get_logger("worker.mt5")
@@ -19,6 +21,11 @@ class MT5:
   def connect(self) -> bool:
     """Initialize and connect to the MT5 Terminal."""
     try:
+      # Explicitly yield the GIL before calling the MT5 C extension.
+      # mt5.initialize() on Windows communicates with the terminal via COM/pipes
+      # and can hold the GIL, freezing the asyncio event loop.
+      time.sleep(0)
+
       logger.info("Initializing MT5 Connection...")
 
       # Initialize with credentials and path
@@ -84,6 +91,51 @@ class MT5:
       f"<b>Server:</b> {self.server}\n"
       f"-----------------------------\n"
     )
+
+  def is_connected(self) -> bool:
+    """Return True if the MT5 terminal is currently reachable."""
+    try:
+      info = mt5.terminal_info()
+      return info is not None and info.connected
+    except Exception:
+      return False
+
+  def reconnect(self, max_attempts: int = 10, delay_seconds: float = 5.0) -> bool:
+    """Attempt to reconnect to MT5 with retries.
+
+    Args:
+      max_attempts: Maximum number of connection attempts (0 = unlimited).
+      delay_seconds: Seconds to wait between each attempt.
+
+    Returns:
+      True if reconnected successfully, False if all attempts exhausted.
+    """
+    attempt = 0
+    while max_attempts == 0 or attempt < max_attempts:
+      attempt += 1
+      logger.info(
+        f"MT5 reconnect attempt {attempt}"
+        + (f"/{max_attempts}" if max_attempts else "")
+        + "..."
+      )
+      # Yield GIL before each C extension call so the asyncio event loop
+      # can continue processing requests (e.g. /health) between retry attempts.
+      time.sleep(0)
+      try:
+        mt5.shutdown()  # Clean up any stale state
+      except Exception:
+        pass
+
+      if self.connect():
+        return True
+
+      logger.warning(
+        f"MT5 reconnect attempt {attempt} failed. Retrying in {delay_seconds}s..."
+      )
+      time.sleep(delay_seconds)
+
+    logger.error("MT5 reconnection exhausted all attempts.")
+    return False
 
   def shutdown(self):
     """Close the MT5 connection."""

@@ -27,4 +27,7 @@ def get_logger(name: str) -> logging.Logger:
     handler.setFormatter(fmt)
     logger.addHandler(handler)
 
+    # Prevent records from bubbling up to uvicorn's root handler
+    logger.propagate = False
+
   return logger

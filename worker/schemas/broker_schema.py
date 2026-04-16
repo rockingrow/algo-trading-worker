@@ -1,22 +1,32 @@
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
-class PositionSchema(BaseModel):
-  action: str = Field(..., description="Action: LONG, SHORT, SL, TP1, etc.")
+class SignalActionEnum(str, Enum):
+  LONG = "LONG"
+  SHORT = "SHORT"
+  TP1 = "TP1"
+  TP2 = "TP2"
+  R_SL = "R_SL"
+  SL = "SL"
+
+
+class SignalSchema(BaseModel):
+  """
+  Flattened SignalSchema matching the TradingSignal produced by the broker.
+  """
+
+  signal_id: str
+  timestamp: datetime
+  action: SignalActionEnum
+  symbol: str
   price: float
   quantity: float
   sl: Optional[float] = None
   tp1: Optional[float] = None
   tp2: Optional[float] = None
-  is_running: bool = False
-
-
-class SignalSchema(BaseModel):
-  token: Optional[str] = None
-  symbol: str = Field(..., description="Trading pair like XAUUSD")
-  timeframe: str
-  timestamp: datetime
-  position: PositionSchema
+  is_running: Optional[bool] = None
+  risk_percent: float
