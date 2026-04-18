@@ -13,6 +13,11 @@ class Settings(BaseSettings):
   # ZeroMQ
   zmq_sub_host: str
 
+  # ZMQ CURVE security (optional — leave blank to disable encryption)
+  zmq_curve_server_public_key: Optional[str] = None  # broker's public key (Z85)
+  zmq_curve_client_public_key: Optional[str] = None  # this client's public key (Z85)
+  zmq_curve_client_secret_key: Optional[str] = None  # this client's secret key (Z85)
+
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
 
   # MT5 Credentials
@@ -26,10 +31,10 @@ class Settings(BaseSettings):
   magic_number: int = 123456
   slippage_deviation: int = 20
 
-  # Optional Notifications
-  telegram_enabled: bool = False
-  telegram_bot_token: Optional[str] = None
-  telegram_chat_id: Optional[str] = None
+  # Telegram
+  telegram_enabled: bool
+  telegram_bot_token: str
+  telegram_chat_id: str
 
   # Logging
   log_level: str = "INFO"

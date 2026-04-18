@@ -1,8 +1,9 @@
 import json
 import threading
-from typing import Generator
+from typing import Generator, Optional
 
 import zmq
+from zmq.utils import z85
 from pydantic import ValidationError
 
 from worker.logger import get_logger
@@ -12,8 +13,17 @@ logger = get_logger("worker.zmq_service")
 
 
 class ZMQ:
-  def __init__(self, host: str):
+  def __init__(
+    self,
+    host: str,
+    curve_server_public_key: Optional[str] = None,
+    curve_client_public_key: Optional[str] = None,
+    curve_client_secret_key: Optional[str] = None,
+  ):
     self.host = host
+    self._curve_server_public_key = curve_server_public_key
+    self._curve_client_public_key = curve_client_public_key
+    self._curve_client_secret_key = curve_client_secret_key
     self.context = zmq.Context()
     self.socket = self._create_socket()
     self._stop_event = threading.Event()
@@ -21,6 +31,42 @@ class ZMQ:
   def _create_socket(self):
     socket = self.context.socket(zmq.SUB)
     socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all topics/signals
+
+    # ── CURVE security (applied before connect) ────────────────────────── #
+    # Filter out None, empty strings, or placeholder text
+    curve_keys = [
+      self._curve_server_public_key,
+      self._curve_client_public_key,
+      self._curve_client_secret_key,
+    ]
+
+    def clean_key(k):
+      if not k:
+        return None
+      return k.strip().strip('"').strip("'").strip()
+
+    def is_valid_key(k):
+      cleaned = clean_key(k)
+      return cleaned and len(cleaned) == 40  # Z85 keys are exactly 40 chars
+
+    if all(is_valid_key(k) for k in curve_keys):
+      try:
+        # Z85 keys (40 chars) must be decoded to 32-byte binary
+        server_pub = clean_key(self._curve_server_public_key)
+        client_pub = clean_key(self._curve_client_public_key)
+        client_sec = clean_key(self._curve_client_secret_key)
+
+        socket.curve_serverkey = z85.decode(server_pub)
+        socket.curve_publickey = z85.decode(client_pub)
+        socket.curve_secretkey = z85.decode(client_sec)
+        logger.info("ZMQ CURVE security enabled and keys decoded successfully.")
+      except Exception as e:
+        logger.error(f"Failed to apply ZMQ CURVE keys: {e}")
+        raise
+    else:
+      logger.warning(
+        "ZMQ CURVE security is DISABLED (keys missing or invalid). Connection is unencrypted."
+      )
 
     # Configure TCP Keep-Alive to detect dead connections
     socket.setsockopt(zmq.TCP_KEEPALIVE, 1)

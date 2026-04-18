@@ -56,7 +56,12 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
     return
 
   # ── 2. Set up ZMQ subscriber ──────────────────────────────────────────── #
-  subscriber = ZMQ(host=settings_dict["zmq_sub_host"])
+  subscriber = ZMQ(
+    host=settings_dict["zmq_sub_host"],
+    curve_server_public_key=settings_dict.get("zmq_curve_server_public_key"),
+    curve_client_public_key=settings_dict.get("zmq_curve_client_public_key"),
+    curve_client_secret_key=settings_dict.get("zmq_curve_client_secret_key"),
+  )
   subscriber.connect()
 
   # ── 3. Set up trading components ──────────────────────────────────────── #

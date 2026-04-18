@@ -23,3 +23,6 @@ lint:
 
 fix:
 	uv run ruff check --fix .
+
+generate-keys:
+	.venv\Scripts\python.exe scripts/generate_curve_keypair.py

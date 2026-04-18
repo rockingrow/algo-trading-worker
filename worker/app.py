@@ -28,6 +28,9 @@ async def lifespan(app: FastAPI):
     "mt5_password": settings.mt5_password,
     "mt5_path": settings.mt5_path,
     "zmq_sub_host": settings.zmq_sub_host,
+    "zmq_curve_server_public_key": settings.zmq_curve_server_public_key,
+    "zmq_curve_client_public_key": settings.zmq_curve_client_public_key,
+    "zmq_curve_client_secret_key": settings.zmq_curve_client_secret_key,
     "magic_number": settings.magic_number,
     "slippage_deviation": settings.slippage_deviation,
   }
