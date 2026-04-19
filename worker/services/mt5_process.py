@@ -35,6 +35,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   from worker.logger import get_logger
   from worker.mt5.executor import MT5Executor
   from worker.mt5.mt5 import MT5
+  from worker.services.callback_service import CallbackService
   from worker.services.db_service import DBService
   from worker.services.notifications_service import TelegramNotification
   from worker.services.zmq_service import ZMQ
@@ -73,6 +74,14 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   handler = SignalHandler(strategy)
   db_service = DBService()
   db_service.initialize()
+
+  account_status = bridge.get_account_status() or {}
+  callback_service = CallbackService(
+    broker_api_url=settings_dict["broker_api_url"],
+    account_id=str(settings_dict["mt5_login"]),
+    api_key=settings_dict["broker_api_key"],
+  )
+  balance_at_start = account_status.get("balance", 0.0)
 
   notifier = TelegramNotification()
   footer = bridge.get_account_footer()
@@ -117,6 +126,14 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
       )
 
       if result.get("success"):
+        callback_service.notify_opened(
+          signal=signal,
+          ticket=result.get("ticket"),
+          comment=result.get("comment", ""),
+          volume=result.get("volume", signal.quantity),
+          price=result.get("price", signal.price),
+          balance_init=balance_at_start,
+        )
         msg = (
           f"✅ <b>Order Filled</b>\n\n"
           f"Symbol: {signal.symbol}\n"
@@ -125,6 +142,11 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
           f"Ticket: {result.get('ticket')}{footer}"
         )
       else:
+        callback_service.notify_rejected(
+          signal=signal,
+          reject_reason=result.get("comment", "Unknown error"),
+          balance_init=balance_at_start,
+        )
         msg = (
           f"❌ <b>Order Failed</b>\n\n"
           f"Symbol: {signal.symbol}\n"

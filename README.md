@@ -2,14 +2,24 @@
 
 This is the execution-end of the Event-Driven trading system. It acts as a ZeroMQ subscriber waiting for highly structured trading signals from the central Broker, then executes them directly into the MetaTrader 5 Terminal.
 
-## 🏗️ Architecture Stack
+## 🏗️ System Architecture
 
-- **MetaTrader5**: Official MT5 python integration for direct terminal execution.
-- **ZMQ SUB**: Resilient ZeroMQ subscriber picking up broadcasted signals.
-- **Pydantic**: Deep JSON validation parsing ensuring zero execution mismatches.
-- **Loguru**: Beautiful structured JSON-capable logging.
-- **SQLite**: Local persistence capturing every ticker intent and subsequent MT5 execution retcode.
-- **UV**: Blazing fast Python environment initialization.
+```mermaid
+graph TD
+    TV[TradingView Alert] -- "POST :8080/webhook" --> Broker
+    subgraph "Broker Node"
+        Broker[FastAPI Webhook Server]
+        DB[(PostgreSQL)]
+        ZMQ["ZeroMQ PUB :5555 (CURVE)"]
+        Broker -- "Log Signal" --> DB
+        Broker -- "Publish" --> ZMQ
+    end
+    ZMQ -- "🔐 Encrypted Stream" --> VPS1[VPS Node #1]
+    ZMQ -- "🔐 Encrypted Stream" --> VPS2[VPS Node #2]
+    ZMQ -- "🔐 Encrypted Stream" --> VPSN[VPS Node #N]
+    VPS1 -- "POST /trades (opened/rejected)" --> Broker
+    VPS1 -- "PATCH /trades/{signal_id} (closed/partial)" --> Broker
+```
 
 ---
 
@@ -25,6 +35,7 @@ worker/
 ├── schemas/             # Pydantic data schemas
 │   └── broker_schema.py # Signal & position validation schemas
 ├── services/            # Business & Infrastructure services
+│   ├── callback_service.py      # HTTP callbacks to broker (POST/PATCH /trades)
 │   ├── db_service.py            # Database access layer
 │   ├── mt5_process.py           # MT5 subprocess manager
 │   ├── notifications_service.py # Telegram notification logic

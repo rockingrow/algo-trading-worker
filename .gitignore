@@ -52,6 +52,7 @@ worker_data.sqlite
 # IDEs and Editors
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 .DS_Store
