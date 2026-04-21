@@ -28,7 +28,7 @@ class Settings(BaseSettings):
   mt5_name: Optional[str] = None
 
   # Strategy configuration
-  magic_number: int = 123456
+  magic_number: int = 20260409
   slippage_deviation: int = 20
 
   # Telegram

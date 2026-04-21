@@ -17,7 +17,45 @@ code lives in the child process and is therefore 100% GIL-isolated.
 from __future__ import annotations
 
 import multiprocessing
+import threading
+import time
 from typing import Optional
+
+_MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
+
+# ---------------------------------------------------------------------------
+# MT5 health-check thread — runs alongside the ZMQ signal loop
+# ---------------------------------------------------------------------------
+
+
+def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
+  """
+  Runs in a daemon thread inside the child process.
+  Proactively detects MT5 disconnect and relaunches/reconnects the terminal
+  without waiting for a ZMQ signal to arrive.
+  """
+  while not stop_event.is_set():
+    time.sleep(_MT5_HEALTH_INTERVAL)
+    if stop_event.is_set():
+      break
+    try:
+      if not bridge.is_connected():
+        log.warning("[MT5 Health] MT5 disconnected — attempting to relaunch/reconnect...")
+        notifier.send_message(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}")
+        reconnected = bridge.reconnect(max_attempts=15, delay_seconds=5.0)
+        if reconnected:
+          log.info("[MT5 Health] MT5 reconnected successfully.")
+          notifier.send_message(f"🟢 <b>MT5 reconnected</b>{footer_fn()}")
+        else:
+          log.error("[MT5 Health] MT5 reconnect failed after 15 attempts — terminal may have crashed.")
+          notifier.send_message(
+            f"🔴 <b>MT5 CRASHED</b>\n\n"
+            f"Failed to relaunch MetaTrader 5 after 15 attempts.\n"
+            f"Please restart the terminal manually.{footer_fn()}"
+          )
+    except Exception as exc:
+      log.exception("[MT5 Health] Unexpected error in health thread: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Child-process entry point
@@ -86,10 +124,20 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   notifier = TelegramNotification()
   footer = bridge.get_account_footer()
 
-  notifier.send_message(f"🟢 <b>MT5 Worker connected</b>{footer}")
+  zmq_host = settings_dict["zmq_sub_host"]
+  notifier.send_message(f"🟢 <b>MT5 Worker connected</b>\n📡 ZMQ subscribed to <code>{zmq_host}</code>{footer}")
   log.info("[MT5 Process] Worker loop started.")
 
-  # ── 4. Signal processing loop ─────────────────────────────────────────── #
+  # ── 4. Start MT5 health-check thread ─────────────────────────────────── #
+  health_thread = threading.Thread(
+    target=_mt5_health_thread,
+    args=(bridge, notifier, bridge.get_account_footer, stop_event, log),
+    name="mt5-health",
+    daemon=True,
+  )
+  health_thread.start()
+
+  # ── 5. Signal processing loop ─────────────────────────────────────────── #
   try:
     for signal in subscriber.listen(stop_event=stop_event):
       if not bridge.is_connected():
@@ -182,6 +230,7 @@ class MT5ProcessManager:
     self._settings_dict = settings_dict
     self._process: Optional[multiprocessing.Process] = None
     self._stop_event = multiprocessing.Event()
+    self._stopping = False
 
   def start(self) -> None:
     """Spawn the child process."""
@@ -196,6 +245,7 @@ class MT5ProcessManager:
 
   def stop(self) -> None:
     """Signal the child to shut down gracefully, then force-kill if needed."""
+    self._stopping = True
     if self._process and self._process.is_alive():
       self._stop_event.set()
       self._process.join(timeout=15)  # wait for Telegram notification to send
@@ -205,6 +255,22 @@ class MT5ProcessManager:
         if self._process.is_alive():
           self._process.kill()
 
+  def restart(self) -> None:
+    """Restart the child process after an unexpected crash."""
+    self._stopping = False
+    self._stop_event.clear()
+    self._process = multiprocessing.Process(
+      target=_worker_process_main,
+      args=(self._settings_dict, self._stop_event),
+      name="mt5-worker",
+      daemon=True,
+    )
+    self._process.start()
+
   @property
   def is_alive(self) -> bool:
     return self._process is not None and self._process.is_alive()
+
+  @property
+  def stopping(self) -> bool:
+    return self._stopping

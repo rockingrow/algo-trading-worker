@@ -3,8 +3,8 @@ import threading
 from typing import Generator, Optional
 
 import zmq
-from zmq.utils import z85
 from pydantic import ValidationError
+from zmq.utils import z85
 
 from worker.logger import get_logger
 from worker.schemas.broker_schema import SignalSchema
@@ -103,6 +103,25 @@ class ZMQ:
     except Exception:
       pass
 
+  def _parse_message(self, message: str) -> Optional[SignalSchema]:
+    if "|" not in message:
+      logger.error(f"Invalid message format (missing '|'): {message}")
+      return None
+    _, payload = message.split("|", 1)
+    raw_data = json.loads(payload)
+    signal = SignalSchema(**raw_data)
+    logger.info(f"Signal validated successfully for {signal.symbol} [{signal.action}]")
+    return signal
+
+  def _reconnect(self):
+    logger.error("ZMQ Error: reconnecting...")
+    try:
+      self.socket.close(linger=0)
+    except Exception:
+      pass
+    self.socket = self._create_socket()
+    self.connect()
+
   def listen(self, stop_event=None) -> Generator[SignalSchema, None, None]:
     """Continuously listen for data and parse JSON using Pydantic."""
     logger.info("Started listening for signals...")
@@ -110,45 +129,21 @@ class ZMQ:
       if stop_event is not None and stop_event.is_set():
         return
       try:
-        # Use a short timeout so we can check the stop event periodically
         if not self.socket.poll(timeout=500):  # 500ms
           continue
         message = self.socket.recv_string(zmq.NOBLOCK)
         logger.debug(f"Received raw message: {message}")
-
-        # Handle "TOPIC|PAYLOAD" format
-        if "|" not in message:
-          logger.error(f"Invalid message format (missing '|'): {message}")
-          continue
-
-        _, payload = message.split("|", 1)
-
-        # Parse JSON
-        raw_data = json.loads(payload)
-
-        # Validate type safety
-        signal = SignalSchema(**raw_data)
-        logger.info(
-          f"Signal validated successfully for {signal.symbol} [{signal.action}]"
-        )
-
-        yield signal
-
+        signal = self._parse_message(message)
+        if signal is not None:
+          yield signal
       except json.JSONDecodeError as err:
         logger.error(f"Malformed JSON received: {err}")
       except ValidationError as err:
         logger.error(f"Pydantic Validation failed: {err}")
       except zmq.ZMQError as err:
         if self._stop_event.is_set():
-          break  # Expected shutdown, not a real error
+          break
         logger.error(f"ZMQ Error: {err}")
-        # Basic reconnect logic if disconnected:
-        # Reset socket
-        try:
-          self.socket.close(linger=0)
-        except Exception:
-          pass
-        self.socket = self._create_socket()
-        self.connect()
+        self._reconnect()
       except Exception as err:
         logger.exception(f"Unexpected error in ZMQ listener: {err}")

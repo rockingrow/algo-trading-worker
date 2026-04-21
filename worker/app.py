@@ -10,6 +10,23 @@ from worker.settings import settings
 
 log = get_logger("worker.app")
 
+_WATCHDOG_INTERVAL = 10  # seconds between liveness checks
+
+
+async def _watchdog(manager: MT5ProcessManager) -> None:
+  """Restart the MT5 child process if it dies unexpectedly."""
+  while True:
+    await asyncio.sleep(_WATCHDOG_INTERVAL)
+    if manager.stopping:
+      break
+    if not manager.is_alive:
+      log.warning("MT5 worker process died unexpectedly — restarting...")
+      try:
+        await asyncio.to_thread(manager.restart)
+        log.info("MT5 worker process restarted successfully.")
+      except Exception as exc:
+        log.exception("Failed to restart MT5 worker process: %s", exc)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -33,6 +50,8 @@ async def lifespan(app: FastAPI):
     "zmq_curve_client_secret_key": settings.zmq_curve_client_secret_key,
     "magic_number": settings.magic_number,
     "slippage_deviation": settings.slippage_deviation,
+    "broker_api_url": settings.broker_api_url,
+    "broker_api_key": settings.broker_api_key,
   }
 
   manager = MT5ProcessManager(settings_dict)
@@ -43,12 +62,20 @@ async def lifespan(app: FastAPI):
   #    to keep the event loop fully responsive from the first millisecond.
   await asyncio.to_thread(manager.start)
 
+  watchdog_task = asyncio.create_task(_watchdog(manager))
+
   log.info(
     "FastAPI lifespan started. MT5 worker running in subprocess. API is now accepting requests."
   )
   yield
 
-  # 4. Shutdown: stop the child process.
+  # 4. Shutdown: stop watchdog then child process.
+  watchdog_task.cancel()
+  try:
+    await watchdog_task
+  except asyncio.CancelledError:
+    pass
+
   log.info("Shutting down MT5 worker subprocess...")
   await asyncio.to_thread(manager.stop)
   log.info("MT5 worker subprocess stopped.")
