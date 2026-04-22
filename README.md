@@ -120,4 +120,4 @@ Start the Worker (from the root directory):
 make start
 ```
 
-The Worker will initialize the `worker_data.sqlite` database, connect to MT5 in an isolated subprocess, and open a Subscribe socket to ZeroMQ. You can monitor the logs printed directly to the screen.
+The Worker will initialize the `worker_data.sqlite` database, connect to MT5 in an isolated subprocess, and open a Subscribe socket to ZeroMQ. You can monitor the logs printed directly to the screen
