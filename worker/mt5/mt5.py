@@ -88,6 +88,12 @@ class MT5:
     return (
       f"\n\n-----------------------------\n"
       f"<b>Account:</b> {self.login} ({self.account_name})\n"
+      f"<b>Balance:</b> {self.get_account_status().get('balance', 0.0):.2f}\n"
+      f"<b>Equity:</b> {self.get_account_status().get('equity', 0.0):.2f}\n"
+      f"<b>Leverage:</b> {self.get_account_status().get('leverage', 0.0):.2f}\n"
+      f"<b>Margin:</b> {self.get_account_status().get('margin', 0.0):.2f}\n"
+      f"<b>Free Margin:</b> {self.get_account_status().get('free_margin', 0.0):.2f}\n"
+      f"<b>Margin Level:</b> {self.get_account_status().get('margin_level', 0.0):.2f}%\n"
       f"<b>Server:</b> {self.server}\n"
       f"-----------------------------\n"
     )

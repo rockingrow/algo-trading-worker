@@ -12,7 +12,7 @@ def init_db():
   try:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-        cursor.execute("""
+    cursor.execute("""
             CREATE TABLE IF NOT EXISTS order_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticket INTEGER,

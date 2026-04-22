@@ -18,7 +18,7 @@ graph TD
     ZMQ -- "🔐 Encrypted Stream" --> VPS2[VPS Node #2]
     ZMQ -- "🔐 Encrypted Stream" --> VPSN[VPS Node #N]
     VPS1 -- "POST /trades (opened/rejected)" --> Broker
-    VPS1 -- "PATCH /trades/{signal_id} (closed/partial)" --> Broker
+    VPS1 -- "PATCH /trades/{account_id}/{ticket} (closed/partial)" --> Broker
 ```
 
 ---
@@ -63,13 +63,16 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 ### Key Design Decisions
 
-- **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries MT5 and force-closes any leftover position for that symbol. This prevents accidental hedging and guarantees each cycle starts flat.
+- **Stale position cleanup (Entry):** An account holds at most 1 position per symbol. Before opening any new LONG/SHORT, the handler queries MT5 and force-closes any leftover position for that identical symbol. This ignores the new signal if a manual trade is open independently, but within the algo context, it guarantees each cycle starts flat and prevents accidental hedging.
+- **`source_ticket` Lifecycle Tracking:** The `source_ticket` acts as the unique identifier for a specific trading _position_. When a new trade is opened (Entry), MT5 assigns an ID which becomes the `source_ticket`. When subsequent signals (`TP1`, `TP2`, `SL`, `R_SL`) arrive, they refer back to that original `source_ticket`. For a given trade, the `source_ticket` remains completely constant across its entire lifecycle. This prevents ambiguity across multiple concurrent active trades on different symbols.
 
 - **Ticket-linked partial close (TP1):** The partial close request always carries the original `position=ticket` so MT5 correctly treats it as a partial close rather than an opposing hedge order.
 
 - **Actual volume on full close (TP2/SL/R_SL):** The signal `quantity` is **never used** for full exit calculations. The handler reads the live `position.volume` directly from MT5 to avoid dust-lot rounding errors.
 
 - **Breakeven SL after TP1:** After the partial close succeeds, a `TRADE_ACTION_SLTP` request moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss.
+
+- **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to a local `order_logs` SQLite table. This audit trail captures the full original ZeroMQ JSON `message`, the MT5 target `ticket`, the original `source_ticket`, and all execution context mapping directly back to the Broker's state.
 
 - **GIL-isolated subprocess:** All MT5 and ZMQ blocking code runs in a separate OS process. The parent process only manages subprocess lifetime, keeping the event loop fully responsive.
 

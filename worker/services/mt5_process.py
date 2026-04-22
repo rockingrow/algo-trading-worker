@@ -155,7 +155,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
       log.info(
         "[MT5 Process] Processing Signal: %s | %s | TV Time: %s",
         signal.symbol,
-        signal.action,
+        signal.action.value,
         signal.timestamp,
       )
 
@@ -165,7 +165,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
         ticket=result.get("ticket"),
         source_ticket=result.get("source_ticket", result.get("ticket")),
         symbol=signal.symbol,
-        action=signal.action,
+        action=signal.action.value,
         volume=result.get("volume", signal.quantity),
         price=result.get("price", signal.price),
         sl=getattr(signal, "sl", None),
@@ -207,9 +207,11 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
         msg = (
           f"✅ <b>Order Filled</b>\n\n"
           f"Symbol: {signal.symbol}\n"
-          f"Action: {signal.action}\n"
+          f"Action: {signal.action.value}\n"
+          f"Price: {result.get('price')}\n"
           f"Volume: {result.get('volume')}\n"
-          f"Ticket: {result.get('ticket')}{footer}"
+          f"Ticket: {result.get('ticket')}\n"
+          f"Source Ticket: {pos_ticket}{footer}"
         )
       else:
         callback_service.notify_rejected(
@@ -220,7 +222,8 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
         msg = (
           f"❌ <b>Order Failed</b>\n\n"
           f"Symbol: {signal.symbol}\n"
-          f"Action: {signal.action}\n"
+          f"Action: {signal.action.value}\n"
+          f"Price: {result.get('price')}\n"
           f"Error: {result.get('comment')} (Code {result.get('retcode')}){footer}"
         )
       notifier.send_message(msg)

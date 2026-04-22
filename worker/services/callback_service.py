@@ -67,7 +67,7 @@ class CallbackService:
       "tp2": signal.tp2,
       "is_running": True,
       "risk_percent": signal.risk_percent,
-      "status": SignalStatusEnum.OPENED,
+      "status": SignalStatusEnum.OPENED.value,
       "reject_reason": None,
     }
     self._post_trade(payload)
@@ -97,7 +97,7 @@ class CallbackService:
       "tp2": signal.tp2,
       "is_running": False,
       "risk_percent": signal.risk_percent,
-      "status": SignalStatusEnum.REJECTED,
+      "status": SignalStatusEnum.REJECTED.value,
       "reject_reason": reject_reason,
     }
     self._post_trade(payload)
@@ -117,7 +117,7 @@ class CallbackService:
       "quantity": quantity,
       "sl": sl,
       "is_running": False,
-      "status": SignalStatusEnum.CLOSED,
+      "status": SignalStatusEnum.CLOSED.value,
       "reject_reason": None,
     }
     self._patch_trade(ticket, payload)
@@ -135,7 +135,7 @@ class CallbackService:
       "price": price,
       "quantity": remaining_quantity,
       "is_running": True,
-      "status": SignalStatusEnum.PARTIALLY_CLOSED,
+      "status": SignalStatusEnum.PARTIALLY_CLOSED.value,
     }
     self._patch_trade(ticket, payload)
 
