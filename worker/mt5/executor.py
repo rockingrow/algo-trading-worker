@@ -406,6 +406,7 @@ class MT5Executor:
         "success": True,
         "retcode": mt5.TRADE_RETCODE_DONE,
         "ticket": last_result.order,
+        "source_ticket": positions[0].ticket, # Include the position's original ticket
         "price": last_result.price,
         "volume": last_result.volume,
         "comment": f"Closed {success_count} position(s) [{reason}]",

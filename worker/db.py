@@ -12,10 +12,11 @@ def init_db():
   try:
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("""
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS order_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticket INTEGER,
+                source_ticket INTEGER,
                 symbol TEXT NOT NULL,
                 action TEXT NOT NULL,
                 volume REAL NOT NULL,
@@ -24,6 +25,7 @@ def init_db():
                 tp1 REAL,
                 mt5_retcode INTEGER,
                 comment TEXT,
+                message TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -36,6 +38,7 @@ def init_db():
 
 def log_order(
   ticket: Optional[int],
+  source_ticket: Optional[int],
   symbol: str,
   action: str,
   volume: float,
@@ -44,6 +47,7 @@ def log_order(
   tp1: Optional[float],
   mt5_retcode: int,
   comment: str = "",
+  message: Optional[str] = None,
 ):
   """Save order execution results to DB."""
   try:
@@ -51,10 +55,10 @@ def log_order(
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO order_logs (ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO order_logs (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment),
+      (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message),
     )
     conn.commit()
     conn.close()

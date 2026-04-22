@@ -1,4 +1,4 @@
-# 🚀 Algo Trading MT5 Worker
+# 🚀 Algo Trading Worker Worker
 
 This is the execution-end of the Event-Driven trading system. It acts as a ZeroMQ subscriber waiting for highly structured trading signals from the central Broker, then executes them directly into the MetaTrader 5 Terminal.
 
@@ -55,11 +55,11 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 ### Action Groups
 
-| Group | Action(s) | MT5 Behaviour |
-| --- | --- | --- |
-| **1 — Entry** | `LONG` / `SHORT` | Force-close any stale position → open a fresh market order with hard SL set on the server |
-| **2 — Partial Exit** | `TP1` | Partial close using signal `quantity` converted to lots → move remaining position SL to breakeven (`price_open`) |
-| **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open lots using **actual MT5 `position.volume`** — signal `quantity` is intentionally ignored |
+| Group                | Action(s)             | MT5 Behaviour                                                                                                    |
+| -------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| **1 — Entry**        | `LONG` / `SHORT`      | Force-close any stale position → open a fresh market order with hard SL set on the server                        |
+| **2 — Partial Exit** | `TP1`                 | Partial close using signal `quantity` converted to lots → move remaining position SL to breakeven (`price_open`) |
+| **3 — Full Exit**    | `TP2` / `SL` / `R_SL` | Close ALL open lots using **actual MT5 `position.volume`** — signal `quantity` is intentionally ignored          |
 
 ### Key Design Decisions
 
@@ -75,14 +75,14 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 ### MT5Executor Primitives (`worker/mt5/executor.py`)
 
-| Method | Used By |
-| --- | --- |
-| `open_position(signal)` | Entry (Group 1) |
-| `partial_close_position(symbol, volume, ticket?)` | TP1 (Group 2) |
-| `update_position_sl(symbol, new_sl, ticket?)` | TP1 breakeven update |
-| `close_all_positions(symbol, reason)` | Full exit (Group 3) |
-| `get_open_positions(symbol)` | Pre-flight guard in all groups |
-| `convert_quantity_to_lots(symbol, quantity)` | Entry & TP1 volume calc |
+| Method                                            | Used By                        |
+| ------------------------------------------------- | ------------------------------ |
+| `open_position(signal)`                           | Entry (Group 1)                |
+| `partial_close_position(symbol, volume, ticket?)` | TP1 (Group 2)                  |
+| `update_position_sl(symbol, new_sl, ticket?)`     | TP1 breakeven update           |
+| `close_all_positions(symbol, reason)`             | Full exit (Group 3)            |
+| `get_open_positions(symbol)`                      | Pre-flight guard in all groups |
+| `convert_quantity_to_lots(symbol, quantity)`      | Entry & TP1 volume calc        |
 | `calculate_lot_size(symbol, entry, sl, risk_pct)` | Entry volume calc (risk-based) |
 
 ---

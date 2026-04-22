@@ -16,6 +16,7 @@ class DBService:
   def log_order(
     self,
     ticket: Optional[int],
+    source_ticket: Optional[int],
     symbol: str,
     action: str,
     volume: float,
@@ -24,10 +25,12 @@ class DBService:
     tp1: Optional[float],
     mt5_retcode: int,
     comment: str = "",
+    message: Optional[str] = None,
   ):
     """Log order execution result to the database."""
     log_order(
       ticket=ticket,
+      source_ticket=source_ticket,
       symbol=symbol,
       action=action,
       volume=volume,
@@ -36,4 +39,5 @@ class DBService:
       tp1=tp1,
       mt5_retcode=mt5_retcode,
       comment=comment,
+      message=message,
     )

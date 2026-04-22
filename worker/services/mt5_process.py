@@ -163,6 +163,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
 
       db_service.log_order(
         ticket=result.get("ticket"),
+        source_ticket=result.get("source_ticket", result.get("ticket")),
         symbol=signal.symbol,
         action=signal.action,
         volume=result.get("volume", signal.quantity),
@@ -171,17 +172,38 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
         tp1=getattr(signal, "tp1", None),
         mt5_retcode=result.get("retcode", -1),
         comment=result.get("comment", ""),
+        message=signal.model_dump_json(),
       )
 
       if result.get("success"):
-        callback_service.notify_opened(
-          signal=signal,
-          ticket=result.get("ticket"),
-          comment=result.get("comment", ""),
-          volume=result.get("volume", signal.quantity),
-          price=result.get("price", signal.price),
-          balance_init=balance_at_start,
-        )
+        # For entries (LONG/SHORT), `ticket` is the position. 
+        # For exits (TP1/TP2/SL/R_SL), `ticket` is the new exit deal, but `source_ticket` is the original position.
+        # We want to callback with the same steady position ticket across all states.
+        pos_ticket = result.get("source_ticket", result.get("ticket"))
+        action_val = signal.action.value
+        
+        if action_val in ("LONG", "SHORT"):
+          callback_service.notify_opened(
+            signal=signal,
+            ticket=pos_ticket,
+            comment=result.get("comment", ""),
+            volume=result.get("volume", signal.quantity),
+            price=result.get("price", signal.price),
+            balance_init=balance_at_start,
+          )
+        elif action_val == "TP1":
+          callback_service.notify_partially_closed(
+            ticket=str(pos_ticket),
+            price=result.get("price", signal.price),
+            remaining_quantity=result.get("volume", signal.quantity),
+          )
+        elif action_val in ("TP2", "SL", "R_SL"):
+          callback_service.notify_closed(
+            ticket=str(pos_ticket),
+            price=result.get("price", signal.price),
+            quantity=result.get("volume", signal.quantity),
+            sl=getattr(signal, "sl", None),
+          )
         msg = (
           f"✅ <b>Order Filled</b>\n\n"
           f"Symbol: {signal.symbol}\n"
