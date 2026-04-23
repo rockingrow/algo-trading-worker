@@ -84,18 +84,18 @@ class MT5:
       return None
 
   def get_account_footer(self) -> str:
-    """Return a formatted footer string with account details."""
+    """Return account detail lines (no border — caller wraps in a box)."""
+    status = self.get_account_status() or {}
     return (
-      f"\n\n-----------------------------\n"
+      f"\n"
       f"<b>Account:</b> {self.login} ({self.account_name})\n"
-      f"<b>Balance:</b> {self.get_account_status().get('balance', 0.0):.2f}\n"
-      f"<b>Equity:</b> {self.get_account_status().get('equity', 0.0):.2f}\n"
-      f"<b>Leverage:</b> {self.get_account_status().get('leverage', 0.0):.2f}\n"
-      f"<b>Margin:</b> {self.get_account_status().get('margin', 0.0):.2f}\n"
-      f"<b>Free Margin:</b> {self.get_account_status().get('free_margin', 0.0):.2f}\n"
-      f"<b>Margin Level:</b> {self.get_account_status().get('margin_level', 0.0):.2f}%\n"
-      f"<b>Server:</b> {self.server}\n"
-      f"-----------------------------\n"
+      f"<b>Balance:</b> {status.get('balance', 0.0):.2f}\n"
+      f"<b>Equity:</b> {status.get('equity', 0.0):.2f}\n"
+      f"<b>Leverage:</b> {status.get('leverage', 0.0):.2f}\n"
+      f"<b>Margin:</b> {status.get('margin', 0.0):.2f}\n"
+      f"<b>Free Margin:</b> {status.get('free_margin', 0.0):.2f}\n"
+      f"<b>Margin Level:</b> {status.get('margin_level', 0.0):.2f}%\n"
+      f"<b>Server:</b> {self.server}"
     )
 
   def is_connected(self) -> bool:

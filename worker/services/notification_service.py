@@ -3,7 +3,7 @@ import requests
 from worker.logger import get_logger
 from worker.settings import settings
 
-logger = get_logger("worker.services.notifications_service")
+logger = get_logger("worker.services.notification_service")
 
 
 class Notification:

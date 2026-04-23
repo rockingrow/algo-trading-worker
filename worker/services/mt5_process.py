@@ -23,6 +23,9 @@ from typing import Optional
 
 _MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 
+def _box(text: str) -> str:
+    return f"<pre>{text.strip()}</pre>"
+
 # ---------------------------------------------------------------------------
 # MT5 health-check thread — runs alongside the ZMQ signal loop
 # ---------------------------------------------------------------------------
@@ -41,18 +44,18 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
     try:
       if not bridge.is_connected():
         log.warning("[MT5 Health] MT5 disconnected — attempting to relaunch/reconnect...")
-        notifier.send_message(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}")
+        notifier.send_message(_box(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}"))
         reconnected = bridge.reconnect(max_attempts=15, delay_seconds=5.0)
         if reconnected:
           log.info("[MT5 Health] MT5 reconnected successfully.")
-          notifier.send_message(f"🟢 <b>MT5 reconnected</b>{footer_fn()}")
+          notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer_fn()}"))
         else:
           log.error("[MT5 Health] MT5 reconnect failed after 15 attempts — terminal may have crashed.")
-          notifier.send_message(
+          notifier.send_message(_box(
             f"🔴 <b>MT5 CRASHED</b>\n\n"
             f"Failed to relaunch MetaTrader 5 after 15 attempts.\n"
             f"Please restart the terminal manually.{footer_fn()}"
-          )
+          ))
     except Exception as exc:
       log.exception("[MT5 Health] Unexpected error in health thread: %s", exc)
 
@@ -75,7 +78,8 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   from worker.mt5.mt5 import MT5
   from worker.services.callback_service import CallbackService
   from worker.services.db_service import DBService
-  from worker.services.notifications_service import TelegramNotification
+  from worker.services.job_service import MT5EventJob
+  from worker.services.notification_service import TelegramNotification
   from worker.services.zmq_service import ZMQ
 
   log = get_logger("worker.mt5_process")
@@ -125,7 +129,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   footer = bridge.get_account_footer()
 
   zmq_host = settings_dict["zmq_sub_host"]
-  notifier.send_message(f"🟢 <b>MT5 Worker connected</b>\n📡 ZMQ subscribed to <code>{zmq_host}</code>{footer}")
+  notifier.send_message(_box(f"🟢 <b>MT5 Worker connected</b>\n📡 ZMQ subscribed to <code>{zmq_host}</code>{footer}"))
   log.info("[MT5 Process] Worker loop started.")
 
   # ── 4. Start MT5 health-check thread ─────────────────────────────────── #
@@ -137,19 +141,26 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   )
   health_thread.start()
 
+  # ── 4b. Start terminal-close polling job ──────────────────────────────── #
+  event_job = MT5EventJob(
+    magic_number=settings_dict["magic_number"],
+    callback_service=callback_service,
+    db_service=db_service,
+    notifier=notifier,
+  )
+  event_job.start(stop_event=stop_event)
+
   # ── 5. Signal processing loop ─────────────────────────────────────────── #
   try:
     for signal in subscriber.listen(stop_event=stop_event):
       if not bridge.is_connected():
         log.warning("[MT5 Process] MT5 connection lost. Reconnecting...")
-        notifier.send_message(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}")
+        notifier.send_message(_box(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}"))
         reconnected = bridge.reconnect(max_attempts=0, delay_seconds=5.0)
         if reconnected:
-          notifier.send_message(f"🟢 <b>MT5 reconnected</b>{footer}")
+          notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer}"))
         else:
-          notifier.send_message(
-            f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}"
-          )
+          notifier.send_message(_box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}"))
           continue
 
       log.info(
@@ -173,6 +184,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
         mt5_retcode=result.get("retcode", -1),
         comment=result.get("comment", ""),
         message=signal.model_dump_json(),
+        author="broker",
       )
 
       if result.get("success"):
@@ -204,14 +216,14 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
             quantity=result.get("volume", signal.quantity),
             sl=getattr(signal, "sl", None),
           )
-        msg = (
+        msg = _box(
           f"✅ <b>Order Filled</b>\n\n"
-          f"Symbol: {signal.symbol}\n"
-          f"Action: {signal.action.value}\n"
-          f"Price: {result.get('price')}\n"
-          f"Volume: {result.get('volume')}\n"
-          f"Ticket: {result.get('ticket')}\n"
-          f"Source Ticket: {pos_ticket}{footer}"
+          f"Symbol: <b>{signal.symbol}</b>\n"
+          f"Action: <b>{signal.action.value}</b>\n"
+          f"Price: <b>{result.get('price')}</b>\n"
+          f"Volume: <b>{result.get('volume')}</b>\n"
+          f"Ticket: <b>{result.get('ticket')}</b>\n"
+          f"Source Ticket: <b>{pos_ticket}</b>{footer}"
         )
       else:
         callback_service.notify_rejected(
@@ -219,12 +231,12 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
           reject_reason=result.get("comment", "Unknown error"),
           balance_init=balance_at_start,
         )
-        msg = (
+        msg = _box(
           f"❌ <b>Order Failed</b>\n\n"
-          f"Symbol: {signal.symbol}\n"
-          f"Action: {signal.action.value}\n"
-          f"Price: {result.get('price')}\n"
-          f"Error: {result.get('comment')} (Code {result.get('retcode')}){footer}"
+          f"Symbol: <b>{signal.symbol}</b>\n"
+          f"Action: <b>{signal.action.value}</b>\n"
+          f"Price: <b>{result.get('price')}</b>\n"
+          f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>){footer}"
         )
       notifier.send_message(msg)
 
@@ -235,7 +247,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   finally:
     subscriber.close()
     bridge.shutdown()
-    notifier.send_message(f"🛑 <b>MT5 Worker disconnected</b>{footer}")
+    notifier.send_message(_box(f"🛑 <b>MT5 Worker disconnected</b>{footer}"))
     log.info("[MT5 Process] Exiting.")
 
 

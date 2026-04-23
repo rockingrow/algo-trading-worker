@@ -26,6 +26,7 @@ def init_db():
                 mt5_retcode INTEGER,
                 comment TEXT,
                 message TEXT,
+                author TEXT NOT NULL DEFAULT 'broker',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -48,6 +49,7 @@ def log_order(
   mt5_retcode: int,
   comment: str = "",
   message: Optional[str] = None,
+  author: str = "broker",
 ):
   """Save order execution results to DB."""
   try:
@@ -55,13 +57,13 @@ def log_order(
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO order_logs (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO order_logs (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message),
+      (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author),
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Order logged to DB: Ticket={ticket}, Retcode={mt5_retcode}")
+    logger.debug(f"Order logged to DB: Ticket={ticket}, Retcode={mt5_retcode}, Author={author}")
   except Exception as e:
     logger.exception(f"Failed to log order to DB: {e}")

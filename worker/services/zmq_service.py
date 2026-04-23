@@ -3,11 +3,13 @@ import threading
 from typing import Generator, Optional
 
 import zmq
+import zmq.utils.monitor
 from pydantic import ValidationError
 from zmq.utils import z85
 
 from worker.logger import get_logger
 from worker.schemas.broker_schema import SignalSchema
+from worker.services.notification_service import TelegramNotification
 
 logger = get_logger("worker.zmq_service")
 
@@ -25,8 +27,11 @@ class ZMQ:
     self._curve_client_public_key = curve_client_public_key
     self._curve_client_secret_key = curve_client_secret_key
     self.context = zmq.Context()
-    self.socket = self._create_socket()
     self._stop_event = threading.Event()
+    self._curve_enabled = False
+    self._monitor_count = 0
+    self._monitor_thread: Optional[threading.Thread] = None
+    self.socket = self._create_socket()
 
   def _create_socket(self):
     socket = self.context.socket(zmq.SUB)
@@ -59,11 +64,13 @@ class ZMQ:
         socket.curve_serverkey = z85.decode(server_pub)
         socket.curve_publickey = z85.decode(client_pub)
         socket.curve_secretkey = z85.decode(client_sec)
+        self._curve_enabled = True
         logger.info("ZMQ CURVE security enabled and keys decoded successfully.")
       except Exception as e:
         logger.error(f"Failed to apply ZMQ CURVE keys: {e}")
         raise
     else:
+      self._curve_enabled = False
       logger.warning(
         "ZMQ CURVE security is DISABLED (keys missing or invalid). Connection is unencrypted."
       )
@@ -79,13 +86,87 @@ class ZMQ:
     )  # Fail 3 times -> Report dead connection (ZMQError)
     return socket
 
+  def _start_monitor(self) -> None:
+    """Spin up a daemon thread that watches for broker connect/disconnect events."""
+    monitor_addr = f"inproc://worker-sub-monitor-{self._monitor_count}"
+    self._monitor_count += 1
+
+    events = (
+      zmq.EVENT_CONNECTED
+      | zmq.EVENT_CONNECT_DELAYED
+      | zmq.EVENT_CONNECT_RETRIED
+      | zmq.EVENT_DISCONNECTED
+      | zmq.EVENT_MONITOR_STOPPED
+    )
+    if self._curve_enabled:
+      events |= zmq.EVENT_HANDSHAKE_SUCCEEDED | zmq.EVENT_HANDSHAKE_FAILED_NO_DETAIL
+
+    self.socket.monitor(monitor_addr, events)
+    curve_enabled = self._curve_enabled
+
+    def _watch() -> None:
+      # ZMQ sockets are not thread-safe — create monitor_sock inside the thread
+      monitor_sock = self.context.socket(zmq.PAIR)
+      monitor_sock.connect(monitor_addr)
+      notification = TelegramNotification()
+      while not self._stop_event.is_set():
+        if not monitor_sock.poll(timeout=500):
+          continue
+        try:
+          event_data = zmq.utils.monitor.recv_monitor_message(monitor_sock)
+          event = event_data["event"]
+          endpoint = event_data.get("endpoint", b"").decode(errors="replace")
+          logger.debug("ZMQ monitor raw event: 0x%x endpoint=%s", event, endpoint)
+
+          if event == zmq.EVENT_CONNECTED:
+            logger.info("ZMQ Broker TCP connection established: %s", endpoint)
+            if not curve_enabled:
+              notification.send_message(
+                f"<pre>🔌 ZMQ Worker Connected to Broker\nEndpoint: {endpoint}</pre>"
+              )
+
+          elif event == zmq.EVENT_HANDSHAKE_SUCCEEDED:
+            logger.info("ZMQ Broker CURVE handshake succeeded: %s", endpoint)
+            notification.send_message(
+              f"<pre>🔌 ZMQ Worker Connected to Broker\n🔐 Authenticated (CURVE)\nEndpoint: {endpoint}</pre>"
+            )
+
+          elif event == zmq.EVENT_HANDSHAKE_FAILED_NO_DETAIL:
+            logger.warning("ZMQ Broker CURVE handshake failed: %s", endpoint)
+            notification.send_message(
+              f"<pre>⚠️ ZMQ Worker Auth Failed (CURVE)\nEndpoint: {endpoint}</pre>"
+            )
+
+          elif event == zmq.EVENT_DISCONNECTED:
+            logger.warning("ZMQ Broker disconnected: %s. Retrying...", endpoint)
+            notification.send_message(
+              f"<pre>🔴 ZMQ Broker Disconnected\nEndpoint: {endpoint}\n⏳ Retrying connection...</pre>"
+            )
+
+          elif event == zmq.EVENT_CONNECT_RETRIED:
+            logger.info("ZMQ retrying connection to Broker: %s", endpoint)
+
+          elif event == zmq.EVENT_CONNECT_DELAYED:
+            logger.warning("ZMQ connection to Broker delayed (pending): %s", endpoint)
+
+          elif event == zmq.EVENT_MONITOR_STOPPED:
+            break
+
+        except Exception as exc:
+          logger.exception("ZMQ monitor error: %s", exc)
+      monitor_sock.close()
+
+    self._monitor_thread = threading.Thread(target=_watch, name="zmq-monitor", daemon=True)
+    self._monitor_thread.start()
+
   def connect(self):
     """Connect to Broker via ZeroMQ SUB."""
     try:
       logger.info(f"Connecting to ZMQ Broker at {self.host}...")
       # Use connect instead of bind because this is a SUB worker
       self.socket.connect(self.host)
-      logger.info("ZMQ Connected successfully.")
+      self._start_monitor()
+      logger.info("ZMQ socket connected. Monitoring for broker state changes...")
     except Exception as e:
       logger.exception(f"Failed to connect to ZMQ Broker: {e}")
       raise
@@ -94,6 +175,12 @@ class ZMQ:
     """Signal the listener to stop and close the socket."""
     logger.info("ZMQ stop requested. Closing socket...")
     self._stop_event.set()
+    try:
+      self.socket.disable_monitor()
+    except Exception:
+      pass
+    if self._monitor_thread is not None:
+      self._monitor_thread.join(timeout=2)
     try:
       self.socket.close(linger=0)
     except Exception:
@@ -115,6 +202,12 @@ class ZMQ:
 
   def _reconnect(self):
     logger.error("ZMQ Error: reconnecting...")
+    try:
+      self.socket.disable_monitor()
+    except Exception:
+      pass
+    if self._monitor_thread is not None:
+      self._monitor_thread.join(timeout=2)
     try:
       self.socket.close(linger=0)
     except Exception:

@@ -26,6 +26,7 @@ class DBService:
     mt5_retcode: int,
     comment: str = "",
     message: Optional[str] = None,
+    author: str = "broker",
   ):
     """Log order execution result to the database."""
     log_order(
@@ -40,4 +41,5 @@ class DBService:
       mt5_retcode=mt5_retcode,
       comment=comment,
       message=message,
+      author=author,
     )
