@@ -58,9 +58,14 @@ def _build_reason_map() -> None:
 @dataclass
 class AccountSnapshot:
   login: int
+  name: str
   balance: float
   equity: float
   leverage: int
+  margin: float
+  free_margin: float
+  margin_level: float
+  server: str
 
 
 @dataclass
@@ -92,9 +97,14 @@ def _account_snapshot() -> Optional[AccountSnapshot]:
     return None
   return AccountSnapshot(
     login=info.login,
+    name=info.name,
     balance=info.balance,
     equity=info.equity,
     leverage=info.leverage,
+    margin=info.margin,
+    free_margin=info.margin_free,
+    margin_level=info.margin_level,
+    server=info.server,
   )
 
 

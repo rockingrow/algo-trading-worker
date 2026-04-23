@@ -34,7 +34,8 @@ class Settings(BaseSettings):
   # Telegram
   telegram_enabled: bool
   telegram_bot_token: str
-  telegram_chat_id: str
+  telegram_chat_id: str           # management: ZMQ events, service start/stop, MT5 health
+  telegram_chat_channel_id: str = ""  # signals: order fills/failures, terminal closes
 
   # Logging
   log_level: str = "INFO"

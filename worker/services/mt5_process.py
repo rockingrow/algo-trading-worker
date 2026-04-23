@@ -23,8 +23,10 @@ from typing import Optional
 
 _MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 
+
 def _box(text: str) -> str:
-    return f"<pre>{text.strip()}</pre>"
+  return f"<pre>{text.strip()}</pre>"
+
 
 # ---------------------------------------------------------------------------
 # MT5 health-check thread — runs alongside the ZMQ signal loop
@@ -43,19 +45,57 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
       break
     try:
       if not bridge.is_connected():
-        log.warning("[MT5 Health] MT5 disconnected — attempting to relaunch/reconnect...")
-        notifier.send_message(_box(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}"))
+        log.warning(
+          "[MT5 Health] MT5 disconnected — attempting to relaunch/reconnect..."
+        )
+        notifier.send_message(
+          _box(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}")
+        )
         reconnected = bridge.reconnect(max_attempts=15, delay_seconds=5.0)
         if reconnected:
           log.info("[MT5 Health] MT5 reconnected successfully.")
           notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer_fn()}"))
         else:
-          log.error("[MT5 Health] MT5 reconnect failed after 15 attempts — terminal may have crashed.")
-          notifier.send_message(_box(
-            f"🔴 <b>MT5 CRASHED</b>\n\n"
-            f"Failed to relaunch MetaTrader 5 after 15 attempts.\n"
-            f"Please restart the terminal manually.{footer_fn()}"
-          ))
+          log.error(
+            "[MT5 Health] MT5 reconnect failed after 15 attempts — killing and restarting terminal64.exe..."
+          )
+          notifier.send_message(
+            _box(
+              f"🔴 <b>MT5 reconnect failed</b>\n\n"
+              f"Killing and restarting terminal64.exe…{footer_fn()}"
+            )
+          )
+          restarted = bridge.restart_terminal(startup_wait=15.0)
+          if restarted:
+            log.info("[MT5 Health] terminal64.exe restarted — retrying reconnect...")
+            reconnected = bridge.reconnect(max_attempts=15, delay_seconds=5.0)
+            if reconnected:
+              log.info("[MT5 Health] MT5 reconnected after terminal restart.")
+              notifier.send_message(
+                _box(f"🟢 <b>MT5 reconnected after terminal restart</b>{footer_fn()}")
+              )
+            else:
+              log.error(
+                "[MT5 Health] MT5 still unreachable after terminal restart — manual intervention required."
+              )
+              notifier.send_message(
+                _box(
+                  f"🔴 <b>MT5 CRASHED</b>\n\n"
+                  f"Failed to reconnect even after restarting terminal64.exe.\n"
+                  f"Please restart the terminal manually.{footer_fn()}"
+                )
+              )
+          else:
+            log.error(
+              "[MT5 Health] terminal64.exe restart failed (path not configured or exe missing) — manual intervention required."
+            )
+            notifier.send_message(
+              _box(
+                f"🔴 <b>MT5 CRASHED</b>\n\n"
+                f"terminal64.exe restart failed — path not configured or exe missing.\n"
+                f"Please restart the terminal manually.{footer_fn()}"
+              )
+            )
     except Exception as exc:
       log.exception("[MT5 Health] Unexpected error in health thread: %s", exc)
 
@@ -65,7 +105,9 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event) -> None:
+def _worker_process_main(
+  settings_dict: dict, stop_event: multiprocessing.Event
+) -> None:
   """
   Entry point that runs inside the child process.
   Imports MT5 / ZMQ only here so the parent process never loads the C extension.
@@ -126,10 +168,13 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
   balance_at_start = account_status.get("balance", 0.0)
 
   notifier = TelegramNotification()
+  channel_notifier = TelegramNotification(
+    chat_id=settings_dict.get("telegram_chat_channel_id")
+    or settings_dict.get("telegram_chat_id")
+  )
   footer = bridge.get_account_footer()
 
-  zmq_host = settings_dict["zmq_sub_host"]
-  notifier.send_message(_box(f"🟢 <b>MT5 Worker connected</b>\n📡 ZMQ subscribed to <code>{zmq_host}</code>{footer}"))
+  notifier.send_message(_box(f"🟢 <b>MT5 Worker connected</b>{footer}"))
   log.info("[MT5 Process] Worker loop started.")
 
   # ── 4. Start MT5 health-check thread ─────────────────────────────────── #
@@ -146,7 +191,7 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
     magic_number=settings_dict["magic_number"],
     callback_service=callback_service,
     db_service=db_service,
-    notifier=notifier,
+    notifier=channel_notifier,
   )
   event_job.start(stop_event=stop_event)
 
@@ -155,12 +200,16 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
     for signal in subscriber.listen(stop_event=stop_event):
       if not bridge.is_connected():
         log.warning("[MT5 Process] MT5 connection lost. Reconnecting...")
-        notifier.send_message(_box(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}"))
+        notifier.send_message(
+          _box(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}")
+        )
         reconnected = bridge.reconnect(max_attempts=0, delay_seconds=5.0)
         if reconnected:
           notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer}"))
         else:
-          notifier.send_message(_box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}"))
+          notifier.send_message(
+            _box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}")
+          )
           continue
 
       log.info(
@@ -188,12 +237,12 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
       )
 
       if result.get("success"):
-        # For entries (LONG/SHORT), `ticket` is the position. 
+        # For entries (LONG/SHORT), `ticket` is the position.
         # For exits (TP1/TP2/SL/R_SL), `ticket` is the new exit deal, but `source_ticket` is the original position.
         # We want to callback with the same steady position ticket across all states.
         pos_ticket = result.get("source_ticket", result.get("ticket"))
         action_val = signal.action.value
-        
+
         if action_val in ("LONG", "SHORT"):
           callback_service.notify_opened(
             signal=signal,
@@ -223,7 +272,9 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
           f"Price: <b>{result.get('price')}</b>\n"
           f"Volume: <b>{result.get('volume')}</b>\n"
           f"Ticket: <b>{result.get('ticket')}</b>\n"
-          f"Source Ticket: <b>{pos_ticket}</b>{footer}"
+          f"Source Ticket: <b>{pos_ticket}</b>\n"
+          f"----------------------------------\n"
+          f"{footer}"
         )
       else:
         callback_service.notify_rejected(
@@ -236,9 +287,11 @@ def _worker_process_main(settings_dict: dict, stop_event: multiprocessing.Event)
           f"Symbol: <b>{signal.symbol}</b>\n"
           f"Action: <b>{signal.action.value}</b>\n"
           f"Price: <b>{result.get('price')}</b>\n"
-          f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>){footer}"
+          f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
+          f"----------------------------------\n"
+          f"{footer}"
         )
-      notifier.send_message(msg)
+      channel_notifier.send_message(msg)
 
   except KeyboardInterrupt:
     log.info("[MT5 Process] Received shutdown signal.")

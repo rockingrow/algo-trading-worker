@@ -12,10 +12,10 @@ class Notification:
 
 
 class TelegramNotification(Notification):
-  def __init__(self):
+  def __init__(self, chat_id: str | None = None):
     self.enabled = settings.telegram_enabled
     self.bot_token = settings.telegram_bot_token
-    self.chat_id = settings.telegram_chat_id
+    self.chat_id = chat_id if chat_id is not None else settings.telegram_chat_id
 
   def send_message(self, message_text: str):
     if not self.enabled:

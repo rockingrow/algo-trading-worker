@@ -147,6 +147,75 @@ class MT5Executor:
     return [p for p in positions if p.magic == self.magic_number]
 
   # ------------------------------------------------------------------ #
+  #  Stop validation helper                                              #
+  # ------------------------------------------------------------------ #
+
+  def _validate_stops(
+    self,
+    symbol: str,
+    order_type: int,
+    tick,
+    sl: Optional[float],
+    tp: Optional[float],
+  ) -> tuple:
+    """
+    Ensure SL/TP satisfy the broker's minimum stop distance from the live
+    tick.  Adjusts by one point if violated so the order isn't rejected
+    with retcode 10016 when market price moved since the signal was sent.
+
+    For SELL (SHORT): SL must be >= ask + stop_dist; TP must be <= bid - stop_dist
+    For BUY  (LONG):  SL must be <= bid - stop_dist; TP must be >= ask + stop_dist
+    """
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info:
+      return sl, tp
+
+    stop_dist = symbol_info.trade_stops_level * symbol_info.point
+    point = symbol_info.point
+    digits = symbol_info.digits
+
+    if order_type == mt5.ORDER_TYPE_SELL:
+      if sl is not None:
+        min_sl = tick.ask + stop_dist
+        if sl <= min_sl:
+          adjusted = round(min_sl + point, digits)
+          logger.warning(
+            f"[validate_stops] SHORT SL {sl} too close "
+            f"(ask={tick.ask} stop_dist={stop_dist} min={min_sl}). Adjusted → {adjusted}"
+          )
+          sl = adjusted
+      if tp is not None:
+        max_tp = tick.bid - stop_dist
+        if tp >= max_tp:
+          adjusted = round(max_tp - point, digits)
+          logger.warning(
+            f"[validate_stops] SHORT TP {tp} too close "
+            f"(bid={tick.bid} stop_dist={stop_dist} max={max_tp}). Adjusted → {adjusted}"
+          )
+          tp = adjusted
+    else:  # BUY
+      if sl is not None:
+        max_sl = tick.bid - stop_dist
+        if sl >= max_sl:
+          adjusted = round(max_sl - point, digits)
+          logger.warning(
+            f"[validate_stops] LONG SL {sl} too close "
+            f"(bid={tick.bid} stop_dist={stop_dist} max={max_sl}). Adjusted → {adjusted}"
+          )
+          sl = adjusted
+      if tp is not None:
+        min_tp = tick.ask + stop_dist
+        if tp <= min_tp:
+          adjusted = round(min_tp + point, digits)
+          logger.warning(
+            f"[validate_stops] LONG TP {tp} too close "
+            f"(ask={tick.ask} stop_dist={stop_dist} min={min_tp}). Adjusted → {adjusted}"
+          )
+          tp = adjusted
+
+    return sl, tp
+
+  # ------------------------------------------------------------------ #
   #  Entry: Open a new LONG / SHORT position                             #
   # ------------------------------------------------------------------ #
 
@@ -184,12 +253,15 @@ class MT5Executor:
       "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
-    # Hard SL on server to protect against connectivity loss
-    if signal.sl is not None:
-      request["sl"] = float(signal.sl)
+    # Validate SL/TP against live price; price may have moved since the signal
+    # was generated, causing 10016 (TRADE_RETCODE_INVALID_STOPS) without this.
+    sl, tp = self._validate_stops(symbol, order_type, tick, signal.sl, signal.tp1)
 
-    if signal.tp1 is not None:
-      request["tp"] = float(signal.tp1)
+    if sl is not None:
+      request["sl"] = float(sl)
+
+    if tp is not None:
+      request["tp"] = float(tp)
 
     logger.info(f"[open_position] Sending Order: {request}")
     result = mt5.order_send(request)

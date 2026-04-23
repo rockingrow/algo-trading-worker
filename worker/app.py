@@ -52,6 +52,8 @@ async def lifespan(app: FastAPI):
     "slippage_deviation": settings.slippage_deviation,
     "broker_api_url": settings.broker_api_url,
     "broker_api_key": settings.broker_api_key,
+    "telegram_chat_id": settings.telegram_chat_id,
+    "telegram_chat_channel_id": settings.telegram_chat_channel_id,
   }
 
   manager = MT5ProcessManager(settings_dict)

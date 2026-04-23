@@ -1,3 +1,5 @@
+import os
+import subprocess
 import time
 from typing import Any, Dict, Optional
 
@@ -88,6 +90,7 @@ class MT5:
     status = self.get_account_status() or {}
     return (
       f"\n"
+      f"----------------------------------\n"
       f"<b>Account:</b> {self.login} ({self.account_name})\n"
       f"<b>Balance:</b> {status.get('balance', 0.0):.2f}\n"
       f"<b>Equity:</b> {status.get('equity', 0.0):.2f}\n"
@@ -95,7 +98,8 @@ class MT5:
       f"<b>Margin:</b> {status.get('margin', 0.0):.2f}\n"
       f"<b>Free Margin:</b> {status.get('free_margin', 0.0):.2f}\n"
       f"<b>Margin Level:</b> {status.get('margin_level', 0.0):.2f}%\n"
-      f"<b>Server:</b> {self.server}"
+      f"<b>Server:</b> {self.server}\n"
+      f"----------------------------------"
     )
 
   def is_connected(self) -> bool:
@@ -142,6 +146,55 @@ class MT5:
 
     logger.error("MT5 reconnection exhausted all attempts.")
     return False
+
+  def restart_terminal(self, startup_wait: float = 15.0) -> bool:
+    """Kill terminal64.exe and relaunch it from self.path.
+
+    Returns True if the executable was successfully relaunched (not necessarily
+    authenticated yet — caller should follow up with reconnect()).
+    """
+    try:
+      kill = subprocess.run(
+        ["taskkill", "/F", "/IM", "terminal64.exe"],
+        capture_output=True,
+        text=True,
+      )
+      if kill.returncode == 0:
+        logger.info("terminal64.exe killed successfully.")
+      else:
+        # Process not found is fine — it may have already crashed.
+        logger.warning(
+          "taskkill output: %s",
+          (kill.stderr or kill.stdout).strip(),
+        )
+    except Exception as e:
+      logger.warning("Failed to kill terminal64.exe: %s", e)
+
+    # Let the OS finish cleaning up before we relaunch.
+    time.sleep(2.0)
+
+    if not self.path:
+      logger.error(
+        "MT5 path not configured — cannot relaunch terminal64.exe automatically."
+      )
+      return False
+
+    if not os.path.isfile(self.path):
+      logger.error("terminal64.exe not found at configured path: %s", self.path)
+      return False
+
+    try:
+      subprocess.Popen([self.path])
+      logger.info(
+        "terminal64.exe relaunched from %s — waiting %.0fs for startup...",
+        self.path,
+        startup_wait,
+      )
+      time.sleep(startup_wait)
+      return True
+    except Exception as e:
+      logger.error("Failed to relaunch terminal64.exe: %s", e)
+      return False
 
   def shutdown(self):
     """Close the MT5 connection."""

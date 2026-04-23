@@ -145,10 +145,15 @@ class MT5EventJob:
     # 4.1 — Telegram
     acct = event.account
     acct_footer = (
-      f"\n<b>Account:</b> {acct.login}\n"
+      f"\n<b>Account:</b> {acct.login} ({acct.name})\n"
       f"<b>Balance:</b> {acct.balance:.2f}\n"
       f"<b>Equity:</b> {acct.equity:.2f}\n"
-      f"<b>Leverage:</b> {acct.leverage}"
+      f"<b>Leverage:</b> {acct.leverage}\n"
+      f"<b>Margin:</b> {acct.margin:.2f}\n"
+      f"<b>Free Margin:</b> {acct.free_margin:.2f}\n"
+      f"<b>Margin Level:</b> {acct.margin_level:.2f}%\n"
+      f"<b>Server:</b> {acct.server}\n"
+      f"----------------------------------"
       if acct
       else ""
     )
@@ -163,7 +168,8 @@ class MT5EventJob:
       f"Deal: <b>{event.deal_ticket}</b>\n"
       f"Entry Price: <b>{event.entry_price}</b>\n"
       f"SL: <b>{event.sl}</b>\n"
-      f"TP: <b>{event.tp}</b>"
+      f"TP: <b>{event.tp}</b>\n"
+      f"----------------------------------\n"
       f"{acct_footer}"
     )
     self._notifier.send_message(msg)

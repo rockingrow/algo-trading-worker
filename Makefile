@@ -7,10 +7,10 @@ install-dev:
 	uv sync --dev
 
 start:
-	uv run uvicorn worker.main:app --host 0.0.0.0 --port 8000 --log-level info
+	uv run python -m uvicorn worker.main:app --host 0.0.0.0 --port 8000 --log-level info
 
 dev:
-	uv run uvicorn main:app --reload --app-dir worker --host 0.0.0.0 --port 8000 --reload-include "*.py" --reload-include ".env"
+	uv run python -m uvicorn main:app --reload --app-dir worker --host 0.0.0.0 --port 8000 --reload-include "*.py" --reload-include ".env"
 
 e2e:
 	uv run e2e/main.py
