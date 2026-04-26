@@ -150,6 +150,40 @@ class MT5Executor:
   #  Stop validation helper                                              #
   # ------------------------------------------------------------------ #
 
+  def _validate_sell_stops(self, sl, tp, tick, stop_dist, point, digits) -> tuple:
+    if sl is not None:
+      min_sl = tick.ask + stop_dist
+      if sl <= min_sl:
+        sl = round(min_sl + point, digits)
+        logger.warning(
+          f"[validate_stops] SHORT SL too close (ask={tick.ask} stop_dist={stop_dist}). Adjusted → {sl}"
+        )
+    if tp is not None:
+      max_tp = tick.bid - stop_dist
+      if tp >= max_tp:
+        tp = round(max_tp - point, digits)
+        logger.warning(
+          f"[validate_stops] SHORT TP too close (bid={tick.bid} stop_dist={stop_dist}). Adjusted → {tp}"
+        )
+    return sl, tp
+
+  def _validate_buy_stops(self, sl, tp, tick, stop_dist, point, digits) -> tuple:
+    if sl is not None:
+      max_sl = tick.bid - stop_dist
+      if sl >= max_sl:
+        sl = round(max_sl - point, digits)
+        logger.warning(
+          f"[validate_stops] LONG SL too close (bid={tick.bid} stop_dist={stop_dist}). Adjusted → {sl}"
+        )
+    if tp is not None:
+      min_tp = tick.ask + stop_dist
+      if tp <= min_tp:
+        tp = round(min_tp + point, digits)
+        logger.warning(
+          f"[validate_stops] LONG TP too close (ask={tick.ask} stop_dist={stop_dist}). Adjusted → {tp}"
+        )
+    return sl, tp
+
   def _validate_stops(
     self,
     symbol: str,
@@ -175,45 +209,8 @@ class MT5Executor:
     digits = symbol_info.digits
 
     if order_type == mt5.ORDER_TYPE_SELL:
-      if sl is not None:
-        min_sl = tick.ask + stop_dist
-        if sl <= min_sl:
-          adjusted = round(min_sl + point, digits)
-          logger.warning(
-            f"[validate_stops] SHORT SL {sl} too close "
-            f"(ask={tick.ask} stop_dist={stop_dist} min={min_sl}). Adjusted → {adjusted}"
-          )
-          sl = adjusted
-      if tp is not None:
-        max_tp = tick.bid - stop_dist
-        if tp >= max_tp:
-          adjusted = round(max_tp - point, digits)
-          logger.warning(
-            f"[validate_stops] SHORT TP {tp} too close "
-            f"(bid={tick.bid} stop_dist={stop_dist} max={max_tp}). Adjusted → {adjusted}"
-          )
-          tp = adjusted
-    else:  # BUY
-      if sl is not None:
-        max_sl = tick.bid - stop_dist
-        if sl >= max_sl:
-          adjusted = round(max_sl - point, digits)
-          logger.warning(
-            f"[validate_stops] LONG SL {sl} too close "
-            f"(bid={tick.bid} stop_dist={stop_dist} max={max_sl}). Adjusted → {adjusted}"
-          )
-          sl = adjusted
-      if tp is not None:
-        min_tp = tick.ask + stop_dist
-        if tp <= min_tp:
-          adjusted = round(min_tp + point, digits)
-          logger.warning(
-            f"[validate_stops] LONG TP {tp} too close "
-            f"(ask={tick.ask} stop_dist={stop_dist} min={min_tp}). Adjusted → {adjusted}"
-          )
-          tp = adjusted
-
-    return sl, tp
+      return self._validate_sell_stops(sl, tp, tick, stop_dist, point, digits)
+    return self._validate_buy_stops(sl, tp, tick, stop_dist, point, digits)
 
   # ------------------------------------------------------------------ #
   #  Entry: Open a new LONG / SHORT position                             #
@@ -478,7 +475,7 @@ class MT5Executor:
         "success": True,
         "retcode": mt5.TRADE_RETCODE_DONE,
         "ticket": last_result.order,
-        "source_ticket": positions[0].ticket, # Include the position's original ticket
+        "source_ticket": positions[0].ticket,  # Include the position's original ticket
         "price": last_result.price,
         "volume": last_result.volume,
         "comment": f"Closed {success_count} position(s) [{reason}]",

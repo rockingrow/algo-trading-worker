@@ -60,10 +60,25 @@ def log_order(
             INSERT INTO order_logs (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author),
+      (
+        ticket,
+        source_ticket,
+        symbol,
+        action,
+        volume,
+        price,
+        sl,
+        tp1,
+        mt5_retcode,
+        comment,
+        message,
+        author,
+      ),
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Order logged to DB: Ticket={ticket}, Retcode={mt5_retcode}, Author={author}")
+    logger.debug(
+      f"Order logged to DB: Ticket={ticket}, Retcode={mt5_retcode}, Author={author}"
+    )
   except Exception as e:
     logger.exception(f"Failed to log order to DB: {e}")

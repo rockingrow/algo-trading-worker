@@ -13,14 +13,14 @@ from typing import Set
 
 from worker.logger import get_logger
 from worker.mt5.jobs import (
-  TerminalCloseReason,
   TerminalClosedEvent,
+  TerminalCloseReason,
   scan_terminal_closed_positions,
 )
+from worker.schemas.job_schema import LogAuthorEnum
 from worker.services.callback_service import CallbackService
 from worker.services.db_service import DBService
 from worker.services.notification_service import TelegramNotification
-from worker.schemas.job_schema import LogAuthorEnum
 
 log = get_logger("worker.services.job_service")
 

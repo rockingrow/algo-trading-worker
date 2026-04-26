@@ -28,27 +28,29 @@ def main() -> None:
   log.info("MT5 Server -> %s (login: %d)", settings.mt5_server, settings.mt5_login)
 
   import copy
+
   from uvicorn.config import LOGGING_CONFIG
 
   log_config = copy.deepcopy(LOGGING_CONFIG)
-  
+
   # Ensure the logs directory exists just in case
   import os
+
   os.makedirs("logs", exist_ok=True)
 
   log_config["handlers"]["file_default"] = {
-      "class": "worker.logger.DailyFileHandler",
-      "directory": "logs",
-      "mode": "a",
-      "encoding": "utf-8",
-      "formatter": "default",
+    "class": "worker.logger.DailyFileHandler",
+    "directory": "logs",
+    "mode": "a",
+    "encoding": "utf-8",
+    "formatter": "default",
   }
   log_config["handlers"]["file_access"] = {
-      "class": "worker.logger.DailyFileHandler",
-      "directory": "logs",
-      "mode": "a",
-      "encoding": "utf-8",
-      "formatter": "access",
+    "class": "worker.logger.DailyFileHandler",
+    "directory": "logs",
+    "mode": "a",
+    "encoding": "utf-8",
+    "formatter": "access",
   }
 
   log_config["loggers"]["uvicorn"]["handlers"].append("file_default")

@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import MetaTrader5 as mt5
 
+from worker.helpers.logging import build_account_footer
 from worker.logger import get_logger
 
 logger = get_logger("worker.mt5")
@@ -86,20 +87,11 @@ class MT5:
       return None
 
   def get_account_footer(self) -> str:
-    """Return account detail lines (no border — caller wraps in a box)."""
-    status = self.get_account_status() or {}
-    return (
-      f"\n"
-      f"----------------------------------\n"
-      f"<b>Account:</b> {self.login} ({self.account_name})\n"
-      f"<b>Balance:</b> {status.get('balance', 0.0):.2f}\n"
-      f"<b>Equity:</b> {status.get('equity', 0.0):.2f}\n"
-      f"<b>Leverage:</b> {status.get('leverage', 0.0):.2f}\n"
-      f"<b>Margin:</b> {status.get('margin', 0.0):.2f}\n"
-      f"<b>Free Margin:</b> {status.get('free_margin', 0.0):.2f}\n"
-      f"<b>Margin Level:</b> {status.get('margin_level', 0.0):.2f}%\n"
-      f"<b>Server:</b> {self.server}\n"
-      f"----------------------------------"
+    return build_account_footer(
+      login=self.login,
+      account_name=self.account_name,
+      server=self.server,
+      status=self.get_account_status(),
     )
 
   def is_connected(self) -> bool:

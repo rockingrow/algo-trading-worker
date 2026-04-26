@@ -13,11 +13,13 @@ class SignalActionEnum(str, Enum):
   R_SL = "R_SL"
   SL = "SL"
 
+
 class SignalStatusEnum(str, Enum):
   OPENED = "OPENED"
   REJECTED = "REJECTED"
   CLOSED = "CLOSED"
   PARTIALLY_CLOSED = "PARTIALLY_CLOSED"
+
 
 class SignalSchema(BaseModel):
   """

@@ -71,8 +71,8 @@ class AccountSnapshot:
 @dataclass
 class TerminalClosedEvent:
   # Position identity
-  source_ticket: int          # position ticket (= source_ticket in our system)
-  deal_ticket: int            # the closing deal ticket
+  source_ticket: int  # position ticket (= source_ticket in our system)
+  deal_ticket: int  # the closing deal ticket
   symbol: str
   # Close details
   close_reason: TerminalCloseReason
@@ -83,7 +83,7 @@ class TerminalClosedEvent:
   entry_price: float
   # Order parameters captured at entry time
   sl: Optional[float]
-  tp: Optional[float]         # server-side TP (= tp1 price level in our system)
+  tp: Optional[float]  # server-side TP (= tp1 price level in our system)
   # Account snapshot at detection time
   account: Optional[AccountSnapshot]
 
@@ -184,12 +184,12 @@ def scan_terminal_closed_positions(
   """
   positions = mt5.positions_get()
   if positions is None:
-    log.warning("[jobs] positions_get() returned None — terminal offline, skipping scan")
+    log.warning(
+      "[jobs] positions_get() returned None — terminal offline, skipping scan"
+    )
     return []
 
-  current_tickets: Set[int] = {
-    p.ticket for p in positions if p.magic == magic_number
-  }
+  current_tickets: Set[int] = {p.ticket for p in positions if p.magic == magic_number}
   disappeared = seen_tickets - current_tickets
   events: List[TerminalClosedEvent] = []
 

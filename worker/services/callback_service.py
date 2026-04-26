@@ -57,7 +57,7 @@ class CallbackService:
       "account_balance": info["balance"],
       "ticket": ticket,
       "comment": comment,
-      "magic": f"{signal.action.value}|{signal.signal_id}", # Only set at beginning LONG/SHORT
+      "magic": f"{signal.action.value}|{signal.signal_id}",  # Only set at beginning LONG/SHORT
       "symbol": signal.symbol,
       "action": signal.action.value,
       "price": price,
@@ -87,7 +87,7 @@ class CallbackService:
       "account_balance": info["balance"],
       "ticket": None,
       "comment": f"{signal.action.value} {signal.symbol} — rejected: {reject_reason}",
-      "magic": f"{signal.action.value}|{signal.signal_id}", # Only set at beginning LONG/SHORT or REJECTED
+      "magic": f"{signal.action.value}|{signal.signal_id}",  # Only set at beginning LONG/SHORT or REJECTED
       "symbol": signal.symbol,
       "action": signal.action.value,
       "price": signal.price,
@@ -163,6 +163,13 @@ class CallbackService:
     url = f"{self._base_url}/trades/{self._account_id}/{ticket}"
     try:
       http_request.patch(url, payload, headers=self._headers)
-      log.info("Callback PATCH /trades/%s/%s status=%s", self._account_id, ticket, payload.get("status"))
+      log.info(
+        "Callback PATCH /trades/%s/%s status=%s",
+        self._account_id,
+        ticket,
+        payload.get("status"),
+      )
     except Exception as exc:
-      log.error("Callback PATCH /trades/%s/%s failed: %s", self._account_id, ticket, exc)
+      log.error(
+        "Callback PATCH /trades/%s/%s failed: %s", self._account_id, ticket, exc
+      )

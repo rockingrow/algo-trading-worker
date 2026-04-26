@@ -51,7 +51,7 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
         notifier.send_message(
           _box(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}")
         )
-        reconnected = bridge.reconnect(max_attempts=15, delay_seconds=5.0)
+        reconnected = bridge.reconnect(max_attempts=15, delay_seconds=10.0)
         if reconnected:
           log.info("[MT5 Health] MT5 reconnected successfully.")
           notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer_fn()}"))
@@ -68,7 +68,7 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
           restarted = bridge.restart_terminal(startup_wait=15.0)
           if restarted:
             log.info("[MT5 Health] terminal64.exe restarted — retrying reconnect...")
-            reconnected = bridge.reconnect(max_attempts=15, delay_seconds=5.0)
+            reconnected = bridge.reconnect(max_attempts=15, delay_seconds=10.0)
             if reconnected:
               log.info("[MT5 Health] MT5 reconnected after terminal restart.")
               notifier.send_message(
@@ -98,6 +98,54 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
             )
     except Exception as exc:
       log.exception("[MT5 Health] Unexpected error in health thread: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal-loop helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_mt5_connected(bridge, notifier, footer: str, log) -> bool:
+  """Return True if MT5 is (or becomes) connected; False if reconnect fails."""
+  if bridge.is_connected():
+    return True
+  log.warning("[MT5 Process] MT5 connection lost. Reconnecting...")
+  notifier.send_message(_box(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}"))
+  reconnected = bridge.reconnect(max_attempts=0, delay_seconds=10.0)
+  if reconnected:
+    notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer}"))
+  else:
+    notifier.send_message(
+      _box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}")
+    )
+  return reconnected
+
+
+def _dispatch_signal_callback(
+  action_val, callback_service, signal, result, pos_ticket, balance_at_start
+) -> None:
+  if action_val in ("LONG", "SHORT"):
+    callback_service.notify_opened(
+      signal=signal,
+      ticket=pos_ticket,
+      comment=result.get("comment", ""),
+      volume=result.get("volume", signal.quantity),
+      price=result.get("price", signal.price),
+      balance_init=balance_at_start,
+    )
+  elif action_val == "TP1":
+    callback_service.notify_partially_closed(
+      ticket=str(pos_ticket),
+      price=result.get("price", signal.price),
+      remaining_quantity=result.get("volume", signal.quantity),
+    )
+  elif action_val in ("TP2", "SL", "R_SL"):
+    callback_service.notify_closed(
+      ticket=str(pos_ticket),
+      price=result.get("price", signal.price),
+      quantity=result.get("volume", signal.quantity),
+      sl=getattr(signal, "sl", None),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +183,7 @@ def _worker_process_main(
   )
 
   # ── 1. Connect (blocking, unlimited retries) ──────────────────────────── #
-  connected = bridge.reconnect(max_attempts=0, delay_seconds=5.0)
+  connected = bridge.reconnect(max_attempts=0, delay_seconds=10.0)
   if not connected:
     log.error("[MT5 Process] Could not connect to MT5. Exiting.")
     return
@@ -146,6 +194,7 @@ def _worker_process_main(
     curve_server_public_key=settings_dict.get("zmq_curve_server_public_key"),
     curve_client_public_key=settings_dict.get("zmq_curve_client_public_key"),
     curve_client_secret_key=settings_dict.get("zmq_curve_client_secret_key"),
+    account_footer_fn=bridge.get_account_footer,
   )
   subscriber.connect()
 
@@ -198,19 +247,8 @@ def _worker_process_main(
   # ── 5. Signal processing loop ─────────────────────────────────────────── #
   try:
     for signal in subscriber.listen(stop_event=stop_event):
-      if not bridge.is_connected():
-        log.warning("[MT5 Process] MT5 connection lost. Reconnecting...")
-        notifier.send_message(
-          _box(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}")
-        )
-        reconnected = bridge.reconnect(max_attempts=0, delay_seconds=5.0)
-        if reconnected:
-          notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer}"))
-        else:
-          notifier.send_message(
-            _box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}")
-          )
-          continue
+      if not _ensure_mt5_connected(bridge, notifier, footer, log):
+        continue
 
       log.info(
         "[MT5 Process] Processing Signal: %s | %s | TV Time: %s",
@@ -241,30 +279,14 @@ def _worker_process_main(
         # For exits (TP1/TP2/SL/R_SL), `ticket` is the new exit deal, but `source_ticket` is the original position.
         # We want to callback with the same steady position ticket across all states.
         pos_ticket = result.get("source_ticket", result.get("ticket"))
-        action_val = signal.action.value
-
-        if action_val in ("LONG", "SHORT"):
-          callback_service.notify_opened(
-            signal=signal,
-            ticket=pos_ticket,
-            comment=result.get("comment", ""),
-            volume=result.get("volume", signal.quantity),
-            price=result.get("price", signal.price),
-            balance_init=balance_at_start,
-          )
-        elif action_val == "TP1":
-          callback_service.notify_partially_closed(
-            ticket=str(pos_ticket),
-            price=result.get("price", signal.price),
-            remaining_quantity=result.get("volume", signal.quantity),
-          )
-        elif action_val in ("TP2", "SL", "R_SL"):
-          callback_service.notify_closed(
-            ticket=str(pos_ticket),
-            price=result.get("price", signal.price),
-            quantity=result.get("volume", signal.quantity),
-            sl=getattr(signal, "sl", None),
-          )
+        _dispatch_signal_callback(
+          signal.action.value,
+          callback_service,
+          signal,
+          result,
+          pos_ticket,
+          balance_at_start,
+        )
         msg = _box(
           f"✅ <b>Order Filled</b>\n\n"
           f"Symbol: <b>{signal.symbol}</b>\n"
