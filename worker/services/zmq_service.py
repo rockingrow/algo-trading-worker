@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from typing import Generator, Optional
 
 import zmq
@@ -31,6 +32,7 @@ class ZMQ:
     self._curve_enabled = False
     self._monitor_count = 0
     self._monitor_thread: Optional[threading.Thread] = None
+    self._retry_delay = 0
     self.socket = self._create_socket()
 
   def _create_socket(self):
@@ -121,12 +123,14 @@ class ZMQ:
           if event == zmq.EVENT_CONNECTED:
             logger.info("ZMQ Broker TCP connection established: %s", endpoint)
             if not curve_enabled:
+              self._retry_delay = 0
               notification.send_message(
                 f"<pre>🔌 ZMQ Worker Connected to Broker\nEndpoint: {endpoint}</pre>"
               )
 
           elif event == zmq.EVENT_HANDSHAKE_SUCCEEDED:
             logger.info("ZMQ Broker CURVE handshake succeeded: %s", endpoint)
+            self._retry_delay = 0
             notification.send_message(
               f"<pre>🔌 ZMQ Worker Connected to Broker\n🔐 Authenticated (CURVE)\nEndpoint: {endpoint}</pre>"
             )
@@ -145,9 +149,15 @@ class ZMQ:
 
           elif event == zmq.EVENT_CONNECT_RETRIED:
             logger.info("ZMQ retrying connection to Broker: %s", endpoint)
+            notification.send_message(
+              f"<pre>🔄 ZMQ Retrying connection to Broker\nEndpoint: {endpoint}</pre>"
+            )
 
           elif event == zmq.EVENT_CONNECT_DELAYED:
             logger.warning("ZMQ connection to Broker delayed (pending): %s", endpoint)
+            notification.send_message(
+              f"<pre>⏳ ZMQ Connection to Broker delayed\nEndpoint: {endpoint}</pre>"
+            )
 
           elif event == zmq.EVENT_MONITOR_STOPPED:
             break
@@ -201,7 +211,12 @@ class ZMQ:
     return signal
 
   def _reconnect(self):
-    logger.error("ZMQ Error: reconnecting...")
+    self._retry_delay += 5
+    logger.error("ZMQ Error: reconnecting in %ds...", self._retry_delay)
+    TelegramNotification().send_message(
+      f"<pre>🔄 ZMQ Worker reconnecting to Broker\nEndpoint: {self.host}\n⏳ Retrying in {self._retry_delay}s...</pre>"
+    )
+    time.sleep(self._retry_delay)
     try:
       self.socket.disable_monitor()
     except Exception:
