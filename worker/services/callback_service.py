@@ -58,6 +58,7 @@ class CallbackService:
       "ticket": ticket,
       "comment": comment,
       "magic": f"{signal.action.value}|{signal.signal_id}",  # Only set at beginning LONG/SHORT
+      "strategy": signal.strategy,
       "symbol": signal.symbol,
       "action": signal.action.value,
       "price": price,
@@ -88,6 +89,7 @@ class CallbackService:
       "ticket": None,
       "comment": f"{signal.action.value} {signal.symbol} — rejected: {reject_reason}",
       "magic": f"{signal.action.value}|{signal.signal_id}",  # Only set at beginning LONG/SHORT or REJECTED
+      "strategy": signal.strategy,
       "symbol": signal.symbol,
       "action": signal.action.value,
       "price": signal.price,
@@ -108,11 +110,18 @@ class CallbackService:
     price: float,
     quantity: float = 0.0,
     sl: Optional[float] = None,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None,
+    balance_init: Optional[float] = None,
   ) -> None:
     """PATCH /trades/{self._account_id}/{ticket} — trade fully closed (SL or TP2)."""
     info = self._account_info()
     payload: Dict[str, Any] = {
+      "account_leverage": info["leverage"],
+      "account_balance_init": balance_init,
       "account_balance": info["balance"],
+      "strategy": strategy,
+      "symbol": symbol,
       "price": price,
       "quantity": quantity,
       "sl": sl,
@@ -127,15 +136,41 @@ class CallbackService:
     ticket: str,
     price: float,
     remaining_quantity: float,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None,
+    balance_init: Optional[float] = None,
   ) -> None:
     """PATCH /trades/{self._account_id}/{ticket} — trade partially closed (TP1 hit)."""
     info = self._account_info()
     payload: Dict[str, Any] = {
+      "account_leverage": info["leverage"],
+      "account_balance_init": balance_init,
       "account_balance": info["balance"],
+      "strategy": strategy,
+      "symbol": symbol,
       "price": price,
       "quantity": remaining_quantity,
       "is_running": True,
       "status": SignalStatusEnum.PARTIALLY_CLOSED.value,
+    }
+    self._patch_trade(ticket, payload)
+
+  def notify_flat(
+    self,
+    ticket: str,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None,
+    balance_init: Optional[float] = None,
+  ) -> None:
+    """PATCH /trades/{self._account_id}/{ticket} — trade closed via FLAT signal."""
+    info = self._account_info()
+    payload: Dict[str, Any] = {
+      "account_leverage": info["leverage"],
+      "account_balance_init": balance_init,
+      "account_balance": info["balance"],
+      "strategy": strategy,
+      "symbol": symbol,
+      "status": SignalStatusEnum.FLAT.value,
     }
     self._patch_trade(ticket, payload)
 

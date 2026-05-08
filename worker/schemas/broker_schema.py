@@ -19,6 +19,7 @@ class SignalStatusEnum(str, Enum):
   REJECTED = "REJECTED"
   CLOSED = "CLOSED"
   PARTIALLY_CLOSED = "PARTIALLY_CLOSED"
+  FLAT = "FLAT"
 
 
 class SignalSchema(BaseModel):
@@ -28,6 +29,7 @@ class SignalSchema(BaseModel):
 
   signal_id: str
   timestamp: datetime
+  strategy: str
   action: SignalActionEnum
   symbol: str
   price: float

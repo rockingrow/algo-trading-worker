@@ -36,8 +36,8 @@ def main() -> None:
   sec_z85 = secret_key.decode("ascii")
 
   print("# -- ZeroMQ CURVE CLIENT keypair--")
-  print(f'ZMQ_CURVE_CLIENT_PUBLIC_KEY="{pub_z85}"')
-  print(f'ZMQ_CURVE_CLIENT_SECRET_KEY="{sec_z85}"')
+  print(f"ZMQ_CURVE_CLIENT_PUBLIC_KEY='{pub_z85}'")
+  print(f"ZMQ_CURVE_CLIENT_SECRET_KEY='{sec_z85}'")
 
 
 if __name__ == "__main__":
