@@ -73,6 +73,18 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 | **1 — Entry**        | `LONG` / `SHORT`      | Force-close any stale position → open a fresh market order with hard SL set on the server                        |
 | **2 — Partial Exit** | `TP1`                 | Partial close using signal `quantity` converted to lots → move remaining position SL to breakeven (`price_open`) |
 | **3 — Full Exit**    | `TP2` / `SL` / `R_SL` | Close ALL open lots using **actual MT5 `position.volume`** — signal `quantity` is intentionally ignored          |
+| **4 — Flat**         | `FLAT`                | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED`               |
+
+#### FLAT Payload (minimal — no price/quantity required)
+
+```json
+{
+  "strategy": "MT5_GOLD_M5_V1",
+  "timestamp": "2026-04-18T21:55:00Z",
+  "action": "FLAT",
+  "symbol": "XAUUSD"
+}
+```
 
 ### Key Design Decisions
 

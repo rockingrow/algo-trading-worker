@@ -21,6 +21,9 @@ import threading
 import time
 from typing import Optional
 
+from worker.schemas.broker_schema import SignalActionEnum
+from worker.schemas.position_schema import PositionStatusEnum
+
 _MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 
 
@@ -119,6 +122,84 @@ def _ensure_mt5_connected(bridge, notifier, footer: str, log) -> bool:
       _box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}")
     )
   return reconnected
+
+
+def _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier, bridge, log) -> None:
+  """
+  Execute a FLAT signal: close all OPENED/TP1 positions for a strategy+symbol.
+
+  Steps:
+    1. Query DB for positions with status OPENED or TP1.
+    2. Close them all via MT5 at market price (100 % volume).
+    3. Write a row to position_logs and update positions.status → FLATTED.
+    4. Send a Telegram notification.
+  """
+  strategy = signal.strategy
+  symbol = signal.symbol
+
+  db_positions = db_service.get_open_positions_by_strategy(strategy, symbol)
+  if not db_positions:
+    log.warning("[FLAT] No open DB positions | strategy=%s symbol=%s", strategy, symbol)
+    notifier.send_message(
+      _box(f"⚡ <b>FLAT [{symbol}]</b>\n\nNo open positions found for strategy <b>{strategy}</b>")
+    )
+    return
+
+  log.info("[FLAT] Closing %d position(s) | strategy=%s symbol=%s", len(db_positions), strategy, symbol)
+
+  result = executor.close_all_positions(symbol, reason="FLAT")
+
+  for pos in db_positions:
+    source_ticket = pos["source_ticket"]
+    db_service.log_position(
+      strategy=strategy,
+      ticket=result.get("ticket"),
+      source_ticket=source_ticket,
+      symbol=symbol,
+      action="FLAT",
+      volume=pos["volume"],
+      price=result.get("price", 0.0),
+      sl=None,
+      tp1=None,
+      mt5_retcode=result.get("retcode", -1),
+      comment=result.get("comment", "FLAT command"),
+      author="broker",
+    )
+    if result.get("success"):
+      db_service.update_position_status(
+        source_ticket=source_ticket,
+        status=PositionStatusEnum.FLATTED,
+        new_ticket=result.get("ticket"),
+        closed_price=result.get("price"),
+        mt5_retcode=result.get("retcode"),
+        comment="FLAT by webhook",
+      )
+
+  footer = bridge.get_account_footer()
+  if result.get("success"):
+    msg = _box(
+      f"⚡ <b>FLAT Executed</b>\n\n"
+      f"Symbol: <b>{symbol}</b>\n"
+      f"Strategy: <b>{strategy}</b>\n"
+      f"Positions closed: <b>{len(db_positions)}</b>\n"
+      f"Price: <b>{result.get('price')}</b>\n"
+      f"Volume: <b>{result.get('volume')}</b>\n"
+      f"----------------------------------\n"
+      f"{footer}"
+    )
+    log.info("[FLAT] Done | strategy=%s symbol=%s price=%s", strategy, symbol, result.get("price"))
+  else:
+    msg = _box(
+      f"❌ <b>FLAT Failed</b>\n\n"
+      f"Symbol: <b>{symbol}</b>\n"
+      f"Strategy: <b>{strategy}</b>\n"
+      f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
+      f"----------------------------------\n"
+      f"{footer}"
+    )
+    log.error("[FLAT] Failed | strategy=%s symbol=%s comment=%s", strategy, symbol, result.get("comment"))
+
+  channel_notifier.send_message(msg)
 
 
 def _dispatch_signal_callback(
@@ -250,6 +331,11 @@ def _worker_process_main(
       if not _ensure_mt5_connected(bridge, notifier, footer, log):
         continue
 
+      # ── FLAT: close all open positions for strategy+symbol ─────────────── #
+      if signal.action == SignalActionEnum.FLAT:
+        _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier, bridge, log)
+        continue
+
       log.info(
         "[MT5 Process] Processing Signal: %s | %s | TV Time: %s",
         signal.symbol,
@@ -259,7 +345,8 @@ def _worker_process_main(
 
       result = handler.handle(signal)
 
-      db_service.log_order(
+      db_service.log_position(
+        strategy=signal.strategy,
         ticket=result.get("ticket"),
         source_ticket=result.get("source_ticket", result.get("ticket")),
         symbol=signal.symbol,
@@ -278,15 +365,44 @@ def _worker_process_main(
         # For entries (LONG/SHORT), `ticket` is the position.
         # For exits (TP1/TP2/SL/R_SL), `ticket` is the new exit deal, but `source_ticket` is the original position.
         # We want to callback with the same steady position ticket across all states.
+        action_val = signal.action.value
         pos_ticket = result.get("source_ticket", result.get("ticket"))
         _dispatch_signal_callback(
-          signal.action.value,
+          action_val,
           callback_service,
           signal,
           result,
           pos_ticket,
           balance_at_start,
         )
+        if action_val in ("LONG", "SHORT"):
+          db_service.insert_position(
+            ticket=pos_ticket,
+            strategy=signal.strategy,
+            symbol=signal.symbol,
+            action=action_val.lower(),
+            volume=result.get("volume", signal.quantity),
+            opened_price=result.get("price", signal.price),
+            mt5_retcode=result.get("retcode"),
+            comment=result.get("comment", ""),
+          )
+        else:
+          _close_status_map = {
+            "TP1": PositionStatusEnum.TP1,
+            "TP2": PositionStatusEnum.TP2,
+            "SL": PositionStatusEnum.SL,
+            "R_SL": PositionStatusEnum.R_SL,
+          }
+          status = _close_status_map.get(action_val)
+          if status:
+            db_service.update_position_status(
+              source_ticket=pos_ticket,
+              status=status,
+              new_ticket=result.get("ticket"),
+              closed_price=result.get("price"),
+              mt5_retcode=result.get("retcode"),
+              comment=result.get("comment", ""),
+            )
         msg = _box(
           f"✅ <b>Order Filled</b>\n\n"
           f"Symbol: <b>{signal.symbol}</b>\n"

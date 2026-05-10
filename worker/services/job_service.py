@@ -18,6 +18,7 @@ from worker.mt5.jobs import (
   scan_terminal_closed_positions,
 )
 from worker.schemas.job_schema import LogAuthorEnum
+from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.callback_service import CallbackService
 from worker.services.db_service import DBService
 from worker.services.notification_service import TelegramNotification
@@ -112,7 +113,7 @@ class MT5EventJob:
     )
 
     # 4.2 — Write to DB with author='terminal'
-    self._db.log_order(
+    self._db.log_position(
       ticket=event.deal_ticket,
       source_ticket=event.source_ticket,
       symbol=event.symbol,
@@ -124,6 +125,14 @@ class MT5EventJob:
       mt5_retcode=0,
       comment=f"Terminal close [{event.close_reason.value}]",
       author=LogAuthorEnum.TERMINAL.value,
+    )
+    self._db.update_position_status(
+      source_ticket=event.source_ticket,
+      status=PositionStatusEnum.TERMINAL_CLOSED,
+      new_ticket=event.deal_ticket,
+      closed_price=event.close_price,
+      mt5_retcode=0,
+      comment=f"Terminal close [{event.close_reason.value}]",
     )
 
     # 4.2 — Broker API callback
