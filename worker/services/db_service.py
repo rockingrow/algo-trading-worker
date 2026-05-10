@@ -15,6 +15,7 @@ class DBService:
 
   def log_order(
     self,
+    strategy: str,
     ticket: Optional[int],
     source_ticket: Optional[int],
     symbol: str,
@@ -30,6 +31,7 @@ class DBService:
   ):
     """Log order execution result to the database."""
     log_order(
+      strategy=strategy,
       ticket=ticket,
       source_ticket=source_ticket,
       symbol=symbol,

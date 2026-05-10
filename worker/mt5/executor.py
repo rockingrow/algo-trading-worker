@@ -5,6 +5,7 @@ import MetaTrader5 as mt5
 
 from worker.logger import get_logger
 from worker.schemas.broker_schema import SignalSchema
+from worker.settings import settings
 
 logger = get_logger("worker.mt5_executor")
 
@@ -41,21 +42,35 @@ class MT5Executor:
     return base_symbol
 
   def calculate_lot_size(
-    self, symbol: str, entry_price: float, sl_price: float, risk_percent: float
+    self,
+    symbol: str,
+    entry_price: float,
+    sl_price: float,
+    risk_percent: float,
+    capital: Optional[float] = None,
   ) -> float:
-    """Calculate lot size based on Risk % configuration and StopLoss distance."""
-    account_info = mt5.account_info()
-    if not account_info:
-      logger.error("Could not retrieve account info for lot sizing.")
-      return 0.01
+    """Calculate lot size based on Risk % and SL distance.
+
+    capital: fixed base to risk against. If None, uses live account equity.
+    """
+    if capital is None:
+      if settings.use_account_equity:
+        account_info = mt5.account_info()
+        if not account_info:
+          logger.error(
+            f"Could not retrieve account info for lot sizing. {mt5.last_error()}"
+          )
+          return 0.01
+        capital = account_info.equity
+      else:
+        capital = settings.capital
 
     symbol_info = mt5.symbol_info(self.get_symbol(symbol))
     if not symbol_info:
       logger.error(f"Cannot find symbol {self.get_symbol(symbol)}")
       return 0.01
 
-    equity = account_info.equity
-    risk_cash = equity * (risk_percent / 100.0)
+    risk_cash = capital * (risk_percent / 100.0)
 
     # Handle Distance calculation
     point = symbol_info.point
@@ -86,7 +101,7 @@ class MT5Executor:
     final_lot = max(symbol_info.volume_min, min(rounded_lot, symbol_info.volume_max))
 
     logger.debug(
-      f"[Volume Setup] Equity: {equity}, Risk Cash: {risk_cash}, SL Points: {sl_distance_points}, "
+      f"[Volume Setup] Capital: {capital}, Risk Cash: {risk_cash}, SL Points: {sl_distance_points}, "
       f"Calculated Lot: {final_lot} (Step: {step})"
     )
 
@@ -230,12 +245,34 @@ class MT5Executor:
     tick = mt5.symbol_info_tick(symbol)
     price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
-    # Calculate position size from risk % + SL distance if available
-    risk_pct = signal.risk_percent
-    if signal.sl:
-      volume = self.calculate_lot_size(symbol, price, signal.sl, risk_pct)
+    # Calculate position size
+    if settings.volume_decision_enabled:
+      # Fixed capital mode: ignore payload quantity, derive lot from settings
+      if signal.sl:
+        volume = self.calculate_lot_size(
+          symbol,
+          price,
+          signal.sl,
+          settings.risk_percentage,
+          capital=settings.capital,
+        )
+        logger.info(
+          f"[open_position] VOLUME_DECISION mode | capital={settings.capital} "
+          f"risk={settings.risk_percentage}% → lot={volume}"
+        )
+      else:
+        sym_info = mt5.symbol_info(symbol)
+        volume = sym_info.volume_min if sym_info else 0.01
+        logger.warning(
+          "[open_position] VOLUME_DECISION_ENABLED but no SL in signal. "
+          "Falling back to minimum lot."
+        )
     else:
+      # Payload quantity mode: use quantity transmitted from broker
       volume = self.convert_quantity_to_lots(symbol, signal.quantity)
+      logger.info(
+        f"[open_position] Payload quantity mode | qty={signal.quantity} → lot={volume}"
+      )
 
     request: Dict[str, Any] = {
       "action": mt5.TRADE_ACTION_DEAL,

@@ -31,6 +31,13 @@ class Settings(BaseSettings):
   magic_number: int = 20260409
   slippage_deviation: int = 20
 
+  # Init capital and risk management
+  capital: float = 1000
+  capital_currency: str = "USC"
+  volume_decision_enabled: bool = True
+  risk_percentage: float = 3.0  # Risk 1% of capital per trade
+  use_account_equity: bool = False  # If true, use account equity instead of initial capital for entry volume calculation
+
   # Telegram
   telegram_enabled: bool
   telegram_bot_token: str

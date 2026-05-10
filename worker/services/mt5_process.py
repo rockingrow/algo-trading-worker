@@ -296,7 +296,7 @@ def _worker_process_main(
           f"Ticket: <b>{result.get('ticket')}</b>\n"
           f"Source Ticket: <b>{pos_ticket}</b>\n"
           f"----------------------------------\n"
-          f"{footer}"
+          f"{bridge.get_account_footer()}"
         )
       else:
         callback_service.notify_rejected(
@@ -311,7 +311,7 @@ def _worker_process_main(
           f"Price: <b>{result.get('price')}</b>\n"
           f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
           f"----------------------------------\n"
-          f"{footer}"
+          f"{bridge.get_account_footer()}"
         )
       channel_notifier.send_message(msg)
 

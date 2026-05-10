@@ -1,4 +1,5 @@
 {
+  "strategy": "MT5_GOLD_M5_V1",
   "signal_id": "8b6aac4d-da0d-41a3-9798-14d0d23d3f68",
   "timestamp": "2026-04-11T16:15:00Z",
   "action": "R_SL",

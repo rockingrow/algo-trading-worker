@@ -15,6 +15,7 @@ def init_db():
     cursor.execute("""
             CREATE TABLE IF NOT EXISTS order_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
                 ticket INTEGER,
                 source_ticket INTEGER,
                 symbol TEXT NOT NULL,
@@ -38,6 +39,7 @@ def init_db():
 
 
 def log_order(
+  strategy: str,
   ticket: Optional[int],
   source_ticket: Optional[int],
   symbol: str,
@@ -57,10 +59,11 @@ def log_order(
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO order_logs (ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO order_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
       (
+        strategy,
         ticket,
         source_ticket,
         symbol,
