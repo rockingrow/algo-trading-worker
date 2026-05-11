@@ -10,13 +10,9 @@ class MarketTypeEnum(str, Enum):
 
 
 class Settings(BaseSettings):
-  # ZeroMQ
-  zmq_sub_host: str
-
-  # ZMQ CURVE security (optional — leave blank to disable encryption)
-  zmq_curve_server_public_key: Optional[str] = None  # broker's public key (Z85)
-  zmq_curve_client_public_key: Optional[str] = None  # this client's public key (Z85)
-  zmq_curve_client_secret_key: Optional[str] = None  # this client's secret key (Z85)
+  # NATS
+  nats_url: str
+  nats_token: Optional[str] = None
 
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
 
@@ -41,7 +37,7 @@ class Settings(BaseSettings):
   # Telegram
   telegram_enabled: bool
   telegram_bot_token: str
-  telegram_chat_id: str  # management: ZMQ events, service start/stop, MT5 health
+  telegram_chat_id: str  # management: NATS events, service start/stop, MT5 health
   telegram_chat_channel_id: str = ""  # signals: order fills/failures, terminal closes
 
   # Logging

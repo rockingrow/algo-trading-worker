@@ -1,16 +1,16 @@
 """
 worker/services/mt5_process.py
 ──────────────────────────────
-Runs the blocking MT5 + ZMQ worker inside a **separate OS process** so the
+Runs the blocking MT5 + NATS worker inside a **separate OS process** so the
 GIL-holding MetaTrader5 C extension never freezes the FastAPI/uvicorn event loop.
 
 Architecture
 ────────────
   FastAPI process  ──start/stop──▶  MT5Worker process
                                     ├─ MT5 reconnect loop
-                                    └─ ZMQ listen loop
+                                    └─ NATS listen loop
 
-The FastAPI process only manages the subprocess lifetime; all MT5/ZMQ blocking
+The FastAPI process only manages the subprocess lifetime; all MT5/NATS blocking
 code lives in the child process and is therefore 100% GIL-isolated.
 """
 
@@ -124,7 +124,9 @@ def _ensure_mt5_connected(bridge, notifier, footer: str, log) -> bool:
   return reconnected
 
 
-def _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier, bridge, log) -> None:
+def _handle_flat_signal(
+  signal, executor, db_service, notifier, channel_notifier, bridge, log
+) -> None:
   """
   Execute a FLAT signal: close all OPENED/TP1 positions for a strategy+symbol.
 
@@ -141,11 +143,18 @@ def _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier
   if not db_positions:
     log.warning("[FLAT] No open DB positions | strategy=%s symbol=%s", strategy, symbol)
     notifier.send_message(
-      _box(f"⚡ <b>FLAT [{symbol}]</b>\n\nNo open positions found for strategy <b>{strategy}</b>")
+      _box(
+        f"⚡ <b>FLAT [{symbol}]</b>\n\nNo open positions found for strategy <b>{strategy}</b>"
+      )
     )
     return
 
-  log.info("[FLAT] Closing %d position(s) | strategy=%s symbol=%s", len(db_positions), strategy, symbol)
+  log.info(
+    "[FLAT] Closing %d position(s) | strategy=%s symbol=%s",
+    len(db_positions),
+    strategy,
+    symbol,
+  )
 
   result = executor.close_all_positions(symbol, reason="FLAT")
 
@@ -187,7 +196,12 @@ def _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier
       f"----------------------------------\n"
       f"{footer}"
     )
-    log.info("[FLAT] Done | strategy=%s symbol=%s price=%s", strategy, symbol, result.get("price"))
+    log.info(
+      "[FLAT] Done | strategy=%s symbol=%s price=%s",
+      strategy,
+      symbol,
+      result.get("price"),
+    )
   else:
     msg = _box(
       f"❌ <b>FLAT Failed</b>\n\n"
@@ -197,7 +211,12 @@ def _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier
       f"----------------------------------\n"
       f"{footer}"
     )
-    log.error("[FLAT] Failed | strategy=%s symbol=%s comment=%s", strategy, symbol, result.get("comment"))
+    log.error(
+      "[FLAT] Failed | strategy=%s symbol=%s comment=%s",
+      strategy,
+      symbol,
+      result.get("comment"),
+    )
 
   channel_notifier.send_message(msg)
 
@@ -242,16 +261,22 @@ def _worker_process_main(
   Imports MT5 / ZMQ only here so the parent process never loads the C extension.
   """
 
+  import json
+
+  from pydantic import ValidationError
+
   from worker.core.market_strategy import MarketStrategyFactory
   from worker.core.signal_handler import SignalHandler
   from worker.logger import get_logger
   from worker.mt5.executor import MT5Executor
   from worker.mt5.mt5 import MT5
+  from worker.schemas.broker_schema import SignalSchema
+  from worker.schemas.nats_schema import NatsSubjectEnum
   from worker.services.callback_service import CallbackService
   from worker.services.db_service import DBService
   from worker.services.job_service import MT5EventJob
+  from worker.services.nats_service import NATSSubscriber
   from worker.services.notification_service import TelegramNotification
-  from worker.services.zmq_service import ZMQ
 
   log = get_logger("worker.mt5_process")
   log.info("[MT5 Process] Started (PID=%d)", multiprocessing.current_process().pid)
@@ -269,12 +294,11 @@ def _worker_process_main(
     log.error("[MT5 Process] Could not connect to MT5. Exiting.")
     return
 
-  # ── 2. Set up ZMQ subscriber ──────────────────────────────────────────── #
-  subscriber = ZMQ(
-    host=settings_dict["zmq_sub_host"],
-    curve_server_public_key=settings_dict.get("zmq_curve_server_public_key"),
-    curve_client_public_key=settings_dict.get("zmq_curve_client_public_key"),
-    curve_client_secret_key=settings_dict.get("zmq_curve_client_secret_key"),
+  # ── 2. Set up NATS subscriber ─────────────────────────────────────────── #
+  subscriber = NATSSubscriber(
+    url=settings_dict["nats_url"],
+    subjects=[NatsSubjectEnum.SIGNAL, NatsSubjectEnum.ADMIN],
+    token=settings_dict.get("nats_token"),
     account_footer_fn=bridge.get_account_footer,
   )
   subscriber.connect()
@@ -327,13 +351,26 @@ def _worker_process_main(
 
   # ── 5. Signal processing loop ─────────────────────────────────────────── #
   try:
-    for signal in subscriber.listen(stop_event=stop_event):
+    for subject, raw in subscriber.listen(stop_event=stop_event):
+      if subject == NatsSubjectEnum.ADMIN:
+        # TODO: handle ADMIN messages
+        continue
+      try:
+        signal = SignalSchema(**json.loads(raw))
+      except json.JSONDecodeError as err:
+        logger.error("[MT5 Process] Malformed JSON: %s", err)
+        continue
+      except ValidationError as err:
+        logger.error("[MT5 Process] Signal validation failed: %s", err)
+        continue
       if not _ensure_mt5_connected(bridge, notifier, footer, log):
         continue
 
       # ── FLAT: close all open positions for strategy+symbol ─────────────── #
       if signal.action == SignalActionEnum.FLAT:
-        _handle_flat_signal(signal, executor, db_service, notifier, channel_notifier, bridge, log)
+        _handle_flat_signal(
+          signal, executor, db_service, notifier, channel_notifier, bridge, log
+        )
         continue
 
       log.info(

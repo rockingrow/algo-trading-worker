@@ -1,6 +1,13 @@
 from typing import Optional
 
-from worker.db import get_open_positions_by_strategy, get_position, init_db, insert_position, log_position, update_position_status
+from worker.db import (
+  get_open_positions_by_strategy,
+  get_position,
+  init_db,
+  insert_position,
+  log_position,
+  update_position_status,
+)
 from worker.schemas.position_schema import PositionStatusEnum
 
 

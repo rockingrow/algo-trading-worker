@@ -1,13 +1,13 @@
 [project]
 name = "algo-trading-mt5"
 version = "0.1.0"
-description = "MT5 execution worker listening to ZeroMQ signals"
+description = "MT5 execution worker listening to NATS signals"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    "pyzmq>=25.0.0",
+    "nats-py>=2.6.0",
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
     "loguru>=0.7.2",
     "requests>=2.31.0",

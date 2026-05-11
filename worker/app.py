@@ -44,10 +44,8 @@ async def lifespan(app: FastAPI):
     "mt5_login": settings.mt5_login,
     "mt5_password": settings.mt5_password,
     "mt5_path": settings.mt5_path,
-    "zmq_sub_host": settings.zmq_sub_host,
-    "zmq_curve_server_public_key": settings.zmq_curve_server_public_key,
-    "zmq_curve_client_public_key": settings.zmq_curve_client_public_key,
-    "zmq_curve_client_secret_key": settings.zmq_curve_client_secret_key,
+    "nats_url": settings.nats_url,
+    "nats_token": settings.nats_token,
     "magic_number": settings.magic_number,
     "slippage_deviation": settings.slippage_deviation,
     "broker_api_url": settings.broker_api_url,
@@ -87,7 +85,7 @@ def create_app() -> FastAPI:
   """Build and return the FastAPI application with all routes wired up."""
   app = FastAPI(
     title="MT5 Trading Worker",
-    description="Connects to MT5 and executes trades based on ZMQ signals.",
+    description="Connects to MT5 and executes trades based on NATS signals.",
     version="2.0.0",
     lifespan=lifespan,
   )

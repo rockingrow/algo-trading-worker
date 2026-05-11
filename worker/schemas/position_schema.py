@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class PositionStatusEnum(str, Enum):
   OPENED = "OPENED"
   TP1 = "TP1"

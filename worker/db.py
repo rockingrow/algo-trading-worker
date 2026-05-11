@@ -2,6 +2,7 @@ import sqlite3
 from typing import Optional
 
 from worker.logger import get_logger
+
 logger = get_logger("worker.db")
 
 DB_FILE = "worker_data.sqlite"
@@ -125,11 +126,25 @@ def insert_position(
             INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, ticket, strategy, symbol, action, volume, opened_price, "OPENED", mt5_retcode, comment, message),
+      (
+        ticket,
+        ticket,
+        strategy,
+        symbol,
+        action,
+        volume,
+        opened_price,
+        "OPENED",
+        mt5_retcode,
+        comment,
+        message,
+      ),
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Position inserted: source_ticket={ticket}, symbol={symbol}, action={action}")
+    logger.debug(
+      f"Position inserted: source_ticket={ticket}, symbol={symbol}, action={action}"
+    )
   except Exception as e:
     logger.exception(f"Failed to insert position ticket={ticket}: {e}")
 
@@ -163,7 +178,9 @@ def update_position_status(
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Position updated: source_ticket={source_ticket}, new_ticket={new_ticket}, status={status}")
+    logger.debug(
+      f"Position updated: source_ticket={source_ticket}, new_ticket={new_ticket}, status={status}"
+    )
   except Exception as e:
     logger.exception(f"Failed to update position source_ticket={source_ticket}: {e}")
 
@@ -197,5 +214,7 @@ def get_open_positions_by_strategy(strategy: str, symbol: str) -> list:
     conn.close()
     return [dict(row) for row in rows]
   except Exception as e:
-    logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
+    logger.exception(
+      f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}"
+    )
     return []

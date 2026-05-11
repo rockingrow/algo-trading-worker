@@ -1,6 +1,6 @@
 # 🚀 Algo Trading Worker
 
-This is the execution-end of the Event-Driven trading system. It acts as a ZeroMQ subscriber waiting for highly structured trading signals from the central Broker, then executes them directly into the MetaTrader 5 Terminal.
+This is the execution-end of the Event-Driven trading system. It acts as a NATS subscriber waiting for highly structured trading signals from the central Broker, then executes them directly into the MetaTrader 5 Terminal.
 
 ## 🏗️ System Architecture
 
@@ -10,13 +10,13 @@ graph TD
     subgraph "Broker Node"
         Broker[FastAPI Webhook Server]
         DB[(PostgreSQL)]
-        ZMQ["ZeroMQ PUB :5555 (CURVE)"]
+        NATS["NATS Server :4222"]
         Broker -- "Log Signal" --> DB
-        Broker -- "Publish" --> ZMQ
+        Broker -- "Publish" --> NATS
     end
-    ZMQ -- "🔐 Encrypted Stream" --> W1
-    ZMQ -- "🔐 Encrypted Stream" --> W2
-    ZMQ -- "🔐 Encrypted Stream" --> WN
+    NATS -- "Subject: SIGNAL" --> W1
+    NATS -- "Subject: SIGNAL" --> W2
+    NATS -- "Subject: SIGNAL" --> WN
     subgraph W1["Worker — Forex (MT5)"]
         W1A[Signal Handler] --> W1B[(SQLite)]
     end
@@ -45,14 +45,15 @@ worker/
 │   ├── executor.py      # MT5 trade execution primitives
 │   └── jobs.py          # Terminal-close event scanner (polling)
 ├── schemas/             # Pydantic data schemas
-│   └── broker_schema.py # Signal & position validation schemas
+│   ├── broker_schema.py # Signal & position validation schemas
+│   └── nats_schema.py   # NatsSubjectEnum (SIGNAL, ADMIN)
 ├── services/            # Business & Infrastructure services
 │   ├── callback_service.py      # HTTP callbacks to broker (POST/PATCH /trades)
 │   ├── db_service.py            # Database access layer
 │   ├── job_service.py           # MT5EventJob background polling thread
 │   ├── mt5_process.py           # MT5 subprocess manager
-│   ├── notification_service.py # Telegram notification logic
-│   └── zmq_service.py           # ZeroMQ signal subscriber
+│   ├── nats_service.py          # NATS signal subscriber
+│   └── notification_service.py  # Telegram notification logic
 ├── app.py               # Application factory & process lifespan
 ├── db.py                # Local SQLite persistence layer
 ├── logger.py            # Structured logging configuration
@@ -97,15 +98,15 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 - **Breakeven SL after TP1:** After the partial close succeeds, a `TRADE_ACTION_SLTP` request moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss.
 
-- **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to a local `order_logs` SQLite table. This audit trail captures the full original ZeroMQ JSON `message`, the MT5 target `ticket`, the original `source_ticket`, and all execution context mapping directly back to the Broker's state.
+- **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to a local `order_logs` SQLite table. This audit trail captures the full original NATS JSON `message`, the MT5 target `ticket`, the original `source_ticket`, and all execution context mapping directly back to the Broker's state.
 
-- **GIL-isolated subprocess:** All MT5 and ZMQ blocking code runs in a separate OS process. The parent process only manages subprocess lifetime, keeping the event loop fully responsive.
+- **GIL-isolated subprocess:** All MT5 and NATS blocking code runs in a separate OS process. The parent process only manages subprocess lifetime, keeping the event loop fully responsive.
 
-- **Hard SL vs. ZMQ SL — callback gap (mitigated by MT5EventJob):** When a LONG/SHORT is opened, the SL is registered directly on the MT5 server (`request["sl"]`), so MT5 will auto-close the position even if the ZMQ signal pipeline is delayed. If the hard SL fires before the ZMQ `SL` signal arrives, `_handle_full_close` finds no open position, returns `success=False`, and no callback is dispatched through the normal path. `MT5EventJob` (see below) closes this gap by detecting the disappearance independently and firing the broker API callback retroactively.
+- **Hard SL vs. NATS SL — callback gap (mitigated by MT5EventJob):** When a LONG/SHORT is opened, the SL is registered directly on the MT5 server (`request["sl"]`), so MT5 will auto-close the position even if the NATS signal pipeline is delayed. If the hard SL fires before the NATS `SL` signal arrives, `_handle_full_close` finds no open position, returns `success=False`, and no callback is dispatched through the normal path. `MT5EventJob` (see below) closes this gap by detecting the disappearance independently and firing the broker API callback retroactively.
 
 ### MT5EventJob — Terminal-Close Polling (`worker/services/job_service.py`)
 
-`MT5EventJob` runs as a daemon thread inside the child process alongside the ZMQ signal loop and the MT5 health-check thread. Its sole purpose is to detect positions that the MT5 server closed autonomously — without a corresponding ZMQ signal reaching the pipeline in time.
+`MT5EventJob` runs as a daemon thread inside the child process alongside the NATS signal loop and the MT5 health-check thread. Its sole purpose is to detect positions that the MT5 server closed autonomously — without a corresponding NATS signal reaching the pipeline in time.
 
 #### How it works
 
@@ -129,7 +130,7 @@ Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/mt5/jo
 On each event the job then:
 
 - **4.1** Sends a Telegram notification with full position and account context.
-- **4.2** Writes a row to `order_logs` with `author = 'terminal'` (vs `'broker'` for ZMQ-triggered rows), then calls the appropriate `CallbackService` method.
+- **4.2** Writes a row to `order_logs` with `author = 'terminal'` (vs `'broker'` for NATS-triggered rows), then calls the appropriate `CallbackService` method.
 
 #### Resilience during MT5 reconnect
 
@@ -141,7 +142,7 @@ On each event the job then:
 
 When `positions_get()` returns `None` (terminal offline), the scan is skipped and `seen_tickets` is left untouched. This prevents false-positive "position closed" events and ensures that once MT5 comes back online, any positions that were closed during the outage are detected on the next scan.
 
-The job shares the process-level `stop_event` (`multiprocessing.Event`) with the health-check thread and the ZMQ loop, so it shuts down cleanly as part of the normal worker lifecycle — no independent restart mechanism is needed.
+The job shares the process-level `stop_event` (`multiprocessing.Event`) with the health-check thread and the NATS loop, so it shuts down cleanly as part of the normal worker lifecycle — no independent restart mechanism is needed.
 
 ### MT5Executor Primitives (`worker/mt5/executor.py`)
 
@@ -174,10 +175,17 @@ uv sync
 
 ### 3. Configure .env
 
-Copy .env.example to .env and fill in the MT5 connection details (Exness Demo/Real) along with the ZeroMQ Broker configuration.
+Copy `.env.example` to `.env` and fill in the MT5 connection details along with the NATS Broker configuration.
 
 ```bash
 cp .env.example .env
+```
+
+Key NATS variables:
+
+```env
+NATS_URL=nats://broker-host:4222
+NATS_TOKEN=your-token-here
 ```
 
 Please ensure that you have enabled "Allow Algo Trading" inside Options > Expert Advisors of the MetaTrader 5 Terminal.
@@ -190,4 +198,4 @@ Start the Worker (from the root directory):
 make start
 ```
 
-The Worker will initialize the `worker_data.sqlite` database, connect to MT5 in an isolated subprocess, and open a Subscribe socket to ZeroMQ. You can monitor the logs printed directly to the screen
+The Worker will initialize the `worker_data.sqlite` database, connect to MT5 in an isolated subprocess, and subscribe to the NATS subjects `SIGNAL` and `ADMIN`. You can monitor the logs printed directly to the screen.

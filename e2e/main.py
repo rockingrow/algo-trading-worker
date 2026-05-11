@@ -1,20 +1,17 @@
+import asyncio
 from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+import nats
 import uvicorn
-import zmq
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Import schemas from production worker to ensure compatibility
 try:
   from worker.schemas.broker_schema import SignalSchema
-
-  logger_name = "e2e.simulator"
 except ImportError:
-  # Fallback if running outside of project root context
-  # This is less likely but good for robustness
+
   class SignalActionEnum(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
@@ -46,39 +43,40 @@ except ImportError:
 
 app = FastAPI(title="Algo Trading - E2E Broker Simulator")
 
-# ZeroMQ Setup
-ZMQ_PUB_HOST = "tcp://*:5555"
-zmq_context = zmq.Context()
-zmq_socket = zmq_context.socket(zmq.PUB)
+NATS_URL = "nats://localhost:4222"
+NATS_SUBJECT = "signals"
+
+_nc = None
 
 
 @app.on_event("startup")
-def startup_event():
-  print(f"🚀 Starting Broker Simulator (PUB) at {ZMQ_PUB_HOST}...")
-  zmq_socket.bind(ZMQ_PUB_HOST)
-  print("✅ Simulator bound and ready to broadcast.")
+async def startup_event():
+  global _nc
+  print(
+    f"🚀 Starting Broker Simulator (NATS PUB) at {NATS_URL}, subject={NATS_SUBJECT}..."
+  )
+  _nc = await nats.connect(NATS_URL)
+  print("✅ Simulator connected to NATS and ready to publish.")
 
 
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():
+  global _nc
   print("🛑 Shutting down Simulator...")
-  zmq_socket.close()
-  zmq_context.term()
+  if _nc:
+    await _nc.drain()
 
 
 @app.post("/simulator/publish")
 async def publish_signal(signal: SignalSchema):
-  """
-  Receives a signal via HTTP and broadcasts it over ZMQ.
-  """
+  """Receives a signal via HTTP and publishes it to NATS."""
   try:
-    # Serialize with Pydantic's model_dump_json to handle datetime properly
-    message = signal.model_dump_json()
+    payload = signal.model_dump_json().encode()
     print(f"📡 Publishing: {signal.symbol} | {signal.position.action.value}")
-    zmq_socket.send_string(message)
+    await _nc.publish(NATS_SUBJECT, payload)
     return {
       "status": "success",
-      "message": "Signal broadcasted to ZMQ bus",
+      "message": "Signal published to NATS",
       "payload": {"symbol": signal.symbol, "action": signal.position.action},
     }
   except Exception as e:
