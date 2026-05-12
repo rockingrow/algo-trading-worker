@@ -31,6 +31,12 @@ def _box(text: str) -> str:
   return f"<pre>{text.strip()}</pre>"
 
 
+def _format_volume(volume: float, auto_calculated: bool = False) -> str:
+  """Format volume with icon if auto-calculated."""
+  icon = "⚙️" if auto_calculated else ""
+  return f"{volume} {icon}" if auto_calculated else str(volume)
+
+
 # ---------------------------------------------------------------------------
 # MT5 health-check thread — runs alongside the ZMQ signal loop
 # ---------------------------------------------------------------------------
@@ -192,7 +198,7 @@ def _handle_flat_signal(
       f"Strategy: <b>{strategy}</b>\n"
       f"Positions closed: <b>{len(db_positions)}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
-      f"Volume: <b>{result.get('volume')}</b>\n"
+      f"Volume: <b>{_format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
       f"----------------------------------\n"
       f"{footer}"
     )
@@ -328,7 +334,27 @@ def _worker_process_main(
   )
   footer = bridge.get_account_footer()
 
-  notifier.send_message(_box(f"🟢 <b>MT5 Worker connected</b>{footer}"))
+  volume_enabled = settings_dict.get("volume_decision_enabled", False)
+  capital = settings_dict.get("capital")
+  capital_currency = settings_dict.get("capital_currency", "")
+  risk_percentage = settings_dict.get("risk_percentage")
+  use_account_equity = settings_dict.get("use_account_equity", False)
+
+  volume_config = (
+    f"VOLUME_DECISION_ENABLED: <b>{volume_enabled}</b>\n"
+    f"CAPITAL: <b>{capital} {capital_currency}</b>\n"
+    f"RISK_PERCENTAGE: <b>{risk_percentage}%</b>\n"
+    f"USE_ACCOUNT_EQUITY: <b>{use_account_equity}</b>\n"
+  )
+
+  notifier.send_message(
+    _box(
+      f"🟢 <b>MT5 Worker connected</b>\n\n"
+      f"{volume_config}"
+      f"----------------------------------\n"
+      f"{footer}"
+    )
+  )
   log.info("[MT5 Process] Worker loop started.")
 
   # ── 4. Start MT5 health-check thread ─────────────────────────────────── #
@@ -445,7 +471,7 @@ def _worker_process_main(
           f"Symbol: <b>{signal.symbol}</b>\n"
           f"Action: <b>{signal.action.value}</b>\n"
           f"Price: <b>{result.get('price')}</b>\n"
-          f"Volume: <b>{result.get('volume')}</b>\n"
+          f"Volume: <b>{_format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
           f"Ticket: <b>{result.get('ticket')}</b>\n"
           f"Source Ticket: <b>{pos_ticket}</b>\n"
           f"----------------------------------\n"

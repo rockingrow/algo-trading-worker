@@ -62,6 +62,7 @@ class NATSSubscriber:
       disconnected_cb=disconnected_cb,
       reconnected_cb=reconnected_cb,
       max_reconnect_attempts=-1,
+      reconnect_time_wait=5,
     )
     if self._token:
       connect_opts["token"] = self._token
