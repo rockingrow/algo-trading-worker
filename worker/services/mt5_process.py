@@ -34,7 +34,7 @@ def _box(text: str) -> str:
 def _format_volume(volume: float, auto_calculated: bool = False) -> str:
   """Format volume with icon if auto-calculated."""
   icon = "⚙️" if auto_calculated else ""
-  return f"{volume} {icon}" if auto_calculated else str(volume)
+  return f"{volume} lot {icon}".strip() if auto_calculated else f"{volume} lot"
 
 
 # ---------------------------------------------------------------------------

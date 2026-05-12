@@ -112,8 +112,19 @@ class MT5EventJob:
       event.close_reason.value,
     )
 
+    # Fetch position from DB to get strategy
+    position = self._db.get_position(source_ticket=event.source_ticket)
+    if not position:
+      log.warning(
+        "[MT5EventJob] Position not found in DB | source_ticket=%d",
+        event.source_ticket,
+      )
+      return
+    strategy = position.get("strategy", "unknown")
+
     # 4.2 — Write to DB with author='terminal'
     self._db.log_position(
+      strategy=strategy,
       ticket=event.deal_ticket,
       source_ticket=event.source_ticket,
       symbol=event.symbol,
@@ -171,13 +182,13 @@ class MT5EventJob:
       f"{icon} <b>Terminal Close [{event.close_reason.value}]</b>\n\n"
       f"Symbol: <b>{event.symbol}</b>\n"
       f"Reason: <b>{event.close_reason.value}</b>\n"
-      f"Close Price: <b>{event.close_price}</b>\n"
+      f"Close Price: <b>{round(event.close_price, 2)}</b>\n"
       f"Volume: <b>{event.close_volume}</b>\n"
       f"Position: <b>{event.source_ticket}</b>\n"
       f"Deal: <b>{event.deal_ticket}</b>\n"
-      f"Entry Price: <b>{event.entry_price}</b>\n"
-      f"SL: <b>{event.sl}</b>\n"
-      f"TP: <b>{event.tp}</b>\n"
+      f"Entry Price: <b>{round(event.entry_price, 2)}</b>\n"
+      f"SL: <b>{round(event.sl, 2)}</b>\n"
+      f"TP: <b>{round(event.tp, 2)}</b>\n"
       f"----------------------------------\n"
       f"{acct_footer}"
     )
