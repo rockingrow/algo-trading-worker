@@ -227,33 +227,6 @@ def _handle_flat_signal(
   channel_notifier.send_message(msg)
 
 
-def _dispatch_signal_callback(
-  action_val, callback_service, signal, result, pos_ticket, balance_at_start
-) -> None:
-  if action_val in ("LONG", "SHORT"):
-    callback_service.notify_opened(
-      signal=signal,
-      ticket=pos_ticket,
-      comment=result.get("comment", ""),
-      volume=result.get("volume", signal.quantity),
-      price=result.get("price", signal.price),
-      balance_init=balance_at_start,
-    )
-  elif action_val == "TP1":
-    callback_service.notify_partially_closed(
-      ticket=str(pos_ticket),
-      price=result.get("price", signal.price),
-      remaining_quantity=result.get("volume", signal.quantity),
-    )
-  elif action_val in ("TP2", "SL", "R_SL"):
-    callback_service.notify_closed(
-      ticket=str(pos_ticket),
-      price=result.get("price", signal.price),
-      quantity=result.get("volume", signal.quantity),
-      sl=getattr(signal, "sl", None),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Child-process entry point
 # ---------------------------------------------------------------------------
@@ -278,11 +251,11 @@ def _worker_process_main(
   from worker.mt5.mt5 import MT5
   from worker.schemas.broker_schema import SignalSchema
   from worker.schemas.nats_schema import NatsSubjectEnum
-  from worker.services.callback_service import CallbackService
   from worker.services.db_service import DBService
   from worker.services.job_service import MT5EventJob
-  from worker.services.nats_service import NATSSubscriber
+  from worker.services.nats_service import NATSPublisher, NATSSubscriber
   from worker.services.notification_service import TelegramNotification
+  from worker.services.position_watcher import PositionWatcher
 
   log = get_logger("worker.mt5_process")
   log.info("[MT5 Process] Started (PID=%d)", multiprocessing.current_process().pid)
@@ -309,6 +282,13 @@ def _worker_process_main(
   )
   subscriber.connect()
 
+  # ── 2b. Set up NATS publisher (TRADE subject → broker) ───────────────── #
+  publisher = NATSPublisher(
+    url=settings_dict["nats_url"],
+    token=settings_dict.get("nats_token"),
+  )
+  publisher.connect()
+
   # ── 3. Set up trading components ──────────────────────────────────────── #
   executor = MT5Executor(
     magic_number=settings_dict["magic_number"],
@@ -318,14 +298,6 @@ def _worker_process_main(
   handler = SignalHandler(strategy)
   db_service = DBService()
   db_service.initialize()
-
-  account_status = bridge.get_account_status() or {}
-  callback_service = CallbackService(
-    broker_api_url=settings_dict["broker_api_url"],
-    account_id=str(settings_dict["mt5_login"]),
-    api_key=settings_dict["broker_api_key"],
-  )
-  balance_at_start = account_status.get("balance", 0.0)
 
   notifier = TelegramNotification()
   channel_notifier = TelegramNotification(
@@ -369,11 +341,18 @@ def _worker_process_main(
   # ── 4b. Start terminal-close polling job ──────────────────────────────── #
   event_job = MT5EventJob(
     magic_number=settings_dict["magic_number"],
-    callback_service=callback_service,
     db_service=db_service,
     notifier=channel_notifier,
   )
   event_job.start(stop_event=stop_event)
+
+  # ── 4c. Start position watcher (SQLite positions → NATS TRADE) ───────── #
+  position_watcher = PositionWatcher(
+    account_id=str(settings_dict["mt5_login"]),
+    publisher=publisher,
+    account_info_fn=bridge.get_account_status,
+  )
+  position_watcher.start(stop_event=stop_event)
 
   # ── 5. Signal processing loop ─────────────────────────────────────────── #
   try:
@@ -427,17 +406,9 @@ def _worker_process_main(
       if result.get("success"):
         # For entries (LONG/SHORT), `ticket` is the position.
         # For exits (TP1/TP2/SL/R_SL), `ticket` is the new exit deal, but `source_ticket` is the original position.
-        # We want to callback with the same steady position ticket across all states.
         action_val = signal.action.value
         pos_ticket = result.get("source_ticket", result.get("ticket"))
-        _dispatch_signal_callback(
-          action_val,
-          callback_service,
-          signal,
-          result,
-          pos_ticket,
-          balance_at_start,
-        )
+        signal_json = signal.model_dump_json()
         if action_val in ("LONG", "SHORT"):
           db_service.insert_position(
             ticket=pos_ticket,
@@ -448,6 +419,7 @@ def _worker_process_main(
             opened_price=result.get("price", signal.price),
             mt5_retcode=result.get("retcode"),
             comment=result.get("comment", ""),
+            message=signal_json,
           )
         else:
           _close_status_map = {
@@ -465,6 +437,7 @@ def _worker_process_main(
               closed_price=result.get("price"),
               mt5_retcode=result.get("retcode"),
               comment=result.get("comment", ""),
+              message=signal_json,
             )
         msg = _box(
           f"✅ <b>Order Filled</b>\n\n"
@@ -478,11 +451,6 @@ def _worker_process_main(
           f"{bridge.get_account_footer()}"
         )
       else:
-        callback_service.notify_rejected(
-          signal=signal,
-          reject_reason=result.get("comment", "Unknown error"),
-          balance_init=balance_at_start,
-        )
         msg = _box(
           f"❌ <b>Order Failed</b>\n\n"
           f"Symbol: <b>{signal.symbol}</b>\n"
@@ -500,6 +468,7 @@ def _worker_process_main(
     log.exception("[MT5 Process] Unexpected error: %s", e)
   finally:
     subscriber.close()
+    publisher.close()
     bridge.shutdown()
     notifier.send_message(_box(f"🛑 <b>[Disconnected] MT5 Worker</b>{footer}"))
     log.info("[MT5 Process] Exiting.")

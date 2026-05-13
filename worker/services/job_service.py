@@ -2,8 +2,10 @@
 worker/services/job_service.py
 ───────────────────────────────
 Background polling job that detects positions closed by the MT5 terminal
-(hard SL, server-side TP, stop-out, or manual) without a ZMQ signal, then
-fires the Telegram notification and broker API callback.
+(hard SL, server-side TP, stop-out, or manual) without a NATS signal, then
+fires the Telegram notification and updates the SQLite positions table.
+The NATS TRADE publisher (PositionWatcher) propagates the status change
+to the broker.
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ from worker.mt5.jobs import (
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.services.callback_service import CallbackService
 from worker.services.db_service import DBService
 from worker.services.notification_service import TelegramNotification
 
@@ -42,24 +43,23 @@ def _box(text: str) -> str:
 class MT5EventJob:
   """
   Daemon thread that polls MT5 every *poll_interval* seconds for positions
-  closed by the terminal without a corresponding ZMQ signal.
+  closed by the terminal without a corresponding NATS signal.
 
   On each detected closure:
     4.1  Sends a Telegram notification.
-    4.2  Writes a row to order_logs with author='terminal'.
-         Calls the broker API callback (notify_closed / notify_partially_closed).
+    4.2  Writes a row to position_logs with author='terminal' and updates the
+         positions table — the PositionWatcher will then publish the status
+         change to NATS TRADE so the broker can update its trades table.
   """
 
   def __init__(
     self,
     magic_number: int,
-    callback_service: CallbackService,
     db_service: DBService,
     notifier: TelegramNotification,
     poll_interval: int = _POLL_INTERVAL,
   ) -> None:
     self._magic = magic_number
-    self._callback = callback_service
     self._db = db_service
     self._notifier = notifier
     self._poll_interval = poll_interval
@@ -145,22 +145,6 @@ class MT5EventJob:
       mt5_retcode=0,
       comment=f"Terminal close [{event.close_reason.value}]",
     )
-
-    # 4.2 — Broker API callback
-    if event.close_reason in (TerminalCloseReason.SL, TerminalCloseReason.STOP_OUT):
-      self._callback.notify_closed(
-        ticket=str(event.source_ticket),
-        price=event.close_price,
-        quantity=event.close_volume,
-        sl=event.sl,
-      )
-    elif event.close_reason == TerminalCloseReason.TP:
-      self._callback.notify_closed(
-        ticket=str(event.source_ticket),
-        price=event.close_price,
-        quantity=event.close_volume,
-      )
-    # MANUAL: no broker API callback — intent is ambiguous.
 
     # 4.1 — Telegram
     acct = event.account

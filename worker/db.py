@@ -27,6 +27,8 @@ def init_db():
                 mt5_retcode INTEGER,
                 comment TEXT,
                 message TEXT,
+                sync_status TEXT NOT NULL DEFAULT 'PENDING',
+                sync_time DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -171,6 +173,7 @@ def update_position_status(
                 mt5_retcode = COALESCE(?, mt5_retcode),
                 comment = COALESCE(?, comment),
                 message = COALESCE(?, message),
+                sync_status = 'PENDING',
                 updated_at = CURRENT_TIMESTAMP
             WHERE source_ticket = ?
         """,
@@ -198,6 +201,47 @@ def get_position(source_ticket: int) -> Optional[dict]:
   except Exception as e:
     logger.exception(f"Failed to fetch position source_ticket={source_ticket}: {e}")
     return None
+
+
+def get_pending_sync_positions() -> list:
+  """Return positions whose state hasn't been published to NATS yet."""
+  try:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM positions WHERE sync_status = 'PENDING'")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+  except Exception as e:
+    logger.exception(f"Failed to fetch pending sync positions: {e}")
+    return []
+
+
+def mark_position_synced(position_id: int, updated_at: str) -> bool:
+  """Mark a position as PUBLISHED, guarded by updated_at to avoid clobbering a
+  concurrent update. Returns True if the row was marked, False if it was
+  modified between fetch and mark (in which case it stays PENDING and will be
+  re-picked up on the next poll)."""
+  try:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+      """
+            UPDATE positions
+            SET sync_status = 'PUBLISHED',
+                sync_time = CURRENT_TIMESTAMP
+            WHERE id = ? AND updated_at = ? AND sync_status = 'PENDING'
+        """,
+      (position_id, updated_at),
+    )
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+  except Exception as e:
+    logger.exception(f"Failed to mark position synced id={position_id}: {e}")
+    return False
 
 
 def get_open_positions_by_strategy(strategy: str, symbol: str) -> list:
