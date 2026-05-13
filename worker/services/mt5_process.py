@@ -58,19 +58,19 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
           "[MT5 Health] MT5 disconnected — attempting to relaunch/reconnect..."
         )
         notifier.send_message(
-          _box(f"⚠️ <b>MT5 disconnected — reconnecting…</b>{footer_fn()}")
+          _box(f"⚠️ <b>[Disconnected] MT5 — reconnecting…</b>{footer_fn()}")
         )
         reconnected = bridge.reconnect(max_attempts=15, delay_seconds=10.0)
         if reconnected:
           log.info("[MT5 Health] MT5 reconnected successfully.")
-          notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer_fn()}"))
+          notifier.send_message(_box(f"🟢 <b>[Connected] MT5</b>{footer_fn()}"))
         else:
           log.error(
             "[MT5 Health] MT5 reconnect failed after 15 attempts — killing and restarting terminal64.exe..."
           )
           notifier.send_message(
             _box(
-              f"🔴 <b>MT5 reconnect failed</b>\n\n"
+              f"🔴 <b>[Disconnected] MT5 reconnect failed</b>\n\n"
               f"Killing and restarting terminal64.exe…{footer_fn()}"
             )
           )
@@ -81,7 +81,7 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
             if reconnected:
               log.info("[MT5 Health] MT5 reconnected after terminal restart.")
               notifier.send_message(
-                _box(f"🟢 <b>MT5 reconnected after terminal restart</b>{footer_fn()}")
+                _box(f"🟢 <b>[Connected] MT5 after terminal restart</b>{footer_fn()}")
               )
             else:
               log.error(
@@ -119,13 +119,13 @@ def _ensure_mt5_connected(bridge, notifier, footer: str, log) -> bool:
   if bridge.is_connected():
     return True
   log.warning("[MT5 Process] MT5 connection lost. Reconnecting...")
-  notifier.send_message(_box(f"⚠️ <b>MT5 connection lost — reconnecting…</b>{footer}"))
+  notifier.send_message(_box(f"⚠️ <b>[Disconnected] MT5 — reconnecting…</b>{footer}"))
   reconnected = bridge.reconnect(max_attempts=0, delay_seconds=10.0)
   if reconnected:
-    notifier.send_message(_box(f"🟢 <b>MT5 reconnected</b>{footer}"))
+    notifier.send_message(_box(f"🟢 <b>[Connected] MT5</b>{footer}"))
   else:
     notifier.send_message(
-      _box(f"🔴 <b>MT5 reconnect failed — signal dropped</b>{footer}")
+      _box(f"🔴 <b>[Disconnected] MT5 reconnect failed — signal dropped</b>{footer}")
     )
   return reconnected
 
@@ -349,7 +349,7 @@ def _worker_process_main(
 
   notifier.send_message(
     _box(
-      f"🟢 <b>MT5 Worker connected</b>\n\n"
+      f"🟢 <b>[Connected] MT5 Worker</b>\n\n"
       f"{volume_config}"
       f"----------------------------------\n"
       f"{footer}"
@@ -501,7 +501,7 @@ def _worker_process_main(
   finally:
     subscriber.close()
     bridge.shutdown()
-    notifier.send_message(_box(f"🛑 <b>MT5 Worker disconnected</b>{footer}"))
+    notifier.send_message(_box(f"🛑 <b>[Disconnected] MT5 Worker</b>{footer}"))
     log.info("[MT5 Process] Exiting.")
 
 

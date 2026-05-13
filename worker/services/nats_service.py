@@ -48,13 +48,13 @@ class NATSSubscriber:
     async def disconnected_cb():
       logger.warning("NATS disconnected from %s. Retrying...", self.url)
       notification.send_message(
-        f"<pre>🔴 NATS Broker Disconnected\nEndpoint: {self.url}\n⏳ Retrying connection...{footer}</pre>"
+        f"<pre>🔴 [Disconnected] NATS Broker\nEndpoint: {self.url}\n⏳ Retrying connection...{footer}</pre>"
       )
 
     async def reconnected_cb():
       logger.info("NATS reconnected to %s", self.url)
       notification.send_message(
-        f"<pre>🔌 NATS Worker Reconnected to Broker\nEndpoint: {self.url}{footer}</pre>"
+        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}{footer}</pre>"
       )
 
     connect_opts: dict = dict(
@@ -71,7 +71,7 @@ class NATSSubscriber:
       nc = await nats.connect(self.url, **connect_opts)
       logger.info("Connected to NATS at %s, subjects=%s", self.url, subject_names)
       notification.send_message(
-        f"<pre>🔌 NATS Worker Connected to Broker\nEndpoint: {self.url}\nSubjects: {', '.join(subject_names)}{footer}</pre>"
+        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nSubjects: {', '.join(subject_names)}{footer}</pre>"
       )
 
       subs = [
