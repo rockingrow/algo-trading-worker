@@ -43,6 +43,7 @@ class BaseMarketStrategy(ABC):
     handle_tp2                →  Group 3 – TP2 full exit
     handle_sl                 →  Group 3 – hard SL triggered
     handle_r_sl               →  Group 3 – reverse SL (trailing stop exit)
+    handle_flat               →  Group 3 – FLAT signal (manual/forced full close)
 
   Position helpers (get_open_positions, close_all_positions) are used
   by SignalHandler for pre-flight checks and stale cleanup.
@@ -77,6 +78,10 @@ class BaseMarketStrategy(ABC):
   @abstractmethod
   def handle_r_sl(self, signal: SignalSchema) -> Dict[str, Any]:
     """Close all remaining volume because trailing/reverse SL was hit."""
+
+  @abstractmethod
+  def handle_flat(self, signal: SignalSchema) -> Dict[str, Any]:
+    """Close all remaining volume on FLAT signal (manual/forced flatten)."""
 
   # ── Position helpers ──────────────────────────────────────────────────── #
 
@@ -149,14 +154,28 @@ class ForexMarket(BaseMarketStrategy):
 
     pos = positions[0]
 
-    if signal.quantity is None:
-      return {
-        "success": False,
-        "retcode": -1,
-        "comment": "Missing quantity in TP1 signal",
-      }
-
-    close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
+    # Calculate close volume based on volume_decision_enabled
+    if settings.volume_decision_enabled:
+      # Close position_tp1_percent% of the current position volume
+      calculated_volume = pos.volume * (settings.position_tp1_percent / 100)
+      close_volume = self._executor.normalize_volume(symbol, calculated_volume)
+      logger.info(
+        f"[handle_tp1] VOLUME_DECISION mode | "
+        f"position_volume={pos.volume} position_tp1_percent={settings.position_tp1_percent}% "
+        f"calculated={calculated_volume} → close_volume={close_volume}"
+      )
+    else:
+      # Use quantity from signal
+      if signal.quantity is None:
+        return {
+          "success": False,
+          "retcode": -1,
+          "comment": "Missing quantity in TP1 signal",
+        }
+      close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
+      logger.info(
+        f"[handle_tp1] Payload quantity mode | qty={signal.quantity} → close_volume={close_volume}"
+      )
 
     close_result = self._executor.partial_close_position(
       symbol=symbol,
@@ -190,6 +209,10 @@ class ForexMarket(BaseMarketStrategy):
   def handle_r_sl(self, signal: SignalSchema) -> Dict[str, Any]:
     """Full close because reverse/trailing SL was triggered."""
     return self._executor.close_all_positions(signal.symbol, reason="R_SL")
+
+  def handle_flat(self, signal: SignalSchema) -> Dict[str, Any]:
+    """Full close all positions for the symbol on FLAT signal."""
+    return self._executor.close_all_positions(signal.symbol, reason="FLAT")
 
   # ── Helpers ──────────────────────────────────────────────────────────── #
 
@@ -240,6 +263,9 @@ class CryptoMarket(BaseMarketStrategy):
 
   def handle_r_sl(self, signal: SignalSchema) -> Dict[str, Any]:
     raise NotImplementedError("CryptoMarket.handle_r_sl is not yet implemented.")
+
+  def handle_flat(self, signal: SignalSchema) -> Dict[str, Any]:
+    raise NotImplementedError("CryptoMarket.handle_flat is not yet implemented.")
 
   def get_open_positions(self, symbol: str) -> List[Any]:
     raise NotImplementedError("CryptoMarket.get_open_positions is not yet implemented.")

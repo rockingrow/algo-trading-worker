@@ -18,11 +18,13 @@ class NATSSubscriber:
     self,
     url: str,
     subjects: list[NatsSubjectEnum],
+    publish_subjects: list[NatsSubjectEnum] | None = None,
     token: Optional[str] = None,
     account_footer_fn: Optional[Callable[[], str]] = None,
   ):
     self.url = url
     self.subjects = subjects
+    self.publish_subjects = publish_subjects or []
     self._token = token
     self._account_footer_fn = account_footer_fn
     self._stop_event = threading.Event()
@@ -33,6 +35,7 @@ class NATSSubscriber:
     notification = TelegramNotification()
     footer = get_footer(self._account_footer_fn)
     subject_names = [s.value for s in self.subjects]
+    publish_subject_names = [s.value for s in self.publish_subjects]
 
     async def message_handler(msg):
       try:
@@ -69,9 +72,13 @@ class NATSSubscriber:
 
     try:
       nc = await nats.connect(self.url, **connect_opts)
-      logger.info("Connected to NATS at %s, subjects=%s", self.url, subject_names)
+      logger.info(
+        "Connected to NATS at %s, listening=%s publishing=%s",
+        self.url, subject_names, publish_subject_names,
+      )
+      pub_line = f"\nPublishing Subjects: {', '.join(publish_subject_names)}" if publish_subject_names else ""
       notification.send_message(
-        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nSubjects: {', '.join(subject_names)}{footer}</pre>"
+        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{footer}</pre>"
       )
 
       subs = [
@@ -133,14 +140,22 @@ class NATSPublisher:
   event loop with a live NATS connection. Other threads call publish() to
   enqueue outgoing messages; the loop drains the queue and publishes them."""
 
-  def __init__(self, url: str, token: Optional[str] = None):
+  def __init__(
+    self,
+    url: str,
+    publish_subjects: list[NatsSubjectEnum],
+    token: Optional[str] = None,
+  ):
     self.url = url
+    self.publish_subjects = publish_subjects
     self._token = token
     self._stop_event = threading.Event()
     self._send_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
     self._loop_thread: Optional[threading.Thread] = None
 
   async def _run_loop(self) -> None:
+    subject_names = [s.value for s in self.publish_subjects]
+
     async def error_cb(e):
       logger.error("NATS publisher error: %s", e)
 
@@ -162,7 +177,7 @@ class NATSPublisher:
 
     try:
       nc = await nats.connect(self.url, **connect_opts)
-      logger.info("NATS publisher connected to %s", self.url)
+      logger.info("NATS publisher connected to %s, publish_subjects=%s", self.url, subject_names)
 
       while not self._stop_event.is_set():
         try:
@@ -182,6 +197,8 @@ class NATSPublisher:
       logger.exception("NATS publisher fatal error: %s", exc)
 
   def connect(self) -> None:
+    subject_names = [s.value for s in self.publish_subjects]
+    logger.info("Starting NATS publisher for subjects: %s", subject_names)
     loop = asyncio.new_event_loop()
     self._loop_thread = threading.Thread(
       target=loop.run_until_complete,

@@ -277,6 +277,7 @@ def _worker_process_main(
   subscriber = NATSSubscriber(
     url=settings_dict["nats_url"],
     subjects=[NatsSubjectEnum.SIGNAL, NatsSubjectEnum.ADMIN],
+    publish_subjects=[NatsSubjectEnum.TRADE],
     token=settings_dict.get("nats_token"),
     account_footer_fn=bridge.get_account_footer,
   )
@@ -285,6 +286,7 @@ def _worker_process_main(
   # ── 2b. Set up NATS publisher (TRADE subject → broker) ───────────────── #
   publisher = NATSPublisher(
     url=settings_dict["nats_url"],
+    publish_subjects=[NatsSubjectEnum.TRADE],
     token=settings_dict.get("nats_token"),
   )
   publisher.connect()
@@ -317,6 +319,7 @@ def _worker_process_main(
     f"CAPITAL: <b>{capital} {capital_currency}</b>\n"
     f"RISK_PERCENTAGE: <b>{risk_percentage}%</b>\n"
     f"USE_ACCOUNT_EQUITY: <b>{use_account_equity}</b>\n"
+    f"POSITION_TP1_PERCENT: <b>{settings_dict.get('position_tp1_percent', 0)}%</b>\n"
   )
 
   notifier.send_message(
@@ -363,10 +366,10 @@ def _worker_process_main(
       try:
         signal = SignalSchema(**json.loads(raw))
       except json.JSONDecodeError as err:
-        logger.error("[MT5 Process] Malformed JSON: %s", err)
+        log.error("[MT5 Process] Malformed JSON: %s", err)
         continue
       except ValidationError as err:
-        logger.error("[MT5 Process] Signal validation failed: %s", err)
+        log.error("[MT5 Process] Signal validation failed: %s", err)
         continue
       if not _ensure_mt5_connected(bridge, notifier, footer, log):
         continue

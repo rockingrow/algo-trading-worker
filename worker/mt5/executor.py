@@ -149,6 +149,31 @@ class MT5Executor:
 
     return final_lot
 
+  def normalize_volume(self, symbol: str, volume: float) -> float:
+    """Round volume according to symbol's volume_step requirements."""
+    symbol_info = mt5.symbol_info(self.get_symbol(symbol))
+    if not symbol_info:
+      logger.warning(f"Cannot get symbol info for {symbol}. Returning volume as-is.")
+      return volume
+
+    step = symbol_info.volume_step
+    # Round down to the nearest multiple of the step for strict risk management
+    rounded = math.floor((volume + 1e-9) / step) * step
+    # Clamp to min/max allowed by broker
+    final_vol = max(symbol_info.volume_min, min(rounded, symbol_info.volume_max))
+
+    # Dynamically calculate decimal places based on step
+    decimals = 0
+    if step < 1.0:
+      decimals = len(str(step).rstrip("0").split(".")[1])
+
+    final_vol = round(final_vol, decimals)
+
+    logger.debug(
+      f"[Volume Normalization] Input: {volume}, Step: {step}, Output: {final_vol}"
+    )
+    return final_vol
+
   # ------------------------------------------------------------------ #
   #  Position Query Helpers                                              #
   # ------------------------------------------------------------------ #

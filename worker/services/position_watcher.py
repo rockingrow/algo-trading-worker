@@ -102,7 +102,15 @@ class PositionWatcher:
         account_id=self._account_id,
         **payload,
       )
-      self._publisher.publish(NatsSubjectEnum.TRADE, event.model_dump_json())
+      event_json = event.model_dump_json()
+      log.info(
+        "[PositionWatcher] Publishing TRADE event | event=%s status=%s source_ticket=%s\n%s",
+        event_type.value,
+        row.get("status"),
+        row.get("source_ticket"),
+        event_json,
+      )
+      self._publisher.publish(NatsSubjectEnum.TRADE, event_json)
       # Publish-then-mark gives at-least-once delivery; the broker handler is
       # idempotent (upsert by account_id + ticket).
       marked = mark_position_synced(row["id"], row["updated_at"])

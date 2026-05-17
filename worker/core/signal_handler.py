@@ -6,7 +6,7 @@ market strategy calls, following the three-group logic defined in logic.md:
 
   Group 1  │ LONG / SHORT  → Open a fresh position (clear any stale one first)
   Group 2  │ TP1           → Partial close + move SL to breakeven (entry price)
-  Group 3  │ TP2 / SL / R_SL → Full close using ACTUAL volume (no signal qty)
+  Group 3  │ TP2 / SL / R_SL / FLAT → Full close using ACTUAL volume (no signal qty)
 
 SignalHandler is market-agnostic: it depends only on BaseMarketStrategy and
 knows nothing about MT5, exchange APIs, or any concrete implementation.
@@ -21,7 +21,7 @@ from worker.schemas.broker_schema import SignalActionEnum, SignalSchema
 logger = get_logger("worker.core.signal_handler")
 
 # Actions that belong to the "full close" group
-_FULL_CLOSE_ACTIONS = {SignalActionEnum.TP2, SignalActionEnum.SL, SignalActionEnum.R_SL}
+_FULL_CLOSE_ACTIONS = {SignalActionEnum.TP2, SignalActionEnum.SL, SignalActionEnum.R_SL, SignalActionEnum.FLAT}
 
 
 class SignalHandler:
@@ -174,7 +174,7 @@ class SignalHandler:
     return result
 
   # ------------------------------------------------------------------ #
-  #  Group 3 — Full close by ACTUAL volume (TP2 / SL / R_SL)            #
+  #  Group 3 — Full close by ACTUAL volume (TP2 / SL / R_SL / FLAT)    #
   # ------------------------------------------------------------------ #
 
   def _handle_full_close(self, signal: SignalSchema) -> Dict[str, Any]:
@@ -204,6 +204,8 @@ class SignalHandler:
       result = self.strategy.handle_tp2(signal)
     elif action == SignalActionEnum.SL:
       result = self.strategy.handle_sl(signal)
+    elif action == SignalActionEnum.FLAT:
+      result = self.strategy.handle_flat(signal)
     else:  # R_SL
       result = self.strategy.handle_r_sl(signal)
 
