@@ -53,8 +53,12 @@ class PositionWatcher:
     publisher: NATSPublisher,
     account_info_fn: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
     poll_interval: int = _POLL_INTERVAL,
+    account_name: Optional[str] = None,
+    market_type: Optional[str] = None,
   ) -> None:
     self._account_id = account_id
+    self._account_name = account_name
+    self._market_type = market_type
     self._publisher = publisher
     self._account_info_fn = account_info_fn
     self._poll_interval = poll_interval
@@ -100,6 +104,8 @@ class PositionWatcher:
       event = PositionEvent(
         event=event_type,
         account_id=self._account_id,
+        account_name=self._account_name,
+        market_type=self._market_type,
         **payload,
       )
       event_json = event.model_dump_json()

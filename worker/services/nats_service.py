@@ -74,9 +74,15 @@ class NATSSubscriber:
       nc = await nats.connect(self.url, **connect_opts)
       logger.info(
         "Connected to NATS at %s, listening=%s publishing=%s",
-        self.url, subject_names, publish_subject_names,
+        self.url,
+        subject_names,
+        publish_subject_names,
       )
-      pub_line = f"\nPublishing Subjects: {', '.join(publish_subject_names)}" if publish_subject_names else ""
+      pub_line = (
+        f"\nPublishing Subjects: {', '.join(publish_subject_names)}"
+        if publish_subject_names
+        else ""
+      )
       notification.send_message(
         f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{footer}</pre>"
       )
@@ -177,7 +183,9 @@ class NATSPublisher:
 
     try:
       nc = await nats.connect(self.url, **connect_opts)
-      logger.info("NATS publisher connected to %s, publish_subjects=%s", self.url, subject_names)
+      logger.info(
+        "NATS publisher connected to %s, publish_subjects=%s", self.url, subject_names
+      )
 
       while not self._stop_event.is_set():
         try:

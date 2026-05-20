@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
+from worker.settings import MarketTypeEnum
+
 
 class PositionEventType(str, Enum):
   CREATED = "CREATED"
@@ -19,6 +21,8 @@ class PositionEvent(BaseModel):
 
   event: PositionEventType
   account_id: str
+  account_name: Optional[str] = None
+  market_type: MarketTypeEnum
 
   id: int
   source_ticket: int

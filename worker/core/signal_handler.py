@@ -21,7 +21,12 @@ from worker.schemas.broker_schema import SignalActionEnum, SignalSchema
 logger = get_logger("worker.core.signal_handler")
 
 # Actions that belong to the "full close" group
-_FULL_CLOSE_ACTIONS = {SignalActionEnum.TP2, SignalActionEnum.SL, SignalActionEnum.R_SL, SignalActionEnum.FLAT}
+_FULL_CLOSE_ACTIONS = {
+  SignalActionEnum.TP2,
+  SignalActionEnum.SL,
+  SignalActionEnum.R_SL,
+  SignalActionEnum.FLAT,
+}
 
 
 class SignalHandler:

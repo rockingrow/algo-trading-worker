@@ -354,6 +354,8 @@ def _worker_process_main(
     account_id=str(settings_dict["mt5_login"]),
     publisher=publisher,
     account_info_fn=bridge.get_account_status,
+    account_name=settings_dict.get("mt5_name"),
+    market_type=settings_dict.get("market_type"),
   )
   position_watcher.start(stop_event=stop_event)
 
