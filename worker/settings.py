@@ -15,6 +15,7 @@ class Settings(BaseSettings):
   nats_token: Optional[str] = None
 
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
+  signal_subjects: str
 
   # MT5 Credentials
   mt5_server: str

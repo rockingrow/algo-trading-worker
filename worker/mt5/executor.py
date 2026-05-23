@@ -314,7 +314,7 @@ class MT5Executor:
 
     # Validate SL/TP against live price; price may have moved since the signal
     # was generated, causing 10016 (TRADE_RETCODE_INVALID_STOPS) without this.
-    sl, tp = self._validate_stops(symbol, order_type, tick, signal.sl, signal.tp1)
+    sl, tp = self._validate_stops(symbol, order_type, tick, signal.sl, signal.tp2)
 
     if sl is not None:
       request["sl"] = float(sl)
