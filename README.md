@@ -188,6 +188,96 @@ The Broker handler is expected to be idempotent (upsert by `account_id + ticket`
 
 ---
 
+## 🗄️ SQLite Schema (`worker_data.sqlite`)
+
+Two tables are created on startup by `db_init()` using WAL journal mode.
+
+### `positions` — Live position state
+
+The canonical record for each open trade. `PositionCDC` watches this table for `sync_status = PENDING` rows to publish as NATS `TRADE` events.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INTEGER PK | Auto-increment row ID |
+| `source_ticket` | INTEGER UNIQUE | Original MT5 ticket at open — never changes across the position's lifetime |
+| `ticket` | INTEGER | Current MT5 ticket (may differ from `source_ticket` after a partial close re-tickets) |
+| `strategy` | TEXT | Strategy name from signal (e.g. `MT5_GOLD_M5_V1`) |
+| `symbol` | TEXT | Instrument symbol (e.g. `XAUUSD`) |
+| `action` | TEXT | `long` or `short` |
+| `volume` | REAL | Lot size at open |
+| `opened_price` | REAL | Fill price at entry |
+| `closed_price` | REAL | Fill price at close (null while open) |
+| `status` | TEXT | See **Position Status Lifecycle** below |
+| `mt5_retcode` | INTEGER | Last MT5 return code |
+| `comment` | TEXT | Last MT5 comment string |
+| `message` | TEXT | Full original signal JSON (used by `PositionCDC` to extract `signal_id`, `sl`, `tp1`, etc.) |
+| `sync_status` | TEXT | `PENDING` → `PUBLISHED` — drives CDC delivery |
+| `sync_time` | DATETIME | Timestamp of last successful publish |
+| `created_at` / `updated_at` | DATETIME | Row timestamps; `updated_at` is used as an optimistic-lock key in `mark_position_synced` |
+
+#### Position Status Lifecycle
+
+```text
+OPENED ──► TP1 ──► TP2
+       │         └──► SL
+       │         └──► R_SL
+       │         └──► TERMINAL_CLOSED  (MT5EventJob: SL/TP/Stop-Out fired server-side)
+       │         └──► FORCED_CLOSED    (new entry signal arrived while position open)
+       └──► FLATTED                    (FLAT signal)
+```
+
+| Status | Set by | Meaning |
+| --- | --- | --- |
+| `OPENED` | Entry signal | Position is live |
+| `TP1` | TP1 signal | Partially closed; runner is still active |
+| `TP2` | TP2 signal | Fully closed at take-profit 2 |
+| `SL` | SL signal | Fully closed at stop-loss (NATS-triggered) |
+| `R_SL` | R_SL signal | Fully closed at revised stop-loss |
+| `TERMINAL_CLOSED` | `MT5EventJob` | Server closed the position (SL/TP/Stop-Out) before NATS signal arrived |
+| `FORCED_CLOSED` | New entry signal | Position was force-closed because an opposing/same-direction entry arrived |
+| `FLATTED` | FLAT signal | Position was closed by an administrative flat command |
+
+### `position_logs` — Immutable execution audit trail
+
+An append-only log of every signal processed and its MT5 execution result. Never updated — only inserted.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `strategy` / `symbol` / `action` | TEXT | Signal identity |
+| `ticket` / `source_ticket` | INTEGER | MT5 ticket references at time of execution |
+| `volume` / `price` / `sl` / `tp1` | REAL | Execution parameters |
+| `mt5_retcode` | INTEGER | MT5 result code (`10009` = filled, etc.) |
+| `message` | TEXT | Full signal JSON |
+| `author` | TEXT | `broker` (NATS signal) or `terminal` (MT5EventJob detection) |
+| `timestamp` | DATETIME | Wall-clock time of insertion |
+
+---
+
+## 🔄 Process Lifecycle & Watchdog
+
+The parent FastAPI process (`app.py`) never loads the MT5 C extension. All MT5 and NATS work runs inside an isolated child process managed by `MT5Manager`.
+
+```text
+FastAPI (parent)
+  └── ForexMarketOrchestrator
+        ├── MT5Manager.start()   — spawns child process
+        ├── Watchdog task        — checks every 10 s (WATCHDOG_INTERVAL)
+        │     └── if child died → MT5Manager.restart()
+        └── MT5Manager.stop()   — on FastAPI shutdown
+```
+
+Inside the child process three daemon threads run alongside the NATS message loop:
+
+| Thread | Interval | Purpose |
+| --- | --- | --- |
+| `mt5-health` | 15 s (`MT5_HEALTH_INTERVAL`) | Checks MT5 connection; sends Telegram alert on disconnect/reconnect |
+| `MT5EventJob` | 5 s | Detects server-side position closes (SL/TP/Stop-Out) |
+| `PositionCDC` | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
+
+All threads share the same `stop_event` (`multiprocessing.Event`) and exit cleanly when it is set.
+
+---
+
 ## ⚡ Quick Start
 
 ### 1. Requirements
@@ -211,24 +301,44 @@ Copy `.env.example` to `.env` and fill in the MT5 connection details along with 
 cp .env.example .env
 ```
 
-Key variables:
+#### All Environment Variables
 
-```env
-# NATS
-NATS_URL=nats://broker-host:4222
-NATS_TOKEN=your-token-here
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| **NATS** | | | |
+| `NATS_URL` | ✅ | — | NATS server URL (e.g. `nats://broker-host:4222`) |
+| `NATS_TOKEN` | | `null` | NATS authentication token |
+| `SIGNAL_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
+| **MT5** | | | |
+| `MT5_SERVER` | ✅ | — | Broker server name (e.g. `Exness-MT5Trial6`) |
+| `MT5_LOGIN` | ✅ | — | MT5 account number |
+| `MT5_PASSWORD` | ✅ | — | MT5 account password |
+| `MT5_PATH` | | auto-detect | Full path to `terminal64.exe`; if omitted the module reads from Windows registry |
+| `MT5_NAME` | | `null` | Display name sent in every `PositionEvent` to the Broker |
+| `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
+| `MAGIC_NUMBER` | | `20260409` | EA magic number stamped on every order; used to filter positions in MT5 |
+| `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
+| **Risk Management** | | | |
+| `VOLUME_DECISION_ENABLED` | | `true` | When `true`, lot size is calculated from capital + risk % instead of signal `quantity` |
+| `CAPITAL` | | `1000` | Notional capital used for lot-size calculation |
+| `CAPITAL_CURRENCY` | | `USC` | Currency of `CAPITAL` (informational, shown in startup notification) |
+| `RISK_PERCENTAGE` | | `3.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
+| `USE_ACCOUNT_EQUITY` | | `false` | When `true`, uses live account equity instead of `CAPITAL` for lot-size base |
+| `POSITION_TP1_PERCENT` | | `30.0` | % of live volume closed at TP1 when `VOLUME_DECISION_ENABLED=true` |
+| **Telegram** | | | |
+| `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
+| `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot API token from @BotFather |
+| `TELEGRAM_CHAT_ID` | ✅ | — | **Management chat**: service start/stop, MT5 health, NATS events |
+| `TELEGRAM_CHAT_CHANNEL_ID` | | `""` | **Signal channel**: order fills/failures, terminal closes, force-close notifications |
+| **Broker** | | | |
+| `BROKER_API_URL` | ✅ | — | Base URL of the central Broker API (used by `PositionCDC` HTTP fallback) |
+| `BROKER_API_KEY` | ✅ | — | API key sent as Bearer token to the Broker API |
+| **App** | | | |
+| `APP_HOST` | | `0.0.0.0` | FastAPI bind host |
+| `APP_PORT` | | `8000` | FastAPI bind port |
+| `LOG_LEVEL` | | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
-# Which NATS subjects this worker listens to (comma-separated)
-SIGNAL_SUBJECTS=MT5_GOLD,MT5_BTCUSD
-
-# MT5 account identity (sent in every PositionEvent to the Broker)
-MT5_NAME=WangDemo1
-MARKET_TYPE=FOREX   # FOREX or CRYPTO
-
-# TP1 volume (percent of live position size, used when VOLUME_DECISION_ENABLED=true)
-VOLUME_DECISION_ENABLED=true
-POSITION_TP1_PERCENT=30.0
-```
+> **Telegram dual-channel setup:** `TELEGRAM_CHAT_ID` is for private management alerts (sent to you as the operator). `TELEGRAM_CHAT_CHANNEL_ID` is for a shared broadcast channel visible to all stakeholders — it receives every order fill, failure, terminal close, and force-close event. If `TELEGRAM_CHAT_CHANNEL_ID` is left empty, it falls back to `TELEGRAM_CHAT_ID`.
 
 Please ensure that you have enabled "Allow Algo Trading" inside Options > Expert Advisors of the MetaTrader 5 Terminal.
 

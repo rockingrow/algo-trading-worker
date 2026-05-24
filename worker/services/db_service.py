@@ -35,7 +35,7 @@ class DBService:
             INSERT INTO position_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author),
+      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2), sl, tp1, mt5_retcode, comment, message, author),
     )
     conn.commit()
     conn.close()
@@ -60,7 +60,7 @@ class DBService:
             INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, ticket, strategy, symbol, action, volume, opened_price, "OPENED", mt5_retcode, comment, message),
+      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message),
     )
     conn.commit()
     conn.close()
@@ -91,7 +91,7 @@ class DBService:
                 updated_at = CURRENT_TIMESTAMP
             WHERE source_ticket = ?
         """,
-      (status.value, new_ticket, closed_price, mt5_retcode, comment, message, source_ticket),
+      (status.value, new_ticket, round(closed_price, 2) if closed_price is not None else None, mt5_retcode, comment, message, source_ticket),
     )
     conn.commit()
     conn.close()

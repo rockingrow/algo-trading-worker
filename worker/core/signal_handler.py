@@ -156,6 +156,7 @@ class SignalHandler:
     symbol = signal.symbol
 
     # Step 1 — Pre-flight: close stale positions to start clean
+    forced_closed: list[dict] = []
     stale = self.strategy.get_open_positions(symbol)
     if stale:
       logger.warning(
@@ -184,6 +185,13 @@ class SignalHandler:
           mt5_retcode=cleanup.get("retcode"),
           comment="Force-closed by new entry signal",
         )
+        forced_closed.append({
+          "source_ticket": pos["source_ticket"],
+          "ticket": pos["ticket"],
+          "price": cleanup.get("price"),
+          "volume": pos.get("volume"),
+          "retcode": cleanup.get("retcode"),
+        })
       logger.info(
         f"[SignalHandler._handle_entry] Stale positions cleared, "
         f"{len(db_stale)} DB record(s) marked FORCED_CLOSED."
@@ -204,6 +212,8 @@ class SignalHandler:
         f"retcode={result.get('retcode')} comment={result.get('comment')}"
       )
 
+    if forced_closed:
+      result["forced_closed"] = forced_closed
     return result
 
   # ------------------------------------------------------------------ #

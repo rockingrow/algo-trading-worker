@@ -88,6 +88,20 @@ def _process_message(
     action_val = signal.action.value
     pos_ticket = result.get("source_ticket", result.get("ticket"))
     signal_json = signal.model_dump_json()
+
+    for fc in result.get("forced_closed", []):
+      fc_msg = _box(
+        f"⚠️ <b>Force Closed (New Entry)</b>\n\n"
+        f"Symbol: <b>{signal.symbol}</b>\n"
+        f"Price: <b>{fc.get('price')}</b>\n"
+        f"Volume: <b>{_format_volume(fc.get('volume'), auto_calculated=False)}</b>\n"
+        f"Ticket: <b>{fc.get('ticket')}</b>\n"
+        f"Source Ticket: <b>{fc.get('source_ticket')}</b>\n"
+        f"----------------------------------\n"
+        f"{bridge.get_account_footer()}"
+      )
+      channel_notifier.send_message(fc_msg)
+
     if action_val in ("LONG", "SHORT"):
       db_service.insert_position(
         ticket=pos_ticket,
