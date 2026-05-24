@@ -8,15 +8,19 @@ market strategy calls, following the three-group logic defined in logic.md:
   Group 2  │ TP1           → Partial close + move SL to breakeven (entry price)
   Group 3  │ TP2 / SL / R_SL / FLAT → Full close using ACTUAL volume (no signal qty)
 
-SignalHandler is market-agnostic: it depends only on BaseMarketStrategy and
-knows nothing about MT5, exchange APIs, or any concrete implementation.
+SignalHandler queries SQLite first for exit signals to obtain the tracked
+source_ticket, ensuring DB updates always target the correct record even
+when the broker re-tickets a position after a partial close.
 """
 
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from worker.core.market_strategy import BaseMarketStrategy
 from worker.logger import get_logger
 from worker.schemas.broker_schema import SignalActionEnum, SignalSchema
+from worker.schemas.position_schema import PositionStatusEnum
+from worker.schemas.trade_result import TradeResult
+from worker.services.db_protocol import DBServiceProtocol
 
 logger = get_logger("worker.core.signal_handler")
 
@@ -35,18 +39,77 @@ class SignalHandler:
 
   Responsibilities:
   - Pre-flight checks (stale position cleanup for LONG/SHORT).
+  - SQLite lookup for exit signals to resolve the tracked source_ticket.
   - Routing each SignalActionEnum to the appropriate BaseMarketStrategy method.
   - Returning a structured result dict so the caller can log/notify.
   """
 
-  def __init__(self, strategy: BaseMarketStrategy) -> None:
+  def __init__(self, strategy: BaseMarketStrategy, db_service: DBServiceProtocol) -> None:
     self.strategy = strategy
+    self._db = db_service
+
+  # ------------------------------------------------------------------ #
+  #  SQLite lookup helper                                                #
+  # ------------------------------------------------------------------ #
+
+  def _get_db_position(self, strategy_name: str, symbol: str) -> Optional[Dict[str, Any]]:
+    """Return the first open/TP1 position for strategy_name+symbol from SQLite, or None."""
+    positions = self._db.get_open_positions_by_strategy(strategy_name, symbol)
+    if not positions:
+      return None
+    return positions[0]
+
+  # ------------------------------------------------------------------ #
+  #  Template: DB lookup + MT5 guard + inject source_ticket              #
+  # ------------------------------------------------------------------ #
+
+  def _execute_exit(
+    self,
+    signal: SignalSchema,
+    strategy_fn: Callable[[SignalSchema], TradeResult],
+    *,
+    no_db_comment: str,
+    no_mt5_comment: str,
+  ) -> TradeResult:
+    """
+    Shared skeleton for all exit-type signals (TP1, full close).
+
+    1. DB lookup — early return if no tracked position.
+    2. Live MT5 guard — early return if position already gone.
+    3. Execute *strategy_fn*.
+    4. Inject source_ticket from DB into a successful result.
+    """
+    db_pos = self._get_db_position(signal.strategy, signal.symbol)
+    if not db_pos:
+      logger.warning(
+        f"[SignalHandler] No DB record for strategy={signal.strategy} "
+        f"symbol={signal.symbol} action={signal.action.value}. "
+        "Position may have been closed already."
+      )
+      return {"success": False, "retcode": -1, "comment": no_db_comment}
+
+    logger.info(
+      f"[SignalHandler] DB position found | "
+      f"source_ticket={db_pos['source_ticket']} ticket={db_pos['ticket']} status={db_pos['status']}"
+    )
+
+    if not self.strategy.get_open_positions(signal.symbol):
+      logger.warning(
+        f"[SignalHandler] No live MT5 position for {signal.symbol} "
+        f"action={signal.action.value}. May have been closed already."
+      )
+      return {"success": False, "retcode": -1, "comment": no_mt5_comment}
+
+    result = strategy_fn(signal)
+    if result.get("success"):
+      result["source_ticket"] = db_pos["source_ticket"]
+    return result
 
   # ------------------------------------------------------------------ #
   #  Public entry-point                                                  #
   # ------------------------------------------------------------------ #
 
-  def handle(self, signal: SignalSchema) -> Dict[str, Any]:
+  def handle(self, signal: SignalSchema) -> TradeResult:
     """
     Process one incoming webhook signal end-to-end.
 
@@ -69,7 +132,7 @@ class SignalHandler:
     if action == SignalActionEnum.TP1:
       return self._handle_tp1(signal)
 
-    # ── Group 3: Full exit (TP2 / SL / R_SL) ───────────────────────
+    # ── Group 3: Full exit (TP2 / SL / R_SL / FLAT) ─────────────────
     if action in _FULL_CLOSE_ACTIONS:
       return self._handle_full_close(signal)
 
@@ -85,11 +148,10 @@ class SignalHandler:
   #  Group 1 — Open position (LONG / SHORT)                             #
   # ------------------------------------------------------------------ #
 
-  def _handle_entry(self, signal: SignalSchema) -> Dict[str, Any]:
+  def _handle_entry(self, signal: SignalSchema) -> TradeResult:
     """
     1. Check for any stale position on this symbol and force-close it.
-    2. Open a fresh LONG (BUY) or SHORT (SELL) market order.
-    3. Hard SL is set on the broker server directly in the entry request.
+    2. Open a fresh position via strategy.entry (direction in signal.action).
     """
     symbol = signal.symbol
 
@@ -111,13 +173,24 @@ class SignalHandler:
           "retcode": cleanup.get("retcode", -1),
           "comment": f"Stale position cleanup failed: {cleanup.get('comment')}",
         }
-      logger.info("[SignalHandler._handle_entry] Stale positions cleared.")
+
+      # Update DB records for force-closed positions
+      db_stale = self._db.get_open_positions_by_strategy(signal.strategy, symbol)
+      for pos in db_stale:
+        self._db.update_position_status(
+          source_ticket=pos["source_ticket"],
+          status=PositionStatusEnum.FORCED_CLOSED,
+          closed_price=cleanup.get("price"),
+          mt5_retcode=cleanup.get("retcode"),
+          comment="Force-closed by new entry signal",
+        )
+      logger.info(
+        f"[SignalHandler._handle_entry] Stale positions cleared, "
+        f"{len(db_stale)} DB record(s) marked FORCED_CLOSED."
+      )
 
     # Step 2 — Open new position
-    if signal.action == SignalActionEnum.LONG:
-      result = self.strategy.entry_long(signal)
-    else:
-      result = self.strategy.entry_short(signal)
+    result = self.strategy.entry(signal)
 
     if result.get("success"):
       logger.info(
@@ -137,92 +210,43 @@ class SignalHandler:
   #  Group 2 — Partial close + move SL to breakeven (TP1)               #
   # ------------------------------------------------------------------ #
 
-  def _handle_tp1(self, signal: SignalSchema) -> Dict[str, Any]:
-    """
-    1. Verify there is still an open position (guard against fast SL hit).
-    2. Delegate to strategy.handle_tp1 which handles qty→lots conversion,
-       partial close, and breakeven SL move.
-    """
-    symbol = signal.symbol
-
-    # Guard: check position still exists
-    positions = self.strategy.get_open_positions(symbol)
-    if not positions:
-      logger.warning(
-        f"[SignalHandler._handle_tp1] No open position found for {symbol}. "
-        "Likely hit hard SL already — skipping TP1 webhook."
-      )
-      return {
-        "success": False,
-        "retcode": -1,
-        "comment": "No open position — likely SL already triggered.",
-      }
-
-    if signal.quantity is None:
-      logger.error("[SignalHandler._handle_tp1] TP1 signal missing 'quantity' field.")
-      return {
-        "success": False,
-        "retcode": -1,
-        "comment": "Missing quantity in TP1 signal",
-      }
-
-    result = self.strategy.handle_tp1(signal)
-
+  def _handle_tp1(self, signal: SignalSchema) -> TradeResult:
+    result = self._execute_exit(
+      signal,
+      self.strategy.handle_tp1,
+      no_db_comment=f"No tracked opening position in DB for {signal.symbol}",
+      no_mt5_comment="No open position — likely SL already triggered.",
+    )
     if result.get("success"):
       logger.info(
         f"[SignalHandler._handle_tp1] TP1 OK | "
+        f"source_ticket={result.get('source_ticket')} "
         f"closed_vol={result.get('volume')} price={result.get('price')}"
       )
     else:
       logger.error(f"[SignalHandler._handle_tp1] TP1 FAILED: {result.get('comment')}")
-
     return result
 
   # ------------------------------------------------------------------ #
   #  Group 3 — Full close by ACTUAL volume (TP2 / SL / R_SL / FLAT)    #
   # ------------------------------------------------------------------ #
 
-  def _handle_full_close(self, signal: SignalSchema) -> Dict[str, Any]:
-    """
-    1. Safety check: if nothing is open, log and return gracefully.
-    2. Route to the correct strategy method based on signal action.
-    3. State cleanup is implicit — once all positions are 0 the system
-       is flat and ready for the next LONG/SHORT cycle.
-    """
-    symbol = signal.symbol
-    action = signal.action
-
-    # Safety check
-    positions = self.strategy.get_open_positions(symbol)
-    if not positions:
-      logger.warning(
-        f"[SignalHandler._handle_full_close] No open positions for {symbol} "
-        f"on action={action.value}. May have been closed by hard SL already."
-      )
-      return {
-        "success": False,
-        "retcode": -1,
-        "comment": f"No open positions to close [{action.value}]",
-      }
-
-    if action == SignalActionEnum.TP2:
-      result = self.strategy.handle_tp2(signal)
-    elif action == SignalActionEnum.SL:
-      result = self.strategy.handle_sl(signal)
-    elif action == SignalActionEnum.FLAT:
-      result = self.strategy.handle_flat(signal)
-    else:  # R_SL
-      result = self.strategy.handle_r_sl(signal)
-
+  def _handle_full_close(self, signal: SignalSchema) -> TradeResult:
+    result = self._execute_exit(
+      signal,
+      self.strategy.handle_full_close,
+      no_db_comment=f"No tracked opening position in DB for {signal.symbol} [{signal.action.value}]",
+      no_mt5_comment=f"No open positions to close [{signal.action.value}]",
+    )
     if result.get("success"):
       logger.info(
         f"[SignalHandler._handle_full_close] Full close OK | "
-        f"action={action.value} vol={result.get('volume')} price={result.get('price')}"
+        f"action={signal.action.value} source_ticket={result.get('source_ticket')} "
+        f"vol={result.get('volume')} price={result.get('price')}"
       )
     else:
       logger.error(
         f"[SignalHandler._handle_full_close] Full close FAILED | "
-        f"action={action.value} retcode={result.get('retcode')} comment={result.get('comment')}"
+        f"action={signal.action.value} retcode={result.get('retcode')} comment={result.get('comment')}"
       )
-
     return result

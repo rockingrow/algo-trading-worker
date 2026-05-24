@@ -3,13 +3,15 @@ from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from worker.schemas.nats_schema import NatsSubjectEnum
+
 
 class MarketTypeEnum(str, Enum):
   FOREX = "FOREX"
   CRYPTO = "CRYPTO"
 
 
-NATS_REQUIRED_LISTENING_SUBJECTS = {"ADMIN"}
+NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN}
 WATCHDOG_INTERVAL = 10  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 

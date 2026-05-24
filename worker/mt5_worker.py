@@ -27,14 +27,16 @@ _CLOSE_STATUS_MAP = {
 }
 
 
-def _parse_nats_subjects(raw: str) -> list[NatsSubjectEnum]:
-  parsed: set[NatsSubjectEnum] = set()
+def _parse_nats_subjects(raw: str) -> list[str | NatsSubjectEnum]:
+  parsed: set[str | NatsSubjectEnum] = set()
   for s in raw.split(","):
     s = s.strip()
+    if not s:
+      continue
     try:
       parsed.add(NatsSubjectEnum(s))
     except ValueError:
-      log.warning("[MT5 Process] Unknown NATS subject: %r — skipping", s)
+      parsed.add(s)
   return list(NATS_REQUIRED_LISTENING_SUBJECTS | parsed)
 
 
@@ -134,23 +136,8 @@ def _process_message(
   channel_notifier.send_message(msg)
 
 
-def worker_initialized(settings_dict: dict, stop_event) -> None:
-  """Entry point for the MT5 child process.
-
-  Safe imports (schemas, services, helpers) are at module level.
-  Only imports that trigger MetaTrader5 / heavy lib loading are kept local
-  so the parent FastAPI process never loads the MT5 C extension.
-  """
-  from worker.core.market_strategy import MarketStrategyFactory
-  from worker.core.signal_handler import SignalHandler
-  from worker.jobs.cdc_job import PositionCDC
-  from worker.jobs.mt5_event_job import MT5EventJob
-  from worker.mt5.executor import MT5Executor
+def _init_mt5(settings_dict: dict):
   from worker.mt5.mt5 import MT5
-  from worker.services.db_service import DBService
-  from worker.services.nats_service import NATSPublisher, NATSSubscriber
-
-  log.info("[MT5 Process] Started (PID=%d)", multiprocessing.current_process().pid)
 
   bridge = MT5(
     server=settings_dict["mt5_server"],
@@ -158,11 +145,14 @@ def worker_initialized(settings_dict: dict, stop_event) -> None:
     password=settings_dict["mt5_password"],
     path=settings_dict.get("mt5_path"),
   )
-
-  connected = bridge.reconnect(max_attempts=0, delay_seconds=10.0)
-  if not connected:
+  if not bridge.reconnect(max_attempts=0, delay_seconds=10.0):
     log.error("[MT5 Process] Could not connect to MT5. Exiting.")
-    return
+    return None
+  return bridge
+
+
+def _init_nats(settings_dict: dict, bridge):
+  from worker.services.nats_service import NATSPublisher, NATSSubscriber
 
   subscriber = NATSSubscriber(
     url=settings_dict["nats_url"],
@@ -180,22 +170,33 @@ def worker_initialized(settings_dict: dict, stop_event) -> None:
   )
   publisher.connect()
 
+  return subscriber, publisher
+
+
+def _init_trading(settings_dict: dict, db_service):
+  from worker.core.market_strategy import MarketStrategyFactory
+  from worker.core.signal_handler import SignalHandler
+  from worker.mt5.executor import MT5Executor
+
   executor = MT5Executor(
     magic_number=settings_dict["magic_number"],
     slippage_deviation=settings_dict["slippage_deviation"],
   )
   strategy = MarketStrategyFactory.create(executor=executor)
-  handler = SignalHandler(strategy)
-  db_service = DBService()
-  db_service.initialize()
+  handler = SignalHandler(strategy, db_service)
+  return executor, handler
 
+
+def _init_notifiers(settings_dict: dict):
   notifier = TelegramNotification()
   channel_notifier = TelegramNotification(
     chat_id=settings_dict.get("telegram_chat_channel_id")
     or settings_dict.get("telegram_chat_id")
   )
-  footer = bridge.get_account_footer()
+  return notifier, channel_notifier
 
+
+def _send_startup_notification(settings_dict: dict, notifier, footer: str) -> None:
   volume_config = (
     f"VOLUME_DECISION_ENABLED: <b>{settings_dict.get('volume_decision_enabled', False)}</b>\n"
     f"CAPITAL: <b>{settings_dict.get('capital')} {settings_dict.get('capital_currency', '')}</b>\n"
@@ -206,7 +207,11 @@ def worker_initialized(settings_dict: dict, stop_event) -> None:
   notifier.send_message(
     _box(f"🟢 <b>[Connected] MT5 Worker</b>\n\n{volume_config}----------------------------------\n{footer}")
   )
-  log.info("[MT5 Process] Worker loop started.")
+
+
+def _start_background_jobs(settings_dict: dict, bridge, db_service, publisher, notifier, channel_notifier, stop_event) -> None:
+  from worker.jobs.cdc_job import PositionCDC
+  from worker.jobs.mt5_event_job import MT5EventJob
 
   threading.Thread(
     target=_mt5_health_thread,
@@ -229,6 +234,36 @@ def worker_initialized(settings_dict: dict, stop_event) -> None:
     account_name=settings_dict.get("mt5_name"),
     market_type=settings_dict.get("market_type"),
   ).start(stop_event=stop_event)
+
+
+def mt5_worker_main(settings_dict: dict, stop_event) -> None:
+  """Entry point for the MT5 child process.
+
+  Safe imports (schemas, services, helpers) are at module level.
+  Only imports that trigger MetaTrader5 / heavy lib loading are kept local
+  so the parent FastAPI process never loads the MT5 C extension.
+  """
+  from worker.services.db_service import DBService
+
+  log.info("[MT5 Process] Started (PID=%d)", multiprocessing.current_process().pid)
+
+  bridge = _init_mt5(settings_dict)
+  if bridge is None:
+    return
+
+  subscriber, publisher = _init_nats(settings_dict, bridge)
+
+  db_service = DBService()
+  db_service.initialize()
+
+  executor, handler = _init_trading(settings_dict, db_service)
+  notifier, channel_notifier = _init_notifiers(settings_dict)
+  footer = bridge.get_account_footer()
+
+  _send_startup_notification(settings_dict, notifier, footer)
+  log.info("[MT5 Process] Worker loop started.")
+
+  _start_background_jobs(settings_dict, bridge, db_service, publisher, notifier, channel_notifier, stop_event)
 
   try:
     for subject, raw in subscriber.listen(stop_event=stop_event):

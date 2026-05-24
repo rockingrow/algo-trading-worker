@@ -1,0 +1,70 @@
+import asyncio
+from abc import ABC, abstractmethod
+
+from worker.logger import get_logger
+from worker.settings import WATCHDOG_INTERVAL, MarketTypeEnum
+
+log = get_logger("worker.market")
+
+
+class MarketOrchestrator(ABC):
+  @abstractmethod
+  async def startup(self) -> None: ...
+
+  @abstractmethod
+  async def shutdown(self) -> None: ...
+
+
+class ForexMarketOrchestrator(MarketOrchestrator):
+  def __init__(self, settings_dict: dict) -> None:
+    from worker.mt5.manager import MT5Manager
+    from worker.mt5_worker import mt5_worker_main
+
+    self._manager = MT5Manager(settings_dict, mt5_worker_main, process_name="worker_mt5")
+    self._watchdog_task: asyncio.Task | None = None
+
+  async def startup(self) -> None:
+    await asyncio.to_thread(self._manager.start)
+    self._watchdog_task = asyncio.create_task(self._watchdog())
+    log.info("[FOREX] MT5 worker process started.")
+
+  async def shutdown(self) -> None:
+    if self._watchdog_task:
+      self._watchdog_task.cancel()
+      try:
+        await self._watchdog_task
+      except asyncio.CancelledError:
+        pass
+    log.info("Shutting down MT5 worker subprocess...")
+    await asyncio.to_thread(self._manager.stop)
+    log.info("MT5 worker subprocess stopped.")
+
+  async def _watchdog(self) -> None:
+    while True:
+      await asyncio.sleep(WATCHDOG_INTERVAL)
+      if self._manager.stopping:
+        break
+      if not self._manager.is_alive:
+        log.warning("[FOREX] Worker process died unexpectedly — restarting...")
+        try:
+          await asyncio.to_thread(self._manager.restart)
+          log.info("[FOREX] Worker process restarted successfully.")
+        except Exception as exc:
+          log.exception("[FOREX] Failed to restart worker process: %s", exc)
+
+
+class CryptoMarketOrchestrator(MarketOrchestrator):
+  async def startup(self) -> None:
+    log.info("[CRYPTO] Market orchestrator: TBD — not yet implemented.")
+
+  async def shutdown(self) -> None:
+    pass
+
+
+def create_market_orchestrator(settings_dict: dict) -> MarketOrchestrator:
+  market_type = settings_dict.get("market_type", MarketTypeEnum.FOREX)
+  if market_type == MarketTypeEnum.FOREX:
+    return ForexMarketOrchestrator(settings_dict)
+  if market_type == MarketTypeEnum.CRYPTO:
+    return CryptoMarketOrchestrator(settings_dict)
+  raise ValueError(f"Unsupported MARKET_TYPE: {market_type!r}")

@@ -13,7 +13,7 @@ def _get_conn() -> sqlite3.Connection:
   return conn
 
 
-def init_db():
+def db_init():
   try:
     conn = _get_conn()
     conn.execute("PRAGMA journal_mode=WAL")

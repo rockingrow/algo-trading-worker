@@ -1,7 +1,7 @@
 import sqlite3
 from typing import Optional
 
-from worker.db import _get_conn, init_db
+from worker.db import _get_conn, db_init
 from worker.logger import get_logger
 from worker.schemas.position_schema import PositionStatusEnum
 
@@ -10,7 +10,7 @@ logger = get_logger("worker.services.db_service")
 
 class DBService:
   def initialize(self):
-    init_db()
+    db_init()
 
   def log_position(
     self,

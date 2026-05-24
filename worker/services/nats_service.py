@@ -10,12 +10,18 @@ from worker.utils.logging import get_footer
 
 logger = get_logger("worker.nats_service")
 
+_Subject = str | NatsSubjectEnum
+
+
+def _subject_str(s: _Subject) -> str:
+  return s if isinstance(s, str) else s.value
+
 
 class NATSSubscriber:
   def __init__(
     self,
     url: str,
-    subjects: list[NatsSubjectEnum],
+    subjects: list[_Subject],
     publish_subjects: list[NatsSubjectEnum] | None = None,
     token: Optional[str] = None,
     account_footer_fn: Optional[Callable[[], str]] = None,
@@ -24,7 +30,7 @@ class NATSSubscriber:
     self.subjects = subjects
     self.publish_subjects = publish_subjects or []
     self._account_footer_fn = account_footer_fn
-    self._msg_queue: queue.Queue[tuple[NatsSubjectEnum, str]] = queue.Queue()
+    self._msg_queue: queue.Queue[tuple[_Subject, str]] = queue.Queue()
     self._notification = TelegramNotification()
     self._footer = get_footer(account_footer_fn)
     self._client = NatsClient(
@@ -51,8 +57,8 @@ class NATSSubscriber:
     )
 
   def connect(self) -> None:
-    subject_names = [s.value for s in self.subjects]
-    publish_subject_names = [s.value for s in self.publish_subjects]
+    subject_names = [_subject_str(s) for s in self.subjects]
+    publish_subject_names = [_subject_str(s) for s in self.publish_subjects]
 
     async def body(nc, stop_event) -> None:
       pub_line = (
@@ -64,25 +70,24 @@ class NATSSubscriber:
         f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{self._footer}</pre>"
       )
       logger.info(
-        "Connected to NATS at %s, listening=%s publishing=%s",
+        "Connected to NATS at %s, listening=[%s] publishing=[%s]",
         self.url,
-        subject_names,
-        publish_subject_names,
+        ", ".join(subject_names),
+        ", ".join(publish_subject_names),
       )
 
       async def message_handler(msg):
         try:
-          subject = NatsSubjectEnum(msg.subject)
+          subject: _Subject = NatsSubjectEnum(msg.subject)
         except ValueError:
-          logger.warning("Received message on unknown subject: %s", msg.subject)
-          return
+          subject = msg.subject
         self._msg_queue.put((subject, msg.data.decode()))
 
       subs = [
-        await nc.subscribe(subject.value, cb=message_handler)
+        await nc.subscribe(_subject_str(subject), cb=message_handler)
         for subject in self.subjects
       ]
-      logger.info("Subscribed to NATS subjects: %s", subject_names)
+      logger.info("Subscribed to NATS subjects: [%s]", ", ".join(subject_names))
 
       while not stop_event.is_set():
         await asyncio.sleep(0.5)
@@ -99,17 +104,17 @@ class NATSSubscriber:
 
   def listen(
     self, stop_event=None
-  ) -> Generator[tuple[NatsSubjectEnum, str], None, None]:
+  ) -> Generator[tuple[_Subject, str], None, None]:
     logger.info(
       "Started listening for NATS messages on subjects: %s",
-      [s.value for s in self.subjects],
+      ", ".join(_subject_str(s) for s in self.subjects),
     )
     while not self._client._stop_event.is_set():
       if stop_event is not None and stop_event.is_set():
         return
       try:
         subject, raw = self._msg_queue.get(timeout=0.5)
-        logger.debug("Received NATS message on %s: %s", subject.value, raw)
+        logger.debug("Received NATS message on %s: %s", _subject_str(subject), raw)
         yield subject, raw
       except queue.Empty:
         continue
