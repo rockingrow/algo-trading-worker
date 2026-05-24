@@ -1,10 +1,10 @@
 """
-worker/services/job_service.py
+worker/jobs/mt5_event_job.py
 ───────────────────────────────
 Background polling job that detects positions closed by the MT5 terminal
 (hard SL, server-side TP, stop-out, or manual) without a NATS signal, then
 fires the Telegram notification and updates the SQLite positions table.
-The NATS TRADE publisher (PositionWatcher) propagates the status change
+The NATS TRADE publisher (PositionCDC) propagates the status change
 to the broker.
 """
 
@@ -22,9 +22,9 @@ from worker.mt5.jobs import (
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.db_service import DBService
-from worker.services.notification_service import TelegramNotification
+from worker.services.notification_service import TelegramNotification, _box
 
-log = get_logger("worker.services.job_service")
+log = get_logger("worker.jobs.mt5_event_job")
 
 _POLL_INTERVAL = 5  # seconds
 
@@ -36,10 +36,6 @@ _REASON_ICON = {
 }
 
 
-def _box(text: str) -> str:
-  return f"<pre>{text.strip()}</pre>"
-
-
 class MT5EventJob:
   """
   Daemon thread that polls MT5 every *poll_interval* seconds for positions
@@ -48,7 +44,7 @@ class MT5EventJob:
   On each detected closure:
     4.1  Sends a Telegram notification.
     4.2  Writes a row to position_logs with author='terminal' and updates the
-         positions table — the PositionWatcher will then publish the status
+         positions table — the PositionCDC will then publish the status
          change to NATS TRADE so the broker can update its trades table.
   """
 

@@ -9,6 +9,11 @@ class MarketTypeEnum(str, Enum):
   CRYPTO = "CRYPTO"
 
 
+NATS_REQUIRED_LISTENING_SUBJECTS = {"ADMIN"}
+WATCHDOG_INTERVAL = 10  # seconds
+MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
+
+
 class Settings(BaseSettings):
   # NATS
   nats_url: str

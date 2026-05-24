@@ -1,6 +1,6 @@
 """
-worker/services/mt5_process.py
-──────────────────────────────
+worker/mt5/manager.py
+─────────────────────
 Runs the blocking MT5 + NATS worker inside a **separate OS process** so the
 GIL-holding MetaTrader5 C extension never freezes the FastAPI/uvicorn event loop.
 
@@ -21,12 +21,8 @@ import time
 from typing import Optional
 
 from worker.schemas.position_schema import PositionStatusEnum
-
-_MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
-
-
-def _box(text: str) -> str:
-  return f"<pre>{text.strip()}</pre>"
+from worker.services.notification_service import _box
+from worker.settings import MT5_HEALTH_INTERVAL
 
 
 def _format_volume(volume: float, auto_calculated: bool = False) -> str:
@@ -47,7 +43,7 @@ def _mt5_health_thread(bridge, notifier, footer_fn, stop_event, log) -> None:
   without waiting for a ZMQ signal to arrive.
   """
   while not stop_event.is_set():
-    time.sleep(_MT5_HEALTH_INTERVAL)
+    time.sleep(MT5_HEALTH_INTERVAL)
     if stop_event.is_set():
       break
     try:
@@ -226,33 +222,37 @@ def _handle_flat_signal(
 
 
 # ---------------------------------------------------------------------------
-# Manager used from the FastAPI lifespan
+# MT5 Manager used from the FastAPI lifespan
 # ---------------------------------------------------------------------------
-
-
-class MT5ProcessManager:
+class MT5Manager:
   """
-  Manages a child process that runs the MT5 + ZMQ worker.
-  The parent (FastAPI) process never imports MetaTrader5 directly, so its
+  Manages a child process that runs a worker function.
+  The parent (FastAPI) process delegates all blocking work to the child so its
   event loop is completely free from GIL interference.
   """
 
-  def __init__(self, settings_dict: dict, worker_fn) -> None:
+  def __init__(
+    self, settings_dict: dict, worker_fn, process_name: str = "worker"
+  ) -> None:
     self._settings_dict = settings_dict
     self._worker_fn = worker_fn
+    self._process_name = process_name
     self._process: Optional[multiprocessing.Process] = None
     self._stop_event = multiprocessing.Event()
     self._stopping = False
 
+  def _spawn(self) -> multiprocessing.Process:
+    return multiprocessing.Process(
+      target=self._worker_fn,
+      args=(self._settings_dict, self._stop_event),
+      name=self._process_name,
+      daemon=True,
+    )
+
   def start(self) -> None:
     """Spawn the child process."""
     self._stop_event.clear()
-    self._process = multiprocessing.Process(
-      target=self._worker_fn,
-      args=(self._settings_dict, self._stop_event),
-      name="mt5-worker",
-      daemon=True,
-    )
+    self._process = self._spawn()
     self._process.start()
 
   def stop(self) -> None:
@@ -271,12 +271,7 @@ class MT5ProcessManager:
     """Restart the child process after an unexpected crash."""
     self._stopping = False
     self._stop_event.clear()
-    self._process = multiprocessing.Process(
-      target=self._worker_fn,
-      args=(self._settings_dict, self._stop_event),
-      name="mt5-worker",
-      daemon=True,
-    )
+    self._process = self._spawn()
     self._process.start()
 
   @property

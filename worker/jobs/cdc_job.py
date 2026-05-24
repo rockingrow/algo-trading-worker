@@ -1,11 +1,11 @@
 """
-worker/services/position_watcher.py
+worker/jobs/position_cdc_job.py
 ────────────────────────────────────
-Background polling thread that watches the SQLite `positions` table for rows
-whose `sync_status` is PENDING (either freshly inserted or just updated),
-publishes a PositionEvent to the NATS TRADE subject, and marks the row as
-PUBLISHED. Update detection is row-scoped via `sync_status`, so polling cost
-stays O(pending) instead of O(table).
+Background polling thread that implements Change Data Capture on the SQLite
+`positions` table. Watches for rows whose `sync_status` is PENDING (either
+freshly inserted or just updated), publishes a PositionEvent to the NATS TRADE
+subject, and marks the row as PUBLISHED. Update detection is row-scoped via
+`sync_status`, so polling cost stays O(pending) instead of O(table).
 """
 
 from __future__ import annotations
@@ -14,13 +14,13 @@ import json
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from worker.db import get_pending_sync_positions, mark_position_synced
 from worker.logger import get_logger
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.trade_event_schema import PositionEvent, PositionEventType
+from worker.services.db_service import DBService
 from worker.services.nats_service import NATSPublisher
 
-log = get_logger("worker.services.position_watcher")
+log = get_logger("worker.jobs.position_cdc_job")
 
 _POLL_INTERVAL = 2  # seconds
 
@@ -46,11 +46,12 @@ _EVENT_FIELDS = {
 }
 
 
-class PositionWatcher:
+class PositionCDC:
   def __init__(
     self,
     account_id: str,
     publisher: NATSPublisher,
+    db_service: DBService,
     account_info_fn: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
     poll_interval: int = _POLL_INTERVAL,
     account_name: Optional[str] = None,
@@ -60,6 +61,7 @@ class PositionWatcher:
     self._account_name = account_name
     self._market_type = market_type
     self._publisher = publisher
+    self._db = db_service
     self._account_info_fn = account_info_fn
     self._poll_interval = poll_interval
     self._stop_event = threading.Event()
@@ -70,11 +72,11 @@ class PositionWatcher:
       self._stop_event = stop_event
     self._thread = threading.Thread(
       target=self._run,
-      name="position-watcher",
+      name="position-cdc",
       daemon=True,
     )
     self._thread.start()
-    log.info("[PositionWatcher] Started (poll_interval=%ds)", self._poll_interval)
+    log.info("[PositionCDC] Started (poll_interval=%ds)", self._poll_interval)
 
   def stop(self) -> None:
     self._stop_event.set()
@@ -84,11 +86,11 @@ class PositionWatcher:
       try:
         self._poll()
       except Exception as exc:
-        log.exception("[PositionWatcher] Unexpected error during poll: %s", exc)
+        log.exception("[PositionCDC] Unexpected error during poll: %s", exc)
       self._stop_event.wait(self._poll_interval)
 
   def _poll(self) -> None:
-    rows = get_pending_sync_positions()
+    rows = self._db.get_pending_sync_positions()
     if not rows:
       return
     account_snapshot = self._snapshot_account()
@@ -110,7 +112,7 @@ class PositionWatcher:
       )
       event_json = event.model_dump_json()
       log.info(
-        "[PositionWatcher] Publishing TRADE event | event=%s status=%s source_ticket=%s\n%s",
+        "[PositionCDC] Publishing TRADE event | event=%s status=%s source_ticket=%s\n%s",
         event_type.value,
         row.get("status"),
         row.get("source_ticket"),
@@ -119,10 +121,10 @@ class PositionWatcher:
       self._publisher.publish(NatsSubjectEnum.TRADE, event_json)
       # Publish-then-mark gives at-least-once delivery; the broker handler is
       # idempotent (upsert by account_id + ticket).
-      marked = mark_position_synced(row["id"], row["updated_at"])
+      marked = self._db.mark_position_synced(row["id"], row["updated_at"])
       if not marked:
         log.debug(
-          "[PositionWatcher] Row id=%s was modified concurrently; left PENDING.",
+          "[PositionCDC] Row id=%s was modified concurrently; left PENDING.",
           row["id"],
         )
 
@@ -132,7 +134,7 @@ class PositionWatcher:
     try:
       info = self._account_info_fn()
     except Exception as exc:
-      log.warning("[PositionWatcher] account_info_fn failed: %s", exc)
+      log.warning("[PositionCDC] account_info_fn failed: %s", exc)
       return {}
     if not info:
       return {}

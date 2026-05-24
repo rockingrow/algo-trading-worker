@@ -5,8 +5,8 @@ from typing import Any, Dict, Optional
 
 import MetaTrader5 as mt5
 
-from worker.helpers.logging import build_account_footer
 from worker.logger import get_logger
+from worker.utils.logging import build_account_footer
 
 logger = get_logger("worker.mt5")
 

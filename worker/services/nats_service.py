@@ -1,14 +1,12 @@
 import asyncio
 import queue
-import threading
 from typing import Callable, Generator, Optional
 
-import nats
-
-from worker.helpers.logging import get_footer
 from worker.logger import get_logger
+from worker.nats import NatsClient
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.services.notification_service import TelegramNotification
+from worker.utils.logging import get_footer
 
 logger = get_logger("worker.nats_service")
 
@@ -25,67 +23,60 @@ class NATSSubscriber:
     self.url = url
     self.subjects = subjects
     self.publish_subjects = publish_subjects or []
-    self._token = token
     self._account_footer_fn = account_footer_fn
-    self._stop_event = threading.Event()
     self._msg_queue: queue.Queue[tuple[NatsSubjectEnum, str]] = queue.Queue()
-    self._loop_thread: Optional[threading.Thread] = None
+    self._notification = TelegramNotification()
+    self._footer = get_footer(account_footer_fn)
+    self._client = NatsClient(
+      url=url,
+      token=token,
+      error_cb=self._on_error,
+      disconnected_cb=self._on_disconnect,
+      reconnected_cb=self._on_reconnect,
+    )
 
-  async def _run_loop(self) -> None:
-    notification = TelegramNotification()
-    footer = get_footer(self._account_footer_fn)
+  async def _on_error(self, e) -> None:
+    logger.error("NATS error: %s", e)
+
+  async def _on_disconnect(self) -> None:
+    logger.warning("NATS disconnected from %s. Retrying...", self.url)
+    self._notification.send_message(
+      f"<pre>🔴 [Disconnected] NATS Broker\nEndpoint: {self.url}\n⏳ Retrying connection...{self._footer}</pre>"
+    )
+
+  async def _on_reconnect(self) -> None:
+    logger.info("NATS reconnected to %s", self.url)
+    self._notification.send_message(
+      f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}{self._footer}</pre>"
+    )
+
+  def connect(self) -> None:
     subject_names = [s.value for s in self.subjects]
     publish_subject_names = [s.value for s in self.publish_subjects]
 
-    async def message_handler(msg):
-      try:
-        subject = NatsSubjectEnum(msg.subject)
-      except ValueError:
-        logger.warning("Received message on unknown subject: %s", msg.subject)
-        return
-      self._msg_queue.put((subject, msg.data.decode()))
-
-    async def error_cb(e):
-      logger.error("NATS error: %s", e)
-
-    async def disconnected_cb():
-      logger.warning("NATS disconnected from %s. Retrying...", self.url)
-      notification.send_message(
-        f"<pre>🔴 [Disconnected] NATS Broker\nEndpoint: {self.url}\n⏳ Retrying connection...{footer}</pre>"
+    async def body(nc, stop_event) -> None:
+      pub_line = (
+        f"\nPublishing Subjects: {', '.join(publish_subject_names)}"
+        if publish_subject_names
+        else ""
       )
-
-    async def reconnected_cb():
-      logger.info("NATS reconnected to %s", self.url)
-      notification.send_message(
-        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}{footer}</pre>"
+      self._notification.send_message(
+        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{self._footer}</pre>"
       )
-
-    connect_opts: dict = dict(
-      error_cb=error_cb,
-      disconnected_cb=disconnected_cb,
-      reconnected_cb=reconnected_cb,
-      max_reconnect_attempts=-1,
-      reconnect_time_wait=5,
-    )
-    if self._token:
-      connect_opts["token"] = self._token
-
-    try:
-      nc = await nats.connect(self.url, **connect_opts)
       logger.info(
         "Connected to NATS at %s, listening=%s publishing=%s",
         self.url,
         subject_names,
         publish_subject_names,
       )
-      pub_line = (
-        f"\nPublishing Subjects: {', '.join(publish_subject_names)}"
-        if publish_subject_names
-        else ""
-      )
-      notification.send_message(
-        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{footer}</pre>"
-      )
+
+      async def message_handler(msg):
+        try:
+          subject = NatsSubjectEnum(msg.subject)
+        except ValueError:
+          logger.warning("Received message on unknown subject: %s", msg.subject)
+          return
+        self._msg_queue.put((subject, msg.data.decode()))
 
       subs = [
         await nc.subscribe(subject.value, cb=message_handler)
@@ -93,42 +84,27 @@ class NATSSubscriber:
       ]
       logger.info("Subscribed to NATS subjects: %s", subject_names)
 
-      while not self._stop_event.is_set():
+      while not stop_event.is_set():
         await asyncio.sleep(0.5)
 
       for sub in subs:
         await sub.unsubscribe()
-      await nc.drain()
-      logger.info("NATS connection closed.")
-    except Exception as exc:
-      logger.exception("NATS fatal error: %s", exc)
+      logger.info("NATS subscriber connection closed.")
 
-  def connect(self) -> None:
-    loop = asyncio.new_event_loop()
-    self._loop_thread = threading.Thread(
-      target=loop.run_until_complete,
-      args=(self._run_loop(),),
-      name="nats-loop",
-      daemon=True,
-    )
-    self._loop_thread.start()
-    logger.info("NATS connection thread started.")
+    self._client.start(body, thread_name="nats-subscriber-loop")
 
   def close(self) -> None:
-    logger.info("NATS stop requested. Closing...")
-    self._stop_event.set()
-    if self._loop_thread is not None:
-      self._loop_thread.join(timeout=5)
+    logger.info("NATS subscriber stop requested. Closing...")
+    self._client.stop()
 
   def listen(
     self, stop_event=None
   ) -> Generator[tuple[NatsSubjectEnum, str], None, None]:
-    """Yield (subject, raw_json) tuples. Caller is responsible for parsing based on subject."""
     logger.info(
       "Started listening for NATS messages on subjects: %s",
       [s.value for s in self.subjects],
     )
-    while not self._stop_event.is_set():
+    while not self._client._stop_event.is_set():
       if stop_event is not None and stop_event.is_set():
         return
       try:
@@ -154,40 +130,33 @@ class NATSPublisher:
   ):
     self.url = url
     self.publish_subjects = publish_subjects
-    self._token = token
-    self._stop_event = threading.Event()
     self._send_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
-    self._loop_thread: Optional[threading.Thread] = None
-
-  async def _run_loop(self) -> None:
-    subject_names = [s.value for s in self.publish_subjects]
-
-    async def error_cb(e):
-      logger.error("NATS publisher error: %s", e)
-
-    async def disconnected_cb():
-      logger.warning("NATS publisher disconnected from %s. Retrying...", self.url)
-
-    async def reconnected_cb():
-      logger.info("NATS publisher reconnected to %s", self.url)
-
-    connect_opts: dict = dict(
-      error_cb=error_cb,
-      disconnected_cb=disconnected_cb,
-      reconnected_cb=reconnected_cb,
-      max_reconnect_attempts=-1,
-      reconnect_time_wait=5,
+    self._client = NatsClient(
+      url=url,
+      token=token,
+      error_cb=self._on_error,
+      disconnected_cb=self._on_disconnect,
+      reconnected_cb=self._on_reconnect,
     )
-    if self._token:
-      connect_opts["token"] = self._token
 
-    try:
-      nc = await nats.connect(self.url, **connect_opts)
+  async def _on_error(self, e) -> None:
+    logger.error("NATS publisher error: %s", e)
+
+  async def _on_disconnect(self) -> None:
+    logger.warning("NATS publisher disconnected from %s. Retrying...", self.url)
+
+  async def _on_reconnect(self) -> None:
+    logger.info("NATS publisher reconnected to %s", self.url)
+
+  def connect(self) -> None:
+    subject_names = [s.value for s in self.publish_subjects]
+    logger.info("Starting NATS publisher for subjects: %s", subject_names)
+
+    async def body(nc, stop_event) -> None:
       logger.info(
         "NATS publisher connected to %s, publish_subjects=%s", self.url, subject_names
       )
-
-      while not self._stop_event.is_set():
+      while not stop_event.is_set():
         try:
           subject, payload = self._send_queue.get_nowait()
         except queue.Empty:
@@ -198,24 +167,9 @@ class NATSPublisher:
           logger.debug("Published NATS message on %s: %s", subject, payload)
         except Exception as exc:
           logger.exception("Failed to publish NATS message on %s: %s", subject, exc)
-
-      await nc.drain()
       logger.info("NATS publisher connection closed.")
-    except Exception as exc:
-      logger.exception("NATS publisher fatal error: %s", exc)
 
-  def connect(self) -> None:
-    subject_names = [s.value for s in self.publish_subjects]
-    logger.info("Starting NATS publisher for subjects: %s", subject_names)
-    loop = asyncio.new_event_loop()
-    self._loop_thread = threading.Thread(
-      target=loop.run_until_complete,
-      args=(self._run_loop(),),
-      name="nats-publisher-loop",
-      daemon=True,
-    )
-    self._loop_thread.start()
-    logger.info("NATS publisher thread started.")
+    self._client.start(body, thread_name="nats-publisher-loop")
 
   def publish(self, subject: NatsSubjectEnum, data: str) -> None:
     """Thread-safe: enqueue a message to be published asynchronously."""
@@ -223,6 +177,4 @@ class NATSPublisher:
 
   def close(self) -> None:
     logger.info("NATS publisher stop requested. Closing...")
-    self._stop_event.set()
-    if self._loop_thread is not None:
-      self._loop_thread.join(timeout=5)
+    self._client.stop()
