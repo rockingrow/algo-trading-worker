@@ -41,18 +41,27 @@ class NATSSubscriber:
       reconnected_cb=self._on_reconnect,
     )
 
+  def _notify(self, message_text: str) -> None:
+    """Send a Telegram notification without blocking the event loop.
+
+    send_message uses a synchronous, blocking requests.post; calling it
+    directly from an async NATS callback freezes the loop for up to the
+    HTTP timeout, stalling heartbeats and reconnection. Offload to a thread
+    and fire-and-forget (send_message swallows its own exceptions)."""
+    asyncio.create_task(asyncio.to_thread(self._notification.send_message, message_text))
+
   async def _on_error(self, e) -> None:
     logger.error("NATS error: %s", e)
 
   async def _on_disconnect(self) -> None:
     logger.warning("NATS disconnected from %s. Retrying...", self.url)
-    self._notification.send_message(
+    self._notify(
       f"<pre>🔴 [Disconnected] NATS Broker\nEndpoint: {self.url}\n⏳ Retrying connection...{self._footer}</pre>"
     )
 
   async def _on_reconnect(self) -> None:
     logger.info("NATS reconnected to %s", self.url)
-    self._notification.send_message(
+    self._notify(
       f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}{self._footer}</pre>"
     )
 
@@ -66,7 +75,7 @@ class NATSSubscriber:
         if publish_subject_names
         else ""
       )
-      self._notification.send_message(
+      self._notify(
         f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{self._footer}</pre>"
       )
       logger.info(
