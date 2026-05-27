@@ -329,7 +329,7 @@ cp .env.example .env
 | `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot API token from @BotFather |
 | `TELEGRAM_CHAT_ID` | ✅ | — | **Management chat**: service start/stop, MT5 health, NATS events |
-| `TELEGRAM_CHAT_CHANNEL_ID` | | `""` | **Signal channel**: order fills/failures, terminal closes, force-close notifications |
+| `TELEGRAM_CHAT_CHANNEL_ID` | | `""` | **Signal channels**: comma-separated channel IDs (e.g. `-1001234,-1009876`). Broadcasts order fills/failures, terminal closes, and force-close events to all listed channels |
 | **Broker** | | | |
 | `BROKER_API_URL` | ✅ | — | Base URL of the central Broker API (used by `PositionCDC` HTTP fallback) |
 | `BROKER_API_KEY` | ✅ | — | API key sent as Bearer token to the Broker API |
@@ -338,7 +338,7 @@ cp .env.example .env
 | `APP_PORT` | | `8000` | FastAPI bind port |
 | `LOG_LEVEL` | | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
-> **Telegram dual-channel setup:** `TELEGRAM_CHAT_ID` is for private management alerts (sent to you as the operator). `TELEGRAM_CHAT_CHANNEL_ID` is for a shared broadcast channel visible to all stakeholders — it receives every order fill, failure, terminal close, and force-close event. If `TELEGRAM_CHAT_CHANNEL_ID` is left empty, it falls back to `TELEGRAM_CHAT_ID`.
+> **Telegram dual-channel setup:** `TELEGRAM_CHAT_ID` is for private management alerts (sent to you as the operator). `TELEGRAM_CHAT_CHANNEL_ID` accepts a comma-separated list of channel IDs for broadcasting to multiple communities — each receives every order fill, failure, terminal close, and force-close event. If `TELEGRAM_CHAT_CHANNEL_ID` is left empty, it falls back to `TELEGRAM_CHAT_ID`.
 
 Please ensure that you have enabled "Allow Algo Trading" inside Options > Expert Advisors of the MetaTrader 5 Terminal.
 

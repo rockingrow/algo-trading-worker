@@ -15,34 +15,32 @@ class Notification:
 
 
 class TelegramNotification(Notification):
-  def __init__(self, chat_id: str | None = None):
+  def __init__(self, chat_ids: list[str] | None = None):
     self.enabled = settings.telegram_enabled
     self.bot_token = settings.telegram_bot_token
-    self.chat_id = chat_id if chat_id is not None else settings.telegram_chat_id
+    self.chat_ids = chat_ids if chat_ids is not None else [settings.telegram_chat_id]
 
   def send_message(self, message_text: str):
     if not self.enabled:
       logger.debug("Telegram notifications are disabled in settings.")
       return
 
-    if not self.bot_token or not self.chat_id:
+    if not self.bot_token or not self.chat_ids:
       logger.warning(
         "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set for notifications."
       )
       return
 
     url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-    payload = {
-      "chat_id": self.chat_id,
-      "text": message_text,
-      "parse_mode": "HTML",
-    }
-
-    try:
-      response = requests.post(url, json=payload, timeout=5)
-      if response.status_code != 200:
-        logger.error(f"Failed to send Telegram message: {response.text}")
-      return response.json()
-    except Exception as e:
-      logger.exception(f"Exception sending Telegram message: {e}")
-      return None
+    for chat_id in self.chat_ids:
+      payload = {
+        "chat_id": chat_id,
+        "text": message_text,
+        "parse_mode": "HTML",
+      }
+      try:
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code != 200:
+          logger.error(f"Failed to send Telegram message to {chat_id}: {response.text}")
+      except Exception as e:
+        logger.exception(f"Exception sending Telegram message to {chat_id}: {e}")

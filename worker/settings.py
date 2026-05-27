@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -47,7 +48,16 @@ class Settings(BaseSettings):
   telegram_enabled: bool
   telegram_bot_token: str
   telegram_chat_id: str  # management: NATS events, service start/stop, MT5 health
-  telegram_chat_channel_id: str = ""  # signals: order fills/failures, terminal closes
+  telegram_chat_channel_id: list[str] = []  # signals: order fills/failures, terminal closes
+
+  @field_validator("telegram_chat_channel_id", mode="before")
+  @classmethod
+  def parse_channel_ids(cls, v):
+    if isinstance(v, list):
+      return [i for i in v if i]
+    if isinstance(v, str):
+      return [i.strip() for i in v.split(",") if i.strip()]
+    return v
 
   # Logging
   log_level: str = "INFO"

@@ -203,10 +203,8 @@ def _init_trading(settings_dict: dict, db_service):
 
 def _init_notifiers(settings_dict: dict):
   notifier = TelegramNotification()
-  channel_notifier = TelegramNotification(
-    chat_id=settings_dict.get("telegram_chat_channel_id")
-    or settings_dict.get("telegram_chat_id")
-  )
+  channel_ids = settings_dict.get("telegram_chat_channel_id") or [settings_dict.get("telegram_chat_id")]
+  channel_notifier = TelegramNotification(chat_ids=channel_ids)
   return notifier, channel_notifier
 
 
