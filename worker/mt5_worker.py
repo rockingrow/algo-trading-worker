@@ -11,10 +11,18 @@ from worker.mt5.manager import (
   _handle_flat_signal,
   _mt5_health_thread,
 )
-from worker.schemas.broker_schema import SignalActionEnum, SignalSchema
 from worker.schemas.nats_schema import NatsSubjectEnum
+from worker.schemas.notification_schema import (
+  NotificationChannelEnum,
+  NotificationPlatformEnum,
+)
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.services.notification_service import TelegramNotification, _box
+from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
+from worker.services.notification_service import (
+  OutboxNotifier,
+  TelegramNotification,
+  _box,
+)
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS
 
 log = get_logger("worker.mt5.manager")
@@ -165,7 +173,7 @@ def _init_mt5(settings_dict: dict):
   return bridge
 
 
-def _init_nats(settings_dict: dict, bridge):
+def _init_nats(settings_dict: dict, bridge, enqueue_fn=None):
   from worker.services.nats_service import NATSPublisher, NATSSubscriber
 
   subscriber = NATSSubscriber(
@@ -174,6 +182,7 @@ def _init_nats(settings_dict: dict, bridge):
     publish_subjects=[NatsSubjectEnum.TRADE],
     token=settings_dict.get("nats_token"),
     account_footer_fn=bridge.get_account_footer,
+    enqueue_fn=enqueue_fn,
   )
   subscriber.connect()
 
@@ -208,6 +217,23 @@ def _init_notifiers(settings_dict: dict):
   return notifier, channel_notifier
 
 
+def _init_outbox_notifiers(db_service, settings_dict: dict):
+  """Build OutboxNotifier wrappers that enqueue to DB instead of sending directly."""
+  def _enqueue(channel: NotificationChannelEnum, category: str):
+    def enqueue(message_text: str) -> None:
+      db_service.enqueue_notification(
+        platform=NotificationPlatformEnum.TELEGRAM,
+        channel=channel,
+        message_text=message_text,
+        category=category,
+      )
+    return enqueue
+
+  notifier = OutboxNotifier(_enqueue(NotificationChannelEnum.INDIVIDUAL, "MT5_MANAGEMENT"))
+  channel_notifier = OutboxNotifier(_enqueue(NotificationChannelEnum.COMMUNITY, "TRADE_EVENT"))
+  return notifier, channel_notifier
+
+
 def _send_startup_notification(settings_dict: dict, notifier, footer: str) -> None:
   volume_config = (
     f"VOLUME_DECISION_ENABLED: <b>{settings_dict.get('volume_decision_enabled', False)}</b>\n"
@@ -224,6 +250,16 @@ def _send_startup_notification(settings_dict: dict, notifier, footer: str) -> No
 def _start_background_jobs(settings_dict: dict, bridge, db_service, publisher, notifier, channel_notifier, stop_event) -> None:
   from worker.jobs.cdc_job import PositionCDC
   from worker.jobs.mt5_event_job import MT5EventJob
+  from worker.jobs.notification_job import NotificationJob
+
+  channel_ids = settings_dict.get("telegram_chat_channel_id") or [settings_dict.get("telegram_chat_id")]
+  NotificationJob(
+    db_service=db_service,
+    notifiers={
+      NotificationChannelEnum.INDIVIDUAL.value: TelegramNotification(),
+      NotificationChannelEnum.COMMUNITY.value: TelegramNotification(chat_ids=channel_ids),
+    },
+  ).start(stop_event=stop_event)
 
   threading.Thread(
     target=_mt5_health_thread,
@@ -263,16 +299,32 @@ def mt5_worker_main(settings_dict: dict, stop_event) -> None:
   if bridge is None:
     return
 
-  subscriber, publisher = _init_nats(settings_dict, bridge)
-
+  # DB must be ready before NATS so outbox notifiers can be built immediately.
   db_service = DBService()
   db_service.initialize()
 
+  def _nats_enqueue(message_text: str) -> None:
+    db_service.enqueue_notification(
+      platform=NotificationPlatformEnum.TELEGRAM,
+      channel=NotificationChannelEnum.INDIVIDUAL,
+      message_text=message_text,
+      category="NATS_EVENT",
+    )
+
+  subscriber, publisher = _init_nats(settings_dict, bridge, enqueue_fn=_nats_enqueue)
+
   executor, handler = _init_trading(settings_dict, db_service)
-  notifier, channel_notifier = _init_notifiers(settings_dict)
+
+  # Direct notifiers: only for startup and shutdown messages that must fire
+  # outside the dispatcher lifecycle.
+  direct_notifier, _ = _init_notifiers(settings_dict)
+
+  # Outbox notifiers: all in-process notification calls go here.
+  notifier, channel_notifier = _init_outbox_notifiers(db_service, settings_dict)
+
   footer = bridge.get_account_footer()
 
-  _send_startup_notification(settings_dict, notifier, footer)
+  _send_startup_notification(settings_dict, direct_notifier, footer)
   log.info("[MT5 Process] Worker loop started.")
 
   _start_background_jobs(settings_dict, bridge, db_service, publisher, notifier, channel_notifier, stop_event)
@@ -288,5 +340,5 @@ def mt5_worker_main(settings_dict: dict, stop_event) -> None:
     subscriber.close()
     publisher.close()
     bridge.shutdown()
-    notifier.send_message(_box(f"🛑 <b>[Disconnected] MT5 Worker</b>{footer}"))
+    direct_notifier.send_message(_box(f"🛑 <b>[Disconnected] MT5 Worker</b>{footer}"))
     log.info("[MT5 Process] Exiting.")

@@ -57,6 +57,8 @@ class Settings(BaseSettings):
       return [i for i in v if i]
     if isinstance(v, str):
       return [i.strip() for i in v.split(",") if i.strip()]
+    if isinstance(v, int):
+      return [str(v)]
     return v
 
   # Logging

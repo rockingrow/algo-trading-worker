@@ -1,5 +1,9 @@
 from typing import Any, Dict, List, Optional, Protocol
 
+from worker.schemas.notification_schema import (
+  NotificationChannelEnum,
+  NotificationPlatformEnum,
+)
 from worker.schemas.position_schema import PositionStatusEnum
 
 
@@ -14,4 +18,11 @@ class DBServiceProtocol(Protocol):
     mt5_retcode: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
+  ) -> None: ...
+  def enqueue_notification(
+    self,
+    platform: NotificationPlatformEnum,
+    channel: NotificationChannelEnum,
+    message_text: str,
+    category: Optional[str] = None,
   ) -> None: ...

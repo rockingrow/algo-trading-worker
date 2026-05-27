@@ -20,9 +20,9 @@ from abc import ABC, abstractmethod
 from typing import Any, List
 
 from worker.logger import get_logger
-from worker.mt5.protocol import MT5ExecutorProtocol
-from worker.schemas.broker_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.interfaces.mt5_executor_protocol import MT5ExecutorProtocol
+from worker.schemas.metatrader_schema import TradeResult
+from worker.schemas.signal_schema import SignalSchema
 from worker.settings import MarketTypeEnum, settings
 
 logger = get_logger("worker.core.market_strategy")

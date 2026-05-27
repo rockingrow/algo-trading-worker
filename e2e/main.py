@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 try:
-  from worker.schemas.broker_schema import SignalSchema
+  from worker.schemas.signal_schema import SignalSchema
 except ImportError:
 
   class SignalActionEnum(str, Enum):

@@ -1,10 +1,9 @@
-from typing import Any, List, Optional, Protocol, runtime_checkable
+from typing import Any, List, Optional, Protocol
 
-from worker.schemas.broker_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.metatrader_schema import TradeResult
+from worker.schemas.signal_schema import SignalSchema
 
 
-@runtime_checkable
 class MT5ExecutorProtocol(Protocol):
   def open_position(self, signal: SignalSchema) -> TradeResult: ...
   def partial_close_position(

@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 import MetaTrader5 as mt5
 
 from worker.logger import get_logger
-from worker.schemas.broker_schema import SignalSchema
+from worker.schemas.signal_schema import SignalSchema
 from worker.settings import settings
 
 logger = get_logger("worker.mt5_executor")

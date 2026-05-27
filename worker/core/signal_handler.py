@@ -16,11 +16,11 @@ when the broker re-tickets a position after a partial close.
 from typing import Any, Callable, Dict, Optional
 
 from worker.core.market_strategy import BaseMarketStrategy
+from worker.interfaces.db_protocol import DBServiceProtocol
 from worker.logger import get_logger
-from worker.schemas.broker_schema import SignalActionEnum, SignalSchema
+from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.schemas.trade_result import TradeResult
-from worker.services.db_protocol import DBServiceProtocol
+from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 
 logger = get_logger("worker.core.signal_handler")
 

@@ -8,6 +8,7 @@ log = get_logger("worker.market")
 
 
 class MarketOrchestrator(ABC):
+  """Abstract base class for market orchestrators."""
   @abstractmethod
   async def startup(self) -> None: ...
 
@@ -16,6 +17,7 @@ class MarketOrchestrator(ABC):
 
 
 class ForexMarketOrchestrator(MarketOrchestrator):
+  """Concrete implementation for Forex market orchestrator."""
   def __init__(self, settings_dict: dict) -> None:
     from worker.mt5.manager import MT5Manager
     from worker.mt5_worker import mt5_worker_main
@@ -54,6 +56,7 @@ class ForexMarketOrchestrator(MarketOrchestrator):
 
 
 class CryptoMarketOrchestrator(MarketOrchestrator):
+  """Concrete implementation for Crypto market orchestrator."""
   async def startup(self) -> None:
     log.info("[CRYPTO] Market orchestrator: TBD — not yet implemented.")
 

@@ -5,7 +5,6 @@ from typing import Callable, Generator, Optional
 from worker.logger import get_logger
 from worker.nats import NatsClient
 from worker.schemas.nats_schema import NatsSubjectEnum
-from worker.services.notification_service import TelegramNotification
 from worker.utils.logging import get_footer
 
 logger = get_logger("worker.nats_service")
@@ -25,13 +24,14 @@ class NATSSubscriber:
     publish_subjects: list[NatsSubjectEnum] | None = None,
     token: Optional[str] = None,
     account_footer_fn: Optional[Callable[[], str]] = None,
+    enqueue_fn: Optional[Callable[[str], None]] = None,
   ):
     self.url = url
     self.subjects = subjects
     self.publish_subjects = publish_subjects or []
     self._account_footer_fn = account_footer_fn
+    self._enqueue_fn = enqueue_fn
     self._msg_queue: queue.Queue[tuple[_Subject, str]] = queue.Queue()
-    self._notification = TelegramNotification()
     self._footer = get_footer(account_footer_fn)
     self._client = NatsClient(
       url=url,
@@ -42,13 +42,10 @@ class NATSSubscriber:
     )
 
   def _notify(self, message_text: str) -> None:
-    """Send a Telegram notification without blocking the event loop.
-
-    send_message uses a synchronous, blocking requests.post; calling it
-    directly from an async NATS callback freezes the loop for up to the
-    HTTP timeout, stalling heartbeats and reconnection. Offload to a thread
-    and fire-and-forget (send_message swallows its own exceptions)."""
-    asyncio.create_task(asyncio.to_thread(self._notification.send_message, message_text))
+    """Enqueue a management notification via the outbox (fast SQLite INSERT,
+    safe to call directly from async NATS callbacks without blocking the loop)."""
+    if self._enqueue_fn is not None:
+      self._enqueue_fn(message_text)
 
   async def _on_error(self, e) -> None:
     logger.error("NATS error: %s", e)
