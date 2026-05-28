@@ -16,6 +16,8 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class DailyFileHandler(logging.FileHandler):
+  """FileHandler that rotates to a new date-stamped log file at midnight."""
+
   def __init__(
     self,
     directory: str | Path,

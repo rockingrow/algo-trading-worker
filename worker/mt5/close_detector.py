@@ -1,6 +1,6 @@
 """
-worker/mt5/jobs.py
-──────────────────
+worker/mt5/close_detector.py
+────────────────────────────
 Scans MT5 deal history to detect positions closed server-side (SL, TP, stop-out,
 or manual) that were not triggered by the ZMQ signal pipeline.
 
@@ -20,13 +20,15 @@ import MetaTrader5 as mt5
 
 from worker.logger import get_logger
 
-log = get_logger("worker.mt5.jobs")
+log = get_logger("worker.mt5.close_detector")
 
 
 # ── Close-reason enum ─────────────────────────────────────────────────────── #
 
 
 class TerminalCloseReason(str, Enum):
+  """Reason codes for positions closed by the MT5 terminal without a broker signal."""
+
   SL = "SL"
   TP = "TP"
   STOP_OUT = "STOP_OUT"
@@ -57,6 +59,8 @@ def _build_reason_map() -> None:
 
 @dataclass
 class AccountSnapshot:
+  """Point-in-time snapshot of MT5 account state captured at position-close detection."""
+
   login: int
   name: str
   balance: float
@@ -70,6 +74,8 @@ class AccountSnapshot:
 
 @dataclass
 class TerminalClosedEvent:
+  """Event emitted when the MT5 terminal closes a position without a broker-side signal."""
+
   # Position identity
   source_ticket: int  # position ticket (= source_ticket in our system)
   deal_ticket: int  # the closing deal ticket
@@ -120,21 +126,21 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
 
   deals = mt5.history_deals_get(position=position_ticket)
   if not deals:
-    log.warning("[jobs] No deal history for position=%d", position_ticket)
+    log.warning("[close_detector] No deal history for position=%d", position_ticket)
     return None
 
   opening_deal = next((d for d in deals if d.entry == mt5.DEAL_ENTRY_IN), None)
   closing_deal = next((d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT), None)
 
   if closing_deal is None:
-    log.warning("[jobs] No closing deal found for position=%d", position_ticket)
+    log.warning("[close_detector] No closing deal found for position=%d", position_ticket)
     return None
 
   reason = _REASON_MAP.get(closing_deal.reason)
   if reason is None:
     # Closed by our own code (DEAL_REASON_EXPERT) or unrecognised reason — skip.
     log.debug(
-      "[jobs] Position %d closed with deal_reason=%d — not terminal-initiated, skipping",
+      "[close_detector] Position %d closed with deal_reason=%d — not terminal-initiated, skipping",
       position_ticket,
       closing_deal.reason,
     )
@@ -185,7 +191,7 @@ def scan_terminal_closed_positions(
   positions = mt5.positions_get()
   if positions is None:
     log.warning(
-      "[jobs] positions_get() returned None — terminal offline, skipping scan"
+      "[close_detector] positions_get() returned None — terminal offline, skipping scan"
     )
     return []
 
@@ -198,7 +204,7 @@ def scan_terminal_closed_positions(
     if event is not None:
       events.append(event)
       log.info(
-        "[jobs] Terminal close detected | position=%d reason=%s price=%.5f vol=%.2f",
+        "[close_detector] Terminal close detected | position=%d reason=%s price=%.5f vol=%.2f",
         ticket,
         event.close_reason.value,
         event.close_price,
@@ -207,7 +213,7 @@ def scan_terminal_closed_positions(
 
   new_tickets = current_tickets - seen_tickets
   if new_tickets:
-    log.debug("[jobs] New positions now tracked: %s", new_tickets)
+    log.debug("[close_detector] New positions now tracked: %s", new_tickets)
 
   seen_tickets.clear()
   seen_tickets.update(current_tickets)

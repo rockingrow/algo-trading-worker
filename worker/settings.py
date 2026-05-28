@@ -8,6 +8,8 @@ from worker.schemas.nats_schema import NatsSubjectEnum
 
 
 class MarketTypeEnum(str, Enum):
+  """Supported trading market types."""
+
   FOREX = "FOREX"
   CRYPTO = "CRYPTO"
 
@@ -18,6 +20,8 @@ MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 
 
 class Settings(BaseSettings):
+  """Application configuration loaded from environment variables and .env file."""
+
   # NATS
   nats_url: str
   nats_token: Optional[str] = None

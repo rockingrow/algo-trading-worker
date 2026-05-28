@@ -9,6 +9,8 @@ from worker.settings import MarketTypeEnum
 
 
 class PositionStatusEnum(str, Enum):
+  """Lifecycle status values for a tracked position row in SQLite."""
+
   OPENED = "OPENED"
   TP1 = "TP1"
   TP2 = "TP2"
@@ -20,6 +22,8 @@ class PositionStatusEnum(str, Enum):
 
 
 class PositionEventType(str, Enum):
+  """Whether the NATS TRADE event represents a new position or an update to an existing one."""
+
   CREATED = "CREATED"
   UPDATED = "UPDATED"
 

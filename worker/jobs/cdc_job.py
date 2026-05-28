@@ -47,6 +47,13 @@ _EVENT_FIELDS = {
 
 
 class PositionCDC:
+  """Daemon thread that implements Change Data Capture on the SQLite positions table.
+
+  Polls for rows with sync_status=PENDING, publishes a PositionEvent to the
+  NATS TRADE subject, then marks the row as PUBLISHED. Provides at-least-once
+  delivery semantics; the broker handler is expected to be idempotent.
+  """
+
   def __init__(
     self,
     account_id: str,

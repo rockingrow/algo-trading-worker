@@ -11,6 +11,12 @@ logger = get_logger("worker.mt5_executor")
 
 
 class MT5Executor:
+  """Executes trade orders on the MT5 broker: open, partial-close, SL update, and full-close operations.
+
+  Handles symbol resolution, lot-size calculation, stop validation, and
+  translates high-level signal actions into raw mt5.order_send() calls.
+  """
+
   def __init__(self, magic_number: int, slippage_deviation: int):
     self.magic_number = magic_number
     self.deviation = slippage_deviation

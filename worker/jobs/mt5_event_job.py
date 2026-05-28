@@ -14,7 +14,7 @@ import threading
 from typing import Set
 
 from worker.logger import get_logger
-from worker.mt5.jobs import (
+from worker.mt5.close_detector import (
   TerminalClosedEvent,
   TerminalCloseReason,
   scan_terminal_closed_positions,

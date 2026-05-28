@@ -12,11 +12,15 @@ def _box(text: str) -> str:
 
 
 class Notification:
+  """Abstract base class for notification senders."""
+
   def send_message(self, message_text: str) -> bool:
     raise NotImplementedError("This method must be implemented by a subclass")
 
 
 class TelegramNotification(Notification):
+  """Sends HTML-formatted messages to one or more Telegram chat IDs via the Bot API."""
+
   def __init__(self, chat_ids: list[str] | None = None):
     self.enabled = settings.telegram_enabled
     self.bot_token = settings.telegram_bot_token

@@ -8,6 +8,8 @@ from worker.schemas.position_schema import PositionStatusEnum
 
 
 class DBServiceProtocol(Protocol):
+  """Structural interface for the database service used by SignalHandler and close-detection jobs."""
+
   def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> List[Dict[str, Any]]: ...
   def update_position_status(
     self,

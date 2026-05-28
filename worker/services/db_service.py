@@ -13,6 +13,8 @@ logger = get_logger("worker.services.db_service")
 
 
 class DBService:
+  """SQLite persistence layer for positions, position logs, and the notification outbox."""
+
   def initialize(self):
     db_init()
 

@@ -17,6 +17,8 @@ def _subject_str(s: _Subject) -> str:
 
 
 class NATSSubscriber:
+  """NATS subscriber that listens on configured subjects and enqueues messages to an internal queue for synchronous consumption via listen()."""
+
   def __init__(
     self,
     url: str,

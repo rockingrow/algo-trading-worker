@@ -6,6 +6,8 @@ from pydantic import BaseModel
 
 
 class SignalActionEnum(str, Enum):
+  """Trading signal actions that the worker can receive and execute."""
+
   LONG = "LONG"
   SHORT = "SHORT"
   TP1 = "TP1"
@@ -16,6 +18,8 @@ class SignalActionEnum(str, Enum):
 
 
 class SignalStatusEnum(str, Enum):
+  """Execution status of a signal as reported back to the broker."""
+
   OPENED = "OPENED"
   REJECTED = "REJECTED"
   CLOSED = "CLOSED"

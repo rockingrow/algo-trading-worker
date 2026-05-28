@@ -12,6 +12,7 @@ logger = get_logger("worker.mt5")
 
 
 class MT5:
+  """Wrapper around the MetaTrader5 Python API."""
   def __init__(
     self, server: str, login: int, password: str, path: Optional[str] = None
   ):

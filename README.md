@@ -39,31 +39,38 @@ worker/
 ├── core/                # Signal processing logic
 │   ├── market_strategy.py        # MarketStrategyFactory & base strategy interface
 │   └── signal_handler.py         # Routes signals to correct MT5 execution flow
+├── interfaces/          # Protocol types for dependency inversion
+│   ├── db_protocol.py            # DBServiceProtocol
+│   └── mt5_executor_protocol.py  # MT5ExecutorProtocol
 ├── jobs/                # Background polling jobs (daemon threads)
 │   ├── cdc_job.py                # PositionCDC — Change Data Capture to NATS TRADE
-│   └── mt5_event_job.py          # MT5EventJob — terminal-close detection
+│   ├── mt5_event_job.py          # MT5EventJob — terminal-close detection
+│   └── notification_job.py       # NotificationJob — outbox dispatcher (Telegram retries)
 ├── mt5/                 # MetaTrader 5 integration
-│   ├── mt5.py                    # MT5 terminal connection bridge
+│   ├── bridge.py                 # MT5 terminal connection bridge
 │   ├── executor.py               # MT5 trade execution primitives
-│   ├── jobs.py                   # Terminal-close event scanner (polling)
-│   └── manager.py                # MT5Manager — subprocess lifecycle + signal helpers
+│   ├── close_detector.py         # Terminal-close event scanner (polling)
+│   ├── manager.py                # MT5Manager — subprocess lifecycle (parent process)
+│   └── signal_processor.py       # Mt5SignalProcessor — child-process signal loop
 ├── schemas/             # Pydantic data schemas
-│   ├── broker_schema.py          # Signal & position validation schemas
 │   ├── job_schema.py             # LogAuthorEnum and job-specific schemas
+│   ├── metatrader_schema.py      # TradeResult TypedDict (MT5 order_send result)
 │   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, TRADE)
-│   ├── position_schema.py        # PositionStatusEnum
-│   ├── publisher_schema.py       # NATS publisher schemas
-│   └── trade_event_schema.py     # PositionEvent & PositionEventType
+│   ├── notification_schema.py    # NotificationPlatformEnum / NotificationChannelEnum
+│   ├── position_schema.py        # PositionStatusEnum + PositionEvent / PositionEventType
+│   └── signal_schema.py          # Signal validation schemas
 ├── services/            # Infrastructure services
-│   ├── db_service.py             # Database access layer
+│   ├── db_service.py             # Database access layer (positions, logs, outbox)
 │   ├── nats_service.py           # NATSSubscriber & NATSPublisher
-│   └── notification_service.py   # Telegram notification logic
+│   └── notification_service.py   # TelegramNotification + OutboxNotifier wrapper
 ├── utils/               # Shared utilities
 │   └── logging.py                # Structured logging helpers
 ├── app.py               # Application factory, FastAPI lifespan & watchdog
+├── context.py           # WorkerContext — market-agnostic services (DB, notifiers, outbox)
 ├── db.py                # Local SQLite persistence layer
 ├── logger.py            # Structured logging configuration
 ├── main.py              # Application entry point
+├── market.py            # Market orchestrator (selects MT5 vs crypto worker)
 ├── mt5_worker.py        # Child-process entry point (worker_initialized)
 └── settings.py          # Environment & app configuration
 ```
@@ -116,13 +123,15 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 - **Hard SL vs. NATS SL — callback gap (mitigated by MT5EventJob):** When a LONG/SHORT is opened, the SL is registered directly on the MT5 server (`request["sl"]`), so MT5 will auto-close the position even if the NATS signal pipeline is delayed. If the hard SL fires before the NATS `SL` signal arrives, `_handle_full_close` finds no open position, returns `success=False`, and no event is published. `MT5EventJob` closes this gap by detecting the disappearance independently and updating the SQLite `positions` table, which then triggers `PositionCDC` to publish the `TRADE` event to the Broker.
 
+- **Notification outbox (store-and-forward):** In-process notification calls (`ctx.notifier` and `ctx.channel_notifier`) do **not** hit the Telegram API directly — they enqueue a row in the SQLite `notifications` table via `OutboxNotifier`. A separate `NotificationJob` daemon thread drains the table every 1 s and performs the actual HTTP send, retrying failed messages with exponential backoff (`5s → 30s → 2m → 10m`) up to `max_attempts` (default `5`). This decouples MT5 signal handling from Telegram's availability/latency and prevents Telegram outages from blocking the NATS event loop. **Startup/shutdown banners** are sent **directly** via `ctx.direct_notifier` (bypassing the outbox) so the user sees them immediately — even before the DB/notification dispatcher is ready or after they are torn down.
+
 ### MT5EventJob — Terminal-Close Polling (`worker/jobs/mt5_event_job.py`)
 
 `MT5EventJob` runs as a daemon thread inside the child process alongside the NATS signal loop and the MT5 health-check thread. Its sole purpose is to detect positions that the MT5 server closed autonomously — without a corresponding NATS signal reaching the pipeline in time.
 
 #### How it works
 
-Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/mt5/jobs.py`), which:
+Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/mt5/close_detector.py`), which:
 
 1. Calls `mt5.positions_get()` filtered by `magic_number` → `current_tickets`
 2. Diffs against an internal `seen_tickets` set maintained across polls
@@ -173,6 +182,38 @@ The job shares the process-level `stop_event` (`multiprocessing.Event`) with the
 
 The Broker handler is expected to be idempotent (upsert by `account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
 
+### NotificationJob — Telegram Outbox Dispatcher (`worker/jobs/notification_job.py`)
+
+`NotificationJob` is the worker side of the notification outbox pattern. It polls the SQLite `notifications` table every 1 second and dispatches due rows via the appropriate Telegram sender, keeping Telegram I/O completely off the NATS event loop.
+
+#### Routing
+
+The job is constructed with a `{channel → TelegramNotification}` map built by `WorkerContext`:
+
+| `channel` value | Maps to | Backing chat IDs |
+| --- | --- | --- |
+| `INDIVIDUAL` | `ctx.direct_notifier` | `TELEGRAM_CHAT_ID` (management) |
+| `COMMUNITY` | `ctx.direct_channel_notifier` | `TELEGRAM_CHAT_CHANNEL_ID` (comma-separated signal channels) |
+
+In-process callers stay decoupled: they hold an `OutboxNotifier` whose `send_message()` just inserts a row tagged with the right `channel` and `category` — the dispatcher does the routing.
+
+#### Retry semantics
+
+| Outcome | Action |
+| --- | --- |
+| Success (HTTP 200 for every chat ID) | `DELETE` the row (hard-delete; no `status` column required) |
+| Partial / total failure | `attempts += 1`, set `next_attempt_at = now + backoff[attempts]`, store `last_error` |
+| `attempts >= max_attempts` (default `5`) | Row becomes dead-letter — skipped by the polling query and left in place for inspection |
+
+Backoff schedule (indexed by attempt, capped at last): **5s → 30s → 2m → 10m**. The polling query is `WHERE attempts < max_attempts AND (next_attempt_at IS NULL OR next_attempt_at <= now)` and is served by the `idx_notifications_pending` index.
+
+#### Direct-send escape hatches
+
+Two notification paths intentionally bypass the outbox:
+
+1. **Startup / shutdown banners** sent via `ctx.direct_notifier` — must surface even before `NotificationJob` is running or after it has been torn down.
+2. **NATS connection events** still go through the outbox via `ctx.nats_enqueue`, but they use the `NATS_EVENT` category so they can be filtered out of analytics if desired.
+
 ### MT5Executor Primitives (`worker/mt5/executor.py`)
 
 | Method                                            | Used By                                          |
@@ -190,7 +231,7 @@ The Broker handler is expected to be idempotent (upsert by `account_id + ticket`
 
 ## 🗄️ SQLite Schema (`worker_data.sqlite`)
 
-Two tables are created on startup by `db_init()` using WAL journal mode.
+Three tables are created on startup by `db_init()` using WAL journal mode.
 
 ### `positions` — Live position state
 
@@ -251,6 +292,25 @@ An append-only log of every signal processed and its MT5 execution result. Never
 | `author` | TEXT | `broker` (NATS signal) or `terminal` (MT5EventJob detection) |
 | `timestamp` | DATETIME | Wall-clock time of insertion |
 
+### `notifications` — Telegram outbox (store-and-forward)
+
+A durable queue of pending Telegram messages. `NotificationJob` polls this table every 1 s, sends due rows, and hard-deletes on success. Failed sends increment `attempts` and reschedule via exponential backoff (`5s → 30s → 2m → 10m`). Rows whose `attempts >= max_attempts` become dead-letters and are left in place.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INTEGER PK | Auto-increment row ID |
+| `platform` | TEXT | `TELEGRAM` (extensible to Slack/Discord/etc.) |
+| `channel` | TEXT | `INDIVIDUAL` (management chat) or `COMMUNITY` (signal channels) |
+| `category` | TEXT | Free-form tag (e.g. `TRADE_EVENT`, `MT5_MANAGEMENT`, `NATS_EVENT`) for filtering/analytics |
+| `message_text` | TEXT | HTML payload sent to Telegram |
+| `attempts` | INTEGER | Number of failed delivery attempts so far |
+| `max_attempts` | INTEGER | Cap (default `5`); row becomes dead-letter when reached |
+| `last_error` | TEXT | Error string from the last failed attempt |
+| `next_attempt_at` | DATETIME | Earliest retry time; `NULL` = ready immediately |
+| `created_at` / `updated_at` | DATETIME | Row timestamps |
+
+Indexed on `(next_attempt_at, id)` to make the dispatcher's poll query O(log n).
+
 ---
 
 ## 🔄 Process Lifecycle & Watchdog
@@ -266,13 +326,14 @@ FastAPI (parent)
         └── MT5Manager.stop()   — on FastAPI shutdown
 ```
 
-Inside the child process three daemon threads run alongside the NATS message loop:
+Inside the child process four daemon threads run alongside the NATS message loop:
 
 | Thread | Interval | Purpose |
 | --- | --- | --- |
 | `mt5-health` | 15 s (`MT5_HEALTH_INTERVAL`) | Checks MT5 connection; sends Telegram alert on disconnect/reconnect |
 | `MT5EventJob` | 5 s | Detects server-side position closes (SL/TP/Stop-Out) |
 | `PositionCDC` | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
+| `NotificationJob` | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
 
 All threads share the same `stop_event` (`multiprocessing.Event`) and exit cleanly when it is set.
 
