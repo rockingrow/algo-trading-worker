@@ -12,7 +12,12 @@ def _box(text: str) -> str:
 
 
 class Notification:
-  """Abstract base class for notification senders."""
+  """Abstract base class for notification senders.
+
+  Concrete senders implement :meth:`send_message` returning ``bool`` so they are
+  freely substitutable (Liskov) and conform to
+  :class:`~worker.interfaces.message_sender_protocol.MessageSenderProtocol`.
+  """
 
   def send_message(self, message_text: str) -> bool:
     raise NotImplementedError("This method must be implemented by a subclass")
@@ -56,11 +61,16 @@ class TelegramNotification(Notification):
     return success
 
 
-class OutboxNotifier:
-  """Drop-in replacement for TelegramNotification that enqueues to the DB outbox."""
+class OutboxNotifier(Notification):
+  """Drop-in replacement for TelegramNotification that enqueues to the DB outbox.
+
+  Returns ``bool`` like every other sender so it is fully substitutable for a
+  direct notifier (Liskov / MessageSenderProtocol).
+  """
 
   def __init__(self, enqueue_fn: Callable[[str], None]) -> None:
     self._enqueue_fn = enqueue_fn
 
-  def send_message(self, message_text: str) -> None:
+  def send_message(self, message_text: str) -> bool:
     self._enqueue_fn(message_text)
+    return True

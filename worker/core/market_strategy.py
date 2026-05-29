@@ -17,10 +17,11 @@ it fully decoupled from MT5 internals.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, List
+from typing import Any, List, Optional
 
-from worker.logger import get_logger
+from worker.core.config import ExecutionConfig
 from worker.interfaces.mt5_executor_protocol import MT5ExecutorProtocol
+from worker.logger import get_logger
 from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.signal_schema import SignalSchema
 from worker.settings import MarketTypeEnum, settings
@@ -92,8 +93,9 @@ class ForexMarket(BaseMarketStrategy):
   tests can inject any compatible mock without importing MetaTrader5.
   """
 
-  def __init__(self, executor: MT5ExecutorProtocol) -> None:
+  def __init__(self, executor: MT5ExecutorProtocol, config: ExecutionConfig) -> None:
     self._executor = executor
+    self._config = config
 
   # ── Entry ────────────────────────────────────────────────────────────── #
 
@@ -124,12 +126,12 @@ class ForexMarket(BaseMarketStrategy):
 
     pos = positions[0]
 
-    if settings.volume_decision_enabled:
-      calculated_volume = pos.volume * (settings.position_tp1_percent / 100)
+    if self._config.volume_decision_enabled:
+      calculated_volume = pos.volume * (self._config.position_tp1_percent / 100)
       close_volume = self._executor.normalize_volume(symbol, calculated_volume)
       logger.info(
         f"[handle_tp1] VOLUME_DECISION mode | "
-        f"position_volume={pos.volume} position_tp1_percent={settings.position_tp1_percent}% "
+        f"position_volume={pos.volume} position_tp1_percent={self._config.position_tp1_percent}% "
         f"calculated={calculated_volume} → close_volume={close_volume}"
       )
     else:
@@ -187,14 +189,16 @@ class MarketStrategyFactory:
   Reads ``settings.market_type`` (a :class:`MarketTypeEnum`) and returns the
   matching :class:`BaseMarketStrategy` implementation.
 
-  Usage (in app.py lifespan)::
+  Usage (in the signal processor)::
 
-      strategy = MarketStrategyFactory.create(executor=executor)
+      strategy = MarketStrategyFactory.create(executor=executor, config=config)
       handler  = SignalHandler(strategy, db_service)
   """
 
   @staticmethod
-  def create(executor=None) -> BaseMarketStrategy:
+  def create(
+    executor=None, config: Optional[ExecutionConfig] = None
+  ) -> BaseMarketStrategy:
     """
     Instantiate and return the correct market strategy.
 
@@ -203,6 +207,8 @@ class MarketStrategyFactory:
     executor:
         Required when ``market_type`` is ``FOREX``.
         Must satisfy :class:`~worker.mt5.protocol.MT5ExecutorProtocol`.
+    config:
+        Execution/risk configuration. Required for ``FOREX``.
     """
     market_type = settings.market_type
     logger.info(f"[MarketStrategyFactory] Detected market_type={market_type.value}")
@@ -212,7 +218,11 @@ class MarketStrategyFactory:
         raise ValueError(
           "MarketStrategyFactory: executor must be provided for FOREX market."
         )
-      strategy = ForexMarket(executor=executor)
+      if config is None:
+        raise ValueError(
+          "MarketStrategyFactory: config must be provided for FOREX market."
+        )
+      strategy = ForexMarket(executor=executor, config=config)
       logger.info("[MarketStrategyFactory] ForexMarket strategy loaded.")
       return strategy
 

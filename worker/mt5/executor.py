@@ -1,51 +1,54 @@
-import math
 from typing import Any, Dict, List, Optional
 
-import MetaTrader5 as mt5
-
+from worker.core.config import ExecutionConfig
+from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
+from worker.mt5.lot_sizing import LotSizer
+from worker.mt5.stop_validator import StopValidator
+from worker.mt5.symbol_resolver import SymbolResolver
 from worker.schemas.signal_schema import SignalSchema
-from worker.settings import settings
 
 logger = get_logger("worker.mt5_executor")
 
 
 class MT5Executor:
-  """Executes trade orders on the MT5 broker: open, partial-close, SL update, and full-close operations.
+  """Sends trade orders to the MT5 broker: open, partial-close, SL update, and
+  full-close operations.
 
-  Handles symbol resolution, lot-size calculation, stop validation, and
-  translates high-level signal actions into raw mt5.order_send() calls.
+  Order-sending is the executor's single responsibility; symbol resolution,
+  lot-size math, and stop validation are delegated to injected collaborators
+  (:class:`SymbolResolver`, :class:`LotSizer`, :class:`StopValidator`). The raw
+  MetaTrader5 module is injected as ``mt5_api`` so the executor can be imported
+  and unit-tested off-Windows with a fake gateway.
   """
 
-  def __init__(self, magic_number: int, slippage_deviation: int):
+  def __init__(
+    self,
+    magic_number: int,
+    slippage_deviation: int,
+    config: ExecutionConfig,
+    mt5_api: Optional[Mt5GatewayProtocol] = None,
+    symbol_resolver: Optional[SymbolResolver] = None,
+    lot_sizer: Optional[LotSizer] = None,
+    stop_validator: Optional[StopValidator] = None,
+  ) -> None:
+    if mt5_api is None:
+      import MetaTrader5 as mt5_api  # lazy: native extension only needed at runtime
+
     self.magic_number = magic_number
     self.deviation = slippage_deviation
-    self._symbol_cache = {}
+    self._config = config
+    self._mt5 = mt5_api
+    self._resolver = symbol_resolver or SymbolResolver(mt5_api)
+    self._lot_sizer = lot_sizer or LotSizer(mt5_api, self._resolver, config)
+    self._stop_validator = stop_validator or StopValidator(mt5_api)
+
+  # ------------------------------------------------------------------ #
+  #  Delegated helpers (kept on the executor to satisfy the protocol)   #
+  # ------------------------------------------------------------------ #
 
   def get_symbol(self, base_symbol: str) -> str:
-    """Dynamically find the tradeable symbol name (e.g., XAUUSD -> XAUUSDc)."""
-    if base_symbol in self._symbol_cache:
-      return self._symbol_cache[base_symbol]
-
-    symbols = mt5.symbols_get(group=f"*{base_symbol}*")
-    if not symbols:
-      logger.warning(f"No symbols found matching {base_symbol}")
-      return base_symbol
-
-    for sym in symbols:
-      # Check if name starts with base_symbol and is tradeable
-      if (
-        sym.name.startswith(base_symbol)
-        and sym.trade_mode != mt5.SYMBOL_TRADE_MODE_DISABLED
-      ):
-        if not sym.visible:
-          mt5.symbol_select(sym.name, True)
-
-        logger.info(f"Resolved symbol: {base_symbol} -> {sym.name}")
-        self._symbol_cache[base_symbol] = sym.name
-        return sym.name
-
-    return base_symbol
+    return self._resolver.get_symbol(base_symbol)
 
   def calculate_lot_size(
     self,
@@ -55,130 +58,15 @@ class MT5Executor:
     risk_percent: float,
     capital: Optional[float] = None,
   ) -> float:
-    """Calculate lot size based on Risk % and SL distance.
-
-    capital: fixed base to risk against. If None, uses live account equity.
-    """
-    if capital is None:
-      if settings.use_account_equity:
-        account_info = mt5.account_info()
-        if not account_info:
-          logger.error(
-            f"Could not retrieve account info for lot sizing. {mt5.last_error()}"
-          )
-          return 0.01
-        capital = account_info.equity
-      else:
-        capital = settings.capital
-
-    symbol_info = mt5.symbol_info(self.get_symbol(symbol))
-    if not symbol_info:
-      logger.error(f"Cannot find symbol {self.get_symbol(symbol)}")
-      return 0.01
-
-    risk_cash = capital * (risk_percent / 100.0)
-
-    # Handle Distance calculation
-    point = symbol_info.point
-    sl_distance_points = abs(entry_price - sl_price) / point
-
-    if sl_distance_points <= 0:
-      logger.warning("SL is too close or invalid. Falling back to minimum lot size.")
-      return symbol_info.volume_min
-
-    # Get tick values: value = (tick_value / tick_size) * point
-    tick_value = symbol_info.trade_tick_value
-    tick_size = symbol_info.trade_tick_size
-
-    if tick_size == 0 or tick_value == 0:
-      logger.error("Tick data is zero! Cannot calculate lot size accurately.")
-      return symbol_info.volume_min
-
-    point_value = (tick_value / tick_size) * point
-
-    # Formula: Lot = Risk_Cash / (Distance_Points * Point_Value)
-    calculated_lot = risk_cash / (sl_distance_points * point_value)
-
-    # Round according to step
-    step = symbol_info.volume_step
-    rounded_lot = round(calculated_lot / step) * step
-
-    # Clamp min, max
-    final_lot = max(symbol_info.volume_min, min(rounded_lot, symbol_info.volume_max))
-
-    logger.debug(
-      f"[Volume Setup] Capital: {capital}, Risk Cash: {risk_cash}, SL Points: {sl_distance_points}, "
-      f"Calculated Lot: {final_lot} (Step: {step})"
+    return self._lot_sizer.calculate_lot_size(
+      symbol, entry_price, sl_price, risk_percent, capital
     )
-
-    return round(final_lot, 2) if symbol_info.volume_step >= 0.01 else final_lot
 
   def convert_quantity_to_lots(self, symbol: str, quantity: float) -> float:
-    """Convert raw quantity (units/contracts) from signal to MT5 lot size."""
-
-    symbol_info = mt5.symbol_info(self.get_symbol(symbol))
-    if not symbol_info:
-      logger.error(f"Cannot get symbol info for {symbol}")
-      return 0.01
-
-    contract_size = symbol_info.trade_contract_size
-    if contract_size <= 0:
-      logger.warning(
-        f"Invalid contract size for {symbol}: {contract_size}. Using raw quantity."
-      )
-      return quantity
-
-    step = symbol_info.volume_step
-    calculated_lot = quantity / contract_size
-
-    # 1. Round down to the nearest multiple of the step for strict risk management.
-    # Add 1e-9 to prevent Python's floating-point precision issues
-    # (e.g., 0.14999999999 / 0.01 being floored down an extra step).
-    rounded_lot = math.floor((calculated_lot + 1e-9) / step) * step
-
-    # 2. Clamp the lot size within the broker's allowed limits.
-    final_lot = max(symbol_info.volume_min, min(rounded_lot, symbol_info.volume_max))
-
-    # 3. Dynamically calculate the number of decimal places instead of hardcoding to 2.
-    # This prevents floating-point artifacts like 0.020000000000000004 from causing MT5 errors.
-    decimals = 0
-    if step < 1.0:
-      # Convert step to string, strip trailing zeros, and count the length of the fractional part.
-      decimals = len(str(step).rstrip("0").split(".")[1])
-
-    final_lot = round(final_lot, decimals)
-
-    logger.debug(
-      f"[Quantity Conversion] Units: {quantity}, Contract Size: {contract_size}, "
-      f"Calculated Lot: {final_lot} (Step: {step})"
-    )
-
-    return final_lot
+    return self._lot_sizer.convert_quantity_to_lots(symbol, quantity)
 
   def normalize_volume(self, symbol: str, volume: float) -> float:
-    """Round volume according to symbol's volume_step requirements."""
-    symbol_info = mt5.symbol_info(self.get_symbol(symbol))
-    if not symbol_info:
-      logger.warning(f"Cannot get symbol info for {symbol}. Returning volume as-is.")
-      return volume
-
-    step = symbol_info.volume_step
-    # Round down to the nearest multiple of the step for strict risk management
-    rounded = math.floor((volume + 1e-9) / step) * step
-    # Clamp to min/max allowed by broker
-    final_vol = max(symbol_info.volume_min, min(rounded, symbol_info.volume_max))
-
-    # Dynamically calculate decimal places based on step
-    decimals = 0
-    if step < 1.0:
-      decimals = len(str(step).rstrip("0").split(".")[1])
-
-    final_vol = round(final_vol, decimals)
-
-    logger.debug(
-      f"[Volume Normalization] Input: {volume}, Step: {step}, Output: {final_vol}"
-    )
-    return final_vol
+    return self._lot_sizer.normalize_volume(symbol, volume)
 
   # ------------------------------------------------------------------ #
   #  Position Query Helpers                                              #
@@ -187,76 +75,10 @@ class MT5Executor:
   def get_open_positions(self, symbol: str) -> List[Any]:
     """Return all open positions for the resolved symbol (filtered by magic)."""
     resolved = self.get_symbol(symbol)
-    positions = mt5.positions_get(symbol=resolved)
+    positions = self._mt5.positions_get(symbol=resolved)
     if positions is None:
       return []
     return [p for p in positions if p.magic == self.magic_number]
-
-  # ------------------------------------------------------------------ #
-  #  Stop validation helper                                              #
-  # ------------------------------------------------------------------ #
-
-  def _validate_sell_stops(self, sl, tp, tick, stop_dist, point, digits) -> tuple:
-    if sl is not None:
-      min_sl = tick.ask + stop_dist
-      if sl <= min_sl:
-        sl = round(min_sl + point, digits)
-        logger.warning(
-          f"[validate_stops] SHORT SL too close (ask={tick.ask} stop_dist={stop_dist}). Adjusted → {sl}"
-        )
-    if tp is not None:
-      max_tp = tick.bid - stop_dist
-      if tp >= max_tp:
-        tp = round(max_tp - point, digits)
-        logger.warning(
-          f"[validate_stops] SHORT TP too close (bid={tick.bid} stop_dist={stop_dist}). Adjusted → {tp}"
-        )
-    return sl, tp
-
-  def _validate_buy_stops(self, sl, tp, tick, stop_dist, point, digits) -> tuple:
-    if sl is not None:
-      max_sl = tick.bid - stop_dist
-      if sl >= max_sl:
-        sl = round(max_sl - point, digits)
-        logger.warning(
-          f"[validate_stops] LONG SL too close (bid={tick.bid} stop_dist={stop_dist}). Adjusted → {sl}"
-        )
-    if tp is not None:
-      min_tp = tick.ask + stop_dist
-      if tp <= min_tp:
-        tp = round(min_tp + point, digits)
-        logger.warning(
-          f"[validate_stops] LONG TP too close (ask={tick.ask} stop_dist={stop_dist}). Adjusted → {tp}"
-        )
-    return sl, tp
-
-  def _validate_stops(
-    self,
-    symbol: str,
-    order_type: int,
-    tick,
-    sl: Optional[float],
-    tp: Optional[float],
-  ) -> tuple:
-    """
-    Ensure SL/TP satisfy the broker's minimum stop distance from the live
-    tick.  Adjusts by one point if violated so the order isn't rejected
-    with retcode 10016 when market price moved since the signal was sent.
-
-    For SELL (SHORT): SL must be >= ask + stop_dist; TP must be <= bid - stop_dist
-    For BUY  (LONG):  SL must be <= bid - stop_dist; TP must be >= ask + stop_dist
-    """
-    symbol_info = mt5.symbol_info(symbol)
-    if not symbol_info:
-      return sl, tp
-
-    stop_dist = symbol_info.trade_stops_level * symbol_info.point
-    point = symbol_info.point
-    digits = symbol_info.digits
-
-    if order_type == mt5.ORDER_TYPE_SELL:
-      return self._validate_sell_stops(sl, tp, tick, stop_dist, point, digits)
-    return self._validate_buy_stops(sl, tp, tick, stop_dist, point, digits)
 
   # ------------------------------------------------------------------ #
   #  Entry: Open a new LONG / SHORT position                             #
@@ -264,7 +86,10 @@ class MT5Executor:
 
   def open_position(self, signal: SignalSchema) -> Dict[str, Any]:
     """Open a new market order (LONG → BUY, SHORT → SELL)."""
-    action_map = {"LONG": mt5.ORDER_TYPE_BUY, "SHORT": mt5.ORDER_TYPE_SELL}
+    action_map = {
+      "LONG": self._mt5.ORDER_TYPE_BUY,
+      "SHORT": self._mt5.ORDER_TYPE_SELL,
+    }
     action_str = signal.action.value  # already validated upstream
 
     if action_str not in action_map:
@@ -273,26 +98,26 @@ class MT5Executor:
 
     order_type = action_map[action_str]
     symbol = self.get_symbol(signal.symbol)
-    tick = mt5.symbol_info_tick(symbol)
-    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+    tick = self._mt5.symbol_info_tick(symbol)
+    price = tick.ask if order_type == self._mt5.ORDER_TYPE_BUY else tick.bid
 
     # Calculate position size
-    if settings.volume_decision_enabled:
-      # Fixed capital mode: ignore payload quantity, derive lot from settings
+    if self._config.volume_decision_enabled:
+      # Fixed capital mode: ignore payload quantity, derive lot from config
       if signal.sl:
         volume = self.calculate_lot_size(
           symbol,
           price,
           signal.sl,
-          settings.risk_percentage,
-          capital=settings.capital,
+          self._config.risk_percentage,
+          capital=self._config.capital,
         )
         logger.info(
-          f"[open_position] VOLUME_DECISION mode | capital={settings.capital} "
-          f"risk={settings.risk_percentage}% → lot={volume}"
+          f"[open_position] VOLUME_DECISION mode | capital={self._config.capital} "
+          f"risk={self._config.risk_percentage}% → lot={volume}"
         )
       else:
-        sym_info = mt5.symbol_info(symbol)
+        sym_info = self._mt5.symbol_info(symbol)
         volume = sym_info.volume_min if sym_info else 0.01
         logger.warning(
           "[open_position] VOLUME_DECISION_ENABLED but no SL in signal. "
@@ -306,7 +131,7 @@ class MT5Executor:
       )
 
     request: Dict[str, Any] = {
-      "action": mt5.TRADE_ACTION_DEAL,
+      "action": self._mt5.TRADE_ACTION_DEAL,
       "symbol": symbol,
       "volume": float(volume),
       "type": order_type,
@@ -314,13 +139,15 @@ class MT5Executor:
       "deviation": self.deviation,
       "magic": self.magic_number,
       "comment": f"TV {signal.action.value}",
-      "type_time": mt5.ORDER_TIME_GTC,
-      "type_filling": mt5.ORDER_FILLING_IOC,
+      "type_time": self._mt5.ORDER_TIME_GTC,
+      "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
 
     # Validate SL/TP against live price; price may have moved since the signal
     # was generated, causing 10016 (TRADE_RETCODE_INVALID_STOPS) without this.
-    sl, tp = self._validate_stops(symbol, order_type, tick, signal.sl, signal.tp2)
+    sl, tp = self._stop_validator.validate_stops(
+      symbol, order_type, tick, signal.sl, signal.tp2
+    )
 
     if sl is not None:
       request["sl"] = float(sl)
@@ -329,13 +156,17 @@ class MT5Executor:
       request["tp"] = float(tp)
 
     logger.info(f"[open_position] Sending Order: {request}")
-    result = mt5.order_send(request)
+    result = self._mt5.order_send(request)
 
     if result is None:
-      logger.error(f"order_send failed. error code: {mt5.last_error()}")
-      return {"success": False, "retcode": mt5.last_error(), "comment": "Send Failed"}
+      logger.error(f"order_send failed. error code: {self._mt5.last_error()}")
+      return {
+        "success": False,
+        "retcode": self._mt5.last_error(),
+        "comment": "Send Failed",
+      }
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
+    if result.retcode != self._mt5.TRADE_RETCODE_DONE:
       logger.error(
         f"Order rejected, retcode={result.retcode}, comment: {result.comment}"
       )
@@ -384,16 +215,18 @@ class MT5Executor:
     )
 
     close_type = (
-      mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+      self._mt5.ORDER_TYPE_SELL
+      if pos.type == self._mt5.ORDER_TYPE_BUY
+      else self._mt5.ORDER_TYPE_BUY
     )
-    tick = mt5.symbol_info_tick(resolved)
-    price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+    tick = self._mt5.symbol_info_tick(resolved)
+    price = tick.bid if close_type == self._mt5.ORDER_TYPE_SELL else tick.ask
 
     # Clamp close_volume so we never exceed what is actually open
     safe_volume = min(close_volume, pos.volume)
 
     request: Dict[str, Any] = {
-      "action": mt5.TRADE_ACTION_DEAL,
+      "action": self._mt5.TRADE_ACTION_DEAL,
       "symbol": resolved,
       "volume": float(safe_volume),
       "type": close_type,
@@ -402,18 +235,22 @@ class MT5Executor:
       "deviation": self.deviation,
       "magic": self.magic_number,
       "comment": "Partial Close TP1",
-      "type_time": mt5.ORDER_TIME_GTC,
-      "type_filling": mt5.ORDER_FILLING_IOC,
+      "type_time": self._mt5.ORDER_TIME_GTC,
+      "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
 
     logger.info(f"[partial_close] Sending partial close: {request}")
-    result = mt5.order_send(request)
+    result = self._mt5.order_send(request)
 
     if result is None:
-      logger.error(f"partial_close order_send failed. error: {mt5.last_error()}")
-      return {"success": False, "retcode": mt5.last_error(), "comment": "Send Failed"}
+      logger.error(f"partial_close order_send failed. error: {self._mt5.last_error()}")
+      return {
+        "success": False,
+        "retcode": self._mt5.last_error(),
+        "comment": "Send Failed",
+      }
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
+    if result.retcode != self._mt5.TRADE_RETCODE_DONE:
       logger.error(
         f"Partial close failed, retcode={result.retcode}, comment: {result.comment}"
       )
@@ -453,7 +290,7 @@ class MT5Executor:
     )
 
     request: Dict[str, Any] = {
-      "action": mt5.TRADE_ACTION_SLTP,
+      "action": self._mt5.TRADE_ACTION_SLTP,
       "symbol": resolved,
       "position": pos.ticket,
       "sl": float(new_sl),
@@ -461,17 +298,17 @@ class MT5Executor:
     }
 
     logger.info(f"[update_sl] Updating SL for ticket {pos.ticket} → {new_sl}")
-    result = mt5.order_send(request)
+    result = self._mt5.order_send(request)
 
     if result is None:
-      logger.error(f"update_sl order_send failed. error: {mt5.last_error()}")
+      logger.error(f"update_sl order_send failed. error: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": mt5.last_error(),
+        "retcode": self._mt5.last_error(),
         "comment": "SL Update Failed",
       }
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
+    if result.retcode != self._mt5.TRADE_RETCODE_DONE:
       logger.error(
         f"SL update rejected, retcode={result.retcode}, comment: {result.comment}"
       )
@@ -506,13 +343,15 @@ class MT5Executor:
 
     for pos in positions:
       close_type = (
-        mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        self._mt5.ORDER_TYPE_SELL
+        if pos.type == self._mt5.ORDER_TYPE_BUY
+        else self._mt5.ORDER_TYPE_BUY
       )
-      tick = mt5.symbol_info_tick(resolved)
-      price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+      tick = self._mt5.symbol_info_tick(resolved)
+      price = tick.bid if close_type == self._mt5.ORDER_TYPE_SELL else tick.ask
 
       request: Dict[str, Any] = {
-        "action": mt5.TRADE_ACTION_DEAL,
+        "action": self._mt5.TRADE_ACTION_DEAL,
         "symbol": resolved,
         "volume": float(pos.volume),  # Use ACTUAL MT5 volume, never webhook quantity
         "type": close_type,
@@ -521,27 +360,27 @@ class MT5Executor:
         "deviation": self.deviation,
         "magic": self.magic_number,
         "comment": f"Full Close {reason}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_time": self._mt5.ORDER_TIME_GTC,
+        "type_filling": self._mt5.ORDER_FILLING_IOC,
       }
 
       logger.info(
         f"[close_all] Closing ticket {pos.ticket}, vol={pos.volume}, reason={reason}"
       )
-      result = mt5.order_send(request)
+      result = self._mt5.order_send(request)
 
-      if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+      if result and result.retcode == self._mt5.TRADE_RETCODE_DONE:
         logger.info(f"[close_all] Closed ticket {pos.ticket} successfully")
         success_count += 1
         last_result = result
       else:
-        err = result.comment if result else mt5.last_error()
+        err = result.comment if result else self._mt5.last_error()
         logger.error(f"[close_all] Failed to close ticket {pos.ticket}. Error: {err}")
 
     if success_count > 0:
       return {
         "success": True,
-        "retcode": mt5.TRADE_RETCODE_DONE,
+        "retcode": self._mt5.TRADE_RETCODE_DONE,
         "ticket": last_result.order,
         "source_ticket": positions[0].ticket,  # Include the position's original ticket
         "price": last_result.price,

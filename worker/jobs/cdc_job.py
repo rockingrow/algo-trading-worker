@@ -14,11 +14,11 @@ import json
 import threading
 from typing import Any, Callable, Dict, Optional
 
+from worker.interfaces.db_protocol import PositionSyncStoreProtocol
+from worker.interfaces.publisher_protocol import MessagePublisherProtocol
 from worker.logger import get_logger
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionEvent, PositionEventType
-from worker.services.db_service import DBService
-from worker.services.nats_service import NATSPublisher
 
 log = get_logger("worker.jobs.position_cdc_job")
 
@@ -57,8 +57,8 @@ class PositionCDC:
   def __init__(
     self,
     account_id: str,
-    publisher: NATSPublisher,
-    db_service: DBService,
+    publisher: MessagePublisherProtocol,
+    db_service: PositionSyncStoreProtocol,
     account_info_fn: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
     poll_interval: int = _POLL_INTERVAL,
     account_name: Optional[str] = None,

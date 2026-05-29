@@ -1,76 +1,51 @@
-import sqlite3
+"""
+worker/services/db_service.py
+─────────────────────────────
+Backward-compatible facade over the split persistence layer.
+
+The actual SQL now lives in two focused repositories
+(:class:`PositionRepository`, :class:`NotificationOutboxRepository`), each with a
+single responsibility. ``DBService`` simply composes them and delegates, so
+existing call sites keep working while new code can depend on the narrow
+repositories / protocols directly.
+"""
+
 from typing import Optional
 
-from worker.db import _get_conn, db_init
+from worker.db import db_init
 from worker.logger import get_logger
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationPlatformEnum,
 )
 from worker.schemas.position_schema import PositionStatusEnum
+from worker.services.notification_repository import NotificationOutboxRepository
+from worker.services.position_repository import PositionRepository
 
 logger = get_logger("worker.services.db_service")
 
 
 class DBService:
-  """SQLite persistence layer for positions, position logs, and the notification outbox."""
+  """SQLite persistence facade for positions, position logs, and the outbox."""
+
+  def __init__(
+    self,
+    positions: Optional[PositionRepository] = None,
+    notifications: Optional[NotificationOutboxRepository] = None,
+  ) -> None:
+    self.positions = positions or PositionRepository()
+    self.notifications = notifications or NotificationOutboxRepository()
 
   def initialize(self):
     db_init()
 
-  def log_position(
-    self,
-    strategy: str,
-    ticket: Optional[int],
-    source_ticket: Optional[int],
-    symbol: str,
-    action: str,
-    volume: float,
-    price: float,
-    sl: Optional[float],
-    tp1: Optional[float],
-    mt5_retcode: int,
-    comment: str = "",
-    message: Optional[str] = None,
-    author: str = "broker",
-  ):
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            INSERT INTO position_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2), sl, tp1, mt5_retcode, comment, message, author),
-    )
-    conn.commit()
-    conn.close()
-    logger.debug(f"Order logged to DB: Ticket={ticket}, Retcode={mt5_retcode}, Author={author}")
+  # ── Position delegation ──────────────────────────────────────────────── #
 
-  def insert_position(
-    self,
-    ticket: int,
-    strategy: str,
-    symbol: str,
-    action: str,
-    volume: float,
-    opened_price: float,
-    mt5_retcode: Optional[int] = None,
-    comment: Optional[str] = None,
-    message: Optional[str] = None,
-  ):
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message),
-    )
-    conn.commit()
-    conn.close()
-    logger.debug(f"Position inserted: source_ticket={ticket}, symbol={symbol}, action={action}")
+  def log_position(self, *args, **kwargs):
+    return self.positions.log_position(*args, **kwargs)
+
+  def insert_position(self, *args, **kwargs):
+    return self.positions.insert_position(*args, **kwargs)
 
   def update_position_status(
     self,
@@ -82,69 +57,23 @@ class DBService:
     comment: Optional[str] = None,
     message: Optional[str] = None,
   ):
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            UPDATE positions
-            SET status = ?,
-                ticket = COALESCE(?, ticket),
-                closed_price = COALESCE(?, closed_price),
-                mt5_retcode = COALESCE(?, mt5_retcode),
-                comment = COALESCE(?, comment),
-                message = COALESCE(?, message),
-                sync_status = 'PENDING',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE source_ticket = ?
-        """,
-      (status.value, new_ticket, round(closed_price, 2) if closed_price is not None else None, mt5_retcode, comment, message, source_ticket),
+    return self.positions.update_position_status(
+      source_ticket, status, new_ticket, closed_price, mt5_retcode, comment, message
     )
-    conn.commit()
-    conn.close()
-    logger.debug(f"Position updated: source_ticket={source_ticket}, new_ticket={new_ticket}, status={status}")
 
-  def get_position(self, source_ticket: int) -> Optional[dict]:
-    try:
-      conn = _get_conn()
-      conn.row_factory = sqlite3.Row
-      cursor = conn.cursor()
-      cursor.execute("SELECT * FROM positions WHERE source_ticket = ?", (source_ticket,))
-      row = cursor.fetchone()
-      conn.close()
-      return dict(row) if row else None
-    except Exception as e:
-      logger.exception(f"Failed to fetch position source_ticket={source_ticket}: {e}")
-      return None
+  def get_position(self, source_ticket: int):
+    return self.positions.get_position(source_ticket)
 
   def get_pending_sync_positions(self) -> list:
-    try:
-      conn = _get_conn()
-      conn.row_factory = sqlite3.Row
-      cursor = conn.cursor()
-      cursor.execute("SELECT * FROM positions WHERE sync_status = 'PENDING'")
-      rows = cursor.fetchall()
-      conn.close()
-      return [dict(row) for row in rows]
-    except Exception as e:
-      logger.exception(f"Failed to fetch pending sync positions: {e}")
-      return []
+    return self.positions.get_pending_sync_positions()
 
   def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            UPDATE positions
-            SET sync_status = 'PUBLISHED',
-                sync_time = CURRENT_TIMESTAMP
-            WHERE id = ? AND updated_at = ? AND sync_status = 'PENDING'
-        """,
-      (position_id, updated_at),
-    )
-    changed = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    return changed
+    return self.positions.mark_position_synced(position_id, updated_at)
+
+  def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
+    return self.positions.get_open_positions_by_strategy(strategy, symbol)
+
+  # ── Notification outbox delegation ───────────────────────────────────── #
 
   def enqueue_notification(
     self,
@@ -154,76 +83,19 @@ class DBService:
     category: Optional[str] = None,
     max_attempts: int = 5,
   ) -> None:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            INSERT INTO notifications (platform, channel, category, message_text, max_attempts)
-            VALUES (?, ?, ?, ?, ?)
-        """,
-      (platform.value, channel.value, category, message_text, max_attempts),
+    return self.notifications.enqueue_notification(
+      platform, channel, message_text, category, max_attempts
     )
-    conn.commit()
-    conn.close()
 
   def get_due_notifications(self, limit: int = 20) -> list:
-    try:
-      conn = _get_conn()
-      conn.row_factory = sqlite3.Row
-      cursor = conn.cursor()
-      cursor.execute(
-        """
-                SELECT * FROM notifications
-                WHERE attempts < max_attempts
-                  AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
-                ORDER BY id ASC
-                LIMIT ?
-            """,
-        (limit,),
-      )
-      rows = cursor.fetchall()
-      conn.close()
-      return [dict(row) for row in rows]
-    except Exception as e:
-      logger.exception(f"Failed to fetch due notifications: {e}")
-      return []
+    return self.notifications.get_due_notifications(limit)
 
   def delete_notification(self, notification_id: int) -> None:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
-    conn.commit()
-    conn.close()
+    return self.notifications.delete_notification(notification_id)
 
-  def mark_notification_failed(self, notification_id: int, error: str, next_attempt_at: str) -> None:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            UPDATE notifications
-            SET attempts = attempts + 1,
-                last_error = ?,
-                next_attempt_at = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """,
-      (error, next_attempt_at, notification_id),
+  def mark_notification_failed(
+    self, notification_id: int, error: str, next_attempt_at: str
+  ) -> None:
+    return self.notifications.mark_notification_failed(
+      notification_id, error, next_attempt_at
     )
-    conn.commit()
-    conn.close()
-
-  def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
-    try:
-      conn = _get_conn()
-      conn.row_factory = sqlite3.Row
-      cursor = conn.cursor()
-      cursor.execute(
-        "SELECT * FROM positions WHERE strategy = ? AND symbol = ? AND status IN ('OPENED', 'TP1')",
-        (strategy, symbol),
-      )
-      rows = cursor.fetchall()
-      conn.close()
-      return [dict(row) for row in rows]
-    except Exception as e:
-      logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
-      return []

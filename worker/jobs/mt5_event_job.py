@@ -13,6 +13,8 @@ from __future__ import annotations
 import threading
 from typing import Set
 
+from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
+from worker.interfaces.message_sender_protocol import MessageSenderProtocol
 from worker.logger import get_logger
 from worker.mt5.close_detector import (
   TerminalClosedEvent,
@@ -21,8 +23,7 @@ from worker.mt5.close_detector import (
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.services.db_service import DBService
-from worker.services.notification_service import TelegramNotification, _box
+from worker.services.notification_service import _box
 
 log = get_logger("worker.jobs.mt5_event_job")
 
@@ -51,8 +52,8 @@ class MT5EventJob:
   def __init__(
     self,
     magic_number: int,
-    db_service: DBService,
-    notifier: TelegramNotification,
+    db_service: TerminalCloseStoreProtocol,
+    notifier: MessageSenderProtocol,
     poll_interval: int = _POLL_INTERVAL,
   ) -> None:
     self._magic = magic_number
