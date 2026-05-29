@@ -42,4 +42,9 @@ ignore = [
 [dependency-groups]
 dev = [
     "watchfiles>=1.1.1",
+    "pytest>=8.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
