@@ -15,6 +15,7 @@ from worker.db.repository import NotificationOutboxRepository, PositionRepositor
 from worker.logger import get_logger
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
+  NotificationModeEnum,
   NotificationPlatformEnum,
 )
 from worker.schemas.position_schema import PositionStatusEnum
@@ -78,10 +79,11 @@ class DBService:
     channel: NotificationChannelEnum,
     message_text: str,
     category: Optional[str] = None,
+    mode: NotificationModeEnum = NotificationModeEnum.VERBOSE,
     max_attempts: int = 5,
   ) -> None:
     return self.notifications.enqueue_notification(
-      platform, channel, message_text, category, max_attempts
+      platform, channel, message_text, category, mode, max_attempts
     )
 
   def get_due_notifications(self, limit: int = 20) -> list:

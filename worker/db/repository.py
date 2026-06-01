@@ -11,6 +11,7 @@ from worker.db.connection import _get_conn
 from worker.logger import get_logger
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
+  NotificationModeEnum,
   NotificationPlatformEnum,
 )
 from worker.schemas.position_schema import PositionStatusEnum
@@ -175,16 +176,17 @@ class NotificationOutboxRepository:
     channel: NotificationChannelEnum,
     message_text: str,
     category: Optional[str] = None,
+    mode: NotificationModeEnum = NotificationModeEnum.VERBOSE,
     max_attempts: int = 5,
   ) -> None:
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO notifications (platform, channel, category, message_text, max_attempts)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO notifications (platform, channel, category, message_text, mode, max_attempts)
+            VALUES (?, ?, ?, ?, ?, ?)
         """,
-      (platform.value, channel.value, category, message_text, max_attempts),
+      (platform.value, channel.value, category, message_text, mode.value, max_attempts),
     )
     conn.commit()
     conn.close()
@@ -197,7 +199,8 @@ class NotificationOutboxRepository:
       cursor.execute(
         """
                 SELECT * FROM notifications
-                WHERE attempts < max_attempts
+                WHERE mode = 'VERBOSE'
+                  AND attempts < max_attempts
                   AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
                 ORDER BY id ASC
                 LIMIT ?

@@ -22,6 +22,9 @@ MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 class Settings(BaseSettings):
   """Application configuration loaded from environment variables and .env file."""
 
+  # Logging
+  notification_mode: str = "VERBOSE" # VERBOSE, SILENT, or ERROR
+
   # NATS
   nats_url: str
   nats_token: Optional[str] = None

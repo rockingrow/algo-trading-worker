@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
+  NotificationModeEnum,
   NotificationPlatformEnum,
 )
 from worker.schemas.position_schema import PositionStatusEnum
@@ -89,6 +90,7 @@ class NotificationOutboxProtocol(Protocol):
     channel: NotificationChannelEnum,
     message_text: str,
     category: Optional[str] = None,
+    mode: NotificationModeEnum = NotificationModeEnum.VERBOSE,
   ) -> None: ...
 
 

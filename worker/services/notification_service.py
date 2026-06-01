@@ -62,7 +62,13 @@ class TelegramNotification(Notification):
 
 
 class OutboxNotifier(Notification):
-  """Drop-in replacement for TelegramNotification that enqueues to the DB outbox.
+  """Enqueues messages to the DB outbox instead of sending them directly.
+
+  ``enqueue_fn`` is expected to be the closure returned by
+  ``WorkerContext._build_enqueue()``, which calls
+  ``DBService.enqueue_notification()`` → ``NotificationOutboxRepository``
+  → INSERT into the ``notifications`` table.  The actual Telegram delivery
+  is handled later by ``NotificationJob`` using a ``TelegramNotification``.
 
   Returns ``bool`` like every other sender so it is fully substitutable for a
   direct notifier (Liskov / MessageSenderProtocol).

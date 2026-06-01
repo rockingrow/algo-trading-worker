@@ -1,4 +1,4 @@
-.PHONY: install install-dev run dev format lint fix
+.PHONY: install install-dev run dev test format lint fix
 
 install:
 	uv sync
@@ -14,6 +14,9 @@ dev:
 
 e2e:
 	uv run e2e/main.py
+
+test:
+	uv run pytest
 
 format:
 	uv run ruff format .

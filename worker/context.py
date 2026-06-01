@@ -29,10 +29,12 @@ from typing import Callable
 from worker.logger import get_logger
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
+  NotificationModeEnum,
   NotificationPlatformEnum,
 )
 from worker.services.db_service import DBService
 from worker.services.notification_service import OutboxNotifier, TelegramNotification
+from worker.settings import settings
 
 log = get_logger("worker.worker_context")
 
@@ -64,11 +66,17 @@ class WorkerContext:
     self, channel: NotificationChannelEnum, category: str
   ) -> Callable[[str], None]:
     def enqueue(message_text: str) -> None:
+      # SILENT mode only suppresses COMMUNITY; INDIVIDUAL always delivered.
+      if channel == NotificationChannelEnum.INDIVIDUAL:
+        mode = NotificationModeEnum.VERBOSE
+      else:
+        mode = NotificationModeEnum(settings.notification_mode.upper())
       self.db_service.enqueue_notification(
         platform=NotificationPlatformEnum.TELEGRAM,
         channel=channel,
         message_text=message_text,
         category=category,
+        mode=mode,
       )
 
     return enqueue
@@ -80,6 +88,7 @@ class WorkerContext:
       channel=NotificationChannelEnum.INDIVIDUAL,
       message_text=message_text,
       category="NATS_EVENT",
+      mode=NotificationModeEnum.VERBOSE,  # INDIVIDUAL always delivered regardless of notification_mode
     )
 
   def start_notification_job(self, stop_event) -> None:

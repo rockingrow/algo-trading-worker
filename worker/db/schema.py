@@ -56,6 +56,7 @@ def db_init():
                 channel         TEXT     NOT NULL,
                 category        TEXT,
                 message_text    TEXT     NOT NULL,
+                mode            TEXT     NOT NULL DEFAULT 'VERBOSE',
                 attempts        INTEGER  NOT NULL DEFAULT 0,
                 max_attempts    INTEGER  NOT NULL DEFAULT 5,
                 last_error      TEXT,
