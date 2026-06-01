@@ -1,16 +1,7 @@
-import sqlite3
-
+from worker.db.connection import _get_conn
 from worker.logger import get_logger
 
-logger = get_logger("worker.db")
-
-DB_FILE = "worker_data.sqlite"
-
-
-def _get_conn() -> sqlite3.Connection:
-  conn = sqlite3.connect(DB_FILE, timeout=5)
-  conn.execute("PRAGMA busy_timeout=5000")
-  return conn
+logger = get_logger("worker.db.schema")
 
 
 def db_init():

@@ -16,7 +16,7 @@ when the broker re-tickets a position after a partial close.
 from typing import Any, Callable, Dict, Optional
 
 from worker.core.market_strategy import BaseMarketStrategy
-from worker.interfaces.db_protocol import DBServiceProtocol
+from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.position_schema import PositionStatusEnum
@@ -44,9 +44,18 @@ class SignalHandler:
   - Returning a structured result dict so the caller can log/notify.
   """
 
-  def __init__(self, strategy: BaseMarketStrategy, db_service: DBServiceProtocol) -> None:
+  def __init__(self, strategy: BaseMarketStrategy, db_service: PositionStoreProtocol) -> None:
     self.strategy = strategy
     self._db = db_service
+    # Action → handler dispatch table. Adding a new action group means adding an
+    # entry here (and to the relevant set) rather than editing handle()'s body
+    # (Open/Closed).
+    self._routes: Dict[SignalActionEnum, Callable[[SignalSchema], TradeResult]] = {
+      SignalActionEnum.LONG: self._handle_entry,
+      SignalActionEnum.SHORT: self._handle_entry,
+      SignalActionEnum.TP1: self._handle_tp1,
+      **dict.fromkeys(_FULL_CLOSE_ACTIONS, self._handle_full_close),
+    }
 
   # ------------------------------------------------------------------ #
   #  SQLite lookup helper                                                #
@@ -124,25 +133,16 @@ class SignalHandler:
       f"action={action.value} | ts={signal.timestamp}"
     )
 
-    # ── Group 1: Entry ──────────────────────────────────────────────
-    if action in (SignalActionEnum.LONG, SignalActionEnum.SHORT):
-      return self._handle_entry(signal)
-
-    # ── Group 2: Partial exit (TP1) ─────────────────────────────────
-    if action == SignalActionEnum.TP1:
-      return self._handle_tp1(signal)
-
-    # ── Group 3: Full exit (TP2 / SL / R_SL / FLAT) ─────────────────
-    if action in _FULL_CLOSE_ACTIONS:
-      return self._handle_full_close(signal)
-
-    # Unknown action — should never reach here given validated enum
-    logger.error(f"[SignalHandler] Unknown action '{action.value}' — skipping.")
-    return {
-      "success": False,
-      "retcode": -1,
-      "comment": f"Unknown action: {action.value}",
-    }
+    route = self._routes.get(action)
+    if route is None:
+      # Unknown action — should never reach here given validated enum
+      logger.error(f"[SignalHandler] Unknown action '{action.value}' — skipping.")
+      return {
+        "success": False,
+        "retcode": -1,
+        "comment": f"Unknown action: {action.value}",
+      }
+    return route(signal)
 
   # ------------------------------------------------------------------ #
   #  Group 1 — Open position (LONG / SHORT)                             #

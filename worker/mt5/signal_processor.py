@@ -39,6 +39,7 @@ from typing import Optional
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
+from worker.core.config import ExecutionConfig
 from worker.core.market_strategy import MarketStrategyFactory
 from worker.core.signal_handler import SignalHandler
 from worker.jobs.cdc_job import PositionCDC
@@ -46,9 +47,10 @@ from worker.jobs.mt5_event_job import MT5EventJob
 from worker.logger import get_logger
 from worker.mt5.bridge import MT5
 from worker.mt5.executor import MT5Executor
+from worker.mt5.message_presenter import TradeMessagePresenter
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
+from worker.schemas.signal_schema import SignalSchema
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.services.notification_service import _box
 from worker.settings import MT5_HEALTH_INTERVAL, NATS_REQUIRED_LISTENING_SUBJECTS
@@ -60,6 +62,7 @@ _CLOSE_STATUS_MAP = {
   "TP2": PositionStatusEnum.TP2,
   "SL": PositionStatusEnum.SL,
   "R_SL": PositionStatusEnum.R_SL,
+  "FLAT": PositionStatusEnum.FLATTED,
 }
 
 
@@ -74,12 +77,6 @@ def _parse_nats_subjects(raw: str) -> list[str | NatsSubjectEnum]:
     except ValueError:
       parsed.add(s)
   return list(NATS_REQUIRED_LISTENING_SUBJECTS | parsed)
-
-
-def _format_volume(volume: float, auto_calculated: bool = False) -> str:
-  """Format volume with icon if auto-calculated."""
-  icon = "⚙️" if auto_calculated else ""
-  return f"{volume} lot {icon}".strip() if auto_calculated else f"{volume} lot"
 
 
 # ── Child-process helpers ────────────────────────────────────────────────── #
@@ -168,103 +165,6 @@ def _ensure_mt5_connected(bridge, notifier, footer: str, log) -> bool:
   return reconnected
 
 
-def _handle_flat_signal(
-  signal, executor, db_service, notifier, channel_notifier, bridge, log
-) -> None:
-  """
-  Execute a FLAT signal: close all OPENED/TP1 positions for a strategy+symbol.
-
-  Steps:
-    1. Query DB for positions with status OPENED or TP1.
-    2. Close them all via MT5 at market price (100 % volume).
-    3. Write a row to position_logs and update positions.status → FLATTED.
-    4. Send a Telegram notification.
-  """
-  strategy = signal.strategy
-  symbol = signal.symbol
-
-  db_positions = db_service.get_open_positions_by_strategy(strategy, symbol)
-  if not db_positions:
-    log.warning("[FLAT] No open DB positions | strategy=%s symbol=%s", strategy, symbol)
-    notifier.send_message(
-      _box(
-        f"⚡ <b>FLAT [{symbol}]</b>\n\nNo open positions found for strategy <b>{strategy}</b>"
-      )
-    )
-    return
-
-  log.info(
-    "[FLAT] Closing %d position(s) | strategy=%s symbol=%s",
-    len(db_positions),
-    strategy,
-    symbol,
-  )
-
-  result = executor.close_all_positions(symbol, reason="FLAT")
-
-  for pos in db_positions:
-    source_ticket = pos["source_ticket"]
-    db_service.log_position(
-      strategy=strategy,
-      ticket=result.get("ticket"),
-      source_ticket=source_ticket,
-      symbol=symbol,
-      action="FLAT",
-      volume=pos["volume"],
-      price=result.get("price", 0.0),
-      sl=None,
-      tp1=None,
-      mt5_retcode=result.get("retcode", -1),
-      comment=result.get("comment", "FLAT command"),
-      author="broker",
-    )
-    if result.get("success"):
-      db_service.update_position_status(
-        source_ticket=source_ticket,
-        status=PositionStatusEnum.FLATTED,
-        new_ticket=result.get("ticket"),
-        closed_price=result.get("price"),
-        mt5_retcode=result.get("retcode"),
-        comment="FLAT by webhook",
-      )
-
-  footer = bridge.get_account_footer()
-  if result.get("success"):
-    msg = _box(
-      f"⚡ <b>FLAT Executed</b>\n\n"
-      f"Symbol: <b>{symbol}</b>\n"
-      f"Strategy: <b>{strategy}</b>\n"
-      f"Positions closed: <b>{len(db_positions)}</b>\n"
-      f"Price: <b>{result.get('price')}</b>\n"
-      f"Volume: <b>{_format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
-      f"----------------------------------\n"
-      f"{footer}"
-    )
-    log.info(
-      "[FLAT] Done | strategy=%s symbol=%s price=%s",
-      strategy,
-      symbol,
-      result.get("price"),
-    )
-  else:
-    msg = _box(
-      f"❌ <b>FLAT Failed</b>\n\n"
-      f"Symbol: <b>{symbol}</b>\n"
-      f"Strategy: <b>{strategy}</b>\n"
-      f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
-      f"----------------------------------\n"
-      f"{footer}"
-    )
-    log.error(
-      "[FLAT] Failed | strategy=%s symbol=%s comment=%s",
-      strategy,
-      symbol,
-      result.get("comment"),
-    )
-
-  channel_notifier.send_message(msg)
-
-
 # ── Processor ────────────────────────────────────────────────────────────── #
 
 
@@ -282,11 +182,15 @@ class Mt5SignalProcessor:
       path=settings_dict.get("mt5_path"),
     )
 
+    self.config = ExecutionConfig.from_dict(settings_dict)
     self.executor = MT5Executor(
       magic_number=settings_dict["magic_number"],
       slippage_deviation=settings_dict["slippage_deviation"],
+      config=self.config,
     )
-    self.strategy = MarketStrategyFactory.create(executor=self.executor)
+    self.strategy = MarketStrategyFactory.create(
+      executor=self.executor, config=self.config
+    )
     self.handler = SignalHandler(self.strategy, ctx.db_service)
 
     self.subscriber: Optional[NATSSubscriber] = None
@@ -328,24 +232,13 @@ class Mt5SignalProcessor:
     self.bridge.shutdown()
 
   def send_startup_notification(self) -> None:
-    s = self.settings
-    volume_config = (
-      f"VOLUME_DECISION_ENABLED: <b>{s.get('volume_decision_enabled', False)}</b>\n"
-      f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
-      f"RISK_PERCENTAGE: <b>{s.get('risk_percentage')}%</b>\n"
-      f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
-      f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
-    )
     self.ctx.direct_notifier.send_message(
-      _box(
-        f"🟢 <b>[Connected] MT5 Worker</b>\n\n{volume_config}"
-        f"----------------------------------\n{self._footer}"
-      )
+      TradeMessagePresenter.startup(self.settings, self._footer)
     )
 
   def send_shutdown_notification(self) -> None:
     self.ctx.direct_notifier.send_message(
-      _box(f"🛑 <b>[Disconnected] MT5 Worker</b>{self._footer}")
+      TradeMessagePresenter.shutdown(self._footer)
     )
 
   def start_market_jobs(self, stop_event) -> None:
@@ -392,18 +285,6 @@ class Mt5SignalProcessor:
     if not _ensure_mt5_connected(self.bridge, self.ctx.notifier, self._footer, log):
       return
 
-    if signal.action == SignalActionEnum.FLAT:
-      _handle_flat_signal(
-        signal,
-        self.executor,
-        self.ctx.db_service,
-        self.ctx.notifier,
-        self.ctx.channel_notifier,
-        self.bridge,
-        log,
-      )
-      return
-
     log.info(
       "[MT5 Process] Processing Signal: %s | %s | TV Time: %s",
       signal.symbol,
@@ -435,17 +316,11 @@ class Mt5SignalProcessor:
       signal_json = signal.model_dump_json()
 
       for fc in result.get("forced_closed", []):
-        fc_msg = _box(
-          f"⚠️ <b>Force Closed (New Entry)</b>\n\n"
-          f"Symbol: <b>{signal.symbol}</b>\n"
-          f"Price: <b>{fc.get('price')}</b>\n"
-          f"Volume: <b>{_format_volume(fc.get('volume'), auto_calculated=False)}</b>\n"
-          f"Ticket: <b>{fc.get('ticket')}</b>\n"
-          f"Source Ticket: <b>{fc.get('source_ticket')}</b>\n"
-          f"----------------------------------\n"
-          f"{self.bridge.get_account_footer()}"
+        self.ctx.channel_notifier.send_message(
+          TradeMessagePresenter.force_closed(
+            signal.symbol, fc, self.bridge.get_account_footer()
+          )
         )
-        self.ctx.channel_notifier.send_message(fc_msg)
 
       if action_val in ("LONG", "SHORT"):
         self.ctx.db_service.insert_position(
@@ -471,25 +346,11 @@ class Mt5SignalProcessor:
             comment=result.get("comment", ""),
             message=signal_json,
           )
-      msg = _box(
-        f"✅ <b>Order Filled</b>\n\n"
-        f"Symbol: <b>{signal.symbol}</b>\n"
-        f"Action: <b>{signal.action.value}</b>\n"
-        f"Price: <b>{result.get('price')}</b>\n"
-        f"Volume: <b>{_format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
-        f"Ticket: <b>{result.get('ticket')}</b>\n"
-        f"Source Ticket: <b>{pos_ticket}</b>\n"
-        f"----------------------------------\n"
-        f"{self.bridge.get_account_footer()}"
+      msg = TradeMessagePresenter.order_filled(
+        signal, result, pos_ticket, self.bridge.get_account_footer()
       )
     else:
-      msg = _box(
-        f"❌ <b>Order Failed</b>\n\n"
-        f"Symbol: <b>{signal.symbol}</b>\n"
-        f"Action: <b>{signal.action.value}</b>\n"
-        f"Price: <b>{result.get('price')}</b>\n"
-        f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
-        f"----------------------------------\n"
-        f"{self.bridge.get_account_footer()}"
+      msg = TradeMessagePresenter.order_failed(
+        signal, result, self.bridge.get_account_footer()
       )
     self.ctx.channel_notifier.send_message(msg)

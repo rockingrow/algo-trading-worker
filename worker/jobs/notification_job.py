@@ -18,9 +18,9 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict
 
+from worker.interfaces.db_protocol import NotificationDispatchStoreProtocol
+from worker.interfaces.message_sender_protocol import MessageSenderProtocol
 from worker.logger import get_logger
-from worker.services.db_service import DBService
-from worker.services.notification_service import TelegramNotification
 
 log = get_logger("worker.jobs.notification_job")
 
@@ -46,8 +46,8 @@ class NotificationJob:
 
   def __init__(
     self,
-    db_service: DBService,
-    notifiers: Dict[str, TelegramNotification],
+    db_service: NotificationDispatchStoreProtocol,
+    notifiers: Dict[str, MessageSenderProtocol],
     poll_interval: int = _POLL_INTERVAL,
   ) -> None:
     self._db = db_service
