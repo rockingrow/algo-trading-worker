@@ -13,14 +13,14 @@ repositories / protocols directly.
 from typing import Optional
 
 from worker.db import db_init
+from worker.db.notification_repository import NotificationOutboxRepository
+from worker.db.position_repository import PositionRepository
 from worker.logger import get_logger
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationPlatformEnum,
 )
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.services.notification_repository import NotificationOutboxRepository
-from worker.services.position_repository import PositionRepository
 
 logger = get_logger("worker.services.db_service")
 

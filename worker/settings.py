@@ -65,6 +65,9 @@ class Settings(BaseSettings):
       return [str(v)]
     return v
 
+  # Database
+  db_file: str = "worker_data.sqlite"
+
   # Logging
   log_level: str = "INFO"
 

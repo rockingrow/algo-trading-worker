@@ -1,6 +1,6 @@
 """
-worker/services/notification_repository.py
-──────────────────────────────────────────
+worker/db/notification_repository.py
+─────────────────────────────────────
 SQLite persistence for the ``notifications`` store-and-forward outbox.
 
 Split out of the former monolithic ``DBService`` so the outbox has a single
@@ -10,14 +10,14 @@ reason to change, separate from position persistence (Single Responsibility).
 import sqlite3
 from typing import Optional
 
-from worker.db import _get_conn
+from worker.db.connection import _get_conn
 from worker.logger import get_logger
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationPlatformEnum,
 )
 
-logger = get_logger("worker.services.notification_repository")
+logger = get_logger("worker.db.notification_repository")
 
 
 class NotificationOutboxRepository:

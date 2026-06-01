@@ -1,6 +1,6 @@
 """
-worker/services/position_repository.py
-──────────────────────────────────────
+worker/db/position_repository.py
+──────────────────────────────────
 SQLite persistence for the ``positions`` and ``position_logs`` tables.
 
 Split out of the former monolithic ``DBService`` so position persistence has a
@@ -11,11 +11,11 @@ Responsibility).
 import sqlite3
 from typing import Optional
 
-from worker.db import _get_conn
+from worker.db.connection import _get_conn
 from worker.logger import get_logger
 from worker.schemas.position_schema import PositionStatusEnum
 
-logger = get_logger("worker.services.position_repository")
+logger = get_logger("worker.db.position_repository")
 
 
 class PositionRepository:
