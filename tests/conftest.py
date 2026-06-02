@@ -59,9 +59,9 @@ def make_tick(ask=2000.0, bid=1999.5):
   return SimpleNamespace(ask=ask, bid=bid)
 
 
-def make_position(ticket=111, type_=0, volume=1.0, price_open=2000.0, tp=2050.0, magic=42):
+def make_position(ticket=111, type_=0, volume=1.0, price_open=2000.0, tp=2050.0, magic=42, symbol="XAUUSDc"):
   return SimpleNamespace(
-    ticket=ticket, type=type_, volume=volume, price_open=price_open, tp=tp, magic=magic
+    ticket=ticket, type=type_, volume=volume, price_open=price_open, tp=tp, magic=magic, symbol=symbol
   )
 
 

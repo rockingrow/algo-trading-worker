@@ -98,3 +98,47 @@ def test_update_position_sl(config):
   assert req["action"] == mt5.TRADE_ACTION_SLTP
   assert req["sl"] == 1995.0
   assert req["tp"] == 2050.0  # preserved
+
+
+def test_get_all_open_positions_filters_by_magic(config):
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, magic=42),
+      make_position(ticket=2, magic=999),
+    ]
+  )
+  ex = _executor(mt5, config)
+  positions = ex.get_all_open_positions()
+  assert [p.ticket for p in positions] == [1]
+
+
+def test_close_single_position_buy_sends_sell(config):
+  pos = make_position(ticket=7, type_=0, volume=0.6, magic=42)  # BUY
+  mt5 = FakeMt5()
+  ex = _executor(mt5, config)
+  res = ex.close_single_position(pos, reason="FLAT")
+  assert res["success"] is True
+  req = mt5.sent_requests[-1]
+  assert req["type"] == mt5.ORDER_TYPE_SELL
+  assert req["volume"] == 0.6
+  assert req["position"] == 7
+  assert "FLAT" in req["comment"]
+
+
+def test_close_single_position_sell_uses_ask(config):
+  pos = make_position(ticket=8, type_=1, volume=0.3, magic=42)  # SELL
+  mt5 = FakeMt5()
+  ex = _executor(mt5, config)
+  ex.close_single_position(pos, reason="FLAT")
+  req = mt5.sent_requests[-1]
+  assert req["type"] == mt5.ORDER_TYPE_BUY
+  assert req["price"] == 2000.0  # ask for counter-sell
+
+
+def test_close_single_position_failure_returns_error(config):
+  pos = make_position(ticket=9, magic=42)
+  mt5 = FakeMt5(order_results=[make_order_result(retcode=10016, comment="requote")])
+  ex = _executor(mt5, config)
+  res = ex.close_single_position(pos, reason="FLAT")
+  assert res["success"] is False
+  assert "requote" in res["comment"]

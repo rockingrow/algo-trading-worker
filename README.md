@@ -53,6 +53,7 @@ worker/
 │   ├── manager.py                # MT5Manager — subprocess lifecycle (parent process)
 │   └── signal_processor.py       # Mt5SignalProcessor — child-process signal loop
 ├── schemas/             # Pydantic data schemas
+│   ├── admin_schema.py           # AdminActionEnum + AdminSignalSchema (NATS ADMIN subject)
 │   ├── job_schema.py             # LogAuthorEnum and job-specific schemas
 │   ├── metatrader_schema.py      # TradeResult TypedDict (MT5 order_send result)
 │   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, TRADE)
@@ -101,7 +102,57 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 }
 ```
 
+---
+
+## 🛡️ ADMIN Subject
+
+The `ADMIN` NATS subject carries out-of-band administrative commands that operate outside the normal strategy signal flow. Messages are received by `Mt5SignalProcessor._handle_admin_message`.
+
+### Action: `FLAT`
+
+Closes open positions across one or more strategies/symbols in a single command. Accepts three **optional** filter attributes — any combination can be specified; omitting all three closes every tracked open position on the account.
+
+| Filter | Behaviour when present |
+| --- | --- |
+| `account_id` | Silently ignored if it does not match the worker's `MT5_LOGIN`; processed normally if it matches or is absent |
+| `strategy` | Restricts close to positions whose `strategy` column equals this value |
+| `symbol` | Restricts close to positions for this symbol |
+
+#### ADMIN FLAT Payload
+
+```json
+{
+  "action": "FLAT",
+  "timestamp": "2026-06-02T08:00:00+00:00",
+  "strategy": "my_strategy",
+  "symbol": "XAUUSD",
+  "account_id": "123456"
+}
+```
+
+All fields except `action` and `timestamp` are optional.
+
+#### Execution flow
+
+1. Parse `AdminSignalSchema`; drop silently on validation error.
+2. If `account_id` is present and does not match `MT5_LOGIN` → skip (no log noise).
+3. Check MT5 connection; abort if unreachable.
+4. Query SQLite `positions` for rows with `status IN ('OPENED', 'TP1')` matching the optional filters.
+5. Fetch all live MT5 positions (`positions_get()` filtered by `magic_number`) and intersect by ticket.
+6. For each position **in DB but absent from MT5** → mark `FLATTED` immediately (already closed server-side).
+7. For each matched live MT5 position → call `close_single_position(pos, reason="FLAT")`:
+   - On success: update DB `status → FLATTED`, set `closed_price`, send `⚡ Admin FLAT Closed` Telegram notification.
+   - On failure: log error, skip DB update.
+
 ### Key Design Decisions
+
+- **Ticket-based matching, not symbol-based:** Unlike the broker FLAT signal (which closes everything for a given symbol), the admin FLAT cross-references DB tickets against live MT5 tickets. This means two strategies running the same symbol are handled independently — only positions whose tickets appear in the filtered DB result set are closed.
+- **Graceful handling of already-closed positions:** If a position is tracked in SQLite but no longer open in MT5, it is marked `FLATTED` without attempting an MT5 close order, so the DB stays consistent even after a connectivity gap.
+- **`PositionCDC` propagation:** After status updates, the CDC job picks up the `PENDING` rows and publishes `PositionEvent(event=UPDATED, status=FLATTED, …)` to the Broker via the NATS `TRADE` subject — no special handling required.
+
+---
+
+## 🧠 Signal Execution — Key Design Decisions
 
 - **Stale position cleanup (Entry):** An account holds at most 1 position per symbol at a time. Before opening any new LONG/SHORT, the handler queries MT5 and force-closes any existing position for that symbol — regardless of whether the new signal is in the same or opposite direction. After the MT5 close succeeds, the corresponding SQLite record(s) are immediately updated to `FORCED_CLOSED` so the DB stays consistent. Only then is the new position opened. This guarantees each cycle starts flat and prevents accidental hedging.
 
@@ -221,8 +272,10 @@ Two notification paths intentionally bypass the outbox:
 | `open_position(signal)`                           | Entry (Group 1)                                  |
 | `partial_close_position(symbol, volume, ticket?)` | TP1 (Group 2)                                    |
 | `update_position_sl(symbol, new_sl, ticket?)`     | TP1 breakeven update                             |
-| `close_all_positions(symbol, reason)`             | Full exit (Group 3) & FLAT                       |
+| `close_all_positions(symbol, reason)`             | Full exit (Group 3) & broker FLAT                |
+| `close_single_position(pos, reason)`              | Admin FLAT — closes one position by MT5 object   |
 | `get_open_positions(symbol)`                      | Pre-flight guard in all groups                   |
+| `get_all_open_positions()`                        | Admin FLAT — fetch all positions across symbols  |
 | `convert_quantity_to_lots(symbol, quantity)`      | Entry & TP1 volume calc                          |
 | `calculate_lot_size(symbol, entry, sl, risk_pct)` | Entry volume calc (risk-based)                   |
 | `normalize_volume(symbol, volume)`                | Rounds/clamps volume to broker lot step & limits |

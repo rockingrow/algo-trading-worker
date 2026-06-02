@@ -29,6 +29,7 @@ def make_service():
 def test_position_methods_delegate_to_position_repo():
   svc, positions, _ = make_service()
   svc.get_open_positions_by_strategy("s", "XAUUSD")
+  svc.get_open_positions_for_flat(strategy="s", symbol="XAUUSD")
   svc.update_position_status(source_ticket=1, status=PositionStatusEnum.TP1)
   svc.get_position(1)
   svc.get_pending_sync_positions()
@@ -36,6 +37,7 @@ def test_position_methods_delegate_to_position_repo():
   names = [c[0] for c in positions.calls]
   assert names == [
     "get_open_positions_by_strategy",
+    "get_open_positions_for_flat",
     "update_position_status",
     "get_position",
     "get_pending_sync_positions",
