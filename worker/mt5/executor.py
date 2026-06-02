@@ -80,6 +80,55 @@ class MT5Executor:
       return []
     return [p for p in positions if p.magic == self.magic_number]
 
+  def get_all_open_positions(self) -> List[Any]:
+    """Return all open positions across all symbols, filtered by magic number."""
+    positions = self._mt5.positions_get()
+    if positions is None:
+      return []
+    return [p for p in positions if p.magic == self.magic_number]
+
+  def close_single_position(self, pos: Any, reason: str = "FLAT") -> Dict[str, Any]:
+    """Close a single MT5 position object (pos.symbol is already resolved)."""
+    close_type = (
+      self._mt5.ORDER_TYPE_SELL
+      if pos.type == self._mt5.ORDER_TYPE_BUY
+      else self._mt5.ORDER_TYPE_BUY
+    )
+    tick = self._mt5.symbol_info_tick(pos.symbol)
+    price = tick.bid if close_type == self._mt5.ORDER_TYPE_SELL else tick.ask
+
+    request: Dict[str, Any] = {
+      "action": self._mt5.TRADE_ACTION_DEAL,
+      "symbol": pos.symbol,
+      "volume": float(pos.volume),
+      "type": close_type,
+      "position": pos.ticket,
+      "price": float(price),
+      "deviation": self.deviation,
+      "magic": self.magic_number,
+      "comment": f"Full Close {reason}",
+      "type_time": self._mt5.ORDER_TIME_GTC,
+      "type_filling": self._mt5.ORDER_FILLING_IOC,
+    }
+
+    logger.info(f"[close_single] Closing ticket {pos.ticket}, vol={pos.volume}, reason={reason}")
+    result = self._mt5.order_send(request)
+
+    if result and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+      logger.info(f"[close_single] Closed ticket {pos.ticket} successfully")
+      return {
+        "success": True,
+        "retcode": result.retcode,
+        "ticket": result.order,
+        "price": result.price,
+        "volume": result.volume,
+        "comment": f"Closed [{reason}]",
+      }
+
+    err = result.comment if result else self._mt5.last_error()
+    logger.error(f"[close_single] Failed to close ticket {pos.ticket}. Error: {err}")
+    return {"success": False, "retcode": -1, "comment": str(err)}
+
   # ------------------------------------------------------------------ #
   #  Entry: Open a new LONG / SHORT position                             #
   # ------------------------------------------------------------------ #

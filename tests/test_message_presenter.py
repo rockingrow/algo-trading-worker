@@ -20,6 +20,7 @@ def test_order_filled_contains_key_fields():
   )
   assert "Order Filled" in msg
   assert "XAUUSD" in msg
+  assert "strat-1" in msg
   assert "FOOTER" in msg
   assert msg.startswith("<pre>") and msg.endswith("</pre>")
 
@@ -30,6 +31,7 @@ def test_order_failed_contains_error():
     signal, {"comment": "rejected", "retcode": 10016, "price": None}, "FOOTER"
   )
   assert "Order Failed" in msg
+  assert "strat-1" in msg
   assert "rejected" in msg
   assert "10016" in msg
 
@@ -37,10 +39,12 @@ def test_order_failed_contains_error():
 def test_force_closed_message():
   msg = TradeMessagePresenter.force_closed(
     "XAUUSD",
+    "strat-1",
     {"price": 1999.0, "volume": 0.2, "ticket": 7, "source_ticket": 3},
     "FOOTER",
   )
   assert "Force Closed" in msg
+  assert "strat-1" in msg
   assert "7" in msg and "3" in msg
 
 
@@ -61,3 +65,15 @@ def test_startup_message_includes_config():
 
 def test_shutdown_message():
   assert "Disconnected" in TradeMessagePresenter.shutdown("FOOTER")
+
+
+def test_admin_flat_closed_contains_key_fields():
+  db_pos = {"symbol": "XAUUSD", "strategy": "strat-A", "source_ticket": 10}
+  result = {"price": 2001.5, "volume": 0.5, "ticket": 999}
+  msg = TradeMessagePresenter.admin_flat_closed(db_pos, result, "FOOTER")
+  assert "Admin FLAT" in msg
+  assert "XAUUSD" in msg
+  assert "strat-A" in msg
+  assert "2001.5" in msg
+  assert "10" in msg
+  assert "FOOTER" in msg

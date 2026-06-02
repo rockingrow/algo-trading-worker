@@ -46,10 +46,11 @@ class TradeMessagePresenter:
     return _box(f"🛑 <b>[Disconnected] MT5 Worker</b>{footer}")
 
   @staticmethod
-  def force_closed(symbol: str, fc: dict, footer: str) -> str:
+  def force_closed(symbol: str, strategy: str, fc: dict, footer: str) -> str:
     return _box(
       f"⚠️ <b>Force Closed (New Entry)</b>\n\n"
       f"Symbol: <b>{symbol}</b>\n"
+      f"Strategy: <b>{strategy}</b>\n"
       f"Price: <b>{fc.get('price')}</b>\n"
       f"Volume: <b>{format_volume(fc.get('volume'), auto_calculated=False)}</b>\n"
       f"Ticket: <b>{fc.get('ticket')}</b>\n"
@@ -65,6 +66,7 @@ class TradeMessagePresenter:
     return _box(
       f"✅ <b>Order Filled</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
+      f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
       f"Volume: <b>{format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
@@ -79,9 +81,24 @@ class TradeMessagePresenter:
     return _box(
       f"❌ <b>Order Failed</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
+      f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
       f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
+      f"{_DIVIDER}\n"
+      f"{footer}"
+    )
+
+  @staticmethod
+  def admin_flat_closed(db_pos: dict, result: dict, footer: str) -> str:
+    return _box(
+      f"⚡ <b>Admin FLAT Closed</b>\n\n"
+      f"Symbol: <b>{db_pos['symbol']}</b>\n"
+      f"Strategy: <b>{db_pos['strategy']}</b>\n"
+      f"Price: <b>{result.get('price')}</b>\n"
+      f"Volume: <b>{result.get('volume')} lot</b>\n"
+      f"Ticket: <b>{result.get('ticket')}</b>\n"
+      f"Source Ticket: <b>{db_pos['source_ticket']}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

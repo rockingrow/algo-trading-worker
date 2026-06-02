@@ -166,6 +166,32 @@ class PositionRepository:
       logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
       return []
 
+  def get_open_positions_for_flat(
+    self,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None,
+  ) -> list:
+    """Fetch all OPENED/TP1 positions, optionally filtered by strategy and/or symbol."""
+    try:
+      conn = _get_conn()
+      conn.row_factory = sqlite3.Row
+      cursor = conn.cursor()
+      conditions = ["status IN ('OPENED', 'TP1')"]
+      params: list = []
+      if strategy:
+        conditions.append("strategy = ?")
+        params.append(strategy)
+      if symbol:
+        conditions.append("symbol = ?")
+        params.append(symbol)
+      cursor.execute(f"SELECT * FROM positions WHERE {' AND '.join(conditions)}", params)
+      rows = cursor.fetchall()
+      conn.close()
+      return [dict(row) for row in rows]
+    except Exception as e:
+      logger.exception(f"Failed to fetch open positions for flat (strategy={strategy}, symbol={symbol}): {e}")
+      return []
+
 
 class NotificationOutboxRepository:
   """Enqueues, fetches, and retires rows in the notification outbox."""

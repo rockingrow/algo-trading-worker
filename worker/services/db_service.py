@@ -71,6 +71,13 @@ class DBService:
   def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
     return self.positions.get_open_positions_by_strategy(strategy, symbol)
 
+  def get_open_positions_for_flat(
+    self,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None,
+  ) -> list:
+    return self.positions.get_open_positions_for_flat(strategy=strategy, symbol=symbol)
+
   # ── Notification outbox delegation ───────────────────────────────────── #
 
   def enqueue_notification(

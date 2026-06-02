@@ -48,6 +48,7 @@ from worker.logger import get_logger
 from worker.mt5.bridge import MT5
 from worker.mt5.executor import MT5Executor
 from worker.mt5.message_presenter import TradeMessagePresenter
+from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalSchema
@@ -270,8 +271,94 @@ class Mt5SignalProcessor:
     for subject, raw in self.subscriber.listen(stop_event=stop_event):
       self._process_message(subject, raw)
 
+  def _handle_admin_message(self, raw: str) -> None:
+    try:
+      admin = AdminSignalSchema(**json.loads(raw))
+    except (json.JSONDecodeError, ValidationError) as err:
+      log.error("[ADMIN] Parse error: %s", err)
+      return
+
+    if admin.action != AdminActionEnum.FLAT:
+      log.warning("[ADMIN] Unknown action: %s", admin.action)
+      return
+
+    worker_account_id = str(self.settings["mt5_login"])
+    if admin.account_id and admin.account_id != worker_account_id:
+      log.info(
+        "[ADMIN FLAT] Skipping: account_id=%s does not match worker account=%s",
+        admin.account_id,
+        worker_account_id,
+      )
+      return
+
+    if not _ensure_mt5_connected(self.bridge, self.ctx.notifier, self._footer, log):
+      return
+
+    db_positions = self.ctx.db_service.get_open_positions_for_flat(
+      strategy=admin.strategy,
+      symbol=admin.symbol,
+    )
+    if not db_positions:
+      log.warning(
+        "[ADMIN FLAT] No open positions (strategy=%s, symbol=%s)",
+        admin.strategy,
+        admin.symbol,
+      )
+      return
+
+    log.info(
+      "[ADMIN FLAT] Closing %d position(s) (strategy=%s, symbol=%s)",
+      len(db_positions),
+      admin.strategy,
+      admin.symbol,
+    )
+
+    db_ticket_map = {pos["ticket"]: pos for pos in db_positions}
+    all_mt5 = self.executor.get_all_open_positions()
+    mt5_to_close = [p for p in all_mt5 if p.ticket in db_ticket_map]
+
+    mt5_tickets = {p.ticket for p in mt5_to_close}
+    for db_pos in db_positions:
+      if db_pos["ticket"] not in mt5_tickets:
+        log.warning(
+          "[ADMIN FLAT] ticket=%s in DB but not in MT5 — marking FLATTED",
+          db_pos["ticket"],
+        )
+        self.ctx.db_service.update_position_status(
+          source_ticket=db_pos["source_ticket"],
+          status=PositionStatusEnum.FLATTED,
+          comment="Admin FLAT (position already closed in MT5)",
+          message=raw,
+        )
+
+    for pos in mt5_to_close:
+      db_pos = db_ticket_map[pos.ticket]
+      result = self.executor.close_single_position(pos, reason="FLAT")
+      if result.get("success"):
+        self.ctx.db_service.update_position_status(
+          source_ticket=db_pos["source_ticket"],
+          status=PositionStatusEnum.FLATTED,
+          new_ticket=result.get("ticket"),
+          closed_price=result.get("price"),
+          mt5_retcode=result.get("retcode"),
+          comment=result.get("comment", ""),
+          message=raw,
+        )
+        self.ctx.channel_notifier.send_message(
+          TradeMessagePresenter.admin_flat_closed(
+            db_pos, result, self.bridge.get_account_footer()
+          )
+        )
+      else:
+        log.error(
+          "[ADMIN FLAT] Failed to close ticket=%s: %s",
+          pos.ticket,
+          result.get("comment"),
+        )
+
   def _process_message(self, subject, raw) -> None:
     if subject == NatsSubjectEnum.ADMIN:
+      self._handle_admin_message(raw)
       return
     try:
       signal = SignalSchema(**json.loads(raw))
@@ -318,7 +405,7 @@ class Mt5SignalProcessor:
       for fc in result.get("forced_closed", []):
         self.ctx.channel_notifier.send_message(
           TradeMessagePresenter.force_closed(
-            signal.symbol, fc, self.bridge.get_account_footer()
+            signal.symbol, signal.strategy, fc, self.bridge.get_account_footer()
           )
         )
 
