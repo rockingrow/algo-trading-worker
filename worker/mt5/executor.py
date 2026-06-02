@@ -105,16 +105,21 @@ class MT5Executor:
     if self._config.volume_decision_enabled:
       # Fixed capital mode: ignore payload quantity, derive lot from config
       if signal.sl:
+        risk = (
+          signal.risk_percent
+          if signal.risk_percent is not None
+          else self._config.risk_percentage
+        )
         volume = self.calculate_lot_size(
           symbol,
           price,
           signal.sl,
-          self._config.risk_percentage,
+          risk,
           capital=self._config.capital,
         )
         logger.info(
           f"[open_position] VOLUME_DECISION mode | capital={self._config.capital} "
-          f"risk={self._config.risk_percentage}% → lot={volume}"
+          f"risk={risk}% (source={'signal' if signal.risk_percent is not None else 'config'}) → lot={volume}"
         )
       else:
         sym_info = self._mt5.symbol_info(symbol)
