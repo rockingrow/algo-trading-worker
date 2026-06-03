@@ -11,6 +11,14 @@ from worker.schemas.signal_schema import SignalSchema
 
 logger = get_logger("worker.mt5_executor")
 
+_MT5_COMMENT_MAX = 31
+
+
+def _mt5_error_code(err) -> int:
+  """mt5.last_error() returns (code, description); extract just the int."""
+  return err[0] if isinstance(err, tuple) else int(err)
+
+
 
 class MT5Executor:
   """Sends trade orders to the MT5 broker: open, partial-close, SL update, and
@@ -25,7 +33,6 @@ class MT5Executor:
 
   def __init__(
     self,
-    magic_number: int,
     slippage_deviation: int,
     config: ExecutionConfig,
     mt5_api: Optional[Mt5GatewayProtocol] = None,
@@ -33,11 +40,11 @@ class MT5Executor:
     lot_sizer: Optional[LotSizer] = None,
     stop_validator: Optional[StopValidator] = None,
     db: Optional[PositionStoreProtocol] = None,
+    strategy_magic_map: Optional[Dict[str, int]] = None,
   ) -> None:
     if mt5_api is None:
       import MetaTrader5 as mt5_api  # lazy: native extension only needed at runtime
 
-    self.magic_number = magic_number
     self.deviation = slippage_deviation
     self._config = config
     self._mt5 = mt5_api
@@ -48,6 +55,33 @@ class MT5Executor:
     # the authoritative `strategy` column. Optional so the executor stays unit-
     # testable without a DB (it then falls back to the comment stamp).
     self._db = db
+    # Maps strategy name → its dedicated MT5 magic number. A strategy present
+    # here is stamped with — and filtered by — its own magic, giving native
+    # MT5-level isolation without a DB lookup.
+    self._strategy_magic_map: Dict[str, int] = strategy_magic_map or {}
+
+  # ------------------------------------------------------------------ #
+  #  Magic-number resolution                                            #
+  # ------------------------------------------------------------------ #
+
+  def _magic_for(self, strategy: Optional[str]) -> int:
+    """Resolve the magic number a *strategy* trades under.
+
+    Returns the strategy's dedicated magic. Raises KeyError if not mapped.
+    """
+    if not strategy:
+      raise ValueError("Strategy must be provided to resolve magic number.")
+    if strategy not in self._strategy_magic_map:
+      raise KeyError(f"Strategy '{strategy}' not found in strategy_magic_map.")
+    return self._strategy_magic_map[strategy]
+
+  def owned_magics(self) -> set:
+    """All magic numbers this worker owns: every mapped magic.
+
+    Used to recognise every position this worker may have opened across all
+    strategies (e.g. account-wide queries and terminal-close detection).
+    """
+    return set(self._strategy_magic_map.values())
 
   # ------------------------------------------------------------------ #
   #  Delegated helpers (kept on the executor to satisfy the protocol)   #
@@ -81,55 +115,44 @@ class MT5Executor:
   def get_open_positions(
     self, symbol: str, strategy: Optional[str] = None
   ) -> List[Any]:
-    """Return open positions for the resolved symbol (filtered by magic).
+    """Return open positions for the resolved symbol, scoped to this worker.
 
     When *strategy* is given, keep only the positions that belong to that
-    strategy so strategies trading the same symbol stay isolated. Membership is
-    resolved against the ``strategy`` column in the positions table
-    (``get_open_positions_by_strategy``), matching live MT5 tickets to the
-    tickets that column records for the strategy.
+    strategy so strategies trading the same symbol stay isolated.
+    The isolation is native at the MT5 level via `strategy_magic_map`, no DB lookup needed.
+
+    When *strategy* is None, every position this worker owns (any of
+    ``owned_magics``) for the symbol is returned.
     """
     resolved = self.get_symbol(symbol)
     positions = self._mt5.positions_get(symbol=resolved)
     if positions is None:
       return []
-    result = [p for p in positions if p.magic == self.magic_number]
-    if strategy is not None:
-      result = self._filter_by_strategy(result, symbol, strategy)
-    return result
 
-  def _filter_by_strategy(
-    self, positions: List[Any], symbol: str, strategy: str
-  ) -> List[Any]:
-    """Keep only *positions* whose ticket is recorded under *strategy* in the
-    positions table.
+    if strategy is None:
+      owned = self.owned_magics()
+      return [p for p in positions if p.magic in owned]
 
-    Both ``ticket`` and ``source_ticket`` are considered so a position that was
-    re-ticketed after a partial close still matches.
+    magic = self._magic_for(strategy)
+    return [p for p in positions if p.magic == magic]
+
+  def get_all_open_positions(self, strategy: Optional[str] = None) -> List[Any]:
+    """Return all open positions across all symbols owned by this worker.
+
+    Filters by every magic number this worker owns (base + mapped), so
+    positions opened under any strategy's dedicated magic are included.
+    When *strategy* is given, only positions belonging to that strategy are returned.
     """
-    if self._db is None:
-      logger.warning(
-        "[get_open_positions] strategy filter requested for '%s' but no DB is "
-        "configured — returning magic-filtered positions without strategy scope.",
-        strategy,
-      )
-      return positions
-
-    db_rows = self._db.get_open_positions_by_strategy(strategy, symbol)
-    owned_tickets: set = set()
-    for row in db_rows:
-      for key in ("ticket", "source_ticket"):
-        value = row.get(key)
-        if value is not None:
-          owned_tickets.add(value)
-    return [p for p in positions if p.ticket in owned_tickets]
-
-  def get_all_open_positions(self) -> List[Any]:
-    """Return all open positions across all symbols, filtered by magic number."""
     positions = self._mt5.positions_get()
     if positions is None:
       return []
-    return [p for p in positions if p.magic == self.magic_number]
+
+    if strategy is None:
+      owned = self.owned_magics()
+      return [p for p in positions if p.magic in owned]
+
+    magic = self._magic_for(strategy)
+    return [p for p in positions if p.magic == magic]
 
   def close_single_position(self, pos: Any, reason: str = "FLAT") -> Dict[str, Any]:
     """Close a single MT5 position object (pos.symbol is already resolved)."""
@@ -149,7 +172,7 @@ class MT5Executor:
       "position": pos.ticket,
       "price": float(price),
       "deviation": self.deviation,
-      "magic": self.magic_number,
+      "magic": pos.magic,  # close deal inherits the position's own magic
       "comment": f"Full Close {reason}",
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
@@ -235,8 +258,8 @@ class MT5Executor:
       "type": order_type,
       "price": float(price),
       "deviation": self.deviation,
-      "magic": self.magic_number,
-      "comment": f"TV {signal.action.value}",
+      "magic": self._magic_for(signal.strategy),
+      "comment": f"{signal.strategy} {(signal.signal_id or '')[-2:]}".strip()[:_MT5_COMMENT_MAX - 1],
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
@@ -260,7 +283,7 @@ class MT5Executor:
       logger.error(f"order_send failed. error code: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": self._mt5.last_error(),
+        "retcode": _mt5_error_code(self._mt5.last_error()),
         "comment": "Send Failed",
       }
 
@@ -337,7 +360,7 @@ class MT5Executor:
       "position": pos.ticket,  # CRITICAL: links close to specific ticket
       "price": float(price),
       "deviation": self.deviation,
-      "magic": self.magic_number,
+      "magic": pos.magic,  # close deal inherits the position's own magic
       "comment": "Partial Close TP1",
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
@@ -350,7 +373,7 @@ class MT5Executor:
       logger.error(f"partial_close order_send failed. error: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": self._mt5.last_error(),
+        "retcode": _mt5_error_code(self._mt5.last_error()),
         "comment": "Send Failed",
       }
 
@@ -413,7 +436,7 @@ class MT5Executor:
       logger.error(f"update_sl order_send failed. error: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": self._mt5.last_error(),
+        "retcode": _mt5_error_code(self._mt5.last_error()),
         "comment": "SL Update Failed",
       }
 
@@ -472,7 +495,7 @@ class MT5Executor:
         "position": pos.ticket,
         "price": float(price),
         "deviation": self.deviation,
-        "magic": self.magic_number,
+        "magic": pos.magic,  # close deal inherits the position's own magic
         "comment": f"Full Close {reason}",
         "type_time": self._mt5.ORDER_TIME_GTC,
         "type_filling": self._mt5.ORDER_FILLING_IOC,
@@ -507,37 +530,3 @@ class MT5Executor:
       "retcode": -1,
       "comment": f"Failed to close positions [{reason}]",
     }
-
-  # ------------------------------------------------------------------ #
-  #  Legacy / Convenience: keep execute_signal + close_position intact   #
-  # ------------------------------------------------------------------ #
-
-  def execute_signal(self, signal: SignalSchema) -> Dict[str, Any]:
-    """
-    Legacy single-entry dispatcher kept for backward compatibility.
-    Prefer using SignalHandler which applies full action-specific logic.
-    """
-    action_str = signal.action.value
-
-    if action_str in ("TP2", "SL", "R_SL"):
-      return self.close_all_positions(
-        signal.symbol, reason=action_str, strategy=signal.strategy
-      )
-
-    if action_str == "TP1":
-      close_vol = self.convert_quantity_to_lots(signal.symbol, signal.quantity)
-      return self.partial_close_position(
-        signal.symbol, close_vol, strategy=signal.strategy
-      )
-
-    # LONG / SHORT
-    return self.open_position(signal)
-
-  def close_position(self, signal: SignalSchema) -> Dict[str, Any]:
-    """
-    Backward-compatible wrapper. Delegates to close_all_positions which
-    uses actual MT5 volume — not the webhook quantity.
-    """
-    return self.close_all_positions(
-      signal.symbol, reason=signal.action.value, strategy=signal.strategy
-    )

@@ -44,7 +44,9 @@ class SignalHandler:
   - Returning a structured result dict so the caller can log/notify.
   """
 
-  def __init__(self, strategy: BaseMarketStrategy, db_service: PositionStoreProtocol) -> None:
+  def __init__(
+    self, strategy: BaseMarketStrategy, db_service: PositionStoreProtocol
+  ) -> None:
     self.strategy = strategy
     self._db = db_service
     # Action → handler dispatch table. Adding a new action group means adding an
@@ -55,13 +57,16 @@ class SignalHandler:
       SignalActionEnum.SHORT: self._handle_entry,
       SignalActionEnum.TP1: self._handle_tp1,
       **dict.fromkeys(_FULL_CLOSE_ACTIONS, self._handle_full_close),
+      SignalActionEnum.FLAT: self._handle_flat,
     }
 
   # ------------------------------------------------------------------ #
   #  SQLite lookup helper                                                #
   # ------------------------------------------------------------------ #
 
-  def _get_db_position(self, strategy_name: str, symbol: str) -> Optional[Dict[str, Any]]:
+  def _get_db_position(
+    self, strategy_name: str, symbol: str
+  ) -> Optional[Dict[str, Any]]:
     """Return the single open/TP1 position for strategy_name+symbol from SQLite, or None.
 
     Invariant: at most one active position per (strategy, symbol) should exist
@@ -214,13 +219,15 @@ class SignalHandler:
           mt5_retcode=cleanup.get("retcode"),
           comment="Force-closed by new entry signal",
         )
-        forced_closed.append({
-          "source_ticket": pos["source_ticket"],
-          "ticket": pos["ticket"],
-          "price": cleanup.get("price"),
-          "volume": pos.get("volume"),
-          "retcode": cleanup.get("retcode"),
-        })
+        forced_closed.append(
+          {
+            "source_ticket": pos["source_ticket"],
+            "ticket": pos["ticket"],
+            "price": cleanup.get("price"),
+            "volume": pos.get("volume"),
+            "retcode": cleanup.get("retcode"),
+          }
+        )
       logger.info(
         f"[SignalHandler._handle_entry] Stale positions cleared, "
         f"{len(db_stale)} DB record(s) marked FORCED_CLOSED."
@@ -288,4 +295,64 @@ class SignalHandler:
         f"[SignalHandler._handle_full_close] Full close FAILED | "
         f"action={signal.action.value} retcode={result.get('retcode')} comment={result.get('comment')}"
       )
+    return result
+
+  def _handle_flat(self, signal: SignalSchema) -> TradeResult:
+    """FLAT: close all MT5 positions regardless of DB state, then sync DB.
+
+    Unlike TP2/SL/R_SL, FLAT must not be gated on a DB record. When the DB
+    is out of sync (position exists in MT5 but not in DB), other full-close
+    handlers would bail early and leave the position open. FLAT always
+    attempts the MT5 close first, then reconciles the DB afterward.
+    """
+    result = self.strategy.close_all_positions(
+      signal.symbol, reason="FLAT", strategy=signal.strategy
+    )
+
+    if not result.get("success"):
+      # Strategy-scoped lookup may have returned empty because the DB is out of
+      # sync (positions exist in MT5 but have no DB record, so _filter_by_strategy
+      # drops them). Retry without the strategy filter to catch those positions.
+      logger.warning(
+        "[SignalHandler._handle_flat] Strategy-scoped close found no positions for "
+        "strategy=%s symbol=%s — retrying without strategy filter (DB may be out of sync)",
+        signal.strategy,
+        signal.symbol,
+      )
+      result = self.strategy.close_all_positions(
+        signal.symbol, reason="FLAT", strategy=None
+      )
+
+    if result.get("success"):
+      db_pos = self._get_db_position(signal.strategy, signal.symbol)
+      if db_pos:
+        result["source_ticket"] = db_pos["source_ticket"]
+      logger.info(
+        "[SignalHandler._handle_flat] FLAT OK | source_ticket=%s vol=%s price=%s",
+        result.get("source_ticket"),
+        result.get("volume"),
+        result.get("price"),
+      )
+      return result
+
+    # MT5 had no positions to close — check if DB has a stale open record
+    db_pos = self._get_db_position(signal.strategy, signal.symbol)
+    if db_pos:
+      logger.warning(
+        "[SignalHandler._handle_flat] No MT5 positions but DB has open record — "
+        "marking source_ticket=%s as FLATTED",
+        db_pos["source_ticket"],
+      )
+      self._db.update_position_status(
+        source_ticket=db_pos["source_ticket"],
+        status=PositionStatusEnum.FLATTED,
+        comment="FLAT signal: position not found in MT5 — DB synced",
+        message=signal.model_dump_json(),
+      )
+
+    logger.error(
+      "[SignalHandler._handle_flat] FLAT FAILED | retcode=%s comment=%s",
+      result.get("retcode"),
+      result.get("comment"),
+    )
     return result

@@ -72,20 +72,30 @@ def test_migration_is_idempotent():
   _apply_migrations(conn)  # running twice must not raise
 
 
-def test_migration_deduplicates_opened_rows():
+def test_migration_on_clean_db_preserves_active_rows():
+  # The migration assumes the DB is already clean (at most one active row per
+  # strategy+symbol). It does not deduplicate — it only creates the index and
+  # must leave existing, non-conflicting rows untouched.
   conn = _make_db()
   _insert(conn, source_ticket=1, strategy="strat-a", symbol="XAUUSD", status="OPENED")
-  _insert(conn, source_ticket=2, strategy="strat-a", symbol="XAUUSD", status="OPENED")
-  _insert(conn, source_ticket=3, strategy="strat-a", symbol="XAUUSD", status="TP1")
+  _insert(conn, source_ticket=2, strategy="strat-a", symbol="EURUSD", status="TP1")
 
   _apply_migrations(conn)
 
-  active = [r for r in _rows(conn) if r["status"] in ("OPENED", "TP1")]
-  forced = [r for r in _rows(conn) if r["status"] == "FORCED_CLOSED"]
-  assert len(active) == 1
-  assert active[0]["source_ticket"] == 1  # oldest (MIN id) kept
-  assert len(forced) == 2
-  assert {r["source_ticket"] for r in forced} == {2, 3}
+  statuses = {r["source_ticket"]: r["status"] for r in _rows(conn)}
+  assert statuses == {1: "OPENED", 2: "TP1"}  # both preserved, no FORCED_CLOSED
+
+
+def test_migration_raises_on_preexisting_duplicate_active_rows():
+  # Contract: the migration no longer self-heals duplicates. If a DB already
+  # violates the one-active-per-(strategy, symbol) invariant, creating the
+  # unique index fails — the operator must clean the data first.
+  conn = _make_db()
+  _insert(conn, source_ticket=1, strategy="strat-a", symbol="XAUUSD", status="OPENED")
+  _insert(conn, source_ticket=2, strategy="strat-a", symbol="XAUUSD", status="OPENED")
+
+  with pytest.raises(sqlite3.IntegrityError):
+    _apply_migrations(conn)
 
 
 def test_migration_leaves_closed_rows_untouched():
@@ -137,3 +147,36 @@ def test_unique_index_allows_different_strategies_on_same_symbol():
   _insert(conn, source_ticket=2, strategy="strat-short", symbol="XAUUSD", status="OPENED")
   # Different strategies → allowed (this is the multi-strategy use-case)
   assert len([r for r in _rows(conn) if r["status"] == "OPENED"]) == 2
+
+
+def test_migration_adds_magic_column():
+  conn = _make_db()
+  _apply_migrations(conn)
+  columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
+  assert "magic" in columns
+
+
+def test_migration_magic_column_is_idempotent():
+  conn = _make_db()
+  _apply_migrations(conn)
+  _apply_migrations(conn)  # second run must not raise
+
+
+def test_magic_column_stores_and_reads_integer():
+  conn = _make_db()
+  _apply_migrations(conn)
+  conn.execute(
+    "INSERT INTO positions (source_ticket, ticket, strategy, symbol, status, magic) VALUES (?,?,?,?,?,?)",
+    (10, 10, "strat-a", "XAUUSD", "OPENED", 12345),
+  )
+  conn.commit()
+  row = dict(conn.execute("SELECT magic FROM positions WHERE source_ticket = 10").fetchone())
+  assert row["magic"] == 12345
+
+
+def test_magic_column_nullable_for_old_rows():
+  conn = _make_db()
+  _apply_migrations(conn)
+  _insert(conn, source_ticket=20, strategy="strat-b", symbol="EURUSD", status="OPENED")
+  row = dict(conn.execute("SELECT magic FROM positions WHERE source_ticket = 20").fetchone())
+  assert row["magic"] is None

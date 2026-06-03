@@ -59,6 +59,9 @@ class FakeExecutor:
   def get_all_open_positions(self):
     return list(self._all)
 
+  def get_open_positions(self, symbol, strategy=None):
+    return list(self._all)
+
   def close_single_position(self, pos, reason="FLAT"):
     self.closed.append(pos)
     return dict(self._close_result)
@@ -151,13 +154,14 @@ def test_no_filters_queries_all():
   assert proc.db.flat_calls[0] == {"strategy": None, "symbol": None}
 
 
-# ── Empty DB result short-circuits ────────────────────────────────────────── #
+# ── MT5-first: no DB records does not prevent MT5 close ───────────────────── #
 
 
-def test_no_db_positions_skips_close():
+def test_mt5_positions_closed_even_with_no_db_records():
   proc = FakeProc(db_positions=[], mt5_positions=[_mt5_pos(ticket=1)])
   proc._handle_admin_message(_payload())
-  assert proc.executor.closed == []
+  assert len(proc.executor.closed) == 1  # MT5 position IS closed
+  assert proc.db.status_updates == []    # no DB records to reconcile
 
 
 # ── Successful close ──────────────────────────────────────────────────────── #

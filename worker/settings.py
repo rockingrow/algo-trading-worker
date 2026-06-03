@@ -40,7 +40,7 @@ class Settings(BaseSettings):
   mt5_name: Optional[str] = None
 
   # Strategy configuration
-  magic_number: int = 20260409
+  strategy_magic_map: dict[str, int] = {}
   slippage_deviation: int = 20
 
   # Init capital and risk management

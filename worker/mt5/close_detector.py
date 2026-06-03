@@ -172,11 +172,15 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
 
 
 def scan_terminal_closed_positions(
-  magic_number: int,
+  magic_numbers: Set[int],
   seen_tickets: Set[int],
 ) -> List[TerminalClosedEvent]:
   """
   Diff current open positions against *seen_tickets*.
+
+  *magic_numbers* is the set of every magic this worker owns (base plus any
+  per-strategy magics), so positions opened under a strategy's dedicated magic
+  are tracked too.
 
   For every ticket that disappeared, query deal history to determine whether
   the close was terminal-initiated (SL, TP, stop-out, manual).  Only those
@@ -195,7 +199,7 @@ def scan_terminal_closed_positions(
     )
     return []
 
-  current_tickets: Set[int] = {p.ticket for p in positions if p.magic == magic_number}
+  current_tickets: Set[int] = {p.ticket for p in positions if p.magic in magic_numbers}
   disappeared = seen_tickets - current_tickets
   events: List[TerminalClosedEvent] = []
 

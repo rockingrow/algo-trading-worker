@@ -58,7 +58,7 @@ class FakeStore:
     (SignalActionEnum.TP2, "full_close"),
     (SignalActionEnum.SL, "full_close"),
     (SignalActionEnum.R_SL, "full_close"),
-    (SignalActionEnum.FLAT, "full_close"),
+    (SignalActionEnum.FLAT, "close_all:FLAT:strat-1"),
   ],
 )
 def test_dispatch_routes_every_action(action, expected):
@@ -78,6 +78,27 @@ def test_flat_routes_through_handler():
   res = handler.handle(make_signal(SignalActionEnum.FLAT))
   assert res["success"] is True
   assert res["source_ticket"] == 9
+
+
+def test_flat_closes_mt5_when_no_db_record():
+  """FLAT must close MT5 positions even when the DB has no tracked record."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=99)])
+  store = FakeStore(positions=[])  # empty DB
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.FLAT))
+  assert res["success"] is True
+  assert "close_all:FLAT:strat-1" in strat.calls
+
+
+def test_flat_syncs_stale_db_record_when_no_mt5_positions():
+  """FLAT must mark stale DB records as FLATTED when MT5 has no open positions."""
+  strat = FakeStrategy(open_positions=[], cleanup_ok=False)
+  store = FakeStore(positions=[{"source_ticket": 7, "ticket": 7, "status": "OPENED"}])
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.FLAT))
+  assert res["success"] is False
+  assert store.status_updates[0]["source_ticket"] == 7
+  assert store.status_updates[0]["status"] == PositionStatusEnum.FLATTED
 
 
 def test_entry_no_stale_position():

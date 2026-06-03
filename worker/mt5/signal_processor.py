@@ -185,10 +185,10 @@ class Mt5SignalProcessor:
 
     self.config = ExecutionConfig.from_dict(settings_dict)
     self.executor = MT5Executor(
-      magic_number=settings_dict["magic_number"],
       slippage_deviation=settings_dict["slippage_deviation"],
       config=self.config,
       db=ctx.db_service,
+      strategy_magic_map=settings_dict.get("strategy_magic_map") or {},
     )
     self.strategy = MarketStrategyFactory.create(
       executor=self.executor, config=self.config
@@ -252,7 +252,7 @@ class Mt5SignalProcessor:
     ).start()
 
     MT5EventJob(
-      magic_number=self.settings["magic_number"],
+      magic_numbers=self.executor.owned_magics(),
       db_service=self.ctx.db_service,
       notifier=self.ctx.channel_notifier,
     ).start(stop_event=stop_event)
@@ -264,6 +264,7 @@ class Mt5SignalProcessor:
       account_info_fn=self.bridge.get_account_status,
       account_name=self.settings.get("mt5_name"),
       market_type=self.settings.get("market_type"),
+      strategy_magic_map=self.settings.get("strategy_magic_map") or {},
     ).start(stop_event=stop_event)
 
   # ── Main loop ────────────────────────────────────────────────────────── #
@@ -295,49 +296,66 @@ class Mt5SignalProcessor:
     if not _ensure_mt5_connected(self.bridge, self.ctx.notifier, self._footer, log):
       return
 
+    # Step 1: Query MT5 by parameters and close positions first.
+    # Do NOT gate on DB state — MT5 is the source of truth for live positions.
+    if admin.symbol:
+      mt5_positions = self.executor.get_open_positions(admin.symbol, strategy=admin.strategy)
+    else:
+      mt5_positions = self.executor.get_all_open_positions(strategy=admin.strategy)
+
+    if not mt5_positions:
+      log.warning(
+        "[ADMIN FLAT] No open MT5 positions found (strategy=%s, symbol=%s)",
+        admin.strategy, admin.symbol,
+      )
+    else:
+      log.info(
+        "[ADMIN FLAT] Closing %d MT5 position(s) (strategy=%s, symbol=%s)",
+        len(mt5_positions), admin.strategy, admin.symbol,
+      )
+
+    attempted_tickets: set[int] = set()
+    closed_tickets: set[int] = set()
+    close_results: dict[int, dict] = {}
+
+    for pos in mt5_positions:
+      attempted_tickets.add(pos.ticket)
+      result = self.executor.close_single_position(pos, reason="FLAT")
+      if result.get("success"):
+        closed_tickets.add(pos.ticket)
+        close_results[pos.ticket] = result
+        log.info(
+          "[ADMIN FLAT] Closed MT5 ticket=%s price=%s vol=%s",
+          pos.ticket, result.get("price"), result.get("volume"),
+        )
+      else:
+        log.error(
+          "[ADMIN FLAT] Failed to close ticket=%s: %s",
+          pos.ticket, result.get("comment"),
+        )
+
+    # Step 2: Reconcile DB — find open records matching closed MT5 tickets and update.
+    # Both ticket and source_ticket are checked so re-ticketed positions (after TP1)
+    # are still matched correctly.
+    # Positions in attempted_tickets but not closed_tickets had a failed close order —
+    # they are still open in MT5, so the DB record is left untouched.
     db_positions = self.ctx.db_service.get_open_positions_for_flat(
       strategy=admin.strategy,
       symbol=admin.symbol,
     )
-    if not db_positions:
-      log.warning(
-        "[ADMIN FLAT] No open positions (strategy=%s, symbol=%s)",
-        admin.strategy,
-        admin.symbol,
-      )
-      return
 
-    log.info(
-      "[ADMIN FLAT] Closing %d position(s) (strategy=%s, symbol=%s)",
-      len(db_positions),
-      admin.strategy,
-      admin.symbol,
-    )
-
-    db_ticket_map = {pos["ticket"]: pos for pos in db_positions}
-    all_mt5 = self.executor.get_all_open_positions()
-    mt5_to_close = [p for p in all_mt5 if p.ticket in db_ticket_map]
-
-    mt5_tickets = {p.ticket for p in mt5_to_close}
     for db_pos in db_positions:
-      if db_pos["ticket"] not in mt5_tickets:
-        log.warning(
-          "[ADMIN FLAT] ticket=%s in DB but not in MT5 — marking FLATTED",
-          db_pos["ticket"],
-        )
+      db_ticket = db_pos.get("ticket")
+      db_source_ticket = db_pos.get("source_ticket")
+      matched_ticket = (
+        db_ticket if db_ticket in closed_tickets
+        else db_source_ticket if db_source_ticket in closed_tickets
+        else None
+      )
+      if matched_ticket is not None:
+        result = close_results[matched_ticket]
         self.ctx.db_service.update_position_status(
-          source_ticket=db_pos["source_ticket"],
-          status=PositionStatusEnum.FLATTED,
-          comment="Admin FLAT (position already closed in MT5)",
-          message=raw,
-        )
-
-    for pos in mt5_to_close:
-      db_pos = db_ticket_map[pos.ticket]
-      result = self.executor.close_single_position(pos, reason="FLAT")
-      if result.get("success"):
-        self.ctx.db_service.update_position_status(
-          source_ticket=db_pos["source_ticket"],
+          source_ticket=db_source_ticket,
           status=PositionStatusEnum.FLATTED,
           new_ticket=result.get("ticket"),
           closed_price=result.get("price"),
@@ -350,11 +368,18 @@ class Mt5SignalProcessor:
             db_pos, result, self.bridge.get_account_footer()
           )
         )
-      else:
-        log.error(
-          "[ADMIN FLAT] Failed to close ticket=%s: %s",
-          pos.ticket,
-          result.get("comment"),
+      elif db_ticket not in attempted_tickets and db_source_ticket not in attempted_tickets:
+        # DB has an open record but the position was never seen in MT5 —
+        # it was already closed externally; sync the DB.
+        log.warning(
+          "[ADMIN FLAT] ticket=%s in DB but not found in MT5 — marking FLATTED",
+          db_ticket,
+        )
+        self.ctx.db_service.update_position_status(
+          source_ticket=db_source_ticket,
+          status=PositionStatusEnum.FLATTED,
+          comment="Admin FLAT (position already closed in MT5)",
+          message=raw,
         )
 
   def _process_message(self, subject, raw) -> None:
@@ -421,6 +446,7 @@ class Mt5SignalProcessor:
           mt5_retcode=result.get("retcode"),
           comment=result.get("comment", ""),
           message=signal_json,
+          magic=self.executor._magic_for(signal.strategy),
         )
       else:
         status = _CLOSE_STATUS_MAP.get(action_val)
