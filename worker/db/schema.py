@@ -70,7 +70,51 @@ def db_init():
                 ON notifications (next_attempt_at, id)
         """)
     conn.commit()
+    _apply_migrations(conn)
     conn.close()
     logger.info("Database initialized successfully.")
   except Exception as e:
     logger.exception(f"Database initialization failed: {e}")
+
+
+def _apply_migrations(conn) -> None:
+  """Run idempotent schema migrations on an existing connection.
+
+  Each migration is guarded so it is safe to re-run on every startup.
+  """
+  cursor = conn.cursor()
+
+  # ── Migration: enforce at most one active position per (strategy, symbol) ──
+  #
+  # Before adding the unique index we deduplicate any existing rows so the
+  # CREATE INDEX does not fail on a DB that was created before this constraint
+  # existed.  The oldest row (MIN id) is kept; any extras are marked
+  # FORCED_CLOSED so they surface in audit queries but no longer block inserts.
+  cursor.execute("""
+      UPDATE positions
+      SET status     = 'FORCED_CLOSED',
+          comment    = 'Deduplicated on startup: multiple active rows for same strategy+symbol',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE status IN ('OPENED', 'TP1')
+        AND id NOT IN (
+            SELECT MIN(id)
+            FROM   positions
+            WHERE  status IN ('OPENED', 'TP1')
+            GROUP  BY strategy, symbol
+        )
+  """)
+  if cursor.rowcount:
+    logger.warning(
+      "[db_migrate] Deduplicated %d orphan active position row(s) before applying unique index.",
+      cursor.rowcount,
+    )
+
+  # Partial unique index: only one OPENED or TP1 row allowed per strategy+symbol.
+  # Closed/force-closed rows are unrestricted.
+  cursor.execute("""
+      CREATE UNIQUE INDEX IF NOT EXISTS uidx_positions_one_active_per_strategy_symbol
+          ON positions (strategy, symbol)
+          WHERE status = 'OPENED' OR status = 'TP1'
+  """)
+  conn.commit()
+

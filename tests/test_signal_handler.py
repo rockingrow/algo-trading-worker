@@ -135,3 +135,28 @@ def test_exit_returns_failure_when_no_live_mt5_position():
   res = handler.handle(make_signal(SignalActionEnum.SL))
   assert res["success"] is False
   assert "full_close" not in strat.calls
+
+
+def test_get_db_position_heals_duplicate_active_rows():
+  """If the DB has > 1 OPENED/TP1 row for the same strategy+symbol, the handler
+  must keep the oldest and immediately mark the rest FORCED_CLOSED."""
+  dup_rows = [
+    {"source_ticket": 10, "ticket": 10, "status": "OPENED"},
+    {"source_ticket": 11, "ticket": 11, "status": "OPENED"},  # duplicate
+    {"source_ticket": 12, "ticket": 12, "status": "TP1"},     # duplicate
+  ]
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=10)])
+  store = FakeStore(positions=dup_rows)
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.TP2))
+
+  # Only source_ticket=10 (oldest) is used; 11 and 12 are healed.
+  assert res.get("source_ticket") == 10
+  healed_tickets = {u["source_ticket"] for u in store.status_updates}
+  assert healed_tickets == {11, 12}
+  assert all(
+    u["status"] == PositionStatusEnum.FORCED_CLOSED
+    for u in store.status_updates
+    if u["source_ticket"] in {11, 12}
+  )

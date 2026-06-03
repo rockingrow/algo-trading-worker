@@ -62,10 +62,32 @@ class SignalHandler:
   # ------------------------------------------------------------------ #
 
   def _get_db_position(self, strategy_name: str, symbol: str) -> Optional[Dict[str, Any]]:
-    """Return the first open/TP1 position for strategy_name+symbol from SQLite, or None."""
+    """Return the single open/TP1 position for strategy_name+symbol from SQLite, or None.
+
+    Invariant: at most one active position per (strategy, symbol) should exist
+    at any time. If more than one is found (data inconsistency from a prior
+    crash), keep the oldest row and mark the extras FORCED_CLOSED so the DB
+    self-heals rather than silently ignoring the duplicates.
+    """
     positions = self._db.get_open_positions_by_strategy(strategy_name, symbol)
     if not positions:
       return None
+    if len(positions) > 1:
+      logger.error(
+        "[SignalHandler] Data inconsistency: %d active DB rows for strategy=%s symbol=%s. "
+        "Keeping source_ticket=%s, marking %d extra(s) FORCED_CLOSED.",
+        len(positions),
+        strategy_name,
+        symbol,
+        positions[0]["source_ticket"],
+        len(positions) - 1,
+      )
+      for dup in positions[1:]:
+        self._db.update_position_status(
+          source_ticket=dup["source_ticket"],
+          status=PositionStatusEnum.FORCED_CLOSED,
+          comment="Duplicate active position — healed by signal handler",
+        )
     return positions[0]
 
   # ------------------------------------------------------------------ #
