@@ -102,10 +102,11 @@ class SignalHandler:
       f"source_ticket={db_pos['source_ticket']} ticket={db_pos['ticket']} status={db_pos['status']}"
     )
 
-    if not self.strategy.get_open_positions(signal.symbol):
+    if not self.strategy.get_open_positions(signal.symbol, strategy=signal.strategy):
       logger.warning(
-        f"[SignalHandler] No live MT5 position for {signal.symbol} "
-        f"action={signal.action.value}. May have been closed already."
+        f"[SignalHandler] No live MT5 position for strategy={signal.strategy} "
+        f"symbol={signal.symbol} action={signal.action.value}. "
+        "May have been closed already."
       )
       return {"success": False, "retcode": -1, "comment": no_mt5_comment}
 
@@ -154,16 +155,22 @@ class SignalHandler:
     2. Open a fresh position via strategy.entry (direction in signal.action).
     """
     symbol = signal.symbol
+    strategy = signal.strategy
 
-    # Step 1 — Pre-flight: close stale positions to start clean
+    # Step 1 — Pre-flight: close this strategy's stale position to start clean.
+    # Scoped to signal.strategy so a concurrent strategy holding a position on
+    # the same symbol (e.g. a Long-only vs a Short-only strategy) is untouched.
     forced_closed: list[dict] = []
-    stale = self.strategy.get_open_positions(symbol)
+    stale = self.strategy.get_open_positions(symbol, strategy=strategy)
     if stale:
       logger.warning(
         f"[SignalHandler._handle_entry] Found {len(stale)} stale position(s) "
-        f"for {symbol}. Force-closing before entering new trade."
+        f"for strategy={strategy} symbol={symbol}. "
+        "Force-closing before entering new trade."
       )
-      cleanup = self.strategy.close_all_positions(symbol, reason="STALE_CLEANUP")
+      cleanup = self.strategy.close_all_positions(
+        symbol, reason="STALE_CLEANUP", strategy=strategy
+      )
       if not cleanup.get("success"):
         logger.error(
           f"[SignalHandler._handle_entry] Failed to clear stale positions: "

@@ -57,6 +57,42 @@ def test_get_open_positions_filters_by_magic(config):
   assert [p.ticket for p in positions] == [1]
 
 
+def test_open_position_stamps_strategy_into_comment(config):
+  mt5 = FakeMt5()
+  ex = _executor(mt5, config)
+  ex.open_position(make_signal(SignalActionEnum.LONG, strategy="trend-v2"))
+  req = mt5.sent_requests[-1]
+  assert req["comment"] == "trend-v2|LONG"
+
+
+def test_get_open_positions_filters_by_strategy(config):
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, magic=42, comment="strat-long|LONG"),
+      make_position(ticket=2, magic=42, comment="strat-short|SHORT"),
+    ]
+  )
+  ex = _executor(mt5, config)
+  positions = ex.get_open_positions("XAUUSD", strategy="strat-short")
+  assert [p.ticket for p in positions] == [2]
+
+
+def test_close_all_positions_only_closes_matching_strategy(config):
+  # Two strategies on the same symbol; closing 'strat-short' must leave the
+  # 'strat-long' position untouched.
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, type_=0, volume=0.7, magic=42, comment="strat-long|LONG"),
+      make_position(ticket=2, type_=1, volume=0.3, magic=42, comment="strat-short|SHORT"),
+    ]
+  )
+  ex = _executor(mt5, config)
+  res = ex.close_all_positions("XAUUSD", reason="TP2", strategy="strat-short")
+  assert res["success"] is True
+  closed_tickets = [r["position"] for r in mt5.sent_requests]
+  assert closed_tickets == [2]  # only the short strategy's ticket was closed
+
+
 def test_partial_close_no_positions(config):
   mt5 = FakeMt5(positions=[])
   ex = _executor(mt5, config)

@@ -28,11 +28,12 @@ class FakeStrategy(BaseMarketStrategy):
     self.calls.append("full_close")
     return {"success": True, "retcode": 0, "volume": 1, "price": 2}
 
-  def get_open_positions(self, symbol):
+  def get_open_positions(self, symbol, strategy=None):
+    self.calls.append(f"get_open:{strategy}")
     return list(self._open)
 
-  def close_all_positions(self, symbol, reason="CLOSE"):
-    self.calls.append(f"close_all:{reason}")
+  def close_all_positions(self, symbol, reason="CLOSE", strategy=None):
+    self.calls.append(f"close_all:{reason}:{strategy}")
     return {"success": self._cleanup_ok, "retcode": 0, "price": 1999.0}
 
 
@@ -93,9 +94,20 @@ def test_entry_force_closes_stale_and_marks_db():
   store = FakeStore(positions=[{"source_ticket": 9, "ticket": 9, "volume": 1.0}])
   handler = SignalHandler(strat, store)
   res = handler.handle(make_signal(SignalActionEnum.LONG))
-  assert "close_all:STALE_CLEANUP" in strat.calls
+  assert "close_all:STALE_CLEANUP:strat-1" in strat.calls
   assert store.status_updates[0]["status"] == PositionStatusEnum.FORCED_CLOSED
   assert res["forced_closed"][0]["source_ticket"] == 9
+
+
+def test_entry_scopes_preflight_to_signal_strategy():
+  """Stale check + force-close must be scoped to the signal's strategy so a
+  concurrent strategy on the same symbol is never touched."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)])
+  store = FakeStore(positions=[{"source_ticket": 9, "ticket": 9, "volume": 1.0}])
+  handler = SignalHandler(strat, store)
+  handler.handle(make_signal(SignalActionEnum.SHORT, strategy="strat-short"))
+  assert "get_open:strat-short" in strat.calls
+  assert "close_all:STALE_CLEANUP:strat-short" in strat.calls
 
 
 def test_entry_aborts_when_cleanup_fails():

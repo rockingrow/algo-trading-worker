@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Per-strategy position isolation on a shared symbol.** When two strategies traded the same symbol at once (e.g. a Long-only and a Short-only strategy), the live MT5 layer filtered positions only by `magic` + `symbol`, so an entry/exit signal for one strategy would fetch — and force-close — the other strategy's position too. The owning strategy is now stamped into the MT5 position `comment` (`"<strategy>|<action>"`, see `worker/mt5/position_comment.py`) and all position queries/closes (`get_open_positions`, `close_all_positions`, `partial_close_position`, `update_position_sl`) accept a `strategy` filter that `SignalHandler` scopes to `signal.strategy`. A new signal now acts only on its own strategy's position.
+
+---
+
 ## [1.0.0] — 2026-06-02
 
 ### Overview

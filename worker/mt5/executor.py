@@ -4,6 +4,7 @@ from worker.core.config import ExecutionConfig
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 from worker.mt5.lot_sizing import LotSizer
+from worker.mt5.position_comment import build_position_comment, comment_matches_strategy
 from worker.mt5.stop_validator import StopValidator
 from worker.mt5.symbol_resolver import SymbolResolver
 from worker.schemas.signal_schema import SignalSchema
@@ -72,13 +73,28 @@ class MT5Executor:
   #  Position Query Helpers                                              #
   # ------------------------------------------------------------------ #
 
-  def get_open_positions(self, symbol: str) -> List[Any]:
-    """Return all open positions for the resolved symbol (filtered by magic)."""
+  def get_open_positions(
+    self, symbol: str, strategy: Optional[str] = None
+  ) -> List[Any]:
+    """Return open positions for the resolved symbol (filtered by magic).
+
+    When *strategy* is given, additionally keep only positions whose comment was
+    stamped with that strategy (see :mod:`worker.mt5.position_comment`). This
+    isolates strategies that trade the same symbol so one strategy's signal
+    never touches another strategy's position.
+    """
     resolved = self.get_symbol(symbol)
     positions = self._mt5.positions_get(symbol=resolved)
     if positions is None:
       return []
-    return [p for p in positions if p.magic == self.magic_number]
+    result = [p for p in positions if p.magic == self.magic_number]
+    if strategy is not None:
+      result = [
+        p
+        for p in result
+        if comment_matches_strategy(getattr(p, "comment", ""), strategy)
+      ]
+    return result
 
   def get_all_open_positions(self) -> List[Any]:
     """Return all open positions across all symbols, filtered by magic number."""
@@ -192,7 +208,7 @@ class MT5Executor:
       "price": float(price),
       "deviation": self.deviation,
       "magic": self.magic_number,
-      "comment": f"TV {signal.action.value}",
+      "comment": build_position_comment(signal.strategy, signal.action.value),
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
@@ -247,15 +263,21 @@ class MT5Executor:
   # ------------------------------------------------------------------ #
 
   def partial_close_position(
-    self, symbol: str, close_volume: float, position_ticket: Optional[int] = None
+    self,
+    symbol: str,
+    close_volume: float,
+    position_ticket: Optional[int] = None,
+    strategy: Optional[str] = None,
   ) -> Dict[str, Any]:
     """
     Partially close a position by sending a counter-direction market order
     with the specified volume. If *position_ticket* is given it targets that
     specific ticket; otherwise closes the first matching magic-number position.
+    When *strategy* is given, only positions belonging to that strategy are
+    considered.
     """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol)
+    positions = self.get_open_positions(symbol, strategy=strategy)
 
     if not positions:
       logger.warning(f"[partial_close] No open positions found for {resolved}")
@@ -323,15 +345,20 @@ class MT5Executor:
     }
 
   def update_position_sl(
-    self, symbol: str, new_sl: float, position_ticket: Optional[int] = None
+    self,
+    symbol: str,
+    new_sl: float,
+    position_ticket: Optional[int] = None,
+    strategy: Optional[str] = None,
   ) -> Dict[str, Any]:
     """
     Update the Stop Loss of an open position to *new_sl* using
     TRADE_ACTION_SLTP. Targets a specific ticket or the first magic-number
-    position found for the symbol.
+    position found for the symbol. When *strategy* is given, only positions
+    belonging to that strategy are considered.
     """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol)
+    positions = self.get_open_positions(symbol, strategy=strategy)
 
     if not positions:
       logger.warning(f"[update_sl] No open positions found for {resolved}")
@@ -380,13 +407,18 @@ class MT5Executor:
   #  TP2 / SL / R_SL: Full close using MT5 actual volume                #
   # ------------------------------------------------------------------ #
 
-  def close_all_positions(self, symbol: str, reason: str = "CLOSE") -> Dict[str, Any]:
+  def close_all_positions(
+    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+  ) -> Dict[str, Any]:
     """
     Close ALL open positions for the symbol at actual MT5 volume.
     Webhook quantity is intentionally ignored to avoid dust-lot errors.
+    When *strategy* is given, only positions belonging to that strategy are
+    closed — positions opened by other strategies on the same symbol are left
+    untouched.
     """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol)
+    positions = self.get_open_positions(symbol, strategy=strategy)
 
     if not positions:
       logger.warning(f"[close_all] No open positions found for {resolved}")
@@ -460,11 +492,15 @@ class MT5Executor:
     action_str = signal.action.value
 
     if action_str in ("TP2", "SL", "R_SL"):
-      return self.close_all_positions(signal.symbol, reason=action_str)
+      return self.close_all_positions(
+        signal.symbol, reason=action_str, strategy=signal.strategy
+      )
 
     if action_str == "TP1":
       close_vol = self.convert_quantity_to_lots(signal.symbol, signal.quantity)
-      return self.partial_close_position(signal.symbol, close_vol)
+      return self.partial_close_position(
+        signal.symbol, close_vol, strategy=signal.strategy
+      )
 
     # LONG / SHORT
     return self.open_position(signal)
@@ -474,4 +510,6 @@ class MT5Executor:
     Backward-compatible wrapper. Delegates to close_all_positions which
     uses actual MT5 volume — not the webhook quantity.
     """
-    return self.close_all_positions(signal.symbol, reason=signal.action.value)
+    return self.close_all_positions(
+      signal.symbol, reason=signal.action.value, strategy=signal.strategy
+    )
