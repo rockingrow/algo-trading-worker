@@ -2,6 +2,85 @@
 
 This is the execution-end of the Event-Driven trading system. It acts as a NATS subscriber waiting for highly structured trading signals from the central Broker, then executes them directly into the MetaTrader 5 Terminal.
 
+---
+
+## ⚡ Quick Start
+
+### 1. Requirements
+
+Ensure you are running on Windows, as the Python `MetaTrader5` module restricts usage to Windows environments only.
+
+### 2. Setup
+
+Because we orchestrate dependencies via `uv`, setup is instantaneous.
+
+```bash
+# Creates a virtual environment and installs all dependencies from pyproject.toml
+uv sync
+```
+
+### 3. Configure .env
+
+Copy `.env.example` to `.env` and fill in the MT5 connection details along with the NATS Broker configuration.
+
+```bash
+cp .env.example .env
+```
+
+#### All Environment Variables
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| **NATS** | | | |
+| `NATS_URL` | ✅ | — | NATS server URL (e.g. `nats://broker-host:4222`) |
+| `NATS_TOKEN` | | `null` | NATS authentication token |
+| `SIGNAL_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
+| **MT5** | | | |
+| `MT5_SERVER` | ✅ | — | Broker server name (e.g. `Exness-MT5Trial6`) |
+| `MT5_LOGIN` | ✅ | — | MT5 account number |
+| `MT5_PASSWORD` | ✅ | — | MT5 account password |
+| `MT5_PATH` | | auto-detect | Full path to `terminal64.exe`; if omitted the module reads from Windows registry |
+| `MT5_NAME` | | `null` | Display name sent in every `PositionEvent` to the Broker |
+| `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
+| `MAGIC_NUMBER` | | `20260409` | EA magic number stamped on every order; used as the base filter for all positions in MT5 |
+| `STRATEGY_MAGIC_MAP` | | `{}` | JSON object mapping strategy names to their own magic numbers (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). When set, each strategy's orders are stamped with its dedicated magic number instead of the shared `MAGIC_NUMBER`, enabling native MT5-level isolation without a DB lookup. |
+| `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
+| **Risk Management** | | | |
+| `VOLUME_DECISION_ENABLED` | | `true` | When `true`, lot size is calculated from capital + risk % instead of signal `quantity` |
+| `CAPITAL` | | `1000` | Notional capital used for lot-size calculation |
+| `CAPITAL_CURRENCY` | | `USC` | Currency of `CAPITAL` (informational, shown in startup notification) |
+| `RISK_PERCENTAGE` | | `3.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
+| `USE_ACCOUNT_EQUITY` | | `false` | When `true`, uses live account equity instead of `CAPITAL` for lot-size base |
+| `POSITION_TP1_PERCENT` | | `30.0` | % of live volume closed at TP1 when `VOLUME_DECISION_ENABLED=true` |
+| **Telegram** | | | |
+| `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
+| `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot API token from @BotFather |
+| `TELEGRAM_CHAT_ID` | ✅ | — | **Management chat**: service start/stop, MT5 health, NATS events |
+| `TELEGRAM_CHAT_CHANNEL_ID` | | `""` | **Signal channels**: comma-separated channel IDs (e.g. `-1001234,-1009876`). Broadcasts order fills/failures, terminal closes, and force-close events to all listed channels |
+| **Broker** | | | |
+| `BROKER_API_URL` | ✅ | — | Base URL of the central Broker API (used by `PositionCDC` HTTP fallback) |
+| `BROKER_API_KEY` | ✅ | — | API key sent as Bearer token to the Broker API |
+| **App** | | | |
+| `APP_HOST` | | `0.0.0.0` | FastAPI bind host |
+| `APP_PORT` | | `8000` | FastAPI bind port |
+| `LOG_LEVEL` | | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+> **Telegram dual-channel setup:** `TELEGRAM_CHAT_ID` is for private management alerts (sent to you as the operator). `TELEGRAM_CHAT_CHANNEL_ID` accepts a comma-separated list of channel IDs for broadcasting to multiple communities — each receives every order fill, failure, terminal close, and force-close event. If `TELEGRAM_CHAT_CHANNEL_ID` is left empty, it falls back to `TELEGRAM_CHAT_ID`.
+
+Please ensure that you have enabled "Allow Algo Trading" inside Options > Expert Advisors of the MetaTrader 5 Terminal.
+
+### 4. Operation
+
+Start the Worker (from the root directory):
+
+```bash
+make start
+```
+
+The Worker will initialise the `worker_data.sqlite` database, spawn an isolated MT5 subprocess, and subscribe to the configured NATS subjects. Inside the subprocess three daemon threads run in parallel: the MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC` (change-data-capture publisher to the NATS `TRADE` subject). You can monitor the logs printed directly to the screen.
+
+---
+
 ## 🏗️ System Architecture
 
 ```mermaid
@@ -28,6 +107,55 @@ graph TD
     end
     W1 -- "Subject: TRADE (PositionEvent)" --> NATS
     W2 -- "Subject: TRADE (PositionEvent)" --> NATS
+```
+
+---
+
+## 🧩 MT5 Module Flow (`worker/mt5/`)
+
+How the files inside `worker/mt5/` wire together at runtime. `Mt5SignalProcessor` is the hub: it owns the connection (`bridge`), the order layer (`executor` + its three collaborators), the message formatter (`message_presenter`), and starts the background jobs. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
+
+```mermaid
+graph TD
+    Manager["manager.py<br/>MT5Manager (parent process)"]
+
+    subgraph Child["Child process — worker/mt5/"]
+        SP["signal_processor.py<br/>Mt5SignalProcessor — hub"]
+        Bridge["bridge.py<br/>MT5 (terminal connection)"]
+        Presenter["message_presenter.py<br/>TradeMessagePresenter"]
+        Executor["executor.py<br/>MT5Executor"]
+        Resolver["symbol_resolver.py<br/>SymbolResolver"]
+        LotSizer["lot_sizing.py<br/>LotSizer"]
+        StopVal["stop_validator.py<br/>StopValidator"]
+        CloseDet["close_detector.py<br/>scan_terminal_closed_positions"]
+    end
+
+    Manager -. "spawns child (mt5_worker)" .-> SP
+
+    %% Composition — signal_processor builds the stack
+    SP -. "owns" .-> Bridge
+    SP -. "owns" .-> Executor
+    SP -. "owns / formats msgs" .-> Presenter
+    Executor -. "resolves symbol" .-> Resolver
+    Executor -. "sizes lot" .-> LotSizer
+    Executor -. "validates SL/TP" .-> StopVal
+    LotSizer -. "uses" .-> Resolver
+
+    %% Live signal path
+    Sub["services/nats_service.py<br/>NATSSubscriber"] -- "SIGNAL / ADMIN" --> SP
+    SP -- "handle(signal)" --> Handler["core/signal_handler.py<br/>SignalHandler"]
+    Handler -- "routes action" --> Strategy["core/market_strategy.py<br/>ForexMarket"]
+    Strategy -- "open / close / SL<br/>(scoped by strategy magic)" --> Executor
+    Executor -- "order_send" --> Term[(MetaTrader5 Terminal)]
+    Bridge -- "connect / account info" --> Term
+
+    %% Background jobs started by the hub
+    SP -. "starts" .-> EventJob["jobs/mt5_event_job.py<br/>MT5EventJob"]
+    SP -. "starts" .-> CDC["jobs/cdc_job.py<br/>PositionCDC"]
+    EventJob -- "poll owned_magics()" --> CloseDet
+    CloseDet -- "positions_get / history" --> Term
+    EventJob -- "update positions" --> DB[("SQLite<br/>positions")]
+    CDC -- "publish PENDING rows" --> Pub["services/nats_service.py<br/>NATSPublisher → TRADE"]
 ```
 
 ---
@@ -138,7 +266,7 @@ All fields except `action` and `timestamp` are optional.
 2. If `account_id` is present and does not match `MT5_LOGIN` → skip (no log noise).
 3. Check MT5 connection; abort if unreachable.
 4. Query SQLite `positions` for rows with `status IN ('OPENED', 'TP1')` matching the optional filters.
-5. Fetch all live MT5 positions (`positions_get()` filtered by `magic_number`) and intersect by ticket.
+5. Fetch all live MT5 positions (`positions_get()` natively filtered by the strategy's `magic_number`, if provided) and intersect by ticket.
 6. For each position **in DB but absent from MT5** → mark `FLATTED` immediately (already closed server-side).
 7. For each matched live MT5 position → call `close_single_position(pos, reason="FLAT")`:
    - On success: update DB `status → FLATTED`, set `closed_price`, send `⚡ Admin FLAT Closed` Telegram notification.
@@ -154,11 +282,20 @@ All fields except `action` and `timestamp` are optional.
 
 ## 🧠 Signal Execution — Key Design Decisions
 
-- **Stale position cleanup (Entry):** An account holds at most 1 position per symbol at a time. Before opening any new LONG/SHORT, the handler queries MT5 and force-closes any existing position for that symbol — regardless of whether the new signal is in the same or opposite direction. After the MT5 close succeeds, the corresponding SQLite record(s) are immediately updated to `FORCED_CLOSED` so the DB stays consistent. Only then is the new position opened. This guarantees each cycle starts flat and prevents accidental hedging.
+- **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation uses a two-layer scheme resolved by `MT5Executor`:
+
+  1. **Magic-based (primary):** Each strategy can be assigned its own MT5 magic number via `STRATEGY_MAGIC_MAP` (JSON object, e.g. `{"SCALP": 20260001, "SWING": 20260002}`). `open_position` stamps a new order with `_magic_for(signal.strategy)`, and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic. When a strategy has a dedicated magic, isolation is **native at the MT5 level — no DB lookup required**.
+  2. **DB-based (fallback):** For strategies *not* present in `STRATEGY_MAGIC_MAP`, all orders share the base `MAGIC_NUMBER`, so membership is disambiguated against the authoritative `strategy` column in the positions table (`get_open_positions_by_strategy`), matching live MT5 tickets to the tickets that column records.
+
+  Closing operations (`close_single_position`, `partial_close_position`, `close_all_positions`) stamp the closing deal with `pos.magic` — the magic of the position being closed — so the close deal always carries the same magic as its position. `owned_magics()` (base + all mapped values) defines the full set of magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
+
+- **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries MT5 for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. After the MT5 close succeeds, the corresponding SQLite record(s) are immediately updated to `FORCED_CLOSED` so the DB stays consistent. Only then is the new position opened.
+
+- **Data self-healing on inconsistency:** `SignalHandler._get_db_position` enforces the one-active-position-per-(strategy, symbol) invariant at read time. If more than one `OPENED`/`TP1` row is found (possible after a crash before the unique index existed), the oldest row is kept and all extras are immediately marked `FORCED_CLOSED` with an explanatory comment, so the DB self-heals on the next signal rather than silently producing split-brain state.
 
 - **SQLite as source of truth for exit signals:** Before executing any exit action (`TP1`, `TP2`, `SL`, `R_SL`), `SignalHandler` queries the local SQLite `positions` table for a tracked record matching the signal's `strategy + symbol`. If no record is found the signal is rejected — this prevents acting on untracked or already-closed positions. On success, `source_ticket` in the result is always taken from the DB record (not from the live MT5 ticket) so `_process_message` always updates the correct DB row, even in edge cases where the broker re-tickets a position after a partial close.
 
-- **`source_ticket` Lifecycle Tracking:** The `source_ticket` acts as the unique identifier for a specific trading _position_. When a new trade is opened (Entry), MT5 assigns an ID which becomes the `source_ticket`. When subsequent signals (`TP1`, `TP2`, `SL`, `R_SL`) arrive, they are resolved against the SQLite record to retrieve the original `source_ticket`. For a given trade, the `source_ticket` remains completely constant across its entire lifecycle. This prevents ambiguity across multiple concurrent active trades on different symbols.
+- **`source_ticket` Lifecycle Tracking:** The `source_ticket` acts as the unique identifier for a specific trading *position*. When a new trade is opened (Entry), MT5 assigns an ID which becomes the `source_ticket`. When subsequent signals (`TP1`, `TP2`, `SL`, `R_SL`) arrive, they are resolved against the SQLite record to retrieve the original `source_ticket`. For a given trade, the `source_ticket` remains completely constant across its entire lifecycle. This prevents ambiguity across multiple concurrent active trades on different symbols.
 
 - **Ticket-linked partial close (TP1):** The partial close request always carries the original `position=ticket` so MT5 correctly treats it as a partial close rather than an opposing hedge order.
 
@@ -172,6 +309,11 @@ All fields except `action` and `timestamp` are optional.
 
 - **GIL-isolated subprocess:** All MT5 and NATS blocking code runs in a separate OS process (`mt5_worker.worker_initialized`). The parent FastAPI process only manages subprocess lifetime via `MT5Manager`, keeping the event loop fully responsive. `MT5Manager` accepts a `worker_fn` parameter so the entry point is injectable and testable.
 
+- **Dependency-injection boundary — why only the executor takes an injected gateway:** The `MetaTrader5` module is a native C extension that exposes a single **process-global** connection — `mt5.initialize()` / `mt5.login()` mutate ambient process state, and every `mt5.*` call implicitly targets that one connection. There is no connection *object* to construct or pass around, and because the calls are GIL-blocking the connection is confined to the child process and its daemon threads (the parent FastAPI process never imports the module at all). This dictates where dependency injection actually pays off:
+
+  - **`MT5Executor` and its collaborators (`SymbolResolver`, `LotSizer`, `StopValidator`) take an injected `mt5_api: Mt5GatewayProtocol`.** These are pure call-sites holding non-trivial logic (translating a signal into an `order_send` request, lot-size math, stop validation), so the injectable gateway is a genuine test seam: production passes the live `MetaTrader5` module, while unit tests pass a `FakeMt5` — letting the whole order layer run off-Windows.
+  - **`bridge.py` and `close_detector.py` deliberately call the module-global `MetaTrader5` directly.** `bridge` *owns* the singleton's lifecycle (`initialize` / `login` / `shutdown`), and `close_detector` is a free-function scanner that runs **inside the `MT5EventJob` daemon thread**, reading the very same process-global connection. There is no FastAPI-level composition root in those background threads to thread an injected handle down from, and "injecting" a singleton that can only ever have one real instance would be ceremony with no testability payoff. They are kept as thin pass-throughs to the C extension, with the test-worthy logic pushed up into the executor/strategy layer above them.
+
 - **Hard SL vs. NATS SL — callback gap (mitigated by MT5EventJob):** When a LONG/SHORT is opened, the SL is registered directly on the MT5 server (`request["sl"]`), so MT5 will auto-close the position even if the NATS signal pipeline is delayed. If the hard SL fires before the NATS `SL` signal arrives, `_handle_full_close` finds no open position, returns `success=False`, and no event is published. `MT5EventJob` closes this gap by detecting the disappearance independently and updating the SQLite `positions` table, which then triggers `PositionCDC` to publish the `TRADE` event to the Broker.
 
 - **Notification outbox (store-and-forward):** In-process notification calls (`ctx.notifier` and `ctx.channel_notifier`) do **not** hit the Telegram API directly — they enqueue a row in the SQLite `notifications` table via `OutboxNotifier`. A separate `NotificationJob` daemon thread drains the table every 1 s and performs the actual HTTP send, retrying failed messages with exponential backoff (`5s → 30s → 2m → 10m`) up to `max_attempts` (default `5`). This decouples MT5 signal handling from Telegram's availability/latency and prevents Telegram outages from blocking the NATS event loop. **Startup/shutdown banners** are sent **directly** via `ctx.direct_notifier` (bypassing the outbox) so the user sees them immediately — even before the DB/notification dispatcher is ready or after they are torn down.
@@ -184,7 +326,7 @@ All fields except `action` and `timestamp` are optional.
 
 Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/mt5/close_detector.py`), which:
 
-1. Calls `mt5.positions_get()` filtered by `magic_number` → `current_tickets`
+1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (base `MAGIC_NUMBER` + all `STRATEGY_MAGIC_MAP` values, via `MT5Executor.owned_magics()`) → `current_tickets`
 2. Diffs against an internal `seen_tickets` set maintained across polls
 3. For each ticket that disappeared, calls `mt5.history_deals_get(position=ticket)` to find the closing deal
 4. Reads `deal.reason` to classify the closure:
@@ -195,7 +337,7 @@ Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/mt5/cl
 | `DEAL_REASON_TP` | `TP` | DB updated → `PositionCDC` publishes TRADE event |
 | `DEAL_REASON_SO` | `STOP_OUT` | DB updated → `PositionCDC` publishes TRADE event |
 | `DEAL_REASON_CLIENT` / `MOBILE` / `WEB` | `MANUAL` | Telegram only — no DB update (ambiguous intent) |
-| `DEAL_REASON_EXPERT` | _(skipped)_ | none — closed by our own `order_send` |
+| `DEAL_REASON_EXPERT` | *(skipped)* | none — closed by our own `order_send` |
 
 1. For terminal-initiated closures, emits a `TerminalClosedEvent` dataclass carrying: `source_ticket`, `deal_ticket`, `symbol`, `close_reason`, `close_price`, `close_volume`, `close_time`, `entry_price`, `sl`, `tp`, and an `AccountSnapshot`.
 
@@ -267,24 +409,24 @@ Two notification paths intentionally bypass the outbox:
 
 ### MT5Executor Primitives (`worker/mt5/executor.py`)
 
-| Method                                            | Used By                                          |
-| ------------------------------------------------- | ------------------------------------------------ |
-| `open_position(signal)`                           | Entry (Group 1)                                  |
-| `partial_close_position(symbol, volume, ticket?)` | TP1 (Group 2)                                    |
-| `update_position_sl(symbol, new_sl, ticket?)`     | TP1 breakeven update                             |
-| `close_all_positions(symbol, reason)`             | Full exit (Group 3) & broker FLAT                |
-| `close_single_position(pos, reason)`              | Admin FLAT — closes one position by MT5 object   |
-| `get_open_positions(symbol)`                      | Pre-flight guard in all groups                   |
-| `get_all_open_positions()`                        | Admin FLAT — fetch all positions across symbols  |
-| `convert_quantity_to_lots(symbol, quantity)`      | Entry & TP1 volume calc                          |
-| `calculate_lot_size(symbol, entry, sl, risk_pct)` | Entry volume calc (risk-based)                   |
-| `normalize_volume(symbol, volume)`                | Rounds/clamps volume to broker lot step & limits |
+| Method                                                        | Used By                                          |
+| ------------------------------------------------------------- | ------------------------------------------------ |
+| `open_position(signal)`                                       | Entry (Group 1)                                  |
+| `partial_close_position(symbol, volume, ticket?, strategy?)`  | TP1 (Group 2)                                    |
+| `update_position_sl(symbol, new_sl, ticket?, strategy?)`      | TP1 breakeven update                             |
+| `close_all_positions(symbol, reason, strategy?)`              | Full exit (Group 3) & broker FLAT                |
+| `close_single_position(pos, reason)`                          | Admin FLAT — closes one position by MT5 object   |
+| `get_open_positions(symbol, strategy?)`                       | Pre-flight guard in all groups                   |
+| `get_all_open_positions(strategy?)`                           | Admin FLAT — fetch all positions across symbols, optionally scoped by strategy |
+| `convert_quantity_to_lots(symbol, quantity)`                  | Entry & TP1 volume calc                          |
+| `calculate_lot_size(symbol, entry, sl, risk_pct)`             | Entry volume calc (risk-based)                   |
+| `normalize_volume(symbol, volume)`                            | Rounds/clamps volume to broker lot step & limits |
 
 ---
 
 ## 🗄️ SQLite Schema (`worker_data.sqlite`)
 
-Three tables are created on startup by `db_init()` using WAL journal mode.
+Three tables are created on startup by `db_init()` using WAL journal mode. After table creation, `db_init()` runs `_apply_migrations()`, which applies idempotent schema changes on every startup (safe to re-run).
 
 ### `positions` — Live position state
 
@@ -308,6 +450,10 @@ The canonical record for each open trade. `PositionCDC` watches this table for `
 | `sync_status` | TEXT | `PENDING` → `PUBLISHED` — drives CDC delivery |
 | `sync_time` | DATETIME | Timestamp of last successful publish |
 | `created_at` / `updated_at` | DATETIME | Row timestamps; `updated_at` is used as an optimistic-lock key in `mark_position_synced` |
+
+#### Constraints & Migrations
+
+A partial unique index `uidx_positions_one_active_per_strategy_symbol` enforces at most one `OPENED` or `TP1` row per `(strategy, symbol)` pair. Closed/force-closed rows are unrestricted. The index is created by `_apply_migrations()` on startup (`CREATE UNIQUE INDEX IF NOT EXISTS`) so it is applied automatically to existing databases on first upgrade.
 
 #### Position Status Lifecycle
 
@@ -389,79 +535,3 @@ Inside the child process four daemon threads run alongside the NATS message loop
 | `NotificationJob` | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
 
 All threads share the same `stop_event` (`multiprocessing.Event`) and exit cleanly when it is set.
-
----
-
-## ⚡ Quick Start
-
-### 1. Requirements
-
-Ensure you are running on Windows, as the Python `MetaTrader5` module restricts usage to Windows environments only.
-
-### 2. Setup
-
-Because we orchestrate dependencies via `uv`, setup is instantaneous.
-
-```bash
-# Creates a virtual environment and installs all dependencies from pyproject.toml
-uv sync
-```
-
-### 3. Configure .env
-
-Copy `.env.example` to `.env` and fill in the MT5 connection details along with the NATS Broker configuration.
-
-```bash
-cp .env.example .env
-```
-
-#### All Environment Variables
-
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| **NATS** | | | |
-| `NATS_URL` | ✅ | — | NATS server URL (e.g. `nats://broker-host:4222`) |
-| `NATS_TOKEN` | | `null` | NATS authentication token |
-| `SIGNAL_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
-| **MT5** | | | |
-| `MT5_SERVER` | ✅ | — | Broker server name (e.g. `Exness-MT5Trial6`) |
-| `MT5_LOGIN` | ✅ | — | MT5 account number |
-| `MT5_PASSWORD` | ✅ | — | MT5 account password |
-| `MT5_PATH` | | auto-detect | Full path to `terminal64.exe`; if omitted the module reads from Windows registry |
-| `MT5_NAME` | | `null` | Display name sent in every `PositionEvent` to the Broker |
-| `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
-| `MAGIC_NUMBER` | | `20260409` | EA magic number stamped on every order; used to filter positions in MT5 |
-| `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
-| **Risk Management** | | | |
-| `VOLUME_DECISION_ENABLED` | | `true` | When `true`, lot size is calculated from capital + risk % instead of signal `quantity` |
-| `CAPITAL` | | `1000` | Notional capital used for lot-size calculation |
-| `CAPITAL_CURRENCY` | | `USC` | Currency of `CAPITAL` (informational, shown in startup notification) |
-| `RISK_PERCENTAGE` | | `3.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
-| `USE_ACCOUNT_EQUITY` | | `false` | When `true`, uses live account equity instead of `CAPITAL` for lot-size base |
-| `POSITION_TP1_PERCENT` | | `30.0` | % of live volume closed at TP1 when `VOLUME_DECISION_ENABLED=true` |
-| **Telegram** | | | |
-| `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
-| `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot API token from @BotFather |
-| `TELEGRAM_CHAT_ID` | ✅ | — | **Management chat**: service start/stop, MT5 health, NATS events |
-| `TELEGRAM_CHAT_CHANNEL_ID` | | `""` | **Signal channels**: comma-separated channel IDs (e.g. `-1001234,-1009876`). Broadcasts order fills/failures, terminal closes, and force-close events to all listed channels |
-| **Broker** | | | |
-| `BROKER_API_URL` | ✅ | — | Base URL of the central Broker API (used by `PositionCDC` HTTP fallback) |
-| `BROKER_API_KEY` | ✅ | — | API key sent as Bearer token to the Broker API |
-| **App** | | | |
-| `APP_HOST` | | `0.0.0.0` | FastAPI bind host |
-| `APP_PORT` | | `8000` | FastAPI bind port |
-| `LOG_LEVEL` | | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-
-> **Telegram dual-channel setup:** `TELEGRAM_CHAT_ID` is for private management alerts (sent to you as the operator). `TELEGRAM_CHAT_CHANNEL_ID` accepts a comma-separated list of channel IDs for broadcasting to multiple communities — each receives every order fill, failure, terminal close, and force-close event. If `TELEGRAM_CHAT_CHANNEL_ID` is left empty, it falls back to `TELEGRAM_CHAT_ID`.
-
-Please ensure that you have enabled "Allow Algo Trading" inside Options > Expert Advisors of the MetaTrader 5 Terminal.
-
-### 4. Operation
-
-Start the Worker (from the root directory):
-
-```bash
-make start
-```
-
-The Worker will initialise the `worker_data.sqlite` database, spawn an isolated MT5 subprocess, and subscribe to the configured NATS subjects. Inside the subprocess three daemon threads run in parallel: the MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC` (change-data-capture publisher to the NATS `TRADE` subject). You can monitor the logs printed directly to the screen.
