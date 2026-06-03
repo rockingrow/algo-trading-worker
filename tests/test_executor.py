@@ -57,36 +57,58 @@ def test_get_open_positions_filters_by_magic(config):
   assert [p.ticket for p in positions] == [1]
 
 
-def test_open_position_stamps_strategy_into_comment(config):
-  mt5 = FakeMt5()
-  ex = _executor(mt5, config)
-  ex.open_position(make_signal(SignalActionEnum.LONG, strategy="trend-v2"))
-  req = mt5.sent_requests[-1]
-  assert req["comment"] == "trend-v2|LONG"
+class FakeStore:
+  """Minimal PositionStoreProtocol stand-in keyed by strategy column."""
+
+  def __init__(self, rows_by_strategy=None):
+    self._rows = rows_by_strategy or {}
+
+  def get_open_positions_by_strategy(self, strategy, symbol):
+    return list(self._rows.get(strategy, []))
+
+  def update_position_status(self, **kwargs):
+    pass
 
 
-def test_get_open_positions_filters_by_strategy(config):
+def test_get_open_positions_filters_by_strategy_column(config):
+  # DB strategy column is authoritative: only ticket 2 belongs to 'strat-short'.
   mt5 = FakeMt5(
     positions=[
-      make_position(ticket=1, magic=42, comment="strat-long|LONG"),
-      make_position(ticket=2, magic=42, comment="strat-short|SHORT"),
+      make_position(ticket=1, magic=42),
+      make_position(ticket=2, magic=42),
     ]
   )
-  ex = _executor(mt5, config)
+  store = FakeStore({"strat-short": [{"ticket": 2, "source_ticket": 2}]})
+  ex = MT5Executor(
+    magic_number=42, slippage_deviation=10, config=config, mt5_api=mt5, db=store
+  )
   positions = ex.get_open_positions("XAUUSD", strategy="strat-short")
   assert [p.ticket for p in positions] == [2]
 
 
-def test_close_all_positions_only_closes_matching_strategy(config):
+def test_get_open_positions_strategy_matches_reticketed_source(config):
+  # After a partial close the live ticket may equal the DB source_ticket.
+  mt5 = FakeMt5(positions=[make_position(ticket=100, magic=42)])
+  store = FakeStore({"strat-1": [{"ticket": 999, "source_ticket": 100}]})
+  ex = MT5Executor(
+    magic_number=42, slippage_deviation=10, config=config, mt5_api=mt5, db=store
+  )
+  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="strat-1")] == [100]
+
+
+def test_close_all_positions_only_closes_matching_strategy_column(config):
   # Two strategies on the same symbol; closing 'strat-short' must leave the
   # 'strat-long' position untouched.
   mt5 = FakeMt5(
     positions=[
-      make_position(ticket=1, type_=0, volume=0.7, magic=42, comment="strat-long|LONG"),
-      make_position(ticket=2, type_=1, volume=0.3, magic=42, comment="strat-short|SHORT"),
+      make_position(ticket=1, type_=0, volume=0.7, magic=42),
+      make_position(ticket=2, type_=1, volume=0.3, magic=42),
     ]
   )
-  ex = _executor(mt5, config)
+  store = FakeStore({"strat-short": [{"ticket": 2, "source_ticket": 2}]})
+  ex = MT5Executor(
+    magic_number=42, slippage_deviation=10, config=config, mt5_api=mt5, db=store
+  )
   res = ex.close_all_positions("XAUUSD", reason="TP2", strategy="strat-short")
   assert res["success"] is True
   closed_tickets = [r["position"] for r in mt5.sent_requests]

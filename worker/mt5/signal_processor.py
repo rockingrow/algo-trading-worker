@@ -188,6 +188,7 @@ class Mt5SignalProcessor:
       magic_number=settings_dict["magic_number"],
       slippage_deviation=settings_dict["slippage_deviation"],
       config=self.config,
+      db=ctx.db_service,
     )
     self.strategy = MarketStrategyFactory.create(
       executor=self.executor, config=self.config

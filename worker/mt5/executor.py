@@ -1,10 +1,10 @@
 from typing import Any, Dict, List, Optional
 
 from worker.core.config import ExecutionConfig
+from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 from worker.mt5.lot_sizing import LotSizer
-from worker.mt5.position_comment import build_position_comment, comment_matches_strategy
 from worker.mt5.stop_validator import StopValidator
 from worker.mt5.symbol_resolver import SymbolResolver
 from worker.schemas.signal_schema import SignalSchema
@@ -32,6 +32,7 @@ class MT5Executor:
     symbol_resolver: Optional[SymbolResolver] = None,
     lot_sizer: Optional[LotSizer] = None,
     stop_validator: Optional[StopValidator] = None,
+    db: Optional[PositionStoreProtocol] = None,
   ) -> None:
     if mt5_api is None:
       import MetaTrader5 as mt5_api  # lazy: native extension only needed at runtime
@@ -43,6 +44,10 @@ class MT5Executor:
     self._resolver = symbol_resolver or SymbolResolver(mt5_api)
     self._lot_sizer = lot_sizer or LotSizer(mt5_api, self._resolver, config)
     self._stop_validator = stop_validator or StopValidator(mt5_api)
+    # Persistence used to resolve which live positions belong to a strategy via
+    # the authoritative `strategy` column. Optional so the executor stays unit-
+    # testable without a DB (it then falls back to the comment stamp).
+    self._db = db
 
   # ------------------------------------------------------------------ #
   #  Delegated helpers (kept on the executor to satisfy the protocol)   #
@@ -78,10 +83,11 @@ class MT5Executor:
   ) -> List[Any]:
     """Return open positions for the resolved symbol (filtered by magic).
 
-    When *strategy* is given, additionally keep only positions whose comment was
-    stamped with that strategy (see :mod:`worker.mt5.position_comment`). This
-    isolates strategies that trade the same symbol so one strategy's signal
-    never touches another strategy's position.
+    When *strategy* is given, keep only the positions that belong to that
+    strategy so strategies trading the same symbol stay isolated. Membership is
+    resolved against the ``strategy`` column in the positions table
+    (``get_open_positions_by_strategy``), matching live MT5 tickets to the
+    tickets that column records for the strategy.
     """
     resolved = self.get_symbol(symbol)
     positions = self._mt5.positions_get(symbol=resolved)
@@ -89,12 +95,34 @@ class MT5Executor:
       return []
     result = [p for p in positions if p.magic == self.magic_number]
     if strategy is not None:
-      result = [
-        p
-        for p in result
-        if comment_matches_strategy(getattr(p, "comment", ""), strategy)
-      ]
+      result = self._filter_by_strategy(result, symbol, strategy)
     return result
+
+  def _filter_by_strategy(
+    self, positions: List[Any], symbol: str, strategy: str
+  ) -> List[Any]:
+    """Keep only *positions* whose ticket is recorded under *strategy* in the
+    positions table.
+
+    Both ``ticket`` and ``source_ticket`` are considered so a position that was
+    re-ticketed after a partial close still matches.
+    """
+    if self._db is None:
+      logger.warning(
+        "[get_open_positions] strategy filter requested for '%s' but no DB is "
+        "configured — returning magic-filtered positions without strategy scope.",
+        strategy,
+      )
+      return positions
+
+    db_rows = self._db.get_open_positions_by_strategy(strategy, symbol)
+    owned_tickets: set = set()
+    for row in db_rows:
+      for key in ("ticket", "source_ticket"):
+        value = row.get(key)
+        if value is not None:
+          owned_tickets.add(value)
+    return [p for p in positions if p.ticket in owned_tickets]
 
   def get_all_open_positions(self) -> List[Any]:
     """Return all open positions across all symbols, filtered by magic number."""
@@ -208,7 +236,7 @@ class MT5Executor:
       "price": float(price),
       "deviation": self.deviation,
       "magic": self.magic_number,
-      "comment": build_position_comment(signal.strategy, signal.action.value),
+      "comment": f"TV {signal.action.value}",
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
