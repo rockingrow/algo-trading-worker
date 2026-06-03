@@ -24,6 +24,7 @@ def db_init():
                 mt5_retcode INTEGER,
                 comment TEXT,
                 message TEXT,
+                magic INTEGER,
                 sync_status TEXT NOT NULL DEFAULT 'PENDING',
                 sync_time DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -38,8 +39,8 @@ def db_init():
                 source_ticket INTEGER,
                 symbol TEXT NOT NULL,
                 action TEXT NOT NULL,
-                volume REAL NOT NULL,
-                price REAL NOT NULL,
+                volume REAL,
+                price REAL,
                 sl REAL,
                 tp1 REAL,
                 mt5_retcode INTEGER,
@@ -69,6 +70,12 @@ def db_init():
             CREATE INDEX IF NOT EXISTS idx_notifications_pending
                 ON notifications (next_attempt_at, id)
         """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_positions_one_active_per_strategy_symbol
+            ON positions (strategy, symbol)
+            WHERE status = 'OPENED' OR status = 'TP1'
+    """)
+
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully.")

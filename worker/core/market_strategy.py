@@ -69,12 +69,23 @@ class BaseMarketStrategy(ABC):
   # ── Position helpers ──────────────────────────────────────────────────── #
 
   @abstractmethod
-  def get_open_positions(self, symbol: str) -> List[Any]:
-    """Return all open positions for *symbol* (filtered to this strategy's scope)."""
+  def get_open_positions(
+    self, symbol: str, strategy: Optional[str] = None
+  ) -> List[Any]:
+    """Return open positions for *symbol*.
+
+    When *strategy* is given, only positions belonging to that strategy are
+    returned, so strategies sharing a symbol stay isolated.
+    """
 
   @abstractmethod
-  def close_all_positions(self, symbol: str, reason: str = "CLOSE") -> TradeResult:
-    """Force-close ALL positions for *symbol*."""
+  def close_all_positions(
+    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+  ) -> TradeResult:
+    """Force-close positions for *symbol*.
+
+    When *strategy* is given, only that strategy's positions are closed.
+    """
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -115,7 +126,7 @@ class ForexMarket(BaseMarketStrategy):
       3. update_position_sl to breakeven (pos.price_open)
     """
     symbol = signal.symbol
-    positions = self._executor.get_open_positions(symbol)
+    positions = self._executor.get_open_positions(symbol, strategy=signal.strategy)
 
     if not positions:
       return {
@@ -150,6 +161,7 @@ class ForexMarket(BaseMarketStrategy):
       symbol=symbol,
       close_volume=close_volume,
       position_ticket=pos.ticket,
+      strategy=signal.strategy,
     )
 
     if not close_result.get("success"):
@@ -159,6 +171,7 @@ class ForexMarket(BaseMarketStrategy):
       symbol=symbol,
       new_sl=pos.price_open,
       position_ticket=pos.ticket,
+      strategy=signal.strategy,
     )
 
     close_result["sl_update"] = sl_result
@@ -168,15 +181,21 @@ class ForexMarket(BaseMarketStrategy):
 
   def handle_full_close(self, signal: SignalSchema) -> TradeResult:
     """Full close using actual MT5 volume; reason derived from signal.action."""
-    return self._executor.close_all_positions(signal.symbol, reason=signal.action.value)
+    return self._executor.close_all_positions(
+      signal.symbol, reason=signal.action.value, strategy=signal.strategy
+    )
 
   # ── Helpers ──────────────────────────────────────────────────────────── #
 
-  def get_open_positions(self, symbol: str) -> List[Any]:
-    return self._executor.get_open_positions(symbol)
+  def get_open_positions(
+    self, symbol: str, strategy: Optional[str] = None
+  ) -> List[Any]:
+    return self._executor.get_open_positions(symbol, strategy=strategy)
 
-  def close_all_positions(self, symbol: str, reason: str = "CLOSE") -> TradeResult:
-    return self._executor.close_all_positions(symbol, reason=reason)
+  def close_all_positions(
+    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+  ) -> TradeResult:
+    return self._executor.close_all_positions(symbol, reason=reason, strategy=strategy)
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

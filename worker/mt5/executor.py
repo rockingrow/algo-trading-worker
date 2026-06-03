@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 
 from worker.core.config import ExecutionConfig
+from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 from worker.mt5.lot_sizing import LotSizer
@@ -9,6 +10,14 @@ from worker.mt5.symbol_resolver import SymbolResolver
 from worker.schemas.signal_schema import SignalSchema
 
 logger = get_logger("worker.mt5_executor")
+
+_MT5_COMMENT_MAX = 31
+
+
+def _mt5_error_code(err) -> int:
+  """mt5.last_error() returns (code, description); extract just the int."""
+  return err[0] if isinstance(err, tuple) else int(err)
+
 
 
 class MT5Executor:
@@ -24,24 +33,55 @@ class MT5Executor:
 
   def __init__(
     self,
-    magic_number: int,
     slippage_deviation: int,
     config: ExecutionConfig,
     mt5_api: Optional[Mt5GatewayProtocol] = None,
     symbol_resolver: Optional[SymbolResolver] = None,
     lot_sizer: Optional[LotSizer] = None,
     stop_validator: Optional[StopValidator] = None,
+    db: Optional[PositionStoreProtocol] = None,
+    strategy_magic_map: Optional[Dict[str, int]] = None,
   ) -> None:
     if mt5_api is None:
       import MetaTrader5 as mt5_api  # lazy: native extension only needed at runtime
 
-    self.magic_number = magic_number
     self.deviation = slippage_deviation
     self._config = config
     self._mt5 = mt5_api
     self._resolver = symbol_resolver or SymbolResolver(mt5_api)
     self._lot_sizer = lot_sizer or LotSizer(mt5_api, self._resolver, config)
     self._stop_validator = stop_validator or StopValidator(mt5_api)
+    # Persistence used to resolve which live positions belong to a strategy via
+    # the authoritative `strategy` column. Optional so the executor stays unit-
+    # testable without a DB (it then falls back to the comment stamp).
+    self._db = db
+    # Maps strategy name → its dedicated MT5 magic number. A strategy present
+    # here is stamped with — and filtered by — its own magic, giving native
+    # MT5-level isolation without a DB lookup.
+    self._strategy_magic_map: Dict[str, int] = strategy_magic_map or {}
+
+  # ------------------------------------------------------------------ #
+  #  Magic-number resolution                                            #
+  # ------------------------------------------------------------------ #
+
+  def _magic_for(self, strategy: Optional[str]) -> int:
+    """Resolve the magic number a *strategy* trades under.
+
+    Returns the strategy's dedicated magic. Raises KeyError if not mapped.
+    """
+    if not strategy:
+      raise ValueError("Strategy must be provided to resolve magic number.")
+    if strategy not in self._strategy_magic_map:
+      raise KeyError(f"Strategy '{strategy}' not found in strategy_magic_map.")
+    return self._strategy_magic_map[strategy]
+
+  def owned_magics(self) -> set:
+    """All magic numbers this worker owns: every mapped magic.
+
+    Used to recognise every position this worker may have opened across all
+    strategies (e.g. account-wide queries and terminal-close detection).
+    """
+    return set(self._strategy_magic_map.values())
 
   # ------------------------------------------------------------------ #
   #  Delegated helpers (kept on the executor to satisfy the protocol)   #
@@ -72,20 +112,47 @@ class MT5Executor:
   #  Position Query Helpers                                              #
   # ------------------------------------------------------------------ #
 
-  def get_open_positions(self, symbol: str) -> List[Any]:
-    """Return all open positions for the resolved symbol (filtered by magic)."""
+  def get_open_positions(
+    self, symbol: str, strategy: Optional[str] = None
+  ) -> List[Any]:
+    """Return open positions for the resolved symbol, scoped to this worker.
+
+    When *strategy* is given, keep only the positions that belong to that
+    strategy so strategies trading the same symbol stay isolated.
+    The isolation is native at the MT5 level via `strategy_magic_map`, no DB lookup needed.
+
+    When *strategy* is None, every position this worker owns (any of
+    ``owned_magics``) for the symbol is returned.
+    """
     resolved = self.get_symbol(symbol)
     positions = self._mt5.positions_get(symbol=resolved)
     if positions is None:
       return []
-    return [p for p in positions if p.magic == self.magic_number]
 
-  def get_all_open_positions(self) -> List[Any]:
-    """Return all open positions across all symbols, filtered by magic number."""
+    if strategy is None:
+      owned = self.owned_magics()
+      return [p for p in positions if p.magic in owned]
+
+    magic = self._magic_for(strategy)
+    return [p for p in positions if p.magic == magic]
+
+  def get_all_open_positions(self, strategy: Optional[str] = None) -> List[Any]:
+    """Return all open positions across all symbols owned by this worker.
+
+    Filters by every magic number this worker owns (base + mapped), so
+    positions opened under any strategy's dedicated magic are included.
+    When *strategy* is given, only positions belonging to that strategy are returned.
+    """
     positions = self._mt5.positions_get()
     if positions is None:
       return []
-    return [p for p in positions if p.magic == self.magic_number]
+
+    if strategy is None:
+      owned = self.owned_magics()
+      return [p for p in positions if p.magic in owned]
+
+    magic = self._magic_for(strategy)
+    return [p for p in positions if p.magic == magic]
 
   def close_single_position(self, pos: Any, reason: str = "FLAT") -> Dict[str, Any]:
     """Close a single MT5 position object (pos.symbol is already resolved)."""
@@ -105,7 +172,7 @@ class MT5Executor:
       "position": pos.ticket,
       "price": float(price),
       "deviation": self.deviation,
-      "magic": self.magic_number,
+      "magic": pos.magic,  # close deal inherits the position's own magic
       "comment": f"Full Close {reason}",
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
@@ -191,8 +258,8 @@ class MT5Executor:
       "type": order_type,
       "price": float(price),
       "deviation": self.deviation,
-      "magic": self.magic_number,
-      "comment": f"TV {signal.action.value}",
+      "magic": self._magic_for(signal.strategy),
+      "comment": f"{signal.strategy} {(signal.signal_id or '')[-2:]}".strip()[:_MT5_COMMENT_MAX - 1],
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
@@ -216,7 +283,7 @@ class MT5Executor:
       logger.error(f"order_send failed. error code: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": self._mt5.last_error(),
+        "retcode": _mt5_error_code(self._mt5.last_error()),
         "comment": "Send Failed",
       }
 
@@ -247,15 +314,21 @@ class MT5Executor:
   # ------------------------------------------------------------------ #
 
   def partial_close_position(
-    self, symbol: str, close_volume: float, position_ticket: Optional[int] = None
+    self,
+    symbol: str,
+    close_volume: float,
+    position_ticket: Optional[int] = None,
+    strategy: Optional[str] = None,
   ) -> Dict[str, Any]:
     """
     Partially close a position by sending a counter-direction market order
     with the specified volume. If *position_ticket* is given it targets that
     specific ticket; otherwise closes the first matching magic-number position.
+    When *strategy* is given, only positions belonging to that strategy are
+    considered.
     """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol)
+    positions = self.get_open_positions(symbol, strategy=strategy)
 
     if not positions:
       logger.warning(f"[partial_close] No open positions found for {resolved}")
@@ -287,7 +360,7 @@ class MT5Executor:
       "position": pos.ticket,  # CRITICAL: links close to specific ticket
       "price": float(price),
       "deviation": self.deviation,
-      "magic": self.magic_number,
+      "magic": pos.magic,  # close deal inherits the position's own magic
       "comment": "Partial Close TP1",
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
@@ -300,7 +373,7 @@ class MT5Executor:
       logger.error(f"partial_close order_send failed. error: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": self._mt5.last_error(),
+        "retcode": _mt5_error_code(self._mt5.last_error()),
         "comment": "Send Failed",
       }
 
@@ -323,15 +396,20 @@ class MT5Executor:
     }
 
   def update_position_sl(
-    self, symbol: str, new_sl: float, position_ticket: Optional[int] = None
+    self,
+    symbol: str,
+    new_sl: float,
+    position_ticket: Optional[int] = None,
+    strategy: Optional[str] = None,
   ) -> Dict[str, Any]:
     """
     Update the Stop Loss of an open position to *new_sl* using
     TRADE_ACTION_SLTP. Targets a specific ticket or the first magic-number
-    position found for the symbol.
+    position found for the symbol. When *strategy* is given, only positions
+    belonging to that strategy are considered.
     """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol)
+    positions = self.get_open_positions(symbol, strategy=strategy)
 
     if not positions:
       logger.warning(f"[update_sl] No open positions found for {resolved}")
@@ -358,7 +436,7 @@ class MT5Executor:
       logger.error(f"update_sl order_send failed. error: {self._mt5.last_error()}")
       return {
         "success": False,
-        "retcode": self._mt5.last_error(),
+        "retcode": _mt5_error_code(self._mt5.last_error()),
         "comment": "SL Update Failed",
       }
 
@@ -380,13 +458,18 @@ class MT5Executor:
   #  TP2 / SL / R_SL: Full close using MT5 actual volume                #
   # ------------------------------------------------------------------ #
 
-  def close_all_positions(self, symbol: str, reason: str = "CLOSE") -> Dict[str, Any]:
+  def close_all_positions(
+    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+  ) -> Dict[str, Any]:
     """
     Close ALL open positions for the symbol at actual MT5 volume.
     Webhook quantity is intentionally ignored to avoid dust-lot errors.
+    When *strategy* is given, only positions belonging to that strategy are
+    closed — positions opened by other strategies on the same symbol are left
+    untouched.
     """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol)
+    positions = self.get_open_positions(symbol, strategy=strategy)
 
     if not positions:
       logger.warning(f"[close_all] No open positions found for {resolved}")
@@ -412,7 +495,7 @@ class MT5Executor:
         "position": pos.ticket,
         "price": float(price),
         "deviation": self.deviation,
-        "magic": self.magic_number,
+        "magic": pos.magic,  # close deal inherits the position's own magic
         "comment": f"Full Close {reason}",
         "type_time": self._mt5.ORDER_TIME_GTC,
         "type_filling": self._mt5.ORDER_FILLING_IOC,
@@ -447,31 +530,3 @@ class MT5Executor:
       "retcode": -1,
       "comment": f"Failed to close positions [{reason}]",
     }
-
-  # ------------------------------------------------------------------ #
-  #  Legacy / Convenience: keep execute_signal + close_position intact   #
-  # ------------------------------------------------------------------ #
-
-  def execute_signal(self, signal: SignalSchema) -> Dict[str, Any]:
-    """
-    Legacy single-entry dispatcher kept for backward compatibility.
-    Prefer using SignalHandler which applies full action-specific logic.
-    """
-    action_str = signal.action.value
-
-    if action_str in ("TP2", "SL", "R_SL"):
-      return self.close_all_positions(signal.symbol, reason=action_str)
-
-    if action_str == "TP1":
-      close_vol = self.convert_quantity_to_lots(signal.symbol, signal.quantity)
-      return self.partial_close_position(signal.symbol, close_vol)
-
-    # LONG / SHORT
-    return self.open_position(signal)
-
-  def close_position(self, signal: SignalSchema) -> Dict[str, Any]:
-    """
-    Backward-compatible wrapper. Delegates to close_all_positions which
-    uses actual MT5 volume — not the webhook quantity.
-    """
-    return self.close_all_positions(signal.symbol, reason=signal.action.value)

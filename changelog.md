@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.1] — 2026-06-03
+
+### Added
+
+- **Per-strategy magic numbers (`STRATEGY_MAGIC_MAP`).** A new optional env var maps strategy names to dedicated MT5 magic numbers (JSON object, e.g. `{"SCALP": 20260001, "SWING": 20260002}`). `MT5Executor` resolves orders and position filters through `_magic_for(strategy)`: `open_position` stamps a new order with the strategy's magic, and `get_open_positions(symbol, strategy)` filters by that same magic — giving native MT5-level isolation **without a DB lookup** for any mapped strategy. Strategies absent from the map continue to share the base `MAGIC_NUMBER` and fall back to the DB `strategy`-column filter. Closing deals now inherit `pos.magic`, and `owned_magics()` (base + all mapped values) drives account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob` / `scan_terminal_closed_positions` now track the full owned-magic set).
+
+### Fixed
+
+- **Per-strategy position isolation on a shared symbol.** When two strategies traded the same symbol at once (e.g. a Long-only and a Short-only strategy), the live MT5 layer filtered positions only by `magic` + `symbol`, so an entry/exit signal for one strategy would fetch — and force-close — the other strategy's position too. Position queries/closes (`get_open_positions`, `close_all_positions`, `partial_close_position`, `update_position_sl`) now accept a `strategy` filter that `SignalHandler` scopes to `signal.strategy`. Strategy membership is resolved either by the strategy's dedicated magic (when present in `STRATEGY_MAGIC_MAP`) or against the authoritative `strategy` column in the positions table (`get_open_positions_by_strategy`). A new signal now acts only on its own strategy's position.
+- **ADMIN FLAT cross-strategy closure bug.** Fixed an issue where executing a `FLAT` action on a specific strategy could accidentally close positions for other strategies if the payload omitted the `symbol` or if a dangerous DB-fallback triggered. `get_all_open_positions` now accepts and strictly enforces a `strategy` filter natively via the MT5 magic number, and the obsolete fallback logic has been removed.
+
+---
+
 ## [1.0.0] — 2026-06-02
 
 ### Overview

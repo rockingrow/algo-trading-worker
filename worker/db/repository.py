@@ -45,7 +45,7 @@ class PositionRepository:
             INSERT INTO position_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2), sl, tp1, mt5_retcode, comment, message, author),
+      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, mt5_retcode, comment, message, author),
     )
     conn.commit()
     conn.close()
@@ -62,15 +62,16 @@ class PositionRepository:
     mt5_retcode: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
+    magic: Optional[int] = None,
   ):
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message, magic)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message),
+      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message, magic),
     )
     conn.commit()
     conn.close()

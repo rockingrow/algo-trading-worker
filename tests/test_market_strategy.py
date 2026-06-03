@@ -16,7 +16,8 @@ class FakeExecutor:
     self._positions = positions if positions is not None else []
     self.calls = []
 
-  def get_open_positions(self, symbol):
+  def get_open_positions(self, symbol, strategy=None):
+    self.calls.append(("get_open", strategy))
     return list(self._positions)
 
   def normalize_volume(self, symbol, volume):
@@ -25,19 +26,19 @@ class FakeExecutor:
   def convert_quantity_to_lots(self, symbol, quantity):
     return quantity / 100.0
 
-  def partial_close_position(self, symbol, close_volume, position_ticket=None):
-    self.calls.append(("partial", close_volume, position_ticket))
+  def partial_close_position(self, symbol, close_volume, position_ticket=None, strategy=None):
+    self.calls.append(("partial", close_volume, position_ticket, strategy))
     return {"success": True, "volume": close_volume, "ticket": 1}
 
-  def update_position_sl(self, symbol, new_sl, position_ticket=None):
-    self.calls.append(("sl", new_sl, position_ticket))
+  def update_position_sl(self, symbol, new_sl, position_ticket=None, strategy=None):
+    self.calls.append(("sl", new_sl, position_ticket, strategy))
     return {"success": True, "new_sl": new_sl}
 
   def open_position(self, signal):
     return {"success": True}
 
-  def close_all_positions(self, symbol, reason="CLOSE"):
-    return {"success": True, "reason": reason}
+  def close_all_positions(self, symbol, reason="CLOSE", strategy=None):
+    return {"success": True, "reason": reason, "strategy": strategy}
 
 
 def test_handle_tp1_volume_decision_mode(config):
@@ -46,10 +47,10 @@ def test_handle_tp1_volume_decision_mode(config):
   market = ForexMarket(ex, config)  # position_tp1_percent=30
   res = market.handle_tp1(make_signal(SignalActionEnum.TP1))
   assert res["success"] is True
-  # 1.0 * 30% = 0.3 normalized
-  assert ("partial", 0.3, 7) in ex.calls
+  # 1.0 * 30% = 0.3 normalized, scoped to the signal's strategy
+  assert ("partial", 0.3, 7, "strat-1") in ex.calls
   # SL moved to breakeven (price_open)
-  assert ("sl", 2000.0, 7) in ex.calls
+  assert ("sl", 2000.0, 7, "strat-1") in ex.calls
 
 
 def test_handle_tp1_payload_quantity_mode(config):
@@ -59,7 +60,7 @@ def test_handle_tp1_payload_quantity_mode(config):
   market = ForexMarket(ex, cfg)
   res = market.handle_tp1(make_signal(SignalActionEnum.TP1, quantity=50))
   # 50 / 100 = 0.5
-  assert ("partial", 0.5, 7) in ex.calls
+  assert ("partial", 0.5, 7, "strat-1") in ex.calls
   assert res["success"] is True
 
 

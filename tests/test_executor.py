@@ -5,7 +5,7 @@ from worker.schemas.signal_schema import SignalActionEnum
 
 
 def _executor(mt5, config):
-  return MT5Executor(magic_number=42, slippage_deviation=10, config=config, mt5_api=mt5)
+  return MT5Executor(slippage_deviation=10, config=config, mt5_api=mt5, strategy_magic_map={"strat-1": 42, "strat-short": 42})
 
 
 def test_open_position_long_builds_buy_request(config):
@@ -55,6 +55,64 @@ def test_get_open_positions_filters_by_magic(config):
   ex = _executor(mt5, config)
   positions = ex.get_open_positions("XAUUSD")
   assert [p.ticket for p in positions] == [1]
+
+
+class FakeStore:
+  """Minimal PositionStoreProtocol stand-in keyed by strategy column."""
+
+  def __init__(self, rows_by_strategy=None):
+    self._rows = rows_by_strategy or {}
+
+  def get_open_positions_by_strategy(self, strategy, symbol):
+    return list(self._rows.get(strategy, []))
+
+  def update_position_status(self, **kwargs):
+    pass
+
+
+def test_get_open_positions_filters_by_strategy_column(config):
+  # DB strategy column is authoritative: only ticket 2 belongs to 'strat-short'.
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, magic=42),
+      make_position(ticket=2, magic=42),
+    ]
+  )
+  store = FakeStore({"strat-short": [{"ticket": 2, "source_ticket": 2}]})
+  ex = MT5Executor(
+    slippage_deviation=10, config=config, mt5_api=mt5, db=store, strategy_magic_map={"strat-1": 42, "strat-short": 42, "strat-long": 43}
+  )
+  positions = ex.get_open_positions("XAUUSD", strategy="strat-short")
+  assert [p.ticket for p in positions] == [2]
+
+
+def test_get_open_positions_strategy_matches_reticketed_source(config):
+  # After a partial close the live ticket may equal the DB source_ticket.
+  mt5 = FakeMt5(positions=[make_position(ticket=100, magic=42)])
+  store = FakeStore({"strat-1": [{"ticket": 999, "source_ticket": 100}]})
+  ex = MT5Executor(
+    slippage_deviation=10, config=config, mt5_api=mt5, db=store, strategy_magic_map={"strat-1": 42, "strat-short": 42, "strat-long": 43}
+  )
+  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="strat-1")] == [100]
+
+
+def test_close_all_positions_only_closes_matching_strategy_column(config):
+  # Two strategies on the same symbol; closing 'strat-short' must leave the
+  # 'strat-long' position untouched.
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, type_=0, volume=0.7, magic=42),
+      make_position(ticket=2, type_=1, volume=0.3, magic=42),
+    ]
+  )
+  store = FakeStore({"strat-short": [{"ticket": 2, "source_ticket": 2}]})
+  ex = MT5Executor(
+    slippage_deviation=10, config=config, mt5_api=mt5, db=store, strategy_magic_map={"strat-1": 42, "strat-short": 42, "strat-long": 43}
+  )
+  res = ex.close_all_positions("XAUUSD", reason="TP2", strategy="strat-short")
+  assert res["success"] is True
+  closed_tickets = [r["position"] for r in mt5.sent_requests]
+  assert closed_tickets == [2]  # only the short strategy's ticket was closed
 
 
 def test_partial_close_no_positions(config):
@@ -142,3 +200,106 @@ def test_close_single_position_failure_returns_error(config):
   res = ex.close_single_position(pos, reason="FLAT")
   assert res["success"] is False
   assert "requote" in res["comment"]
+
+
+# ── STRATEGY_MAGIC_MAP: per-strategy magic numbers ──────────────────────── #
+
+
+def _executor_with_map(mt5, config, strategy_magic_map, db=None):
+  return MT5Executor(
+    slippage_deviation=10,
+    config=config,
+    mt5_api=mt5,
+    db=db,
+    strategy_magic_map=strategy_magic_map,
+  )
+
+
+def test_magic_for_resolves_mapped_strategy(config):
+  ex = _executor_with_map(FakeMt5(), config, {"SCALP": 100, "SWING": 200})
+  assert ex._magic_for("SCALP") == 100
+  assert ex._magic_for("SWING") == 200
+
+
+import pytest
+
+def test_magic_for_raises_for_unmapped(config):
+  ex = _executor_with_map(FakeMt5(), config, {"SCALP": 100})
+  with pytest.raises(KeyError):
+    ex._magic_for("UNMAPPED")
+  with pytest.raises(ValueError):
+    ex._magic_for(None)
+
+
+def test_owned_magics_includes_only_mapped(config):
+  ex = _executor_with_map(FakeMt5(), config, {"SCALP": 100, "SWING": 200})
+  assert ex.owned_magics() == {100, 200}
+
+
+def test_open_position_stamps_strategy_magic(config):
+  mt5 = FakeMt5()
+  ex = _executor_with_map(mt5, config, {"SCALP": 100})
+  ex.open_position(make_signal(SignalActionEnum.LONG, strategy="SCALP"))
+  assert mt5.sent_requests[-1]["magic"] == 100  # mapped, not the base 42
+
+
+def test_open_position_unmapped_strategy_raises(config):
+  mt5 = FakeMt5()
+  ex = _executor_with_map(mt5, config, {"SCALP": 100})
+  with pytest.raises(KeyError):
+    ex.open_position(make_signal(SignalActionEnum.LONG, strategy="OTHER"))
+
+
+def test_get_open_positions_mapped_strategy_filters_by_magic_without_db(config):
+  # Two strategies share the symbol but have distinct magics. The mapped
+  # strategy is isolated purely by magic — no DB is configured.
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, magic=100),  # SCALP
+      make_position(ticket=2, magic=200),  # SWING
+      make_position(ticket=3, magic=42),   # base / unmapped
+    ]
+  )
+  ex = _executor_with_map(mt5, config, {"SCALP": 100, "SWING": 200})
+  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="SCALP")] == [1]
+  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="SWING")] == [2]
+
+
+def test_close_all_positions_mapped_strategy_only_closes_its_magic(config):
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, type_=0, volume=0.5, magic=100),  # SCALP
+      make_position(ticket=2, type_=1, volume=0.3, magic=200),  # SWING
+    ]
+  )
+  ex = _executor_with_map(mt5, config, {"SCALP": 100, "SWING": 200})
+  res = ex.close_all_positions("XAUUSD", reason="TP2", strategy="SCALP")
+  assert res["success"] is True
+  assert [r["position"] for r in mt5.sent_requests] == [1]  # only SCALP closed
+  assert mt5.sent_requests[-1]["magic"] == 100  # close deal inherits pos magic
+
+
+def test_get_open_positions_no_strategy_returns_all_owned_magics(config):
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, magic=100),
+      make_position(ticket=2, magic=42),
+      make_position(ticket=3, magic=999),  # foreign EA — excluded
+    ]
+  )
+  ex = _executor_with_map(mt5, config, {"SCALP": 100})
+  tickets = sorted(p.ticket for p in ex.get_open_positions("XAUUSD"))
+  assert tickets == [1, 2]
+
+
+def test_get_all_open_positions_includes_mapped_magics(config):
+  mt5 = FakeMt5(
+    positions=[
+      make_position(ticket=1, magic=100),  # mapped
+      make_position(ticket=2, magic=42),   # base
+      make_position(ticket=3, magic=999),  # foreign — excluded
+    ]
+  )
+  ex = _executor_with_map(mt5, config, {"SCALP": 100})
+  tickets = sorted(p.ticket for p in ex.get_all_open_positions())
+  assert tickets == [1, 2]

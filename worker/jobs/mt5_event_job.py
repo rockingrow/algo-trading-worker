@@ -51,12 +51,12 @@ class MT5EventJob:
 
   def __init__(
     self,
-    magic_number: int,
+    magic_numbers: Set[int],
     db_service: TerminalCloseStoreProtocol,
     notifier: MessageSenderProtocol,
     poll_interval: int = _POLL_INTERVAL,
   ) -> None:
-    self._magic = magic_number
+    self._magics = set(magic_numbers)
     self._db = db_service
     self._notifier = notifier
     self._poll_interval = poll_interval
@@ -93,7 +93,7 @@ class MT5EventJob:
   def _run(self) -> None:
     while not self._stop_event.is_set():
       try:
-        events = scan_terminal_closed_positions(self._magic, self._seen_tickets)
+        events = scan_terminal_closed_positions(self._magics, self._seen_tickets)
         for event in events:
           self._handle(event)
       except Exception as exc:

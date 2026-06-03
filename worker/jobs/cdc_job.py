@@ -39,6 +39,7 @@ _EVENT_FIELDS = {
   "mt5_retcode",
   "comment",
   "message",
+  "magic",
   "created_at",
   "updated_at",
   "sync_status",
@@ -63,6 +64,7 @@ class PositionCDC:
     poll_interval: int = _POLL_INTERVAL,
     account_name: Optional[str] = None,
     market_type: Optional[str] = None,
+    strategy_magic_map: Optional[Dict[str, int]] = None,
   ) -> None:
     self._account_id = account_id
     self._account_name = account_name
@@ -71,8 +73,15 @@ class PositionCDC:
     self._db = db_service
     self._account_info_fn = account_info_fn
     self._poll_interval = poll_interval
+    self._strategy_magic_map: Dict[str, int] = strategy_magic_map or {}
     self._stop_event = threading.Event()
     self._thread: threading.Thread | None = None
+
+  def _magic_for(self, strategy: Optional[str]) -> int:
+    if not strategy:
+      return 0
+    return self._strategy_magic_map.get(strategy, 0)
+
 
   def start(self, stop_event=None) -> None:
     if stop_event is not None:
@@ -109,6 +118,8 @@ class PositionCDC:
       )
       payload = {k: row[k] for k in _EVENT_FIELDS if k in row}
       payload.update(self._extract_signal_fields(row.get("message")))
+      magic = payload.get("magic")
+      payload["magic"] = str(magic) if magic is not None else str(self._magic_for(row.get("strategy")))
       payload.update(account_snapshot)
       event = PositionEvent(
         event=event_type,
@@ -168,8 +179,4 @@ class PositionCDC:
         extracted[key] = data[key]
     if data.get("risk_percent") is not None:
       extracted["risk_percent"] = data["risk_percent"]
-    action = data.get("action")
-    signal_id = data.get("signal_id")
-    if action and signal_id:
-      extracted["magic"] = f"{action}|{signal_id}"
     return extracted
