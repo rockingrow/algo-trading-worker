@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/mt5/lot_sizing.py
 ────────────────────────
 All lot-size / volume arithmetic, extracted from ``MT5Executor``.
@@ -18,11 +18,11 @@ import math
 from typing import Optional
 
 from worker.core.config import ExecutionConfig
+from worker.gateways.mt5.symbol_resolver import SymbolResolver
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
-from worker.mt5.symbol_resolver import SymbolResolver
 
-logger = get_logger("worker.mt5.lot_sizing")
+logger = get_logger("worker.gateways.mt5.lot_sizing")
 
 
 def _decimals_for_step(step: float) -> int:

@@ -17,7 +17,7 @@ class MarketTypeEnum(str, Enum):
 class CryptoExchangeEnum(str, Enum):
   """Supported crypto centralized exchanges (CEX).
 
-  The factory in :mod:`worker.crypto.factory` maps each member to a concrete
+  The factory in :mod:`worker.gateways.crypto.factory` maps each member to a concrete
   gateway implementation, so adding an exchange means adding a member here and a
   gateway — no call site changes.
   """

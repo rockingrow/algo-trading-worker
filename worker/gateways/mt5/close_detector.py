@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/mt5/close_detector.py
 ────────────────────────────
 Scans MT5 deal history to detect positions closed server-side (SL, TP, stop-out,
@@ -20,7 +20,7 @@ import MetaTrader5 as mt5
 
 from worker.logger import get_logger
 
-log = get_logger("worker.mt5.close_detector")
+log = get_logger("worker.gateways.mt5.close_detector")
 
 
 # ── Close-reason enum ─────────────────────────────────────────────────────── #

@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/mt5/signal_processor.py
 ──────────────────────────────
 MT5/FOREX-specific signal processor.
@@ -42,12 +42,12 @@ from worker.context import WorkerContext
 from worker.core.config import ExecutionConfig
 from worker.core.market_strategy import MarketStrategyFactory
 from worker.core.signal_handler import SignalHandler
+from worker.gateways.mt5.bridge import MT5
+from worker.gateways.mt5.executor import MT5Executor
+from worker.gateways.mt5.message_presenter import TradeMessagePresenter
 from worker.jobs.cdc_job import PositionCDC
 from worker.jobs.mt5_event_job import MT5EventJob
 from worker.logger import get_logger
-from worker.mt5.bridge import MT5
-from worker.mt5.executor import MT5Executor
-from worker.mt5.message_presenter import TradeMessagePresenter
 from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
@@ -56,7 +56,7 @@ from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.services.notification_service import _box
 from worker.settings import MT5_HEALTH_INTERVAL, NATS_REQUIRED_LISTENING_SUBJECTS
 
-log = get_logger("worker.mt5.signal_processor")
+log = get_logger("worker.gateways.mt5.signal_processor")
 
 _CLOSE_STATUS_MAP = {
   "TP1": PositionStatusEnum.TP1,

@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/crypto/executor.py
 ─────────────────────────
 Crypto order executor — the CRYPTO counterpart of ``MT5Executor``.
@@ -6,7 +6,7 @@ Crypto order executor — the CRYPTO counterpart of ``MT5Executor``.
 Implements :class:`~worker.interfaces.executor_protocol.TradeExecutorProtocol`
 so :class:`~worker.core.market_strategy.CryptoMarket` drives it exactly like the
 Forex strategy drives the MT5 executor. All exchange specifics are delegated to
-an injected :class:`~worker.crypto.base.BaseExchangeGateway`, so the executor is
+an injected :class:`~worker.gateways.crypto.base.BaseExchangeGateway`, so the executor is
 exchange-agnostic and unit-testable with a fake gateway.
 
 Notes
@@ -25,12 +25,12 @@ import math
 from typing import Any, Dict, List, Optional
 
 from worker.core.config import ExecutionConfig
-from worker.crypto.base import BaseExchangeGateway, ExchangePosition
+from worker.gateways.crypto.base import BaseExchangeGateway, ExchangePosition
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
 
-logger = get_logger("worker.crypto.executor")
+logger = get_logger("worker.gateways.crypto.executor")
 
 
 class CryptoExecutor:

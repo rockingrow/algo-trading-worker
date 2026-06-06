@@ -9,7 +9,7 @@ bridge, no real DB, no NATS).
 import json
 from types import SimpleNamespace
 
-from worker.mt5.signal_processor import Mt5SignalProcessor
+from worker.gateways.mt5.signal_processor import Mt5SignalProcessor
 from worker.schemas.position_schema import PositionStatusEnum
 
 # ── Fakes ─────────────────────────────────────────────────────────────────── #

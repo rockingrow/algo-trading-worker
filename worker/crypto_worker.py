@@ -13,7 +13,7 @@ Composition mirrors the FOREX worker:
 
 Heavy/exchange-specific imports stay lazy (inside :func:`crypto_worker_main`) so
 the parent FastAPI process never loads exchange or websocket code. Crucially,
-nothing here imports ``worker.mt5.*`` or MetaTrader5 — the CRYPTO path carries
+nothing here imports ``worker.gateways.mt5.*`` or MetaTrader5 — the CRYPTO path carries
 no Forex dependencies.
 """
 
@@ -29,7 +29,7 @@ log = get_logger("worker.crypto_worker")
 
 def crypto_worker_main(settings_dict: dict, stop_event) -> None:
   """Entry point for the crypto child process."""
-  from worker.crypto.signal_processor import CryptoSignalProcessor
+  from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
 
   log.info("[Crypto Process] Started (PID=%d)", multiprocessing.current_process().pid)
 

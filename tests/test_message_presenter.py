@@ -1,6 +1,6 @@
 from conftest import make_signal
 
-from worker.mt5.message_presenter import TradeMessagePresenter, format_volume
+from worker.gateways.mt5.message_presenter import TradeMessagePresenter, format_volume
 from worker.schemas.signal_schema import SignalActionEnum
 
 

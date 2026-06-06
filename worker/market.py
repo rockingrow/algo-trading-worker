@@ -20,7 +20,7 @@ class ForexMarketOrchestrator(MarketOrchestrator):
   """Concrete implementation for Forex market orchestrator."""
   def __init__(self, settings_dict: dict) -> None:
     # Imported lazily so the CRYPTO path never loads MetaTrader5 / mt5 modules.
-    from worker.mt5.manager import MT5Manager
+    from worker.gateways.mt5.manager import MT5Manager
     from worker.mt5_worker import mt5_worker_main
 
     self._manager = MT5Manager(settings_dict, mt5_worker_main, process_name="worker_mt5")

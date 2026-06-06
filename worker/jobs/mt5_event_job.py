@@ -13,14 +13,14 @@ from __future__ import annotations
 import threading
 from typing import Set
 
-from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
-from worker.interfaces.message_sender_protocol import MessageSenderProtocol
-from worker.logger import get_logger
-from worker.mt5.close_detector import (
+from worker.gateways.mt5.close_detector import (
   TerminalClosedEvent,
   TerminalCloseReason,
   scan_terminal_closed_positions,
 )
+from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
+from worker.interfaces.message_sender_protocol import MessageSenderProtocol
+from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.notification_service import _box

@@ -1,12 +1,12 @@
-from typing import Any, Dict, List, Optional
+﻿from typing import Any, Dict, List, Optional
 
 from worker.core.config import ExecutionConfig
+from worker.gateways.mt5.lot_sizing import LotSizer
+from worker.gateways.mt5.stop_validator import StopValidator
+from worker.gateways.mt5.symbol_resolver import SymbolResolver
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
-from worker.mt5.lot_sizing import LotSizer
-from worker.mt5.stop_validator import StopValidator
-from worker.mt5.symbol_resolver import SymbolResolver
 from worker.schemas.signal_schema import SignalSchema
 
 logger = get_logger("worker.mt5_executor")

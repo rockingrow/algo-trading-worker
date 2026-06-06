@@ -2,8 +2,8 @@ from dataclasses import replace
 
 from conftest import FakeMt5, make_symbol_info
 
-from worker.mt5.lot_sizing import LotSizer, _decimals_for_step
-from worker.mt5.symbol_resolver import SymbolResolver
+from worker.gateways.mt5.lot_sizing import LotSizer, _decimals_for_step
+from worker.gateways.mt5.symbol_resolver import SymbolResolver
 
 
 def _sizer(mt5, config):

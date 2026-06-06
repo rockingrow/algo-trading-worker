@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/crypto/binance/user_data_stream.py
 ──────────────────────────────────────────
 Event ingestion from Binance — the CRYPTO counterpart of ``MT5EventJob``.
@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Optional
 
 from worker.logger import get_logger
 
-log = get_logger("worker.crypto.binance.user_data_stream")
+log = get_logger("worker.gateways.crypto.binance.user_data_stream")
 
 _KEEPALIVE_INTERVAL = 30 * 60  # seconds (Binance expires the listenKey at 60 min)
 

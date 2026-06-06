@@ -1,6 +1,6 @@
 from conftest import FakeMt5, make_order_result, make_position, make_signal
 
-from worker.mt5.executor import MT5Executor
+from worker.gateways.mt5.executor import MT5Executor
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -222,6 +222,7 @@ def test_magic_for_resolves_mapped_strategy(config):
 
 
 import pytest
+
 
 def test_magic_for_raises_for_unmapped(config):
   ex = _executor_with_map(FakeMt5(), config, {"SCALP": 100})

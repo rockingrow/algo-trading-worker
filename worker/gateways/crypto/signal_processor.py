@@ -1,17 +1,17 @@
-"""
+﻿"""
 worker/crypto/signal_processor.py
 ─────────────────────────────────
 CRYPTO/CEX-specific signal processor — the counterpart of ``Mt5SignalProcessor``.
 
 Owns the dependencies specific to a centralized exchange: the exchange gateway
-(built by :class:`~worker.crypto.factory.ExchangeFactory`), the crypto executor,
+(built by :class:`~worker.gateways.crypto.factory.ExchangeFactory`), the crypto executor,
 the strategy/handler stack, the NATS subscriber/publisher, and the crypto
 background jobs (position CDC + the exchange user-data event stream).
 
 Receives a :class:`WorkerContext` for market-agnostic infrastructure (DB,
 outbox/direct notifiers, NotificationJob).
 
-This module imports **no** MetaTrader5 / ``worker.mt5.*`` code, so the CRYPTO
+This module imports **no** MetaTrader5 / ``worker.gateways.mt5.*`` code, so the CRYPTO
 path never initializes any Forex dependency.
 """
 
@@ -26,13 +26,13 @@ from worker.context import WorkerContext
 from worker.core.config import ExecutionConfig
 from worker.core.market_strategy import MarketStrategyFactory
 from worker.core.signal_handler import SignalHandler
-from worker.crypto.binance.user_data_stream import (
+from worker.gateways.crypto.binance.user_data_stream import (
   ExchangeCloseEvent,
   ExchangeCloseReason,
 )
-from worker.crypto.executor import CryptoExecutor
-from worker.crypto.factory import ExchangeFactory
-from worker.crypto.message_presenter import CryptoMessagePresenter
+from worker.gateways.crypto.executor import CryptoExecutor
+from worker.gateways.crypto.factory import ExchangeFactory
+from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
 from worker.jobs.cdc_job import PositionCDC
 from worker.logger import get_logger
 from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
@@ -43,7 +43,7 @@ from worker.schemas.signal_schema import SignalSchema
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
 
-log = get_logger("worker.crypto.signal_processor")
+log = get_logger("worker.gateways.crypto.signal_processor")
 
 _CLOSE_STATUS_MAP = {
   "TP1": PositionStatusEnum.TP1,

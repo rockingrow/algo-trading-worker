@@ -1,6 +1,6 @@
 from conftest import FakeMt5, make_symbol_info, make_tick
 
-from worker.mt5.stop_validator import StopValidator
+from worker.gateways.mt5.stop_validator import StopValidator
 
 
 def _validator(**si):

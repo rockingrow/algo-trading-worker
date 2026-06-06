@@ -28,7 +28,7 @@ log = get_logger("worker.mt5_worker")
 
 def mt5_worker_main(settings_dict: dict, stop_event) -> None:
   """Entry point for the MT5 child process."""
-  from worker.mt5.signal_processor import Mt5SignalProcessor
+  from worker.gateways.mt5.signal_processor import Mt5SignalProcessor
 
   log.info("[MT5 Process] Started (PID=%d)", multiprocessing.current_process().pid)
 

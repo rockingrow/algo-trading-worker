@@ -2,8 +2,8 @@
 
 import pytest
 
-from worker.crypto.base import BaseExchangeGateway
-from worker.crypto.factory import ExchangeFactory
+from worker.gateways.crypto.base import BaseExchangeGateway
+from worker.gateways.crypto.factory import ExchangeFactory
 from worker.settings import CryptoExchangeEnum
 
 

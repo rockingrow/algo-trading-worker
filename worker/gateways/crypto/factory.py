@@ -1,8 +1,8 @@
-"""
+﻿"""
 worker/crypto/factory.py
 ────────────────────────
 Exchange factory — turns the configured ``CryptoExchangeEnum`` into a concrete
-:class:`~worker.crypto.base.BaseExchangeGateway`.
+:class:`~worker.gateways.crypto.base.BaseExchangeGateway`.
 
 Adding a new CEX means adding a builder here and a gateway module; no other code
 changes. This is the seam that keeps the worker from depending on any specific
@@ -13,16 +13,16 @@ from __future__ import annotations
 
 from typing import Callable, Dict
 
-from worker.crypto.base import BaseExchangeGateway
+from worker.gateways.crypto.base import BaseExchangeGateway
 from worker.logger import get_logger
 from worker.settings import CryptoExchangeEnum
 
-logger = get_logger("worker.crypto.factory")
+logger = get_logger("worker.gateways.crypto.factory")
 
 
 def _build_binance(settings_dict: dict) -> BaseExchangeGateway:
   # Imported lazily so non-Binance deployments never import its module.
-  from worker.crypto.binance.gateway import BinanceFuturesGateway
+  from worker.gateways.crypto.binance.gateway import BinanceFuturesGateway
 
   return BinanceFuturesGateway(
     api_key=settings_dict["binance_api_key"],

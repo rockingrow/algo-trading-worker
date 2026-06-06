@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/crypto/binance/gateway.py
 ────────────────────────────────
 Binance USDⓈ-M Futures adapter — the first concrete ``BaseExchangeGateway``.
@@ -23,7 +23,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from worker.crypto.base import (
+from worker.gateways.crypto.base import (
   SIDE_LONG,
   SIDE_SHORT,
   BaseExchangeGateway,
@@ -32,7 +32,7 @@ from worker.crypto.base import (
 )
 from worker.logger import get_logger
 
-logger = get_logger("worker.crypto.binance.gateway")
+logger = get_logger("worker.gateways.crypto.binance.gateway")
 
 _MAINNET = "https://fapi.binance.com"
 _TESTNET = "https://testnet.binancefuture.com"
@@ -251,7 +251,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def create_event_stream(self, handler):
     # Lazy import keeps the websocket dependency out of import time.
-    from worker.crypto.binance.user_data_stream import BinanceUserDataStream
+    from worker.gateways.crypto.binance.user_data_stream import BinanceUserDataStream
 
     return BinanceUserDataStream(self, handler)
 

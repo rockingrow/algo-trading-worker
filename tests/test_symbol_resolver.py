@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from conftest import FakeMt5
 
-from worker.mt5.symbol_resolver import SymbolResolver
+from worker.gateways.mt5.symbol_resolver import SymbolResolver
 
 
 def test_resolves_to_broker_symbol():

@@ -1,6 +1,6 @@
 """Tests for the pure Binance user-data-stream event parser."""
 
-from worker.crypto.binance.user_data_stream import (
+from worker.gateways.crypto.binance.user_data_stream import (
   ExchangeCloseReason,
   parse_order_trade_update,
 )

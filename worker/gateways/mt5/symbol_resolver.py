@@ -1,4 +1,4 @@
-"""
+﻿"""
 worker/mt5/symbol_resolver.py
 ─────────────────────────────
 Resolves a base symbol (e.g. ``XAUUSD``) to the broker's actual tradeable
@@ -13,7 +13,7 @@ from __future__ import annotations
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 
-logger = get_logger("worker.mt5.symbol_resolver")
+logger = get_logger("worker.gateways.mt5.symbol_resolver")
 
 
 class SymbolResolver:
