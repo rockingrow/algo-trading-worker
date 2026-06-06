@@ -37,15 +37,16 @@ class PositionRepository:
     comment: str = "",
     message: Optional[str] = None,
     author: str = "broker",
+    market_type: Optional[str] = None,
   ):
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO position_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO position_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author, market_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, mt5_retcode, comment, message, author),
+      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, mt5_retcode, comment, message, author, market_type),
     )
     conn.commit()
     conn.close()
@@ -63,15 +64,16 @@ class PositionRepository:
     comment: Optional[str] = None,
     message: Optional[str] = None,
     magic: Optional[int] = None,
+    market_type: Optional[str] = None,
   ):
     conn = _get_conn()
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message, magic)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message, magic, market_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message, magic),
+      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message, magic, market_type),
     )
     conn.commit()
     conn.close()

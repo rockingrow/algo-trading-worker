@@ -6,12 +6,18 @@ Market abstraction layer.
 Architecture
 ────────────
   BaseMarketStrategy     Abstract interface every market must implement.
-  ForexMarket            Production implementation backed by MT5Executor.
+  ExecutorBackedMarket   Shared concrete logic for any market that drives an
+                         executor satisfying ``TradeExecutorProtocol``.
+  ForexMarket            FOREX implementation backed by MT5Executor.
+  CryptoMarket           CRYPTO implementation backed by CryptoExecutor.
   MarketStrategyFactory  Factory that reads ``settings.market_type`` and
                          returns the correct concrete strategy.
 
-SignalHandler consumes *only* the BaseMarketStrategy interface, keeping
-it fully decoupled from MT5 internals.
+SignalHandler consumes *only* the BaseMarketStrategy interface, keeping it fully
+decoupled from any broker's internals. The entry / TP1 / full-close logic is the
+same regardless of broker — it only ever calls the executor protocol — so it
+lives once in :class:`ExecutorBackedMarket`; ``ForexMarket`` and ``CryptoMarket``
+just bind a concrete executor.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
 from worker.core.config import ExecutionConfig
-from worker.interfaces.mt5_executor_protocol import MT5ExecutorProtocol
+from worker.interfaces.executor_protocol import TradeExecutorProtocol
 from worker.logger import get_logger
 from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.signal_schema import SignalSchema
@@ -89,22 +95,23 @@ class BaseMarketStrategy(ABC):
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-#  ForexMarket — backed by MT5Executor                                         #
+#  ExecutorBackedMarket — shared logic over any TradeExecutorProtocol           #
 # ──────────────────────────────────────────────────────────────────────────── #
 
 
-class ForexMarket(BaseMarketStrategy):
+class ExecutorBackedMarket(BaseMarketStrategy):
   """
-  Concrete implementation for Forex/CFD markets via MetaTrader 5.
+  Concrete strategy logic shared by every executor-driven market.
 
-  Delegates all broker communication to the injected *executor* so that
-  ForexMarket itself remains free of raw ``mt5.*`` calls and is
-  easier to unit-test. The executor is accepted as
-  :class:`~worker.mt5.protocol.MT5ExecutorProtocol` (duck-typed) so
-  tests can inject any compatible mock without importing MetaTrader5.
+  Delegates all broker communication to the injected *executor* so this class
+  stays free of any broker's raw API and is easy to unit-test. The executor is
+  accepted as :class:`TradeExecutorProtocol` (duck-typed) so tests can inject
+  any compatible fake.
   """
 
-  def __init__(self, executor: MT5ExecutorProtocol, config: ExecutionConfig) -> None:
+  def __init__(
+    self, executor: TradeExecutorProtocol, config: ExecutionConfig
+  ) -> None:
     self._executor = executor
     self._config = config
 
@@ -180,7 +187,7 @@ class ForexMarket(BaseMarketStrategy):
   # ── Group 3 ──────────────────────────────────────────────────────────── #
 
   def handle_full_close(self, signal: SignalSchema) -> TradeResult:
-    """Full close using actual MT5 volume; reason derived from signal.action."""
+    """Full close using actual broker volume; reason derived from signal.action."""
     return self._executor.close_all_positions(
       signal.symbol, reason=signal.action.value, strategy=signal.strategy
     )
@@ -196,6 +203,19 @@ class ForexMarket(BaseMarketStrategy):
     self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
   ) -> TradeResult:
     return self._executor.close_all_positions(symbol, reason=reason, strategy=strategy)
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Concrete markets                                                             #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+
+class ForexMarket(ExecutorBackedMarket):
+  """FOREX / CFD market via MetaTrader 5 (backed by ``MT5Executor``)."""
+
+
+class CryptoMarket(ExecutorBackedMarket):
+  """CRYPTO market via a centralized exchange (backed by ``CryptoExecutor``)."""
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -224,27 +244,33 @@ class MarketStrategyFactory:
     Parameters
     ----------
     executor:
-        Required when ``market_type`` is ``FOREX``.
-        Must satisfy :class:`~worker.mt5.protocol.MT5ExecutorProtocol`.
+        The broker executor. Must satisfy :class:`TradeExecutorProtocol`.
+        Required for both FOREX (``MT5Executor``) and CRYPTO (``CryptoExecutor``).
     config:
-        Execution/risk configuration. Required for ``FOREX``.
+        Execution/risk configuration. Required for every market.
     """
     market_type = settings.market_type
     logger.info(f"[MarketStrategyFactory] Detected market_type={market_type.value}")
 
-    if market_type == MarketTypeEnum.FOREX:
-      if executor is None:
-        raise ValueError(
-          "MarketStrategyFactory: executor must be provided for FOREX market."
-        )
-      if config is None:
-        raise ValueError(
-          "MarketStrategyFactory: config must be provided for FOREX market."
-        )
-      strategy = ForexMarket(executor=executor, config=config)
-      logger.info("[MarketStrategyFactory] ForexMarket strategy loaded.")
-      return strategy
+    market_classes = {
+      MarketTypeEnum.FOREX: ForexMarket,
+      MarketTypeEnum.CRYPTO: CryptoMarket,
+    }
+    market_cls = market_classes.get(market_type)
+    if market_cls is None:
+      raise ValueError(
+        f"Unsupported or not-yet-implemented market_type: {market_type!r}"
+      )
 
-    raise ValueError(
-      f"Unsupported or not-yet-implemented market_type: {market_type!r}"
-    )
+    if executor is None:
+      raise ValueError(
+        f"MarketStrategyFactory: executor must be provided for {market_type.value} market."
+      )
+    if config is None:
+      raise ValueError(
+        f"MarketStrategyFactory: config must be provided for {market_type.value} market."
+      )
+
+    strategy = market_cls(executor=executor, config=config)
+    logger.info("[MarketStrategyFactory] %s strategy loaded.", market_cls.__name__)
+    return strategy

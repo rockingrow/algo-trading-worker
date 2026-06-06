@@ -35,13 +35,19 @@ cp .env.example .env
 | `NATS_URL` | ✅ | — | NATS server URL (e.g. `nats://broker-host:4222`) |
 | `NATS_TOKEN` | | `null` | NATS authentication token |
 | `SIGNAL_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
-| **MT5** | | | |
-| `MT5_SERVER` | ✅ | — | Broker server name (e.g. `Exness-MT5Trial6`) |
-| `MT5_LOGIN` | ✅ | — | MT5 account number |
-| `MT5_PASSWORD` | ✅ | — | MT5 account password |
+| `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
+| **MT5** (required when `MARKET_TYPE=FOREX`) | | | |
+| `MT5_SERVER` | FOREX | — | Broker server name (e.g. `Exness-MT5Trial6`) |
+| `MT5_LOGIN` | FOREX | — | MT5 account number |
+| `MT5_PASSWORD` | FOREX | — | MT5 account password |
 | `MT5_PATH` | | auto-detect | Full path to `terminal64.exe`; if omitted the module reads from Windows registry |
 | `MT5_NAME` | | `null` | Display name sent in every `PositionEvent` to the Broker |
-| `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
+| **Crypto CEX** (required when `MARKET_TYPE=CRYPTO`) | | | |
+| `CRYPTO_EXCHANGE` | | `BINANCE` | Which CEX to use; resolved by `ExchangeFactory` |
+| `CRYPTO_QUOTE_ASSET` | | `USDT` | Quote currency appended to bare symbols (`BTCUSD` → `BTCUSDT`) |
+| `BINANCE_API_KEY` | CRYPTO | — | Binance API key |
+| `BINANCE_API_SECRET` | CRYPTO | — | Binance API secret |
+| `BINANCE_TESTNET` | | `false` | Use the Binance Futures testnet when `true` |
 | `MAGIC_NUMBER` | | `20260409` | EA magic number stamped on every order; used as the base filter for all positions in MT5 |
 | `STRATEGY_MAGIC_MAP` | | `{}` | JSON object mapping strategy names to their own magic numbers (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). When set, each strategy's orders are stamped with its dedicated magic number instead of the shared `MAGIC_NUMBER`, enabling native MT5-level isolation without a DB lookup. |
 | `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
@@ -102,12 +108,36 @@ graph TD
     subgraph W2["Worker — Forex (MT5)"]
         W2A[Signal Handler] --> W2B[(SQLite)]
     end
-    subgraph WN["Worker — Crypto (TBD)"]
+    subgraph WN["Worker — Crypto (CEX, e.g. Binance)"]
         WNA[Signal Handler] --> WNB[(SQLite)]
     end
     W1 -- "Subject: TRADE (PositionEvent)" --> NATS
     W2 -- "Subject: TRADE (PositionEvent)" --> NATS
+    WN -- "Subject: TRADE (PositionEvent)" --> NATS
+    Binance["Binance User Data Stream (ws)"] -- "fills / SL / TP / liquidation" --> WN
 ```
+
+### Crypto (CEX) integration
+
+`MARKET_TYPE=CRYPTO` selects the crypto worker instead of the MT5 worker. The
+crypto path is fully **exchange-agnostic** via the factory pattern and never
+imports MetaTrader5 or any `worker.mt5.*` module:
+
+| Layer | Type | Role |
+| --- | --- | --- |
+| `worker/crypto/base.py` | `BaseExchangeGateway` (ABC) | CEX contract: orders, positions, stops, account |
+| `worker/crypto/factory.py` | `ExchangeFactory` | Builds the configured exchange (first: Binance) |
+| `worker/crypto/binance/gateway.py` | `BinanceFuturesGateway` | Binance USDⓈ-M Futures REST adapter |
+| `worker/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Websocket job ingesting fills / SL / TP / liquidation |
+| `worker/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
+| `worker/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
+
+Adding a new exchange = implement `BaseExchangeGateway` + register it in
+`ExchangeFactory`. No business-logic change.
+
+Required env when `MARKET_TYPE=CRYPTO`: `CRYPTO_EXCHANGE`, `BINANCE_API_KEY`,
+`BINANCE_API_SECRET` (optionally `BINANCE_TESTNET`, `CRYPTO_QUOTE_ASSET`). MT5
+credentials are **not** required. See `.env.example`.
 
 ---
 

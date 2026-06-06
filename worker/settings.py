@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -12,6 +12,17 @@ class MarketTypeEnum(str, Enum):
 
   FOREX = "FOREX"
   CRYPTO = "CRYPTO"
+
+
+class CryptoExchangeEnum(str, Enum):
+  """Supported crypto centralized exchanges (CEX).
+
+  The factory in :mod:`worker.crypto.factory` maps each member to a concrete
+  gateway implementation, so adding an exchange means adding a member here and a
+  gateway — no call site changes.
+  """
+
+  BINANCE = "BINANCE"
 
 
 NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN}
@@ -32,12 +43,21 @@ class Settings(BaseSettings):
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
   signal_subjects: str
 
-  # MT5 Credentials
-  mt5_server: str
-  mt5_login: int
-  mt5_password: str
+  # MT5 Credentials — required only when MARKET_TYPE == FOREX. They are optional
+  # at the field level so a pure CRYPTO deployment never has to set them (and the
+  # MT5 / MetaTrader5 stack is never initialized). See the model validator below.
+  mt5_server: Optional[str] = None
+  mt5_login: Optional[int] = None
+  mt5_password: Optional[str] = None
   mt5_path: Optional[str] = None
   mt5_name: Optional[str] = None
+
+  # Crypto CEX — required only when MARKET_TYPE == CRYPTO.
+  crypto_exchange: CryptoExchangeEnum = CryptoExchangeEnum.BINANCE
+  crypto_quote_asset: str = "USDT"  # quote currency appended to bare symbols
+  binance_api_key: Optional[str] = None
+  binance_api_secret: Optional[str] = None
+  binance_testnet: bool = False
 
   # Strategy configuration
   strategy_magic_map: dict[str, int] = {}
@@ -81,6 +101,44 @@ class Settings(BaseSettings):
   # Broker
   broker_api_url: str
   broker_api_key: str
+
+  @model_validator(mode="after")
+  def _validate_market_requirements(self):
+    """Require only the credentials the selected market actually needs.
+
+    FOREX must not boot without MT5 credentials; CRYPTO must not boot without
+    the selected exchange's API keys. This keeps each deployment from carrying
+    (or initializing) the other market's dependencies.
+    """
+    if self.market_type == MarketTypeEnum.FOREX:
+      missing = [
+        name
+        for name, value in (
+          ("MT5_SERVER", self.mt5_server),
+          ("MT5_LOGIN", self.mt5_login),
+          ("MT5_PASSWORD", self.mt5_password),
+        )
+        if not value
+      ]
+      if missing:
+        raise ValueError(
+          f"MARKET_TYPE=FOREX requires: {', '.join(missing)}"
+        )
+    elif self.market_type == MarketTypeEnum.CRYPTO:
+      if self.crypto_exchange == CryptoExchangeEnum.BINANCE:
+        missing = [
+          name
+          for name, value in (
+            ("BINANCE_API_KEY", self.binance_api_key),
+            ("BINANCE_API_SECRET", self.binance_api_secret),
+          )
+          if not value
+        ]
+        if missing:
+          raise ValueError(
+            f"MARKET_TYPE=CRYPTO (BINANCE) requires: {', '.join(missing)}"
+          )
+    return self
 
   model_config = SettingsConfigDict(
     env_file=".env", env_file_encoding="utf-8", extra="ignore"
