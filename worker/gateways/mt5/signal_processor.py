@@ -1,32 +1,17 @@
-﻿"""
-worker/mt5/signal_processor.py
-──────────────────────────────
+"""
+worker/gateways/mt5/signal_processor.py
+───────────────────────────────────────
 MT5/FOREX-specific signal processor.
 
-Owns all dependencies that are specific to the MT5 broker: the MT5 bridge
-itself, the NATS subscriber/publisher (which embeds account-footer info),
-the executor, the strategy/handler stack, and the MT5-specific background
-jobs (health thread, terminal-close detection, position CDC).
+Implements the broker-specific hooks of
+:class:`~worker.core.base_signal_processor.BaseSignalProcessor`: the MT5 bridge,
+executor, reconnect handling, and the MT5 background jobs (health thread,
+terminal-close detection). Everything market-agnostic — the NATS loop, signal
+persistence, notifications, position CDC — is inherited from the base.
 
-Receives a :class:`WorkerContext` for market-agnostic infrastructure
-(DB, outbox/direct notifiers, NotificationJob).
-
-Lifecycle (all called from inside the child process):
-
-    processor = Mt5SignalProcessor(ctx, settings_dict)
-    if not processor.connect(): return
-    processor.send_startup_notification()
-    processor.start_market_jobs(stop_event)
-    try:
-        processor.run(stop_event)
-    finally:
-        processor.shutdown()
-        processor.send_shutdown_notification()
-
-All heavy MetaTrader5 imports are at module level — this module must
-only be imported from the child process (i.e. lazy-imported inside
-:func:`worker.mt5_worker.mt5_worker_main`) so the parent FastAPI process
-never loads the MT5 C extension.
+All heavy MetaTrader5 imports are at module level, so this module must only be
+imported from the child process (lazy-imported inside
+:func:`worker.mt5_worker.mt5_worker_main`) — never by the parent FastAPI process.
 """
 
 from __future__ import annotations
@@ -34,50 +19,23 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
-from worker.core.config import ExecutionConfig
-from worker.core.market_strategy import MarketStrategyFactory
-from worker.core.signal_handler import SignalHandler
+from worker.core.base_signal_processor import BaseSignalProcessor
 from worker.gateways.mt5.bridge import MT5
 from worker.gateways.mt5.executor import MT5Executor
 from worker.gateways.mt5.message_presenter import TradeMessagePresenter
-from worker.jobs.cdc_job import PositionCDC
 from worker.jobs.mt5_event_job import MT5EventJob
 from worker.logger import get_logger
 from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
-from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.schemas.signal_schema import SignalSchema
-from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.services.notification_service import _box
-from worker.settings import MT5_HEALTH_INTERVAL, NATS_REQUIRED_LISTENING_SUBJECTS
+from worker.settings import MT5_HEALTH_INTERVAL
 
 log = get_logger("worker.gateways.mt5.signal_processor")
-
-_CLOSE_STATUS_MAP = {
-  "TP1": PositionStatusEnum.TP1,
-  "TP2": PositionStatusEnum.TP2,
-  "SL": PositionStatusEnum.SL,
-  "R_SL": PositionStatusEnum.R_SL,
-  "FLAT": PositionStatusEnum.FLATTED,
-}
-
-
-def _parse_nats_subjects(raw: str) -> list[str | NatsSubjectEnum]:
-  parsed: set[str | NatsSubjectEnum] = set()
-  for s in raw.split(","):
-    s = s.strip()
-    if not s:
-      continue
-    try:
-      parsed.add(NatsSubjectEnum(s))
-    except ValueError:
-      parsed.add(s)
-  return list(NATS_REQUIRED_LISTENING_SUBJECTS | parsed)
 
 
 # ── Child-process helpers ────────────────────────────────────────────────── #
@@ -169,81 +127,59 @@ def _ensure_mt5_connected(bridge, notifier, footer: str, log) -> bool:
 # ── Processor ────────────────────────────────────────────────────────────── #
 
 
-class Mt5SignalProcessor:
-  """Composes MT5 broker bridge + NATS + executor/handler, drives the signal loop."""
+class Mt5SignalProcessor(BaseSignalProcessor):
+  """MT5 broker bridge + executor + MT5 jobs over the shared signal skeleton."""
+
+  name = "MT5"
+  presenter = TradeMessagePresenter
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
-    self.ctx = ctx
-    self.settings = settings_dict
+    super().__init__(ctx, settings_dict)
+    self._footer = ""
 
+  # ── Broker hooks ──────────────────────────────────────────────────────── #
+
+  def _build_executor(self) -> MT5Executor:
     self.bridge = MT5(
-      server=settings_dict["mt5_server"],
-      login=settings_dict["mt5_login"],
-      password=settings_dict["mt5_password"],
-      path=settings_dict.get("mt5_path"),
+      server=self.settings["mt5_server"],
+      login=self.settings["mt5_login"],
+      password=self.settings["mt5_password"],
+      path=self.settings.get("mt5_path"),
     )
-
-    self.config = ExecutionConfig.from_dict(settings_dict)
-    self.executor = MT5Executor(
-      slippage_deviation=settings_dict["slippage_deviation"],
+    return MT5Executor(
+      slippage_deviation=self.settings["slippage_deviation"],
       config=self.config,
-      db=ctx.db_service,
-      strategy_magic_map=settings_dict.get("strategy_magic_map") or {},
+      db=self.ctx.db_service,
+      strategy_magic_map=self.settings.get("strategy_magic_map") or {},
     )
-    self.strategy = MarketStrategyFactory.create(
-      executor=self.executor, config=self.config
-    )
-    self.handler = SignalHandler(self.strategy, ctx.db_service)
 
-    self.subscriber: Optional[NATSSubscriber] = None
-    self.publisher: Optional[NATSPublisher] = None
-    self._footer: str = ""
+  def _connect_broker(self) -> bool:
+    return self.bridge.reconnect(max_attempts=0, delay_seconds=10.0)
 
-  # ── Lifecycle ────────────────────────────────────────────────────────── #
-
-  def connect(self) -> bool:
-    if not self.bridge.reconnect(max_attempts=0, delay_seconds=10.0):
-      log.error("[MT5 Process] Could not connect to MT5. Exiting.")
-      return False
-
-    self.subscriber = NATSSubscriber(
-      url=self.settings["nats_url"],
-      subjects=_parse_nats_subjects(self.settings.get("signal_subjects", "")),
-      publish_subjects=[NatsSubjectEnum.TRADE],
-      token=self.settings.get("nats_token"),
-      account_footer_fn=self.bridge.get_account_footer,
-      enqueue_fn=self.ctx.nats_enqueue,
-    )
-    self.subscriber.connect()
-
-    self.publisher = NATSPublisher(
-      url=self.settings["nats_url"],
-      publish_subjects=[NatsSubjectEnum.TRADE],
-      token=self.settings.get("nats_token"),
-    )
-    self.publisher.connect()
-
-    self._footer = self.bridge.get_account_footer()
-    return True
-
-  def shutdown(self) -> None:
-    if self.subscriber is not None:
-      self.subscriber.close()
-    if self.publisher is not None:
-      self.publisher.close()
+  def _disconnect_broker(self) -> None:
     self.bridge.shutdown()
 
-  def send_startup_notification(self) -> None:
-    self.ctx.direct_notifier.send_message(
-      TradeMessagePresenter.startup(self.settings, self._footer)
-    )
+  def _account_footer(self) -> str:
+    return self.bridge.get_account_footer()
 
-  def send_shutdown_notification(self) -> None:
-    self.ctx.direct_notifier.send_message(
-      TradeMessagePresenter.shutdown(self._footer)
-    )
+  @property
+  def _account_id(self) -> str:
+    return str(self.settings["mt5_login"])
 
-  def start_market_jobs(self, stop_event) -> None:
+  def _magic_for(self, strategy: str) -> Optional[int]:
+    return self.executor._magic_for(strategy)
+
+  def _position_cdc_kwargs(self) -> Dict[str, Any]:
+    return {
+      "account_info_fn": self.bridge.get_account_status,
+      "account_name": self.settings.get("mt5_name"),
+      "strategy_magic_map": self.settings.get("strategy_magic_map") or {},
+    }
+
+  def _ensure_connected(self) -> bool:
+    return _ensure_mt5_connected(self.bridge, self.ctx.notifier, self._footer, log)
+
+  def _start_broker_jobs(self, stop_event) -> None:
     threading.Thread(
       target=_mt5_health_thread,
       args=(self.bridge, self.ctx.notifier, self.bridge.get_account_footer, stop_event, log),
@@ -257,21 +193,7 @@ class Mt5SignalProcessor:
       notifier=self.ctx.channel_notifier,
     ).start(stop_event=stop_event)
 
-    PositionCDC(
-      account_id=str(self.settings["mt5_login"]),
-      publisher=self.publisher,
-      db_service=self.ctx.db_service,
-      account_info_fn=self.bridge.get_account_status,
-      account_name=self.settings.get("mt5_name"),
-      market_type=self.settings.get("market_type"),
-      strategy_magic_map=self.settings.get("strategy_magic_map") or {},
-    ).start(stop_event=stop_event)
-
-  # ── Main loop ────────────────────────────────────────────────────────── #
-
-  def run(self, stop_event) -> None:
-    for subject, raw in self.subscriber.listen(stop_event=stop_event):
-      self._process_message(subject, raw)
+  # ── ADMIN FLAT (MT5 reconciles against live tickets) ──────────────────── #
 
   def _handle_admin_message(self, raw: str) -> None:
     try:
@@ -381,90 +303,3 @@ class Mt5SignalProcessor:
           comment="Admin FLAT (position already closed in MT5)",
           message=raw,
         )
-
-  def _process_message(self, subject, raw) -> None:
-    if subject == NatsSubjectEnum.ADMIN:
-      self._handle_admin_message(raw)
-      return
-    try:
-      signal = SignalSchema(**json.loads(raw))
-    except json.JSONDecodeError as err:
-      log.error("[MT5 Process] Malformed JSON: %s", err)
-      return
-    except ValidationError as err:
-      log.error("[MT5 Process] Signal validation failed: %s", err)
-      return
-
-    if not _ensure_mt5_connected(self.bridge, self.ctx.notifier, self._footer, log):
-      return
-
-    log.info(
-      "[MT5 Process] Processing Signal: %s | %s | TV Time: %s",
-      signal.symbol,
-      signal.action.value,
-      signal.timestamp,
-    )
-
-    result = self.handler.handle(signal)
-
-    self.ctx.db_service.log_position(
-      strategy=signal.strategy,
-      ticket=result.get("ticket"),
-      source_ticket=result.get("source_ticket", result.get("ticket")),
-      symbol=signal.symbol,
-      action=signal.action.value,
-      volume=result.get("volume", signal.quantity),
-      price=result.get("price", signal.price),
-      sl=getattr(signal, "sl", None),
-      tp1=getattr(signal, "tp1", None),
-      mt5_retcode=result.get("retcode", -1),
-      comment=result.get("comment", ""),
-      message=signal.model_dump_json(),
-      author="broker",
-    )
-
-    if result.get("success"):
-      action_val = signal.action.value
-      pos_ticket = result.get("source_ticket", result.get("ticket"))
-      signal_json = signal.model_dump_json()
-
-      for fc in result.get("forced_closed", []):
-        self.ctx.channel_notifier.send_message(
-          TradeMessagePresenter.force_closed(
-            signal.symbol, signal.strategy, fc, self.bridge.get_account_footer()
-          )
-        )
-
-      if action_val in ("LONG", "SHORT"):
-        self.ctx.db_service.insert_position(
-          ticket=pos_ticket,
-          strategy=signal.strategy,
-          symbol=signal.symbol,
-          action=action_val.lower(),
-          volume=result.get("volume", signal.quantity),
-          opened_price=result.get("price", signal.price),
-          mt5_retcode=result.get("retcode"),
-          comment=result.get("comment", ""),
-          message=signal_json,
-          magic=self.executor._magic_for(signal.strategy),
-        )
-      else:
-        status = _CLOSE_STATUS_MAP.get(action_val)
-        if status:
-          self.ctx.db_service.update_position_status(
-            source_ticket=pos_ticket,
-            status=status,
-            new_ticket=result.get("ticket"),
-            closed_price=result.get("price"),
-            mt5_retcode=result.get("retcode"),
-            comment=result.get("comment", ""),
-            message=signal_json,
-          )
-      msg = TradeMessagePresenter.order_filled(
-        signal, result, pos_ticket, self.bridge.get_account_footer()
-      )
-    else:
-      msg = TradeMessagePresenter.order_failed(
-        signal, result, self.bridge.get_account_footer()
-      )
-    self.ctx.channel_notifier.send_message(msg)
