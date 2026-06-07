@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.1.0] — 2026-06-07
+
+### Added
+
+- **Crypto (CEX) market via the factory pattern — Binance first.** A new `MARKET_TYPE=CRYPTO` runs the worker against a centralized exchange instead of MT5. The integration is exchange-agnostic: business logic depends only on `BaseExchangeGateway` (ABC), and `ExchangeFactory` builds the configured exchange from `CRYPTO_EXCHANGE`. Adding an exchange = implement the gateway + register it; no call-site changes. First adapter: `BinanceFuturesGateway` (USDⓈ-M Futures, HMAC-SHA256 signed REST). Order service via `CryptoExecutor` (implements the broker-neutral `TradeExecutorProtocol`); risk-based or payload-quantity sizing; reduce-only closes; breakeven-after-TP1 as a `STOP_MARKET`.
+- **Exchange event ingestion (`BinanceUserDataStream`).** A websocket User Data Stream job (the optimal, push-based mechanism) ingests fills / stop-loss / take-profit / liquidation and reconciles the DB + notifies — the CRYPTO counterpart of `MT5EventJob`. Frame parsing is a pure, unit-tested function (`parse_order_trade_update`); the listenKey is kept alive automatically.
+- **`TradeResult` value object** (`worker/schemas/trade_result.py`) with `ok()` / `fail()` factories, replacing the scattered `{"success": ..., "retcode": ..., "comment": ...}` dict literals across both executors, the gateway, strategy, and handler. Keeps dict-style read/write access for backward compatibility; `metatrader_schema.TradeResult` re-exports it.
+- **Docker for the crypto worker.** `Dockerfile` (Linux, `python:3.12-slim` + `uv`, non-root) and `docker-compose.yml` (NATS + crypto worker, persistent SQLite volume, healthchecks). `MetaTrader5` is skipped on Linux via its platform marker, so the image carries no Forex dependency. New `make docker-*` targets. MT5/FOREX is intentionally not containerized (Windows + terminal required).
+- **`market_type` column** on `positions` / `position_logs`, and an `exchange` log author for CEX-triggered closes.
+
+### Changed
+
+- **Gateway-neutral database columns** (no migration — PROD has no data, the DB is recreated). `positions` / `position_logs` columns renamed so both markets share them: `magic → strategy_code`, `mt5_retcode → gateway_return_code`, `message → gateway_message`, `ticket → ref_id`, `source_ticket → ref_source_id`. `ref_id` / `ref_source_id` are stored as TEXT (any gateway's id format fits); `worker/db/repository.py` is the single boundary that maps columns ↔ application-domain names and parses TEXT↔int. The NATS `PositionEvent` contract and all consumers are unchanged.
+- **`BaseSignalProcessor` (Template Method).** Extracted the shared signal-processor skeleton (NATS loop, `connect`/`shutdown`/`run`/`start_market_jobs`, signal persistence, notifications, `PositionCDC` wiring) into `worker/core/base_signal_processor.py`. `Mt5SignalProcessor` and `CryptoSignalProcessor` now implement only broker-specific `@abstractmethod` hooks (`_build_executor`, `_connect_broker`, `_account_footer`, `_magic_for`, `_start_broker_jobs`, `_handle_admin_message`, …).
+- **Unified worker bootstrap & orchestration.** A single `run_worker()` (`worker/worker_runtime.py`) drives every child-process lifecycle; `mt5_worker_main` / `crypto_worker_main` only bind their processor. The two orchestrators collapsed into one `GatewayProcessOrchestrator` (worker fn + label) backed by the generic `WorkerProcessManager`.
+- **`MarketStrategyFactory.create(market_type, executor, config)`** now takes `market_type` explicitly (Dependency Injection) instead of reading the global `settings` singleton.
+- **Per-market credential validation.** MT5 credentials are required only for FOREX; the exchange API keys only for CRYPTO — so each deployment carries (and initializes) only its own market's dependencies. The CRYPTO path imports no MetaTrader5 / `worker.gateways.mt5.*` (verified).
+- **Repository structure.** MT5 and crypto integrations grouped under `worker/gateways/{mt5,crypto}/`; the SQLite layer lives in `worker/db/` (`schema.py`, `repository.py`, `connection.py`).
+
+### Notes
+
+- New settings: `CRYPTO_EXCHANGE`, `CRYPTO_QUOTE_ASSET`, `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_TESTNET`. MT5 settings (`MT5_SERVER` / `MT5_LOGIN` / `MT5_PASSWORD`) are now optional at the field level (validated only for FOREX).
+- Removed the standalone `MAGIC_NUMBER` env var from the docs (the worker uses `STRATEGY_MAGIC_MAP` exclusively; every FOREX strategy that trades must be mapped).
+
+---
+
 ## [1.0.1] — 2026-06-03
 
 ### Added

@@ -1,6 +1,6 @@
 # 🚀 Algo Trading Worker
 
-This is the execution-end of the Event-Driven trading system. It acts as a NATS subscriber waiting for highly structured trading signals from the central Broker, then executes them directly into the MetaTrader 5 Terminal.
+This is the execution-end of the Event-Driven trading system. It acts as a NATS subscriber waiting for highly structured trading signals from the central Broker, then executes them on the configured market gateway — **FOREX** via the MetaTrader 5 Terminal (Windows) or **CRYPTO** via a centralized exchange such as Binance (any OS, containerized). The market is selected by `MARKET_TYPE`, and the two paths share the same NATS/SQLite/notification core through a factory + Template-Method design.
 
 ---
 
@@ -51,8 +51,7 @@ cp .env.example .env
 | `BINANCE_API_KEY` | CRYPTO | — | Binance API key |
 | `BINANCE_API_SECRET` | CRYPTO | — | Binance API secret |
 | `BINANCE_TESTNET` | | `false` | Use the Binance Futures testnet when `true` |
-| `MAGIC_NUMBER` | | `20260409` | EA magic number stamped on every order; used as the base filter for all positions in MT5 |
-| `STRATEGY_MAGIC_MAP` | | `{}` | JSON object mapping strategy names to their own magic numbers (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). When set, each strategy's orders are stamped with its dedicated magic number instead of the shared `MAGIC_NUMBER`, enabling native MT5-level isolation without a DB lookup. |
+| `STRATEGY_MAGIC_MAP` | FOREX | `{}` | JSON mapping each strategy to its dedicated MT5 magic number (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). Each strategy's orders are stamped with — and filtered by — its own magic, giving native MT5-level isolation without a DB lookup. Every FOREX strategy that trades must be listed here. |
 | `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
 | **Risk Management** | | | |
 | `VOLUME_DECISION_ENABLED` | | `true` | When `true`, lot size is calculated from capital + risk % instead of signal `quantity` |
@@ -86,7 +85,9 @@ Start the Worker (from the root directory):
 make start
 ```
 
-The Worker will initialise the `worker_data.sqlite` database, spawn an isolated MT5 subprocess, and subscribe to the configured NATS subjects. Inside the subprocess three daemon threads run in parallel: the MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC` (change-data-capture publisher to the NATS `TRADE` subject). You can monitor the logs printed directly to the screen.
+The Worker will initialise the `worker_data.sqlite` database, spawn an isolated market subprocess (MT5 for FOREX, the exchange worker for CRYPTO), and subscribe to the configured NATS subjects. For FOREX, three daemon threads run in parallel inside the subprocess: the MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC`. For CRYPTO, the subprocess runs `PositionCDC` plus the exchange user-data event stream (Binance websocket). You can monitor the logs printed directly to the screen.
+
+> For CRYPTO on Linux, prefer the containerized setup — see [🐳 Docker (Crypto worker)](#-docker-crypto-worker).
 
 ---
 
@@ -156,12 +157,12 @@ imports MetaTrader5 or any `worker.mt5.*` module:
 
 | Layer | Type | Role |
 | --- | --- | --- |
-| `worker/crypto/base.py` | `BaseExchangeGateway` (ABC) | CEX contract: orders, positions, stops, account |
-| `worker/crypto/factory.py` | `ExchangeFactory` | Builds the configured exchange (first: Binance) |
-| `worker/crypto/binance/gateway.py` | `BinanceFuturesGateway` | Binance USDⓈ-M Futures REST adapter |
-| `worker/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Websocket job ingesting fills / SL / TP / liquidation |
-| `worker/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
-| `worker/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
+| `worker/gateways/crypto/base.py` | `BaseExchangeGateway` (ABC) | CEX contract: orders, positions, stops, account |
+| `worker/gateways/crypto/factory.py` | `ExchangeFactory` | Builds the configured exchange (first: Binance) |
+| `worker/gateways/crypto/binance/gateway.py` | `BinanceFuturesGateway` | Binance USDⓈ-M Futures REST adapter |
+| `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Websocket job ingesting fills / SL / TP / liquidation |
+| `worker/gateways/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
+| `worker/gateways/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
 
 Adding a new exchange = implement `BaseExchangeGateway` + register it in
 `ExchangeFactory`. No business-logic change.
@@ -172,15 +173,15 @@ credentials are **not** required. See `.env.example`.
 
 ---
 
-## 🧩 MT5 Module Flow (`worker/mt5/`)
+## 🧩 MT5 Gateway Module Flow (`worker/gateways/mt5/`)
 
-How the files inside `worker/mt5/` wire together at runtime. `Mt5SignalProcessor` is the hub: it owns the connection (`bridge`), the order layer (`executor` + its three collaborators), the message formatter (`message_presenter`), and starts the background jobs. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
+How the files inside `worker/gateways/mt5/` wire together at runtime. `Mt5SignalProcessor` is the hub: it owns the connection (`bridge`), the order layer (`executor` + its three collaborators), the message formatter (`message_presenter`), and starts the background jobs. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
 
 ```mermaid
 graph TD
     Manager["manager.py<br/>MT5Manager (parent process)"]
 
-    subgraph Child["Child process — worker/mt5/"]
+    subgraph Child["Child process — worker/gateways/mt5/"]
         SP["signal_processor.py<br/>Mt5SignalProcessor — hub"]
         Bridge["bridge.py<br/>MT5 (terminal connection)"]
         Presenter["message_presenter.py<br/>TradeMessagePresenter"]
@@ -225,44 +226,68 @@ graph TD
 
 ```text
 worker/
-├── core/                # Signal processing logic
-│   ├── market_strategy.py        # MarketStrategyFactory & base strategy interface
-│   └── signal_handler.py         # Routes signals to correct MT5 execution flow
+├── core/                # Market-agnostic signal processing
+│   ├── base_signal_processor.py  # BaseSignalProcessor — shared NATS loop (Template Method)
+│   ├── config.py                 # ExecutionConfig value object (risk/volume params)
+│   ├── market_strategy.py        # MarketStrategyFactory + ExecutorBackedMarket / Forex / Crypto
+│   └── signal_handler.py         # Routes signals to the correct execution flow
+├── gateways/            # External trading-platform integrations
+│   ├── mt5/             # FOREX — MetaTrader 5 (Windows only)
+│   │   ├── bridge.py                 # MT5 terminal connection bridge
+│   │   ├── executor.py               # MT5 trade execution primitives
+│   │   ├── close_detector.py         # Terminal-close event scanner (polling)
+│   │   ├── manager.py                # MT5Manager (alias of WorkerProcessManager)
+│   │   ├── message_presenter.py      # TradeMessagePresenter (Telegram strings)
+│   │   └── signal_processor.py       # Mt5SignalProcessor — MT5 hooks over the base
+│   └── crypto/          # CRYPTO — centralized exchanges (CEX); any OS
+│       ├── base.py                   # BaseExchangeGateway (ABC) + ExchangePosition
+│       ├── executor.py               # CryptoExecutor (TradeExecutorProtocol)
+│       ├── factory.py                # ExchangeFactory — selects the CEX
+│       ├── message_presenter.py      # CryptoMessagePresenter
+│       ├── signal_processor.py       # CryptoSignalProcessor — crypto hooks over the base
+│       └── binance/                  # First concrete exchange
+│           ├── gateway.py            # BinanceFuturesGateway (signed REST)
+│           └── user_data_stream.py   # BinanceUserDataStream (websocket events) + parser
 ├── interfaces/          # Protocol types for dependency inversion
-│   ├── db_protocol.py            # DBServiceProtocol
-│   └── mt5_executor_protocol.py  # MT5ExecutorProtocol
+│   ├── db_protocol.py            # Segregated persistence protocols
+│   ├── executor_protocol.py      # TradeExecutorProtocol (broker-neutral)
+│   ├── mt5_executor_protocol.py  # MT5ExecutorProtocol (legacy alias)
+│   ├── mt5_gateway_protocol.py   # Mt5GatewayProtocol (MetaTrader5 surface)
+│   ├── publisher_protocol.py     # MessagePublisherProtocol
+│   └── trade_presenter_protocol.py # TradePresenterProtocol
 ├── jobs/                # Background polling jobs (daemon threads)
 │   ├── cdc_job.py                # PositionCDC — Change Data Capture to NATS TRADE
-│   ├── mt5_event_job.py          # MT5EventJob — terminal-close detection
+│   ├── mt5_event_job.py          # MT5EventJob — terminal-close detection (FOREX)
 │   └── notification_job.py       # NotificationJob — outbox dispatcher (Telegram retries)
-├── mt5/                 # MetaTrader 5 integration
-│   ├── bridge.py                 # MT5 terminal connection bridge
-│   ├── executor.py               # MT5 trade execution primitives
-│   ├── close_detector.py         # Terminal-close event scanner (polling)
-│   ├── manager.py                # MT5Manager — subprocess lifecycle (parent process)
-│   └── signal_processor.py       # Mt5SignalProcessor — child-process signal loop
-├── schemas/             # Pydantic data schemas
+├── schemas/             # Pydantic / dataclass data schemas
 │   ├── admin_schema.py           # AdminActionEnum + AdminSignalSchema (NATS ADMIN subject)
-│   ├── job_schema.py             # LogAuthorEnum and job-specific schemas
-│   ├── metatrader_schema.py      # TradeResult TypedDict (MT5 order_send result)
+│   ├── job_schema.py             # LogAuthorEnum (broker / terminal / exchange)
+│   ├── trade_result.py           # TradeResult value object (ok()/fail() factories)
+│   ├── metatrader_schema.py      # Back-compat re-export of TradeResult
 │   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, TRADE)
 │   ├── notification_schema.py    # NotificationPlatformEnum / NotificationChannelEnum
 │   ├── position_schema.py        # PositionStatusEnum + PositionEvent / PositionEventType
 │   └── signal_schema.py          # Signal validation schemas
 ├── services/            # Infrastructure services
-│   ├── db_service.py             # Database access layer (positions, logs, outbox)
+│   ├── db_service.py             # Persistence facade (positions, logs, outbox)
 │   ├── nats_service.py           # NATSSubscriber & NATSPublisher
 │   └── notification_service.py   # TelegramNotification + OutboxNotifier wrapper
+├── db/                  # SQLite persistence layer
+│   ├── connection.py             # Connection factory
+│   ├── repository.py             # SQL + gateway-neutral column ↔ app-domain mapping
+│   └── schema.py                 # Table DDL (gateway-neutral columns)
 ├── utils/               # Shared utilities
 │   └── logging.py                # Structured logging helpers
-├── app.py               # Application factory, FastAPI lifespan & watchdog
+├── app.py               # Application factory, FastAPI lifespan
 ├── context.py           # WorkerContext — market-agnostic services (DB, notifiers, outbox)
-├── db.py                # Local SQLite persistence layer
 ├── logger.py            # Structured logging configuration
 ├── main.py              # Application entry point
-├── market.py            # Market orchestrator (selects MT5 vs crypto worker)
-├── mt5_worker.py        # Child-process entry point (worker_initialized)
-└── settings.py          # Environment & app configuration
+├── market.py            # GatewayProcessOrchestrator + create_market_orchestrator
+├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
+├── worker_runtime.py    # run_worker() — shared child-process bootstrap
+├── mt5_worker.py        # FOREX child-process entry point
+├── crypto_worker.py     # CRYPTO child-process entry point
+└── settings.py          # Environment & app configuration (per-market validation)
 ```
 
 ---
@@ -343,12 +368,10 @@ All fields except `action` and `timestamp` are optional.
 
 ## 🧠 Signal Execution — Key Design Decisions
 
-- **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation uses a two-layer scheme resolved by `MT5Executor`:
+- **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation differs per gateway:
 
-  1. **Magic-based (primary):** Each strategy can be assigned its own MT5 magic number via `STRATEGY_MAGIC_MAP` (JSON object, e.g. `{"SCALP": 20260001, "SWING": 20260002}`). `open_position` stamps a new order with `_magic_for(signal.strategy)`, and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic. When a strategy has a dedicated magic, isolation is **native at the MT5 level — no DB lookup required**.
-  2. **DB-based (fallback):** For strategies *not* present in `STRATEGY_MAGIC_MAP`, all orders share the base `MAGIC_NUMBER`, so membership is disambiguated against the authoritative `strategy` column in the positions table (`get_open_positions_by_strategy`), matching live MT5 tickets to the tickets that column records.
-
-  Closing operations (`close_single_position`, `partial_close_position`, `close_all_positions`) stamp the closing deal with `pos.magic` — the magic of the position being closed — so the close deal always carries the same magic as its position. `owned_magics()` (base + all mapped values) defines the full set of magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
+  - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number via `STRATEGY_MAGIC_MAP`. `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
+  - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol)` DB invariant and the `strategy` column.
 
 - **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries MT5 for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. After the MT5 close succeeds, the corresponding SQLite record(s) are immediately updated to `FORCED_CLOSED` so the DB stays consistent. Only then is the new position opened.
 
@@ -366,9 +389,9 @@ All fields except `action` and `timestamp` are optional.
 
 - **Breakeven SL after TP1:** After the partial close succeeds, a `TRADE_ACTION_SLTP` request moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss.
 
-- **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to a local `order_logs` SQLite table. This audit trail captures the full original NATS JSON `message`, the MT5 target `ticket`, the original `source_ticket`, and all execution context mapping directly back to the Broker's state.
+- **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 
-- **GIL-isolated subprocess:** All MT5 and NATS blocking code runs in a separate OS process (`mt5_worker.worker_initialized`). The parent FastAPI process only manages subprocess lifetime via `MT5Manager`, keeping the event loop fully responsive. `MT5Manager` accepts a `worker_fn` parameter so the entry point is injectable and testable.
+- **GIL-isolated subprocess:** All MT5 and NATS blocking code runs in a separate OS process (`mt5_worker.mt5_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable.
 
 - **Dependency-injection boundary — why only the executor takes an injected gateway:** The `MetaTrader5` module is a native C extension that exposes a single **process-global** connection — `mt5.initialize()` / `mt5.login()` mutate ambient process state, and every `mt5.*` call implicitly targets that one connection. There is no connection *object* to construct or pass around, and because the calls are GIL-blocking the connection is confined to the child process and its daemon threads (the parent FastAPI process never imports the module at all). This dictates where dependency injection actually pays off:
 
@@ -385,9 +408,9 @@ All fields except `action` and `timestamp` are optional.
 
 #### How it works
 
-Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/mt5/close_detector.py`), which:
+Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/gateways/mt5/close_detector.py`), which:
 
-1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (base `MAGIC_NUMBER` + all `STRATEGY_MAGIC_MAP` values, via `MT5Executor.owned_magics()`) → `current_tickets`
+1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (all `STRATEGY_MAGIC_MAP` values, via `MT5Executor.owned_magics()`) → `current_tickets`
 2. Diffs against an internal `seen_tickets` set maintained across polls
 3. For each ticket that disappeared, calls `mt5.history_deals_get(position=ticket)` to find the closing deal
 4. Reads `deal.reason` to classify the closure:
@@ -468,7 +491,7 @@ Two notification paths intentionally bypass the outbox:
 1. **Startup / shutdown banners** sent via `ctx.direct_notifier` — must surface even before `NotificationJob` is running or after it has been torn down.
 2. **NATS connection events** still go through the outbox via `ctx.nats_enqueue`, but they use the `NATS_EVENT` category so they can be filtered out of analytics if desired.
 
-### MT5Executor Primitives (`worker/mt5/executor.py`)
+### MT5Executor Primitives (`worker/gateways/mt5/executor.py`)
 
 | Method                                                        | Used By                                          |
 | ------------------------------------------------------------- | ------------------------------------------------ |
@@ -487,7 +510,17 @@ Two notification paths intentionally bypass the outbox:
 
 ## 🗄️ SQLite Schema (`worker_data.sqlite`)
 
-Three tables are created on startup by `db_init()` using WAL journal mode. After table creation, `db_init()` runs `_apply_migrations()`, which applies idempotent schema changes on every startup (safe to re-run).
+Three tables are created on startup by `db_init()` using WAL journal mode. There are no runtime migrations — the schema is created from scratch (drop the sqlite file to recreate).
+
+The `positions` / `position_logs` columns are **gateway-neutral** because the same tables back both markets (FOREX/MT5 and CRYPTO/CEX). `worker/db/repository.py` is the single boundary that maps these physical columns to the application-domain names callers use (and parses the TEXT ref ids ↔ `int`), so the NATS `PositionEvent` contract and consumers are unaffected:
+
+| DB column (generic) | App-domain key | Notes |
+| --- | --- | --- |
+| `ref_id` | `ticket` | TEXT in DB, `int` in app |
+| `ref_source_id` | `source_ticket` | TEXT in DB, `int` in app |
+| `strategy_code` | `magic` | INTEGER (MT5 magic; `NULL` for crypto) |
+| `gateway_return_code` | `mt5_retcode` | INTEGER broker/exchange status code |
+| `gateway_message` | `message` | Raw signal/event JSON |
 
 ### `positions` — Live position state
 
@@ -496,25 +529,27 @@ The canonical record for each open trade. `PositionCDC` watches this table for `
 | Column | Type | Description |
 | --- | --- | --- |
 | `id` | INTEGER PK | Auto-increment row ID |
-| `source_ticket` | INTEGER UNIQUE | Original MT5 ticket at open — never changes across the position's lifetime |
-| `ticket` | INTEGER | Current MT5 ticket (may differ from `source_ticket` after a partial close re-tickets) |
+| `ref_source_id` | TEXT UNIQUE | Originating order/position reference at open — never changes across the position's lifetime |
+| `ref_id` | TEXT | Current order/deal reference (may differ from `ref_source_id` after a partial close re-tickets) |
 | `strategy` | TEXT | Strategy name from signal (e.g. `MT5_GOLD_M5_V1`) |
-| `symbol` | TEXT | Instrument symbol (e.g. `XAUUSD`) |
+| `symbol` | TEXT | Instrument symbol (e.g. `XAUUSD`, `BTCUSD`) |
 | `action` | TEXT | `long` or `short` |
-| `volume` | REAL | Lot size at open |
+| `volume` | REAL | Lot/contract size at open |
 | `opened_price` | REAL | Fill price at entry |
 | `closed_price` | REAL | Fill price at close (null while open) |
 | `status` | TEXT | See **Position Status Lifecycle** below |
-| `mt5_retcode` | INTEGER | Last MT5 return code |
-| `comment` | TEXT | Last MT5 comment string |
-| `message` | TEXT | Full original signal JSON (used by `PositionCDC` to extract `signal_id`, `sl`, `tp1`, etc.) |
+| `gateway_return_code` | INTEGER | Last broker/exchange return code |
+| `comment` | TEXT | Last broker/exchange comment string |
+| `gateway_message` | TEXT | Full original signal JSON (used by `PositionCDC` to extract `signal_id`, `sl`, `tp1`, etc.) |
+| `strategy_code` | INTEGER | Broker isolation handle (MT5 magic; `NULL` for crypto) |
+| `market_type` | TEXT | `FOREX` / `CRYPTO` tag |
 | `sync_status` | TEXT | `PENDING` → `PUBLISHED` — drives CDC delivery |
 | `sync_time` | DATETIME | Timestamp of last successful publish |
 | `created_at` / `updated_at` | DATETIME | Row timestamps; `updated_at` is used as an optimistic-lock key in `mark_position_synced` |
 
-#### Constraints & Migrations
+#### Constraints
 
-A partial unique index `uidx_positions_one_active_per_strategy_symbol` enforces at most one `OPENED` or `TP1` row per `(strategy, symbol)` pair. Closed/force-closed rows are unrestricted. The index is created by `_apply_migrations()` on startup (`CREATE UNIQUE INDEX IF NOT EXISTS`) so it is applied automatically to existing databases on first upgrade.
+A partial unique index `uidx_positions_one_active_per_strategy_symbol` enforces at most one `OPENED` or `TP1` row per `(strategy, symbol)` pair. Closed/force-closed rows are unrestricted. The index is created together with the table (`CREATE UNIQUE INDEX IF NOT EXISTS`).
 
 #### Position Status Lifecycle
 
@@ -534,22 +569,23 @@ OPENED ──► TP1 ──► TP2
 | `TP2` | TP2 signal | Fully closed at take-profit 2 |
 | `SL` | SL signal | Fully closed at stop-loss (NATS-triggered) |
 | `R_SL` | R_SL signal | Fully closed at revised stop-loss |
-| `TERMINAL_CLOSED` | `MT5EventJob` | Server closed the position (SL/TP/Stop-Out) before NATS signal arrived |
-| `FORCED_CLOSED` | New entry signal | Position was force-closed because an opposing/same-direction entry arrived |
+| `TERMINAL_CLOSED` | `MT5EventJob` / exchange event | Broker/exchange closed the position (SL/TP/Stop-Out/manual) before a NATS signal arrived |
+| `FORCED_CLOSED` | New entry signal / liquidation | Position was force-closed (opposing/same-direction entry, or a crypto liquidation) |
 | `FLATTED` | FLAT signal | Position was closed by an administrative flat command |
 
 ### `position_logs` — Immutable execution audit trail
 
-An append-only log of every signal processed and its MT5 execution result. Never updated — only inserted.
+An append-only log of every signal processed and its execution result. Never updated — only inserted.
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `strategy` / `symbol` / `action` | TEXT | Signal identity |
-| `ticket` / `source_ticket` | INTEGER | MT5 ticket references at time of execution |
+| `ref_id` / `ref_source_id` | TEXT | Order/deal references at time of execution (`ticket` / `source_ticket` in the app) |
 | `volume` / `price` / `sl` / `tp1` | REAL | Execution parameters |
-| `mt5_retcode` | INTEGER | MT5 result code (`10009` = filled, etc.) |
-| `message` | TEXT | Full signal JSON |
-| `author` | TEXT | `broker` (NATS signal) or `terminal` (MT5EventJob detection) |
+| `gateway_return_code` | INTEGER | Broker/exchange result code (`10009` = MT5 filled, etc.) |
+| `gateway_message` | TEXT | Full signal/event JSON |
+| `market_type` | TEXT | `FOREX` / `CRYPTO` tag |
+| `author` | TEXT | `broker` (NATS signal), `terminal` (MT5 detection), or `exchange` (CEX event) |
 | `timestamp` | DATETIME | Wall-clock time of insertion |
 
 ### `notifications` — Telegram outbox (store-and-forward)
