@@ -8,7 +8,10 @@ This is the execution-end of the Event-Driven trading system. It acts as a NATS 
 
 ### 1. Requirements
 
-Ensure you are running on Windows, as the Python `MetaTrader5` module restricts usage to Windows environments only.
+Depends on the market:
+
+- **FOREX (`MARKET_TYPE=FOREX`)** must run on **Windows** — the `MetaTrader5` module and the MT5 terminal are Windows-only.
+- **CRYPTO (`MARKET_TYPE=CRYPTO`)** is pure Python (REST + websocket) and runs on **any OS**; the recommended deployment is the Docker setup below — see [🐳 Docker (Crypto worker)](#-docker-crypto-worker).
 
 ### 2. Setup
 
@@ -84,6 +87,34 @@ make start
 ```
 
 The Worker will initialise the `worker_data.sqlite` database, spawn an isolated MT5 subprocess, and subscribe to the configured NATS subjects. Inside the subprocess three daemon threads run in parallel: the MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC` (change-data-capture publisher to the NATS `TRADE` subject). You can monitor the logs printed directly to the screen.
+
+---
+
+## 🐳 Docker (Crypto worker)
+
+The CRYPTO market runs on any OS, so it ships as a container. The MT5/FOREX
+worker is **not** containerized (it needs Windows + the MT5 terminal) and keeps
+its native Windows deployment.
+
+`docker-compose.yml` brings up two services: a **NATS** broker and the **crypto
+worker** (`MARKET_TYPE=CRYPTO`).
+
+```bash
+cp .env.example .env          # fill BINANCE_API_KEY / BINANCE_API_SECRET, SIGNAL_SUBJECTS, TELEGRAM_*
+docker compose up -d --build  # or: make docker-up
+docker compose logs -f worker # or: make docker-logs
+```
+
+Notes:
+
+- The image installs from `uv.lock`; `MetaTrader5` is skipped automatically on
+  Linux (it is marked `sys_platform == 'win32'` in `pyproject.toml`), so the
+  crypto image carries no Forex dependency.
+- Compose overrides `NATS_URL=nats://nats:4222`, `MARKET_TYPE=CRYPTO`, and
+  `DB_FILE=/app/data/worker_data.sqlite`; the SQLite DB persists in the
+  `worker-data` volume.
+- Point an external broker/strategy at the same NATS (`SIGNAL` / `ADMIN`
+  subjects). For a self-contained host, expose `4222` (already mapped).
 
 ---
 

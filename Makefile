@@ -1,4 +1,4 @@
-.PHONY: install install-dev run dev test format lint fix
+.PHONY: install install-dev run dev test format lint fix docker-build docker-up docker-down docker-logs
 
 install:
 	uv sync
@@ -29,3 +29,16 @@ fix:
 
 generate-keys:
 	.venv\Scripts\python.exe scripts/generate_curve_keypair.py
+
+# ── Docker (crypto worker, Linux) ──────────────────────────────────────────
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d --build
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f worker
