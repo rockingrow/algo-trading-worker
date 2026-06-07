@@ -2,6 +2,17 @@
 worker/db/repository.py
 ───────────────────────
 SQLite persistence for positions, position logs, and the notification outbox.
+
+The physical ``positions`` / ``position_logs`` columns are gateway-neutral
+(``ref_id``, ``ref_source_id``, ``strategy_code``, ``gateway_return_code``,
+``gateway_message`` — see :mod:`worker.db.schema`). This repository is the single
+translation boundary between those columns and the application domain, which
+continues to use ``ticket`` / ``source_ticket`` (as ``int``), ``magic``,
+``mt5_retcode`` and ``message`` — so callers and the NATS ``PositionEvent``
+contract are unaffected.
+
+``ref_id`` / ``ref_source_id`` are stored as TEXT (any gateway's id format fits)
+and parsed text↔int here at the boundary.
 """
 
 import sqlite3
@@ -17,6 +28,41 @@ from worker.schemas.notification_schema import (
 from worker.schemas.position_schema import PositionStatusEnum
 
 logger = get_logger("worker.db.repository")
+
+
+# ── Boundary helpers: TEXT ref ids ↔ int app ids ──────────────────────────── #
+
+
+def _id_to_db(value) -> Optional[str]:
+  """App int id → DB TEXT ref (None stays None)."""
+  return None if value is None else str(value)
+
+
+def _id_from_db(value) -> Optional[int]:
+  """DB TEXT ref → app int id (None stays None; non-numeric falls back to raw)."""
+  if value is None:
+    return None
+  try:
+    return int(value)
+  except (TypeError, ValueError):
+    return value
+
+
+# Map gateway-neutral DB columns back to the application-domain dict keys callers
+# expect, converting the ref ids text→int.
+def _to_app_dict(row: sqlite3.Row) -> dict:
+  d = dict(row)
+  if "ref_id" in d:
+    d["ticket"] = _id_from_db(d.pop("ref_id"))
+  if "ref_source_id" in d:
+    d["source_ticket"] = _id_from_db(d.pop("ref_source_id"))
+  if "strategy_code" in d:
+    d["magic"] = d.pop("strategy_code")
+  if "gateway_return_code" in d:
+    d["mt5_retcode"] = d.pop("gateway_return_code")
+  if "gateway_message" in d:
+    d["message"] = d.pop("gateway_message")
+  return d
 
 
 class PositionRepository:
@@ -43,14 +89,14 @@ class PositionRepository:
     cursor = conn.cursor()
     cursor.execute(
       """
-            INSERT INTO position_logs (strategy, ticket, source_ticket, symbol, action, volume, price, sl, tp1, mt5_retcode, comment, message, author, market_type)
+            INSERT INTO position_logs (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (strategy, ticket, source_ticket, symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, mt5_retcode, comment, message, author, market_type),
+      (strategy, _id_to_db(ticket), _id_to_db(source_ticket), symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, mt5_retcode, comment, message, author, market_type),
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Order logged to DB: Ticket={ticket}, Retcode={mt5_retcode}, Author={author}")
+    logger.debug(f"Order logged to DB: ref_id={ticket}, code={mt5_retcode}, Author={author}")
 
   def insert_position(
     self,
@@ -68,16 +114,17 @@ class PositionRepository:
   ):
     conn = _get_conn()
     cursor = conn.cursor()
+    ref = _id_to_db(ticket)
     cursor.execute(
       """
-            INSERT INTO positions (source_ticket, ticket, strategy, symbol, action, volume, opened_price, status, mt5_retcode, comment, message, magic, market_type)
+            INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-      (ticket, ticket, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message, magic, market_type),
+      (ref, ref, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", mt5_retcode, comment, message, magic, market_type),
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Position inserted: source_ticket={ticket}, symbol={symbol}, action={action}")
+    logger.debug(f"Position inserted: ref_source_id={ref}, symbol={symbol}, action={action}")
 
   def update_position_status(
     self,
@@ -95,32 +142,32 @@ class PositionRepository:
       """
             UPDATE positions
             SET status = ?,
-                ticket = COALESCE(?, ticket),
+                ref_id = COALESCE(?, ref_id),
                 closed_price = COALESCE(?, closed_price),
-                mt5_retcode = COALESCE(?, mt5_retcode),
+                gateway_return_code = COALESCE(?, gateway_return_code),
                 comment = COALESCE(?, comment),
-                message = COALESCE(?, message),
+                gateway_message = COALESCE(?, gateway_message),
                 sync_status = 'PENDING',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE source_ticket = ?
+            WHERE ref_source_id = ?
         """,
-      (status.value, new_ticket, round(closed_price, 2) if closed_price is not None else None, mt5_retcode, comment, message, source_ticket),
+      (status.value, _id_to_db(new_ticket), round(closed_price, 2) if closed_price is not None else None, mt5_retcode, comment, message, _id_to_db(source_ticket)),
     )
     conn.commit()
     conn.close()
-    logger.debug(f"Position updated: source_ticket={source_ticket}, new_ticket={new_ticket}, status={status}")
+    logger.debug(f"Position updated: ref_source_id={source_ticket}, new ref_id={new_ticket}, status={status}")
 
   def get_position(self, source_ticket: int) -> Optional[dict]:
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
       cursor = conn.cursor()
-      cursor.execute("SELECT * FROM positions WHERE source_ticket = ?", (source_ticket,))
+      cursor.execute("SELECT * FROM positions WHERE ref_source_id = ?", (_id_to_db(source_ticket),))
       row = cursor.fetchone()
       conn.close()
-      return dict(row) if row else None
+      return _to_app_dict(row) if row else None
     except Exception as e:
-      logger.exception(f"Failed to fetch position source_ticket={source_ticket}: {e}")
+      logger.exception(f"Failed to fetch position ref_source_id={source_ticket}: {e}")
       return None
 
   def get_pending_sync_positions(self) -> list:
@@ -131,7 +178,7 @@ class PositionRepository:
       cursor.execute("SELECT * FROM positions WHERE sync_status = 'PENDING'")
       rows = cursor.fetchall()
       conn.close()
-      return [dict(row) for row in rows]
+      return [_to_app_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch pending sync positions: {e}")
       return []
@@ -164,7 +211,7 @@ class PositionRepository:
       )
       rows = cursor.fetchall()
       conn.close()
-      return [dict(row) for row in rows]
+      return [_to_app_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
       return []
@@ -190,7 +237,7 @@ class PositionRepository:
       cursor.execute(f"SELECT * FROM positions WHERE {' AND '.join(conditions)}", params)
       rows = cursor.fetchall()
       conn.close()
-      return [dict(row) for row in rows]
+      return [_to_app_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch open positions for flat (strategy={strategy}, symbol={symbol}): {e}")
       return []

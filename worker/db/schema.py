@@ -1,21 +1,26 @@
 """
 worker/db/schema.py
 ────────────────────
-Schema creation + idempotent migrations for the worker's SQLite database.
+Schema creation for the worker's SQLite database.
 
-The schema is intentionally **market-agnostic**: the same ``positions`` /
-``position_logs`` / ``notifications`` tables back both the FOREX (MT5) and the
-CRYPTO (CEX) workers. Two columns make this possible:
+The ``positions`` / ``position_logs`` / ``notifications`` tables are shared by
+every gateway (FOREX/MT5 and CRYPTO/CEX), so the columns are deliberately
+**gateway-neutral**:
 
-  * ``magic``        — broker-side isolation handle. Used by MT5 (per-strategy
-                       magic number); left ``NULL`` by crypto exchanges that
-                       have no equivalent (strategy isolation is logical only).
-  * ``market_type``  — tags every row as ``FOREX`` / ``CRYPTO`` so a shared DB
-                       can be queried per market.
+  * ``strategy_code``        INTEGER — broker-side isolation handle (MT5 magic
+                             number; ``NULL`` for exchanges that have none).
+  * ``gateway_return_code``  INTEGER — broker/exchange numeric status code.
+  * ``gateway_message``      TEXT    — raw signal/event JSON kept for audit.
+  * ``ref_id``               TEXT    — broker reference for the live order/deal
+                             (MT5 ticket, exchange order id). Stored as text so
+                             any gateway's id format fits; the repository parses
+                             text↔int at the boundary.
+  * ``ref_source_id``        TEXT    — the originating position reference (stable
+                             across re-ticketing after a partial close).
+  * ``market_type``          TEXT    — FOREX / CRYPTO tag.
 
-``db_init`` first creates the tables for a fresh DB, then runs
-``_apply_migrations`` so databases created by an older worker version are
-upgraded in place without losing data.
+No runtime migrations: PROD has no data yet, so the database is simply created
+from scratch (drop the sqlite file to recreate).
 """
 
 from worker.db.connection import _get_conn
@@ -27,8 +32,8 @@ logger = get_logger("worker.db.schema")
 _POSITIONS_TABLE = """
     CREATE TABLE IF NOT EXISTS positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_ticket INTEGER NOT NULL UNIQUE,
-        ticket INTEGER NOT NULL,
+        ref_source_id TEXT NOT NULL UNIQUE,
+        ref_id TEXT NOT NULL,
         strategy TEXT NOT NULL,
         symbol TEXT NOT NULL,
         action TEXT NOT NULL,
@@ -36,10 +41,10 @@ _POSITIONS_TABLE = """
         opened_price REAL NOT NULL,
         closed_price REAL,
         status TEXT NOT NULL DEFAULT 'OPENED',
-        mt5_retcode INTEGER,
+        gateway_return_code INTEGER,
         comment TEXT,
-        message TEXT,
-        magic INTEGER,
+        gateway_message TEXT,
+        strategy_code INTEGER,
         market_type TEXT,
         sync_status TEXT NOT NULL DEFAULT 'PENDING',
         sync_time DATETIME,
@@ -52,17 +57,17 @@ _POSITION_LOGS_TABLE = """
     CREATE TABLE IF NOT EXISTS position_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         strategy TEXT NOT NULL,
-        ticket INTEGER,
-        source_ticket INTEGER,
+        ref_id TEXT,
+        ref_source_id TEXT,
         symbol TEXT NOT NULL,
         action TEXT NOT NULL,
         volume REAL,
         price REAL,
         sl REAL,
         tp1 REAL,
-        mt5_retcode INTEGER,
+        gateway_return_code INTEGER,
         comment TEXT,
-        message TEXT,
+        gateway_message TEXT,
         market_type TEXT,
         author TEXT NOT NULL DEFAULT 'broker',
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -101,48 +106,12 @@ _ONE_ACTIVE_INDEX = """
 """
 
 
-def _table_exists(conn, table: str) -> bool:
-  row = conn.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-  ).fetchone()
-  return row is not None
-
-
-def _columns(conn, table: str) -> set:
-  return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
-def _add_column_if_missing(conn, table: str, column: str, ddl: str) -> None:
-  if column not in _columns(conn, table):
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
-    logger.info("Migration: added %s.%s", table, column)
-
-
 def _create_tables(conn) -> None:
   conn.execute(_POSITIONS_TABLE)
   conn.execute(_POSITION_LOGS_TABLE)
   conn.execute(_NOTIFICATIONS_TABLE)
   conn.execute(_NOTIFICATIONS_INDEX)
-
-
-def _apply_migrations(conn) -> None:
-  """Bring an existing DB up to the current schema. Safe to run repeatedly.
-
-  Each step is guarded so the function is idempotent and works whether the DB
-  was created by an old worker version or freshly by ``_create_tables``.
-  """
-  # Columns added after the original release.
-  _add_column_if_missing(conn, "positions", "magic", "magic INTEGER")
-  _add_column_if_missing(conn, "positions", "market_type", "market_type TEXT")
-  if _table_exists(conn, "position_logs"):
-    _add_column_if_missing(
-      conn, "position_logs", "market_type", "market_type TEXT"
-    )
-
-  # Enforce the one-active-position invariant. Raises IntegrityError if the DB
-  # already violates it — the operator must clean the data first.
   conn.execute(_ONE_ACTIVE_INDEX)
-  conn.commit()
 
 
 def db_init():
@@ -150,7 +119,6 @@ def db_init():
     conn = _get_conn()
     conn.execute("PRAGMA journal_mode=WAL")
     _create_tables(conn)
-    _apply_migrations(conn)
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully.")
