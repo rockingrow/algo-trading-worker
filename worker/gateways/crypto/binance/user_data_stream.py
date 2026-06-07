@@ -1,27 +1,24 @@
-﻿"""
-worker/crypto/binance/user_data_stream.py
-──────────────────────────────────────────
+"""
+worker/gateways/crypto/binance/user_data_stream.py
+──────────────────────────────────────────────────
 Event ingestion from Binance — the CRYPTO counterpart of ``MT5EventJob``.
 
-Binance pushes account/order events over the **User Data Stream** (a websocket),
-which is the optimal, low-latency way to learn about fills and exchange-triggered
-exits (stop-loss / take-profit / liquidation) — far better than polling the REST
-API. This module:
+Uses the **official SDK** websocket (``binance_sdk_derivatives_trading_usds_futures``)
+for the User Data Stream — it manages the connection and auto-reconnect/renew —
+while we manage the ``listenKey`` (start + periodic keepalive) and convert each
+``ORDER_TRADE_UPDATE`` frame into a broker-neutral :class:`ExchangeCloseEvent`.
 
-  1. Obtains a ``listenKey`` and connects to the futures user stream.
-  2. Parses ``ORDER_TRADE_UPDATE`` frames into a broker-neutral
-     :class:`ExchangeCloseEvent` and hands each to a caller-supplied handler.
-  3. Keeps the ``listenKey`` alive (Binance expires it after 60 min).
-
-The frame-parsing logic is a pure function (:func:`parse_order_trade_update`),
-so it is fully unit-tested without any network. The websocket plumbing is kept
-thin around it.
+The frame-parsing logic is a pure, fully unit-tested function
+(:func:`parse_order_trade_update`) that works on the raw Binance payload; the SDK
+delivers typed events, so :meth:`BinanceUserDataStream._to_raw_dict` unwraps them
+back to that raw shape before parsing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
@@ -96,23 +93,26 @@ def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent
 
 
 class BinanceUserDataStream:
-  """Daemon that streams Binance user events and dispatches close events.
+  """Daemon that streams Binance user events (via the SDK) and dispatches closes.
 
-  *gateway* must expose ``create_listen_key()``, ``keepalive_listen_key()`` and
-  ``ws_base_url`` (Binance gateway does). *handler* is called with each
-  :class:`ExchangeCloseEvent`.
+  *handler* is called with each :class:`ExchangeCloseEvent`.
   """
 
   def __init__(
     self,
-    gateway: Any,
+    api_key: str,
+    api_secret: str,
+    testnet: bool,
     handler: Callable[[ExchangeCloseEvent], None],
   ) -> None:
-    self._gateway = gateway
+    self._api_key = api_key
+    self._api_secret = api_secret
+    self._testnet = testnet
     self._handler = handler
     self._stop_event = threading.Event()
     self._thread: Optional[threading.Thread] = None
-    self._keepalive_thread: Optional[threading.Thread] = None
+
+  # ── lifecycle ─────────────────────────────────────────────────────────── #
 
   def start(self, stop_event=None) -> None:
     if stop_event is not None:
@@ -121,27 +121,12 @@ class BinanceUserDataStream:
       target=self._run, name="binance-user-stream", daemon=True
     )
     self._thread.start()
-    self._keepalive_thread = threading.Thread(
-      target=self._keepalive_loop, name="binance-listenkey-keepalive", daemon=True
-    )
-    self._keepalive_thread.start()
     log.info("[BinanceUserDataStream] Started.")
 
   def stop(self) -> None:
     self._stop_event.set()
 
   # ── internals ─────────────────────────────────────────────────────────── #
-
-  def _keepalive_loop(self) -> None:
-    while not self._stop_event.is_set():
-      self._stop_event.wait(_KEEPALIVE_INTERVAL)
-      if self._stop_event.is_set():
-        break
-      try:
-        self._gateway.keepalive_listen_key()
-        log.debug("[BinanceUserDataStream] listenKey kept alive.")
-      except Exception as exc:
-        log.warning("[BinanceUserDataStream] keepalive failed: %s", exc)
 
   def _run(self) -> None:
     while not self._stop_event.is_set():
@@ -152,28 +137,97 @@ class BinanceUserDataStream:
       if not self._stop_event.is_set():
         self._stop_event.wait(5)  # backoff before reconnecting
 
+  def _build_client(self):
+    # Lazy import so the SDK (aiohttp etc.) loads only when the stream runs.
+    from binance_common.configuration import (
+      ConfigurationRestAPI,
+      ConfigurationWebSocketStreams,
+    )
+    from binance_common.constants import (
+      DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL,
+      DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL,
+      DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_PROD_URL,
+      DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_TESTNET_URL,
+    )
+    from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import (
+      DerivativesTradingUsdsFutures,
+    )
+
+    rest_cfg = ConfigurationRestAPI(
+      api_key=self._api_key,
+      api_secret=self._api_secret,
+      base_path=(
+        DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL
+        if self._testnet
+        else DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
+      ),
+    )
+    ws_cfg = ConfigurationWebSocketStreams(
+      stream_url=(
+        DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_TESTNET_URL
+        if self._testnet
+        else DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_PROD_URL
+      )
+    )
+    return DerivativesTradingUsdsFutures(
+      config_rest_api=rest_cfg, config_ws_streams=ws_cfg
+    )
+
+  @staticmethod
+  def _listen_key(client) -> Optional[str]:
+    data = client.rest_api.start_user_data_stream().data()
+    key = getattr(data, "listen_key", None)
+    if key is None and isinstance(data, dict):
+      key = data.get("listenKey")
+    return key
+
   async def _stream(self) -> None:
-    import json
+    client = self._build_client()
+    listen_key = await asyncio.to_thread(self._listen_key, client)
+    if not listen_key:
+      raise RuntimeError("Failed to obtain listenKey")
 
-    import websockets  # lazy: keep the dep out of import time
-
-    listen_key = self._gateway.create_listen_key()
-    url = f"{self._gateway.ws_base_url}/{listen_key}"
+    connection = await client.websocket_streams.create_connection()
+    last_keepalive = time.monotonic()
     log.info("[BinanceUserDataStream] Connecting to user data stream.")
+    try:
+      stream = await connection.user_data(listenKey=listen_key)
+      stream.on("message", self._on_message)
+      log.info("[BinanceUserDataStream] Subscribed.")
 
-    async with websockets.connect(url, ping_interval=180) as ws:
       while not self._stop_event.is_set():
-        try:
-          raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-        except asyncio.TimeoutError:
-          continue
-        try:
-          msg = json.loads(raw)
-        except (ValueError, TypeError):
-          continue
-        event = parse_order_trade_update(msg)
-        if event is not None:
-          self._dispatch(event)
+        await asyncio.sleep(1.0)
+        if time.monotonic() - last_keepalive >= _KEEPALIVE_INTERVAL:
+          try:
+            await asyncio.to_thread(client.rest_api.keepalive_user_data_stream)
+            last_keepalive = time.monotonic()
+            log.debug("[BinanceUserDataStream] listenKey kept alive.")
+          except Exception as exc:
+            log.warning("[BinanceUserDataStream] keepalive failed: %s", exc)
+    finally:
+      try:
+        await client.websocket_streams.close_connection()
+      except Exception:  # pragma: no cover - best effort
+        pass
+
+  # ── message handling ──────────────────────────────────────────────────── #
+
+  @staticmethod
+  def _to_raw_dict(event: Any) -> Dict[str, Any]:
+    """Unwrap an SDK typed user event back to the raw Binance payload dict."""
+    inst = getattr(event, "actual_instance", event)
+    if hasattr(inst, "model_dump"):
+      return inst.model_dump(by_alias=True, exclude_none=True)
+    return inst if isinstance(inst, dict) else {}
+
+  def _on_message(self, event: Any) -> None:
+    try:
+      parsed = parse_order_trade_update(self._to_raw_dict(event))
+    except Exception as exc:
+      log.exception("[BinanceUserDataStream] failed to parse event: %s", exc)
+      return
+    if parsed is not None:
+      self._dispatch(parsed)
 
   def _dispatch(self, event: ExchangeCloseEvent) -> None:
     try:

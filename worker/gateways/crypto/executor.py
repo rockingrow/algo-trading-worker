@@ -1,4 +1,4 @@
-﻿"""
+"""
 worker/crypto/executor.py
 ─────────────────────────
 Crypto order executor — the CRYPTO counterpart of ``MT5Executor``.
@@ -52,12 +52,14 @@ class CryptoExecutor:
   # ── Symbol / quantity helpers ─────────────────────────────────────────── #
 
   def get_symbol(self, base_symbol: str) -> str:
-    """Resolve a signal symbol to the exchange symbol (e.g. BTCUSD → BTCUSDT)."""
+    """Resolve a signal symbol to the exchange symbol (e.g. BTCUSDT.P → BTCUSDT)."""
     s = base_symbol.upper().replace("/", "").replace(":", "")
+    if s.endswith(".P"):
+      s = s[:-2]
     if s.endswith(self._quote):
       return s
-    if s.endswith("USD") and self._quote == "USDT":
-      return s + "T"
+    if s.endswith("USD"):
+      return s[:-3] + self._quote
     return s + self._quote
 
   def normalize_volume(self, symbol: str, volume: float) -> float:
@@ -129,15 +131,22 @@ class CryptoExecutor:
           if signal.risk_percent is not None
           else self._config.risk_percentage
         )
-        qty = self.calculate_quantity(symbol, price, signal.sl, risk, self._config.capital)
+        qty = self.calculate_quantity(
+          symbol, price, signal.sl, risk, self._config.capital
+        )
         logger.info(
           "[open_position] RISK mode | price=%s sl=%s risk=%s%% → qty=%s",
-          price, signal.sl, risk, qty,
+          price,
+          signal.sl,
+          risk,
+          qty,
         )
       else:
         f = self._gateway.get_symbol_filter(symbol)
         qty = f.min_qty or 0.0
-        logger.warning("[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty)
+        logger.warning(
+          "[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty
+        )
     else:
       if signal.quantity is None:
         return TradeResult.fail("Missing quantity")
@@ -241,7 +250,9 @@ class CryptoExecutor:
         success_count += 1
         last_result = result
       else:
-        logger.error("[close_all] Failed to close %s: %s", resolved, result.get("comment"))
+        logger.error(
+          "[close_all] Failed to close %s: %s", resolved, result.get("comment")
+        )
 
     if success_count > 0 and last_result is not None:
       return TradeResult.ok(

@@ -199,13 +199,20 @@ imports MetaTrader5 or any `worker.mt5.*` module:
 | --- | --- | --- |
 | `worker/gateways/crypto/base.py` | `BaseExchangeGateway` (ABC) | CEX contract: orders, positions, stops, account |
 | `worker/gateways/crypto/factory.py` | `ExchangeFactory` | Builds the configured exchange (first: Binance) |
-| `worker/gateways/crypto/binance/gateway.py` | `BinanceFuturesGateway` | Binance USDⓈ-M Futures REST adapter |
-| `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Websocket job ingesting fills / SL / TP / liquidation |
+| `worker/gateways/crypto/binance/gateway.py` | `BinanceFuturesGateway` | Binance USDⓈ-M Futures REST via the official `binance_common` transport (signing, retries, rate-limit errors) |
+| `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Official-SDK websocket User Data Stream ingesting fills / SL / TP / liquidation (+ pure parser) |
 | `worker/gateways/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
 | `worker/gateways/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
 
 Adding a new exchange = implement `BaseExchangeGateway` + register it in
 `ExchangeFactory`. No business-logic change.
+
+Binance specifics use the **official** `binance-sdk-derivatives-trading-usds-futures`
+(and its `binance_common` transport): REST calls go through `binance_common.send_request`
+(HMAC signing, timestamps, retries/backoff, typed rate-limit errors) and the User
+Data Stream uses the SDK websocket (auto-reconnect). All of this lives only inside
+`worker/gateways/crypto/binance/` — the gateway abstraction keeps it out of the
+executor/strategy/processor, so it never leaks upward.
 
 Required env when `MARKET_TYPE=CRYPTO`: `CRYPTO_EXCHANGE`, `BINANCE_API_KEY`,
 `BINANCE_API_SECRET` (optionally `BINANCE_TESTNET`, `CRYPTO_QUOTE_ASSET`). MT5
@@ -286,8 +293,8 @@ worker/
 │       ├── message_presenter.py      # CryptoMessagePresenter
 │       ├── signal_processor.py       # CryptoSignalProcessor — crypto hooks over the base
 │       └── binance/                  # First concrete exchange
-│           ├── gateway.py            # BinanceFuturesGateway (signed REST)
-│           └── user_data_stream.py   # BinanceUserDataStream (websocket events) + parser
+│           ├── gateway.py            # BinanceFuturesGateway (official binance_common transport)
+│           └── user_data_stream.py   # BinanceUserDataStream (official-SDK websocket) + parser
 ├── interfaces/          # Protocol types for dependency inversion
 │   ├── db_protocol.py            # Segregated persistence protocols
 │   ├── executor_protocol.py      # TradeExecutorProtocol (broker-neutral)

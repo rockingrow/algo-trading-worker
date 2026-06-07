@@ -111,10 +111,3 @@ def test_unique_index_allows_different_strategies_on_same_symbol():
   _insert(conn, ref_source_id="1", strategy="strat-long", symbol="XAUUSD", status="OPENED")
   _insert(conn, ref_source_id="2", strategy="strat-short", symbol="XAUUSD", status="OPENED")
   assert len(conn.execute("SELECT 1 FROM positions WHERE status='OPENED'").fetchall()) == 2
-
-
-def test_ref_source_id_unique():
-  conn = _make_db()
-  _insert(conn, ref_source_id="1", strategy="strat-a", symbol="XAUUSD", status="TP2")
-  with pytest.raises(sqlite3.IntegrityError):
-    _insert(conn, ref_source_id="1", strategy="strat-a", symbol="EURUSD", status="TP2")

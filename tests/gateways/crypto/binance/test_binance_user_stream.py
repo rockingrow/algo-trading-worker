@@ -1,6 +1,7 @@
 """Tests for the pure Binance user-data-stream event parser."""
 
 from worker.gateways.crypto.binance.user_data_stream import (
+  BinanceUserDataStream,
   ExchangeCloseReason,
   parse_order_trade_update,
 )
@@ -61,3 +62,56 @@ def test_parses_liquidation():
   )
   assert event is not None
   assert event.reason == ExchangeCloseReason.LIQUIDATION
+
+
+# ── SDK event adapter (typed event → raw dict → dispatch) ──────────────────── #
+
+
+class _FakeModel:
+  """Stand-in for an SDK pydantic event model."""
+
+  def __init__(self, payload):
+    self._payload = payload
+
+  def model_dump(self, by_alias=False, exclude_none=False):
+    return self._payload
+
+
+class _FakeWrapper:
+  """Stand-in for the SDK's parsed wrapper that holds .actual_instance."""
+
+  def __init__(self, payload):
+    self.actual_instance = _FakeModel(payload)
+
+
+def _stream(handler):
+  return BinanceUserDataStream("k", "s", testnet=True, handler=handler)
+
+
+def test_to_raw_dict_unwraps_actual_instance():
+  payload = {"e": "ORDER_TRADE_UPDATE", "o": {"X": "FILLED"}}
+  assert BinanceUserDataStream._to_raw_dict(_FakeWrapper(payload)) == payload
+
+
+def test_to_raw_dict_passthrough_dict():
+  payload = {"e": "ORDER_TRADE_UPDATE"}
+  assert BinanceUserDataStream._to_raw_dict(payload) == payload
+
+
+def test_on_message_dispatches_stop_loss():
+  seen = []
+  stream = _stream(seen.append)
+  event = _FakeWrapper(
+    {"e": "ORDER_TRADE_UPDATE", "o": {"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0.5", "i": 42}}
+  )
+  stream._on_message(event)
+  assert len(seen) == 1
+  assert seen[0].reason == ExchangeCloseReason.SL
+  assert seen[0].symbol == "BTCUSDT"
+
+
+def test_on_message_ignores_worker_market_close():
+  seen = []
+  stream = _stream(seen.append)
+  stream._on_message(_FakeWrapper({"e": "ORDER_TRADE_UPDATE", "o": {"X": "FILLED", "ot": "MARKET"}}))
+  assert seen == []

@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.2.0] — 2026-06-07
+
+### Changed
+
+- **Binance now uses the official SDK / transport** instead of a hand-rolled signed REST client. All of this stays inside `worker/gateways/crypto/binance/` (the `BaseExchangeGateway` abstraction keeps it out of the executor/strategy/processor):
+  - **REST → `binance_common.send_request`.** Every endpoint (orders, positions, account, exchangeInfo, mark price, cancel) goes through the official transport: HMAC signing, automatic timestamps, retries/backoff, typed rate-limit/error exceptions, and snake_case→wire conversion. We call `send_request` directly rather than the generated typed methods because the generated `new_order` cannot express `STOP_MARKET` / `closePosition` (needed for stop-losses), and going through one transport keeps every endpoint uniform.
+  - **User Data Stream → official SDK websocket.** `BinanceUserDataStream` now drives `binance_sdk_derivatives_trading_usds_futures` (auto-reconnect/renew) and only manages the `listenKey` (start + 30-min keepalive). The pure, unit-tested `parse_order_trade_update` is unchanged; a small adapter unwraps the SDK's typed event back to the raw payload before parsing.
+  - Fixed a latent bug surfaced during the swap: futures `exchangeInfo` returns *all* symbols (the `symbol` query is ignored), so `get_symbol_filter` now indexes the full list instead of assuming `symbols[0]`.
+
+### Dependencies
+
+- Added `binance-sdk-derivatives-trading-usds-futures` (pulls `binance-common`, `aiohttp`, `pycryptodome`). Removed the direct `websockets` dependency (the SDK provides its own transport).
+
+### Notes
+
+- The REST request-building and the websocket event adapter/parser are unit-tested with fakes (no network). The live websocket wiring (SDK connection + `listenKey` keepalive) cannot be exercised offline and should be verified against the Binance **testnet** (`BINANCE_TESTNET=true`) before production.
+
+---
+
 ## [1.1.0] — 2026-06-07
 
 ### Added
