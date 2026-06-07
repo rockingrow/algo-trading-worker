@@ -1,6 +1,10 @@
 """Tests for the shared worker runtime + the unified orchestrator factory."""
 
-from worker.market import GatewayProcessOrchestrator, create_market_orchestrator
+from worker.market import (
+  GatewayProcessOrchestrator,
+  ThreadGatewayOrchestrator,
+  create_market_orchestrator,
+)
 from worker.settings import MarketTypeEnum
 from worker.worker_runtime import run_worker
 
@@ -65,15 +69,18 @@ def test_run_worker_aborts_when_connect_fails(monkeypatch):
   assert proc.calls == ["connect"]
 
 
-def test_factory_builds_forex_orchestrator():
+def test_factory_builds_forex_process_orchestrator():
+  # FOREX → child process (GIL isolation for MetaTrader5).
   orch = create_market_orchestrator({"market_type": MarketTypeEnum.FOREX})
   assert isinstance(orch, GatewayProcessOrchestrator)
   assert orch._label == "FOREX"
 
 
-def test_factory_builds_crypto_orchestrator():
+def test_factory_builds_crypto_thread_orchestrator():
+  # CRYPTO → in-process thread (no multiprocessing).
   orch = create_market_orchestrator({"market_type": MarketTypeEnum.CRYPTO})
-  assert isinstance(orch, GatewayProcessOrchestrator)
+  assert isinstance(orch, ThreadGatewayOrchestrator)
+  assert not isinstance(orch, GatewayProcessOrchestrator)
   assert orch._label == "CRYPTO"
 
 
@@ -82,3 +89,54 @@ def test_factory_rejects_unknown_market():
 
   with pytest.raises(ValueError):
     create_market_orchestrator({"market_type": "OPTIONS"})
+
+
+# ── Standalone crypto entry point ──────────────────────────────────────────── #
+
+
+def test_crypto_worker_main_uses_crypto_processor(monkeypatch):
+  import worker.crypto_worker as cw
+
+  captured = {}
+
+  def fake_run(factory, settings, stop, *, label):
+    captured["factory"] = factory
+    captured["label"] = label
+
+  monkeypatch.setattr(cw, "run_worker", fake_run)
+  cw.crypto_worker_main({}, object())
+
+  from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
+
+  assert captured["factory"] is CryptoSignalProcessor
+  assert captured["label"] == "Crypto"
+
+
+def test_heartbeat_writes_fresh_timestamp(tmp_path, monkeypatch):
+  import threading
+  import time
+
+  from worker.crypto_worker import _start_heartbeat
+
+  hb = tmp_path / "heartbeat"
+  monkeypatch.setenv("HEARTBEAT_FILE", str(hb))
+  stop = threading.Event()
+  _start_heartbeat(stop)
+  try:
+    for _ in range(100):  # wait up to ~2s for the first beat
+      if hb.exists():
+        break
+      time.sleep(0.02)
+    assert hb.exists()
+    assert time.time() - float(hb.read_text()) < 5  # a real, fresh timestamp
+  finally:
+    stop.set()
+
+
+def test_heartbeat_noop_without_env(monkeypatch):
+  import threading
+
+  from worker.crypto_worker import _start_heartbeat
+
+  monkeypatch.delenv("HEARTBEAT_FILE", raising=False)
+  _start_heartbeat(threading.Event())  # must not raise / not start a thread

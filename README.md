@@ -85,9 +85,14 @@ Start the Worker (from the root directory):
 make start
 ```
 
-The Worker will initialise the `worker_data.sqlite` database, spawn an isolated market subprocess (MT5 for FOREX, the exchange worker for CRYPTO), and subscribe to the configured NATS subjects. For FOREX, three daemon threads run in parallel inside the subprocess: the MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC`. For CRYPTO, the subprocess runs `PositionCDC` plus the exchange user-data event stream (Binance websocket). You can monitor the logs printed directly to the screen.
+The Worker initialises the `worker_data.sqlite` database, starts the market worker, and subscribes to the configured NATS subjects. The worker runs differently per market:
 
-> For CRYPTO on Linux, prefer the containerized setup — see [🐳 Docker (Crypto worker)](#-docker-crypto-worker).
+- **FOREX** — in an isolated child **process** (GIL isolation for the MetaTrader5 C extension), supervised by a watchdog. Daemon threads inside it: MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC`.
+- **CRYPTO** — in a background **thread** (the pure-Python gateway needs no process isolation). Daemon threads: `PositionCDC` and the exchange user-data event stream (Binance websocket).
+
+You can monitor the logs printed directly to the screen.
+
+> For CRYPTO on Linux, prefer the containerized setup, which runs the worker as a **single process** (`python -m worker.crypto_worker`, no FastAPI/uvicorn) — see [🐳 Docker (Crypto worker)](#-docker-crypto-worker).
 
 ---
 
@@ -108,14 +113,23 @@ docker compose logs -f worker # or: make docker-logs
 
 Notes:
 
+- **Single process.** The container runs the worker directly via
+  `python -m worker.crypto_worker` — no FastAPI/uvicorn and no multiprocessing
+  child. The crypto gateway is pure Python (REST + websocket threads), so the
+  GIL-isolating subprocess that MT5 needs is redundant here; dropping it keeps
+  the container minimal. `docker stop` (SIGTERM) triggers a graceful shutdown.
+- **Liveness via heartbeat.** With no HTTP server, the worker touches
+  `HEARTBEAT_FILE` (`/app/data/heartbeat`) every 15 s and the compose
+  healthcheck verifies it stays fresh; a hung worker goes `unhealthy`, a crashed
+  one is restarted by `restart: unless-stopped`.
 - The image installs from `uv.lock`; `MetaTrader5` is skipped automatically on
-  Linux (it is marked `sys_platform == 'win32'` in `pyproject.toml`), so the
-  crypto image carries no Forex dependency.
-- Compose overrides `NATS_URL=nats://nats:4222`, `MARKET_TYPE=CRYPTO`, and
-  `DB_FILE=/app/data/worker_data.sqlite`; the SQLite DB persists in the
-  `worker-data` volume.
+  Linux (marked `sys_platform == 'win32'` in `pyproject.toml`), so the crypto
+  image carries no Forex dependency.
+- Compose overrides `NATS_URL=nats://nats:4222`, `MARKET_TYPE=CRYPTO`,
+  `DB_FILE=/app/data/worker_data.sqlite`, `HEARTBEAT_FILE=/app/data/heartbeat`;
+  the SQLite DB + heartbeat persist in the `worker-data` volume.
 - Point an external broker/strategy at the same NATS (`SIGNAL` / `ADMIN`
-  subjects). For a self-contained host, expose `4222` (already mapped).
+  subjects). `4222` is mapped for a self-contained host.
 
 ---
 
@@ -282,7 +296,7 @@ worker/
 ├── context.py           # WorkerContext — market-agnostic services (DB, notifiers, outbox)
 ├── logger.py            # Structured logging configuration
 ├── main.py              # Application entry point
-├── market.py            # GatewayProcessOrchestrator + create_market_orchestrator
+├── market.py            # Gateway orchestrators (FOREX=process, CRYPTO=thread) + factory
 ├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
 ├── worker_runtime.py    # run_worker() — shared child-process bootstrap
 ├── mt5_worker.py        # FOREX child-process entry point
@@ -391,7 +405,7 @@ All fields except `action` and `timestamp` are optional.
 
 - **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 
-- **GIL-isolated subprocess:** All MT5 and NATS blocking code runs in a separate OS process (`mt5_worker.mt5_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable.
+- **GIL-isolated subprocess (FOREX only):** All MT5 and NATS blocking code runs in a separate OS process (`mt5_worker.mt5_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable. **CRYPTO** skips this entirely: the pure-Python gateway runs in a background thread (`ThreadGatewayOrchestrator`) under the app, or as a single process via `python -m worker.crypto_worker` in the container.
 
 - **Dependency-injection boundary — why only the executor takes an injected gateway:** The `MetaTrader5` module is a native C extension that exposes a single **process-global** connection — `mt5.initialize()` / `mt5.login()` mutate ambient process state, and every `mt5.*` call implicitly targets that one connection. There is no connection *object* to construct or pass around, and because the calls are GIL-blocking the connection is confined to the child process and its daemon threads (the parent FastAPI process never imports the module at all). This dictates where dependency injection actually pays off:
 
@@ -611,24 +625,29 @@ Indexed on `(next_attempt_at, id)` to make the dispatcher's poll query O(log n).
 
 ## 🔄 Process Lifecycle & Watchdog
 
-The parent FastAPI process (`app.py`) never loads the MT5 C extension. All MT5 and NATS work runs inside an isolated child process managed by `MT5Manager`.
+How the worker is hosted depends on the market (`create_market_orchestrator`):
 
-```text
-FastAPI (parent)
-  └── ForexMarketOrchestrator
-        ├── MT5Manager.start()   — spawns child process
-        ├── Watchdog task        — checks every 10 s (WATCHDOG_INTERVAL)
-        │     └── if child died → MT5Manager.restart()
-        └── MT5Manager.stop()   — on FastAPI shutdown
-```
+- **FOREX** — a child **process** (the parent FastAPI process never loads the MT5 C extension), supervised by a watchdog:
 
-Inside the child process four daemon threads run alongside the NATS message loop:
+  ```text
+  FastAPI (parent)
+    └── GatewayProcessOrchestrator (FOREX)
+          ├── WorkerProcessManager.start()  — spawns child process
+          ├── Watchdog task                 — checks every 10 s (WATCHDOG_INTERVAL)
+          │     └── if child died → WorkerProcessManager.restart()
+          └── WorkerProcessManager.stop()   — on FastAPI shutdown
+  ```
 
-| Thread | Interval | Purpose |
-| --- | --- | --- |
-| `mt5-health` | 15 s (`MT5_HEALTH_INTERVAL`) | Checks MT5 connection; sends Telegram alert on disconnect/reconnect |
-| `MT5EventJob` | 5 s | Detects server-side position closes (SL/TP/Stop-Out) |
-| `PositionCDC` | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
-| `NotificationJob` | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
+- **CRYPTO** — no GIL isolation needed (pure-Python gateway), so it runs in a background **thread** when launched via the FastAPI app (`ThreadGatewayOrchestrator`, same watchdog/restart contract), or — in the container — as a **single process** via `python -m worker.crypto_worker` (no FastAPI, no thread orchestrator), with SIGTERM → graceful shutdown and a heartbeat file for liveness.
 
-All threads share the same `stop_event` (`multiprocessing.Event`) and exit cleanly when it is set.
+Daemon threads running alongside the NATS message loop:
+
+| Thread | Markets | Interval | Purpose |
+| --- | --- | --- | --- |
+| `mt5-health` | FOREX | 15 s (`MT5_HEALTH_INTERVAL`) | Checks MT5 connection; sends Telegram alert on disconnect/reconnect |
+| `MT5EventJob` | FOREX | 5 s | Detects terminal-side position closes (SL/TP/Stop-Out) |
+| `binance-user-stream` | CRYPTO | push | Websocket user-data stream → exchange-side fills / SL / TP / liquidation |
+| `PositionCDC` | both | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
+| `NotificationJob` | both | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
+
+All threads share the same `stop_event` — a `multiprocessing.Event` for FOREX, a `threading.Event` for CRYPTO — and exit cleanly when it is set.

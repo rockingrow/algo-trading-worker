@@ -29,20 +29,18 @@ services:
         condition: service_healthy
     env_file: .env
     # These override .env so the container talks to the compose NATS service and
-    # always runs the crypto market with a persistent DB path.
+    # always runs the crypto market with a persistent DB path. The worker runs as
+    # a single process (no HTTP server), so liveness is a heartbeat file.
     environment:
       MARKET_TYPE: CRYPTO
       NATS_URL: nats://nats:4222
       DB_FILE: /app/data/worker_data.sqlite
-      APP_HOST: 0.0.0.0
-      APP_PORT: 8000
+      HEARTBEAT_FILE: /app/data/heartbeat
     volumes:
-      - worker-data:/app/data        # persist the SQLite DB across restarts
-    ports:
-      - "8000:8000"
+      - worker-data:/app/data        # persist the SQLite DB + heartbeat across restarts
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=3)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; p=os.environ['HEARTBEAT_FILE']; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 60 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3

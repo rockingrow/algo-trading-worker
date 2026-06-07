@@ -38,10 +38,9 @@ RUN mkdir -p /app/data && \
 USER appuser
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    APP_HOST=0.0.0.0 \
-    APP_PORT=8000
+    HEARTBEAT_FILE=/app/data/heartbeat
 
-EXPOSE 8000
-
-# Matches the Makefile `start` target; logs go to stdout (captured by Docker).
-CMD ["uvicorn", "worker.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
+# Single-process crypto worker: no FastAPI/uvicorn and no multiprocessing child
+# (the crypto gateway is pure Python — REST + websocket threads). Logs go to
+# stdout (captured by Docker); SIGTERM from `docker stop` shuts it down cleanly.
+CMD ["python", "-m", "worker.crypto_worker"]
