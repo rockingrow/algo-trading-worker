@@ -30,7 +30,7 @@ from worker.interfaces.executor_protocol import TradeExecutorProtocol
 from worker.logger import get_logger
 from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.signal_schema import SignalSchema
-from worker.settings import MarketTypeEnum, settings
+from worker.settings import MarketTypeEnum
 
 logger = get_logger("worker.core.market_strategy")
 
@@ -136,11 +136,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     positions = self._executor.get_open_positions(symbol, strategy=signal.strategy)
 
     if not positions:
-      return {
-        "success": False,
-        "retcode": -1,
-        "comment": "No open position — likely SL already triggered.",
-      }
+      return TradeResult.fail("No open position — likely SL already triggered.")
 
     pos = positions[0]
 
@@ -154,11 +150,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
       )
     else:
       if signal.quantity is None:
-        return {
-          "success": False,
-          "retcode": -1,
-          "comment": "Missing quantity in TP1 signal",
-        }
+        return TradeResult.fail("Missing quantity in TP1 signal")
       close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
       logger.info(
         f"[handle_tp1] Payload quantity mode | qty={signal.quantity} → close_volume={close_volume}"
@@ -225,38 +217,48 @@ class CryptoMarket(ExecutorBackedMarket):
 
 class MarketStrategyFactory:
   """
-  Reads ``settings.market_type`` (a :class:`MarketTypeEnum`) and returns the
-  matching :class:`BaseMarketStrategy` implementation.
+  Maps a :class:`MarketTypeEnum` to its :class:`BaseMarketStrategy` implementation.
+
+  ``market_type`` is passed in explicitly (Dependency Injection) rather than read
+  from the global ``settings`` singleton, so the factory has no hidden dependency
+  and is trivially testable.
 
   Usage (in the signal processor)::
 
-      strategy = MarketStrategyFactory.create(executor=executor, config=config)
+      strategy = MarketStrategyFactory.create(market_type, executor, config)
       handler  = SignalHandler(strategy, db_service)
   """
 
+  _MARKET_CLASSES = {
+    MarketTypeEnum.FOREX: ForexMarket,
+    MarketTypeEnum.CRYPTO: CryptoMarket,
+  }
+
   @staticmethod
   def create(
-    executor=None, config: Optional[ExecutionConfig] = None
+    market_type, executor=None, config: Optional[ExecutionConfig] = None
   ) -> BaseMarketStrategy:
     """
     Instantiate and return the correct market strategy.
 
     Parameters
     ----------
+    market_type:
+        A :class:`MarketTypeEnum` (or its string value) selecting the market.
     executor:
         The broker executor. Must satisfy :class:`TradeExecutorProtocol`.
         Required for both FOREX (``MT5Executor``) and CRYPTO (``CryptoExecutor``).
     config:
         Execution/risk configuration. Required for every market.
     """
-    market_type = settings.market_type
-    logger.info(f"[MarketStrategyFactory] Detected market_type={market_type.value}")
+    market_type = (
+      market_type
+      if isinstance(market_type, MarketTypeEnum)
+      else MarketTypeEnum(market_type)
+    )
+    logger.info(f"[MarketStrategyFactory] market_type={market_type.value}")
 
-    market_classes = {
-      MarketTypeEnum.FOREX: ForexMarket,
-      MarketTypeEnum.CRYPTO: CryptoMarket,
-    }
-    market_cls = market_classes.get(market_type)
+    market_cls = MarketStrategyFactory._MARKET_CLASSES.get(market_type)
     if market_cls is None:
       raise ValueError(
         f"Unsupported or not-yet-implemented market_type: {market_type!r}"

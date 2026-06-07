@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 from conftest import make_signal
 
-from worker.core import market_strategy as ms
 from worker.core.market_strategy import (
   CryptoMarket,
   ForexMarket,
@@ -44,28 +43,26 @@ class FakeExecutor:
     return {"success": True, "reason": reason}
 
 
-@pytest.fixture
-def crypto_market(monkeypatch):
-  monkeypatch.setattr(ms.settings, "market_type", MarketTypeEnum.CRYPTO)
-  return None
-
-
-def test_factory_builds_crypto_market(config, crypto_market):
-  market = MarketStrategyFactory.create(executor=FakeExecutor(), config=config)
+def test_factory_builds_crypto_market(config):
+  market = MarketStrategyFactory.create(
+    MarketTypeEnum.CRYPTO, executor=FakeExecutor(), config=config
+  )
   assert isinstance(market, CryptoMarket)
   # CryptoMarket shares the executor-backed base, not a Forex instance.
   assert not isinstance(market, ForexMarket)
 
 
-def test_factory_crypto_requires_executor(config, crypto_market):
+def test_factory_crypto_requires_executor(config):
   with pytest.raises(ValueError):
-    MarketStrategyFactory.create(executor=None, config=config)
+    MarketStrategyFactory.create(MarketTypeEnum.CRYPTO, executor=None, config=config)
 
 
-def test_crypto_handle_tp1_partial_then_breakeven(config, crypto_market):
+def test_crypto_handle_tp1_partial_then_breakeven(config):
   pos = SimpleNamespace(ticket=7, volume=0.02, price_open=30000.0)
   ex = FakeExecutor(positions=[pos])
-  market = MarketStrategyFactory.create(executor=ex, config=config)
+  market = MarketStrategyFactory.create(
+    MarketTypeEnum.CRYPTO, executor=ex, config=config
+  )
   res = market.handle_tp1(make_signal(SignalActionEnum.TP1, symbol="BTCUSD"))
   assert res["success"] is True
   # 0.02 * 30% = 0.006 partial close, SL moved to entry (breakeven)
@@ -73,7 +70,9 @@ def test_crypto_handle_tp1_partial_then_breakeven(config, crypto_market):
   assert ("sl", 30000.0, 7, "strat-1") in ex.calls
 
 
-def test_crypto_full_close_passes_reason(config, crypto_market):
-  market = MarketStrategyFactory.create(executor=FakeExecutor(), config=config)
+def test_crypto_full_close_passes_reason(config):
+  market = MarketStrategyFactory.create(
+    MarketTypeEnum.CRYPTO, executor=FakeExecutor(), config=config
+  )
   res = market.handle_full_close(make_signal(SignalActionEnum.SL, symbol="BTCUSD"))
   assert res["reason"] == "SL"

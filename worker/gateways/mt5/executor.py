@@ -8,6 +8,7 @@ from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.mt5_executor")
 
@@ -154,7 +155,7 @@ class MT5Executor:
     magic = self._magic_for(strategy)
     return [p for p in positions if p.magic == magic]
 
-  def close_single_position(self, pos: Any, reason: str = "FLAT") -> Dict[str, Any]:
+  def close_single_position(self, pos: Any, reason: str = "FLAT") -> TradeResult:
     """Close a single MT5 position object (pos.symbol is already resolved)."""
     close_type = (
       self._mt5.ORDER_TYPE_SELL
@@ -183,24 +184,23 @@ class MT5Executor:
 
     if result and result.retcode == self._mt5.TRADE_RETCODE_DONE:
       logger.info(f"[close_single] Closed ticket {pos.ticket} successfully")
-      return {
-        "success": True,
-        "retcode": result.retcode,
-        "ticket": result.order,
-        "price": result.price,
-        "volume": result.volume,
-        "comment": f"Closed [{reason}]",
-      }
+      return TradeResult.ok(
+        retcode=result.retcode,
+        ticket=result.order,
+        price=result.price,
+        volume=result.volume,
+        comment=f"Closed [{reason}]",
+      )
 
     err = result.comment if result else self._mt5.last_error()
     logger.error(f"[close_single] Failed to close ticket {pos.ticket}. Error: {err}")
-    return {"success": False, "retcode": -1, "comment": str(err)}
+    return TradeResult.fail(str(err))
 
   # ------------------------------------------------------------------ #
   #  Entry: Open a new LONG / SHORT position                             #
   # ------------------------------------------------------------------ #
 
-  def open_position(self, signal: SignalSchema) -> Dict[str, Any]:
+  def open_position(self, signal: SignalSchema) -> TradeResult:
     """Open a new market order (LONG → BUY, SHORT → SELL)."""
     action_map = {
       "LONG": self._mt5.ORDER_TYPE_BUY,
@@ -210,7 +210,7 @@ class MT5Executor:
 
     if action_str not in action_map:
       logger.warning(f"open_position called with unsupported action: '{action_str}'")
-      return {"success": False, "retcode": -1, "comment": "Action Mapping Failed"}
+      return TradeResult.fail("Action Mapping Failed")
 
     order_type = action_map[action_str]
     symbol = self.get_symbol(signal.symbol)
@@ -281,33 +281,25 @@ class MT5Executor:
 
     if result is None:
       logger.error(f"order_send failed. error code: {self._mt5.last_error()}")
-      return {
-        "success": False,
-        "retcode": _mt5_error_code(self._mt5.last_error()),
-        "comment": "Send Failed",
-      }
+      return TradeResult.fail(
+        "Send Failed", retcode=_mt5_error_code(self._mt5.last_error())
+      )
 
     if result.retcode != self._mt5.TRADE_RETCODE_DONE:
       logger.error(
         f"Order rejected, retcode={result.retcode}, comment: {result.comment}"
       )
-      return {
-        "success": False,
-        "retcode": result.retcode,
-        "comment": result.comment,
-        "ticket": 0,
-      }
+      return TradeResult.fail(result.comment, retcode=result.retcode, ticket=0)
 
     logger.info(
       f"[open_position] Filled! Ticket: {result.order}, Price: {result.price}, Vol: {result.volume}"
     )
-    return {
-      "success": True,
-      "retcode": result.retcode,
-      "ticket": result.order,
-      "price": result.price,
-      "volume": result.volume,
-    }
+    return TradeResult.ok(
+      retcode=result.retcode,
+      ticket=result.order,
+      price=result.price,
+      volume=result.volume,
+    )
 
   # ------------------------------------------------------------------ #
   #  TP1: Partial close + move SL to breakeven                           #
@@ -319,7 +311,7 @@ class MT5Executor:
     close_volume: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     """
     Partially close a position by sending a counter-direction market order
     with the specified volume. If *position_ticket* is given it targets that
@@ -332,7 +324,7 @@ class MT5Executor:
 
     if not positions:
       logger.warning(f"[partial_close] No open positions found for {resolved}")
-      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+      return TradeResult.fail("No Positions Found")
 
     # Target a specific ticket or fall back to the first open position
     pos = (
@@ -371,29 +363,26 @@ class MT5Executor:
 
     if result is None:
       logger.error(f"partial_close order_send failed. error: {self._mt5.last_error()}")
-      return {
-        "success": False,
-        "retcode": _mt5_error_code(self._mt5.last_error()),
-        "comment": "Send Failed",
-      }
+      return TradeResult.fail(
+        "Send Failed", retcode=_mt5_error_code(self._mt5.last_error())
+      )
 
     if result.retcode != self._mt5.TRADE_RETCODE_DONE:
       logger.error(
         f"Partial close failed, retcode={result.retcode}, comment: {result.comment}"
       )
-      return {"success": False, "retcode": result.retcode, "comment": result.comment}
+      return TradeResult.fail(result.comment, retcode=result.retcode)
 
     logger.info(
       f"[partial_close] OK. Ticket: {result.order}, Closed Vol: {result.volume}, Price: {result.price}"
     )
-    return {
-      "success": True,
-      "retcode": result.retcode,
-      "ticket": result.order,
-      "price": result.price,
-      "volume": result.volume,
-      "source_ticket": pos.ticket,
-    }
+    return TradeResult.ok(
+      retcode=result.retcode,
+      ticket=result.order,
+      price=result.price,
+      volume=result.volume,
+      source_ticket=pos.ticket,
+    )
 
   def update_position_sl(
     self,
@@ -401,7 +390,7 @@ class MT5Executor:
     new_sl: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     """
     Update the Stop Loss of an open position to *new_sl* using
     TRADE_ACTION_SLTP. Targets a specific ticket or the first magic-number
@@ -413,7 +402,7 @@ class MT5Executor:
 
     if not positions:
       logger.warning(f"[update_sl] No open positions found for {resolved}")
-      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+      return TradeResult.fail("No Positions Found")
 
     pos = (
       next((p for p in positions if p.ticket == position_ticket), positions[0])
@@ -434,25 +423,22 @@ class MT5Executor:
 
     if result is None:
       logger.error(f"update_sl order_send failed. error: {self._mt5.last_error()}")
-      return {
-        "success": False,
-        "retcode": _mt5_error_code(self._mt5.last_error()),
-        "comment": "SL Update Failed",
-      }
+      return TradeResult.fail(
+        "SL Update Failed", retcode=_mt5_error_code(self._mt5.last_error())
+      )
 
     if result.retcode != self._mt5.TRADE_RETCODE_DONE:
       logger.error(
         f"SL update rejected, retcode={result.retcode}, comment: {result.comment}"
       )
-      return {"success": False, "retcode": result.retcode, "comment": result.comment}
+      return TradeResult.fail(result.comment, retcode=result.retcode)
 
     logger.info(f"[update_sl] SL updated successfully for ticket {pos.ticket}")
-    return {
-      "success": True,
-      "retcode": result.retcode,
-      "ticket": pos.ticket,
-      "new_sl": new_sl,
-    }
+    return TradeResult.ok(
+      retcode=result.retcode,
+      ticket=pos.ticket,
+      new_sl=new_sl,
+    )
 
   # ------------------------------------------------------------------ #
   #  TP2 / SL / R_SL: Full close using MT5 actual volume                #
@@ -460,7 +446,7 @@ class MT5Executor:
 
   def close_all_positions(
     self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     """
     Close ALL open positions for the symbol at actual MT5 volume.
     Webhook quantity is intentionally ignored to avoid dust-lot errors.
@@ -473,7 +459,7 @@ class MT5Executor:
 
     if not positions:
       logger.warning(f"[close_all] No open positions found for {resolved}")
-      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+      return TradeResult.fail("No Positions Found")
 
     success_count = 0
     last_result = None
@@ -515,18 +501,13 @@ class MT5Executor:
         logger.error(f"[close_all] Failed to close ticket {pos.ticket}. Error: {err}")
 
     if success_count > 0:
-      return {
-        "success": True,
-        "retcode": self._mt5.TRADE_RETCODE_DONE,
-        "ticket": last_result.order,
-        "source_ticket": positions[0].ticket,  # Include the position's original ticket
-        "price": last_result.price,
-        "volume": last_result.volume,
-        "comment": f"Closed {success_count} position(s) [{reason}]",
-      }
+      return TradeResult.ok(
+        retcode=self._mt5.TRADE_RETCODE_DONE,
+        ticket=last_result.order,
+        source_ticket=positions[0].ticket,  # the position's original ticket
+        price=last_result.price,
+        volume=last_result.volume,
+        comment=f"Closed {success_count} position(s) [{reason}]",
+      )
 
-    return {
-      "success": False,
-      "retcode": -1,
-      "comment": f"Failed to close positions [{reason}]",
-    }
+    return TradeResult.fail(f"Failed to close positions [{reason}]")

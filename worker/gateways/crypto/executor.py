@@ -22,13 +22,14 @@ Notes
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from worker.core.config import ExecutionConfig
 from worker.gateways.crypto.base import BaseExchangeGateway, ExchangePosition
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.gateways.crypto.executor")
 
@@ -113,10 +114,10 @@ class CryptoExecutor:
 
   # ── Entry ─────────────────────────────────────────────────────────────── #
 
-  def open_position(self, signal: SignalSchema) -> Dict[str, Any]:
+  def open_position(self, signal: SignalSchema) -> TradeResult:
     action = signal.action.value  # LONG / SHORT
     if action not in ("LONG", "SHORT"):
-      return {"success": False, "retcode": -1, "comment": "Action Mapping Failed"}
+      return TradeResult.fail("Action Mapping Failed")
 
     symbol = self.get_symbol(signal.symbol)
 
@@ -139,12 +140,12 @@ class CryptoExecutor:
         logger.warning("[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty)
     else:
       if signal.quantity is None:
-        return {"success": False, "retcode": -1, "comment": "Missing quantity"}
+        return TradeResult.fail("Missing quantity")
       qty = self.convert_quantity_to_lots(symbol, signal.quantity)
 
     qty = self.normalize_volume(symbol, qty)
     if qty <= 0:
-      return {"success": False, "retcode": -1, "comment": "Computed quantity is zero"}
+      return TradeResult.fail("Computed quantity is zero")
 
     result = self._gateway.place_market_order(
       symbol,
@@ -172,11 +173,11 @@ class CryptoExecutor:
     close_volume: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
-      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+      return TradeResult.fail("No Positions Found")
 
     pos = (
       next((p for p in positions if p.ticket == position_ticket), positions[0])
@@ -185,7 +186,7 @@ class CryptoExecutor:
     )
     safe_volume = self.normalize_volume(symbol, min(close_volume, pos.volume))
     if safe_volume <= 0:
-      return {"success": False, "retcode": -1, "comment": "Close volume rounds to zero"}
+      return TradeResult.fail("Close volume rounds to zero")
 
     result = self._gateway.place_market_order(
       resolved, pos.side, safe_volume, reduce_only=True
@@ -200,11 +201,11 @@ class CryptoExecutor:
     new_sl: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
-      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+      return TradeResult.fail("No Positions Found")
 
     pos = (
       next((p for p in positions if p.ticket == position_ticket), positions[0])
@@ -223,15 +224,15 @@ class CryptoExecutor:
 
   def close_all_positions(
     self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
-      return {"success": False, "retcode": -1, "comment": "No Positions Found"}
+      return TradeResult.fail("No Positions Found")
 
     self._gateway.cancel_all_orders(resolved)
     success_count = 0
-    last_result: Optional[Dict[str, Any]] = None
+    last_result: Optional[Any] = None
     for pos in positions:
       result = self._gateway.place_market_order(
         resolved, pos.side, pos.volume, reduce_only=True
@@ -243,18 +244,16 @@ class CryptoExecutor:
         logger.error("[close_all] Failed to close %s: %s", resolved, result.get("comment"))
 
     if success_count > 0 and last_result is not None:
-      return {
-        "success": True,
-        "retcode": 0,
-        "ticket": last_result.get("ticket"),
-        "source_ticket": positions[0].ticket,
-        "price": last_result.get("price"),
-        "volume": last_result.get("volume"),
-        "comment": f"Closed {success_count} position(s) [{reason}]",
-      }
-    return {"success": False, "retcode": -1, "comment": f"Failed to close [{reason}]"}
+      return TradeResult.ok(
+        ticket=last_result.get("ticket"),
+        source_ticket=positions[0].ticket,
+        price=last_result.get("price"),
+        volume=last_result.get("volume"),
+        comment=f"Closed {success_count} position(s) [{reason}]",
+      )
+    return TradeResult.fail(f"Failed to close [{reason}]")
 
-  def close_single_position(self, pos: Any, reason: str = "FLAT") -> Dict[str, Any]:
+  def close_single_position(self, pos: Any, reason: str = "FLAT") -> TradeResult:
     """Close one :class:`ExchangePosition` (its ``symbol`` is already resolved)."""
     result = self._gateway.place_market_order(
       pos.symbol, pos.side, pos.volume, reduce_only=True

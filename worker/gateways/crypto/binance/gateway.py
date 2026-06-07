@@ -31,6 +31,7 @@ from worker.gateways.crypto.base import (
   SymbolFilter,
 )
 from worker.logger import get_logger
+from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.gateways.crypto.binance.gateway")
 
@@ -170,10 +171,10 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     quantity: float,
     reduce_only: bool = False,
     client_order_id: Optional[str] = None,
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     order_side = (_CLOSE_SIDE if reduce_only else _OPEN_SIDE).get(side)
     if order_side is None:
-      return {"success": False, "retcode": -1, "comment": f"Bad side: {side}"}
+      return TradeResult.fail(f"Bad side: {side}")
 
     params: Dict[str, Any] = {
       "symbol": symbol,
@@ -191,11 +192,11 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       return self._order_result(data)
     except Exception as exc:
       logger.exception("[Binance] place_market_order failed: %s", exc)
-      return {"success": False, "retcode": -1, "comment": str(exc)}
+      return TradeResult.fail(str(exc))
 
   def set_stop_loss(
     self, symbol: str, position_side: str, stop_price: float, quantity: float
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     # closePosition=true closes the whole remaining position when the stop trips,
     # which is exactly the breakeven-after-TP1 behavior the strategy wants.
     params: Dict[str, Any] = {
@@ -210,7 +211,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       return self._order_result(data)
     except Exception as exc:
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
-      return {"success": False, "retcode": -1, "comment": str(exc)}
+      return TradeResult.fail(str(exc))
 
   def cancel_all_orders(self, symbol: str) -> None:
     try:
@@ -258,14 +259,10 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   # ── Helpers ───────────────────────────────────────────────────────────── #
 
   @staticmethod
-  def _order_result(data: Dict[str, Any]) -> Dict[str, Any]:
-    avg = float(data.get("avgPrice", 0) or 0)
-    executed = float(data.get("executedQty", 0) or 0)
-    return {
-      "success": True,
-      "retcode": 0,
-      "ticket": data.get("orderId"),
-      "price": avg,
-      "volume": executed,
-      "comment": data.get("status", "NEW"),
-    }
+  def _order_result(data: Dict[str, Any]) -> TradeResult:
+    return TradeResult.ok(
+      ticket=data.get("orderId"),
+      price=float(data.get("avgPrice", 0) or 0),
+      volume=float(data.get("executedQty", 0) or 0),
+      comment=data.get("status", "NEW"),
+    )

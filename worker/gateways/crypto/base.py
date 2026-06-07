@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from worker.schemas.trade_result import TradeResult
+
 # Reuse the broker-neutral side vocabulary the rest of the worker speaks.
 SIDE_LONG = "LONG"
 SIDE_SHORT = "SHORT"
@@ -61,11 +63,7 @@ class ExchangePosition:
 class BaseExchangeGateway(ABC):
   """Contract every CEX adapter must implement.
 
-  Order-placement methods return a normalized result dict shaped like the rest
-  of the worker's ``TradeResult``::
-
-      {"success": bool, "retcode": int, "ticket": int,
-       "price": float, "volume": float, "comment": str}
+  Order-placement methods return a :class:`~worker.schemas.trade_result.TradeResult`.
   """
 
   name: str = "BASE"
@@ -105,13 +103,13 @@ class BaseExchangeGateway(ABC):
     quantity: float,
     reduce_only: bool = False,
     client_order_id: Optional[str] = None,
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     """Place a market order. *side* is SIDE_LONG/SIDE_SHORT (mapped to BUY/SELL)."""
 
   @abstractmethod
   def set_stop_loss(
     self, symbol: str, position_side: str, stop_price: float, quantity: float
-  ) -> Dict[str, Any]:
+  ) -> TradeResult:
     """Place / replace a reduce-only stop order protecting an open position."""
 
   @abstractmethod

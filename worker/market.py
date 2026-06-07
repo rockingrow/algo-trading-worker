@@ -16,68 +16,31 @@ class MarketOrchestrator(ABC):
   async def shutdown(self) -> None: ...
 
 
-class ForexMarketOrchestrator(MarketOrchestrator):
-  """Concrete implementation for Forex market orchestrator."""
-  def __init__(self, settings_dict: dict) -> None:
-    # Imported lazily so the CRYPTO path never loads MetaTrader5 / mt5 modules.
-    from worker.gateways.mt5.manager import MT5Manager
-    from worker.mt5_worker import mt5_worker_main
+class GatewayProcessOrchestrator(MarketOrchestrator):
+  """Supervises a market's worker child process.
 
-    self._manager = MT5Manager(settings_dict, mt5_worker_main, process_name="worker_mt5")
-    self._watchdog_task: asyncio.Task | None = None
-
-  async def startup(self) -> None:
-    await asyncio.to_thread(self._manager.start)
-    self._watchdog_task = asyncio.create_task(self._watchdog())
-    log.info("[FOREX] MT5 worker process started.")
-
-  async def shutdown(self) -> None:
-    if self._watchdog_task:
-      self._watchdog_task.cancel()
-      try:
-        await self._watchdog_task
-      except asyncio.CancelledError:
-        pass
-    log.info("Shutting down MT5 worker subprocess...")
-    await asyncio.to_thread(self._manager.stop)
-    log.info("MT5 worker subprocess stopped.")
-
-  async def _watchdog(self) -> None:
-    while True:
-      await asyncio.sleep(WATCHDOG_INTERVAL)
-      if self._manager.stopping:
-        break
-      if not self._manager.is_alive:
-        log.warning("[FOREX] Worker process died unexpectedly — restarting...")
-        try:
-          await asyncio.to_thread(self._manager.restart)
-          log.info("[FOREX] Worker process restarted successfully.")
-        except Exception as exc:
-          log.exception("[FOREX] Failed to restart worker process: %s", exc)
-
-
-class CryptoMarketOrchestrator(MarketOrchestrator):
-  """Concrete implementation for Crypto market orchestrator.
-
-  Spawns the crypto child process via the generic process manager and supervises
-  it with the same watchdog/restart loop the Forex orchestrator uses. No MT5 /
-  MetaTrader5 dependency is imported on this path.
+  Both markets spawn a child process (so the GIL-holding MT5 extension or a
+  long-lived websocket loop never blocks the FastAPI event loop) and supervise it
+  with the same watchdog/restart loop — only the worker function, label, and
+  process name differ. Parameterizing those collapses what used to be two nearly
+  identical orchestrator classes into one (composition over duplication).
   """
 
-  def __init__(self, settings_dict: dict) -> None:
-    # Imported lazily so the FOREX path never loads exchange/websocket modules.
-    from worker.crypto_worker import crypto_worker_main
+  def __init__(
+    self, settings_dict: dict, worker_fn, *, label: str, process_name: str
+  ) -> None:
     from worker.process_manager import WorkerProcessManager
 
     self._manager = WorkerProcessManager(
-      settings_dict, crypto_worker_main, process_name="worker_crypto"
+      settings_dict, worker_fn, process_name=process_name
     )
+    self._label = label
     self._watchdog_task: asyncio.Task | None = None
 
   async def startup(self) -> None:
     await asyncio.to_thread(self._manager.start)
     self._watchdog_task = asyncio.create_task(self._watchdog())
-    log.info("[CRYPTO] Crypto worker process started.")
+    log.info("[%s] Worker process started.", self._label)
 
   async def shutdown(self) -> None:
     if self._watchdog_task:
@@ -86,9 +49,9 @@ class CryptoMarketOrchestrator(MarketOrchestrator):
         await self._watchdog_task
       except asyncio.CancelledError:
         pass
-    log.info("Shutting down crypto worker subprocess...")
+    log.info("[%s] Shutting down worker subprocess...", self._label)
     await asyncio.to_thread(self._manager.stop)
-    log.info("Crypto worker subprocess stopped.")
+    log.info("[%s] Worker subprocess stopped.", self._label)
 
   async def _watchdog(self) -> None:
     while True:
@@ -96,18 +59,35 @@ class CryptoMarketOrchestrator(MarketOrchestrator):
       if self._manager.stopping:
         break
       if not self._manager.is_alive:
-        log.warning("[CRYPTO] Worker process died unexpectedly — restarting...")
+        log.warning("[%s] Worker process died unexpectedly — restarting...", self._label)
         try:
           await asyncio.to_thread(self._manager.restart)
-          log.info("[CRYPTO] Worker process restarted successfully.")
+          log.info("[%s] Worker process restarted successfully.", self._label)
         except Exception as exc:
-          log.exception("[CRYPTO] Failed to restart worker process: %s", exc)
+          log.exception("[%s] Failed to restart worker process: %s", self._label, exc)
 
 
 def create_market_orchestrator(settings_dict: dict) -> MarketOrchestrator:
+  """Build the orchestrator for the configured market.
+
+  The market's worker function is imported lazily here so the other market's
+  dependencies are never loaded (the CRYPTO path never imports MetaTrader5, and
+  vice-versa).
+  """
   market_type = settings_dict.get("market_type", MarketTypeEnum.FOREX)
+
   if market_type == MarketTypeEnum.FOREX:
-    return ForexMarketOrchestrator(settings_dict)
+    from worker.mt5_worker import mt5_worker_main
+
+    return GatewayProcessOrchestrator(
+      settings_dict, mt5_worker_main, label="FOREX", process_name="worker_mt5"
+    )
+
   if market_type == MarketTypeEnum.CRYPTO:
-    return CryptoMarketOrchestrator(settings_dict)
+    from worker.crypto_worker import crypto_worker_main
+
+    return GatewayProcessOrchestrator(
+      settings_dict, crypto_worker_main, label="CRYPTO", process_name="worker_crypto"
+    )
+
   raise ValueError(f"Unsupported MARKET_TYPE: {market_type!r}")

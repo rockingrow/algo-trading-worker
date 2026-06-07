@@ -90,7 +90,9 @@ class BaseSignalProcessor(ABC):
     # Build the broker executor (hook), then the shared strategy/handler stack.
     self.executor = self._build_executor()
     self.strategy = MarketStrategyFactory.create(
-      executor=self.executor, config=self.config
+      settings_dict.get("market_type", MarketTypeEnum.FOREX),
+      executor=self.executor,
+      config=self.config,
     )
     self.handler = SignalHandler(self.strategy, ctx.db_service)
 

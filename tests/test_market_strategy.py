@@ -9,6 +9,7 @@ from worker.core.market_strategy import (
   MarketStrategyFactory,
 )
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.settings import MarketTypeEnum
 
 
 class FakeExecutor:
@@ -80,14 +81,16 @@ def test_handle_full_close_passes_reason(config):
 
 def test_factory_requires_executor(config):
   with pytest.raises(ValueError):
-    MarketStrategyFactory.create(executor=None, config=config)
+    MarketStrategyFactory.create(MarketTypeEnum.FOREX, executor=None, config=config)
 
 
 def test_factory_requires_config():
   with pytest.raises(ValueError):
-    MarketStrategyFactory.create(executor=FakeExecutor(), config=None)
+    MarketStrategyFactory.create(MarketTypeEnum.FOREX, executor=FakeExecutor(), config=None)
 
 
 def test_factory_builds_forex_market(config):
-  market = MarketStrategyFactory.create(executor=FakeExecutor(), config=config)
+  market = MarketStrategyFactory.create(
+    MarketTypeEnum.FOREX, executor=FakeExecutor(), config=config
+  )
   assert isinstance(market, ForexMarket)

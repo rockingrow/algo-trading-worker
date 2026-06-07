@@ -122,7 +122,7 @@ class SignalHandler:
         f"symbol={signal.symbol} action={signal.action.value}. "
         "Position may have been closed already."
       )
-      return {"success": False, "retcode": -1, "comment": no_db_comment}
+      return TradeResult.fail(no_db_comment)
 
     logger.info(
       f"[SignalHandler] DB position found | "
@@ -135,7 +135,7 @@ class SignalHandler:
         f"symbol={signal.symbol} action={signal.action.value}. "
         "May have been closed already."
       )
-      return {"success": False, "retcode": -1, "comment": no_mt5_comment}
+      return TradeResult.fail(no_mt5_comment)
 
     result = strategy_fn(signal)
     if result.get("success"):
@@ -165,11 +165,7 @@ class SignalHandler:
     if route is None:
       # Unknown action — should never reach here given validated enum
       logger.error(f"[SignalHandler] Unknown action '{action.value}' — skipping.")
-      return {
-        "success": False,
-        "retcode": -1,
-        "comment": f"Unknown action: {action.value}",
-      }
+      return TradeResult.fail(f"Unknown action: {action.value}")
     return route(signal)
 
   # ------------------------------------------------------------------ #
@@ -203,11 +199,10 @@ class SignalHandler:
           f"[SignalHandler._handle_entry] Failed to clear stale positions: "
           f"{cleanup.get('comment')}. Aborting entry."
         )
-        return {
-          "success": False,
-          "retcode": cleanup.get("retcode", -1),
-          "comment": f"Stale position cleanup failed: {cleanup.get('comment')}",
-        }
+        return TradeResult.fail(
+          f"Stale position cleanup failed: {cleanup.get('comment')}",
+          retcode=cleanup.get("retcode", -1),
+        )
 
       # Update DB records for force-closed positions
       db_stale = self._db.get_open_positions_by_strategy(signal.strategy, symbol)
