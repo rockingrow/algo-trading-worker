@@ -24,7 +24,7 @@ from __future__ import annotations
 import math
 from typing import Any, List, Optional
 
-from worker.core.config import ExecutionConfig
+from worker.gateways.config import ExecutionConfig
 from worker.gateways.crypto.base import BaseExchangeGateway, ExchangePosition
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger

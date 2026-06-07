@@ -1,10 +1,10 @@
 from types import SimpleNamespace
 
 import pytest
-from conftest import make_signal
+from helpers import make_signal
 
-from worker.core.market_strategy import BaseMarketStrategy
-from worker.core.signal_handler import SignalHandler
+from worker.gateways.market_strategy import BaseMarketStrategy
+from worker.gateways.signal_handler import SignalHandler
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum
 

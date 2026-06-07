@@ -1,6 +1,6 @@
 """
-worker/core/signal_handler.py
-─────────────────────────────
+worker/gateways/signal_handler.py
+──────────────────────────────────
 Translates an incoming SignalSchema payload into the correct sequence of
 market strategy calls, following the three-group logic defined in logic.md:
 
@@ -15,14 +15,14 @@ when the broker re-tickets a position after a partial close.
 
 from typing import Any, Callable, Dict, Optional
 
-from worker.core.market_strategy import BaseMarketStrategy
+from worker.gateways.market_strategy import BaseMarketStrategy
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 
-logger = get_logger("worker.core.signal_handler")
+logger = get_logger("worker.gateways.signal_handler")
 
 # Actions that belong to the "full close" group
 _FULL_CLOSE_ACTIONS = {

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
+from enum import StrEnum
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -37,6 +38,17 @@ logger = get_logger("worker.gateways.crypto.binance.gateway")
 
 _MAINNET = "https://fapi.binance.com"
 _TESTNET = "https://testnet.binancefuture.com"
+
+
+class _API_Endpoints(StrEnum):
+  BALANCE = "/fapi/v2/balance"
+  EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
+  PREMIUM_INDEX = "/fapi/v1/premiumIndex"
+  POSITION_RISK = "/fapi/v2/positionRisk"
+  ORDER = "/fapi/v1/order"
+  ALL_OPEN_ORDERS = "/fapi/v1/allOpenOrders"
+  ACCOUNT = "/fapi/v2/account"
+  LISTEN_KEY = "/fapi/v1/listenKey"
 
 # Binance order side mapping for opening positions in one-way mode.
 _OPEN_SIDE = {SIDE_LONG: "BUY", SIDE_SHORT: "SELL"}
@@ -96,7 +108,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def connect(self) -> bool:
     try:
-      self._request("GET", "/fapi/v2/balance", signed=True)
+      self._request("GET", _API_Endpoints.BALANCE, signed=True)
       logger.info("[Binance] Connected (%s).", self._base_url)
       return True
     except Exception as exc:
@@ -115,7 +127,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     if symbol in self._filters:
       return self._filters[symbol]
     try:
-      info = self._request("GET", "/fapi/v1/exchangeInfo", {"symbol": symbol})
+      info = self._request("GET", _API_Endpoints.EXCHANGE_INFO, {"symbol": symbol})
       symbols = info.get("symbols", [])
       if not symbols:
         return SymbolFilter()
@@ -134,14 +146,14 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       return SymbolFilter()
 
   def get_mark_price(self, symbol: str) -> float:
-    data = self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
+    data = self._request("GET", _API_Endpoints.PREMIUM_INDEX, {"symbol": symbol})
     return float(data["markPrice"])
 
   # ── Positions ─────────────────────────────────────────────────────────── #
 
   def get_positions(self, symbol: Optional[str] = None) -> List[ExchangePosition]:
     params = {"symbol": symbol} if symbol else {}
-    rows = self._request("GET", "/fapi/v2/positionRisk", params, signed=True)
+    rows = self._request("GET", _API_Endpoints.POSITION_RISK, params, signed=True)
     positions: List[ExchangePosition] = []
     for row in rows:
       amt = float(row.get("positionAmt", 0) or 0)
@@ -188,7 +200,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       params["newClientOrderId"] = client_order_id
 
     try:
-      data = self._request("POST", "/fapi/v1/order", params, signed=True)
+      data = self._request("POST", _API_Endpoints.ORDER, params, signed=True)
       return self._order_result(data)
     except Exception as exc:
       logger.exception("[Binance] place_market_order failed: %s", exc)
@@ -207,7 +219,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "closePosition": "true",
     }
     try:
-      data = self._request("POST", "/fapi/v1/order", params, signed=True)
+      data = self._request("POST", _API_Endpoints.ORDER, params, signed=True)
       return self._order_result(data)
     except Exception as exc:
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
@@ -215,7 +227,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def cancel_all_orders(self, symbol: str) -> None:
     try:
-      self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+      self._request("DELETE", _API_Endpoints.ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_all_orders(%s) failed: %s", symbol, exc)
 
@@ -223,7 +235,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def get_account(self) -> Optional[Dict[str, Any]]:
     try:
-      data = self._request("GET", "/fapi/v2/account", signed=True)
+      data = self._request("GET", _API_Endpoints.ACCOUNT, signed=True)
       return {
         "balance": float(data.get("totalWalletBalance", 0) or 0),
         "equity": float(data.get("totalMarginBalance", 0) or 0),
@@ -236,11 +248,11 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   # ── User data stream (used by the event job) ──────────────────────────── #
 
   def create_listen_key(self) -> str:
-    data = self._request("POST", "/fapi/v1/listenKey")
+    data = self._request("POST", _API_Endpoints.LISTEN_KEY)
     return data["listenKey"]
 
   def keepalive_listen_key(self) -> None:
-    self._request("PUT", "/fapi/v1/listenKey")
+    self._request("PUT", _API_Endpoints.LISTEN_KEY)
 
   @property
   def ws_base_url(self) -> str:

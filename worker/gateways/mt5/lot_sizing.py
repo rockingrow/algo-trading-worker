@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from worker.core.config import ExecutionConfig
+from worker.gateways.config import ExecutionConfig
 from worker.gateways.mt5.symbol_resolver import SymbolResolver
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger

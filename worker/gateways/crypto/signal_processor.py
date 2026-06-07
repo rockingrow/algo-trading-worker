@@ -21,7 +21,6 @@ from typing import Any, Dict, Optional
 
 from pydantic import ValidationError
 
-from worker.core.base_signal_processor import BaseSignalProcessor
 from worker.gateways.crypto.binance.user_data_stream import (
   ExchangeCloseEvent,
   ExchangeCloseReason,
@@ -29,6 +28,7 @@ from worker.gateways.crypto.binance.user_data_stream import (
 from worker.gateways.crypto.executor import CryptoExecutor
 from worker.gateways.crypto.factory import ExchangeFactory
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
+from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
 from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
 from worker.schemas.job_schema import LogAuthorEnum

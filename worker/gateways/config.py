@@ -1,6 +1,6 @@
 """
-worker/core/config.py
-──────────────────────
+worker/gateways/config.py
+──────────────────────────
 Immutable, explicitly-injected execution configuration.
 
 Business-logic objects (the MT5 executor, lot sizer, market strategy) used to

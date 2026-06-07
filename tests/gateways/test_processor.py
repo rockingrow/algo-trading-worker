@@ -7,9 +7,9 @@ shared `_process_message` algorithm runs identically regardless of market.
 from types import SimpleNamespace
 
 import pytest
-from conftest import make_signal
+from helpers import make_signal
 
-from worker.core.base_signal_processor import BaseSignalProcessor
+from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
 

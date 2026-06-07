@@ -96,6 +96,32 @@ You can monitor the logs printed directly to the screen.
 
 ---
 
+## 📖 Key Concepts
+
+### Market
+
+The `MARKET_TYPE` environment variable defines which trading market the worker operates on:
+
+| Value | Description |
+| --- | --- |
+| `FOREX` | Foreign exchange — instruments like `XAUUSD`, `EURUSD`, etc. Execution goes through the **MT5** gateway (Windows only). |
+| `CRYPTO` | Cryptocurrency — perpetual futures on instruments like `BTCUSDT`. Execution goes through a **CEX** gateway (any OS). |
+
+The market type drives the entire execution path: which gateway is loaded, which environment variables are required, and whether the worker runs as a subprocess (FOREX) or a thread/container (CRYPTO).
+
+### Gateway
+
+A gateway is the integration layer between this worker and the actual trading platform. Each market has its own gateway implementation:
+
+| Market | Gateway | Technology |
+| --- | --- | --- |
+| `FOREX` | **MT5** (`worker/gateways/mt5/`) | MetaTrader 5 terminal via the `MetaTrader5` C extension. Windows-only. Managed as an isolated child process due to GIL constraints. |
+| `CRYPTO` | **CEX** (`worker/gateways/crypto/`) | Centralized Exchange via REST + WebSocket. Exchange-agnostic by design — the first concrete implementation is **Binance** Futures (`worker/gateways/crypto/binance/`). Adding a new exchange only requires implementing `BaseExchangeGateway` and registering it in `ExchangeFactory`. |
+
+The selected gateway handles all order execution, position queries, and real-time event streaming (MT5 terminal events for FOREX; exchange user-data WebSocket for CRYPTO). Business logic above the gateway layer is market-agnostic.
+
+---
+
 ## 🐳 Docker (Crypto worker)
 
 The CRYPTO market runs on any OS, so it ships as a container. The MT5/FOREX

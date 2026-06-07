@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from conftest import FakeMt5
+from helpers import FakeMt5
 
 from worker.gateways.mt5.symbol_resolver import SymbolResolver
 

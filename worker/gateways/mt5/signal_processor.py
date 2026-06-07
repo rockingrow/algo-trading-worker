@@ -24,10 +24,10 @@ from typing import Any, Dict, Optional
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
-from worker.core.base_signal_processor import BaseSignalProcessor
 from worker.gateways.mt5.bridge import MT5
 from worker.gateways.mt5.executor import MT5Executor
 from worker.gateways.mt5.message_presenter import TradeMessagePresenter
+from worker.gateways.processor import BaseSignalProcessor
 from worker.jobs.mt5_event_job import MT5EventJob
 from worker.logger import get_logger
 from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema

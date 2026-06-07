@@ -1,4 +1,4 @@
-from conftest import FakeMt5, make_order_result, make_position, make_signal
+from helpers import FakeMt5, make_order_result, make_position, make_signal
 
 from worker.gateways.mt5.executor import MT5Executor
 from worker.schemas.signal_schema import SignalActionEnum

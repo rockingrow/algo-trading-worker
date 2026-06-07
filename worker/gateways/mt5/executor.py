@@ -1,6 +1,6 @@
 ﻿from typing import Any, Dict, List, Optional
 
-from worker.core.config import ExecutionConfig
+from worker.gateways.config import ExecutionConfig
 from worker.gateways.mt5.lot_sizing import LotSizer
 from worker.gateways.mt5.stop_validator import StopValidator
 from worker.gateways.mt5.symbol_resolver import SymbolResolver

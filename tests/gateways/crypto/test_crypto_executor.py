@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from conftest import make_signal
+from helpers import make_signal
 
 from worker.gateways.crypto.base import SIDE_LONG, ExchangePosition, SymbolFilter
 from worker.gateways.crypto.executor import CryptoExecutor

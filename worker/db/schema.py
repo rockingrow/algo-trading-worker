@@ -32,7 +32,7 @@ logger = get_logger("worker.db.schema")
 _POSITIONS_TABLE = """
     CREATE TABLE IF NOT EXISTS positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ref_source_id TEXT NOT NULL UNIQUE,
+        ref_source_id TEXT NOT NULL,
         ref_id TEXT NOT NULL,
         strategy TEXT NOT NULL,
         symbol TEXT NOT NULL,

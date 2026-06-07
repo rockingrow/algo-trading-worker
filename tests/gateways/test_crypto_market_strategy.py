@@ -3,9 +3,9 @@
 from types import SimpleNamespace
 
 import pytest
-from conftest import make_signal
+from helpers import make_signal
 
-from worker.core.market_strategy import (
+from worker.gateways.market_strategy import (
   CryptoMarket,
   ForexMarket,
   MarketStrategyFactory,

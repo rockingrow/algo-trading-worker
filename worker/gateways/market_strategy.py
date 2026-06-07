@@ -1,6 +1,6 @@
 """
-worker/core/market_strategy.py
-──────────────────────────────
+worker/gateways/market_strategy.py
+────────────────────────────────────
 Market abstraction layer.
 
 Architecture
@@ -25,14 +25,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
-from worker.core.config import ExecutionConfig
+from worker.gateways.config import ExecutionConfig
 from worker.interfaces.executor_protocol import TradeExecutorProtocol
 from worker.logger import get_logger
 from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.signal_schema import SignalSchema
 from worker.settings import MarketTypeEnum
 
-logger = get_logger("worker.core.market_strategy")
+logger = get_logger("worker.gateways.market_strategy")
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

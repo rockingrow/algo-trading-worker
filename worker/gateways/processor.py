@@ -1,6 +1,6 @@
 """
-worker/core/base_signal_processor.py
-────────────────────────────────────
+worker/gateways/processor.py
+────────────────────────────
 Market-agnostic signal-processor skeleton (Template Method pattern).
 
 Both the FOREX (MT5) and CRYPTO (CEX) gateways run the *same* algorithm:
@@ -29,9 +29,9 @@ from typing import Any, Dict, Optional
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
-from worker.core.config import ExecutionConfig
-from worker.core.market_strategy import MarketStrategyFactory
-from worker.core.signal_handler import SignalHandler
+from worker.gateways.config import ExecutionConfig
+from worker.gateways.market_strategy import MarketStrategyFactory
+from worker.gateways.signal_handler import SignalHandler
 from worker.interfaces.trade_presenter_protocol import TradePresenterProtocol
 from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
@@ -41,7 +41,7 @@ from worker.schemas.signal_schema import SignalSchema
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
 
-log = get_logger("worker.core.base_signal_processor")
+log = get_logger("worker.gateways.processor")
 
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
