@@ -53,8 +53,8 @@ class TradeMessagePresenter:
       f"Strategy: <b>{strategy}</b>\n"
       f"Price: <b>{fc.get('price')}</b>\n"
       f"Volume: <b>{format_volume(fc.get('volume'), auto_calculated=False)}</b>\n"
-      f"Ticket: <b>{fc.get('ticket')}</b>\n"
-      f"Source Ticket: <b>{fc.get('source_ticket')}</b>\n"
+      f"Ticket: <b>{fc.get('ref_id')}</b>\n"
+      f"Source Ticket: <b>{fc.get('ref_source_id')}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )
@@ -98,7 +98,7 @@ class TradeMessagePresenter:
       f"Price: <b>{result.get('price')}</b>\n"
       f"Volume: <b>{result.get('volume')} lot</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
-      f"Source Ticket: <b>{db_pos['source_ticket']}</b>\n"
+      f"Source Ticket: <b>{db_pos['ref_source_id']}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

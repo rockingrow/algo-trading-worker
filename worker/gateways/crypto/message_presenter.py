@@ -47,8 +47,8 @@ class CryptoMessagePresenter:
       f"Strategy: <b>{strategy}</b>\n"
       f"Price: <b>{fc.get('price')}</b>\n"
       f"Quantity: <b>{fc.get('volume')}</b>\n"
-      f"Order: <b>{fc.get('ticket')}</b>\n"
-      f"Source: <b>{fc.get('source_ticket')}</b>\n"
+      f"Order: <b>{fc.get('ref_id')}</b>\n"
+      f"Source: <b>{fc.get('ref_source_id')}</b>\n"
       f"{_DIVIDER}\n{footer}"
     )
 
@@ -103,6 +103,6 @@ class CryptoMessagePresenter:
       f"Price: <b>{result.get('price')}</b>\n"
       f"Quantity: <b>{result.get('volume')}</b>\n"
       f"Order: <b>{result.get('ticket')}</b>\n"
-      f"Source: <b>{db_pos['source_ticket']}</b>\n"
+      f"Source: <b>{db_pos['ref_source_id']}</b>\n"
       f"{_DIVIDER}\n{footer}"
     )

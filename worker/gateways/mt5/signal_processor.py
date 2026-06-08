@@ -267,21 +267,21 @@ class Mt5SignalProcessor(BaseSignalProcessor):
     )
 
     for db_pos in db_positions:
-      db_ticket = db_pos.get("ticket")
-      db_source_ticket = db_pos.get("source_ticket")
+      db_ref_id = db_pos.get("ref_id")
+      db_ref_source_id = db_pos.get("ref_source_id")
       matched_ticket = (
-        db_ticket if db_ticket in closed_tickets
-        else db_source_ticket if db_source_ticket in closed_tickets
+        db_ref_id if db_ref_id in closed_tickets
+        else db_ref_source_id if db_ref_source_id in closed_tickets
         else None
       )
       if matched_ticket is not None:
         result = close_results[matched_ticket]
         self.ctx.db_service.update_position_status(
-          source_ticket=db_source_ticket,
+          ref_source_id=db_ref_source_id,
           status=PositionStatusEnum.FLATTED,
-          new_ticket=result.get("ticket"),
+          ref_id=result.get("ticket"),
           closed_price=result.get("price"),
-          mt5_retcode=result.get("retcode"),
+          gateway_return_code=result.get("retcode"),
           comment=result.get("comment", ""),
           message=raw,
         )
@@ -290,15 +290,15 @@ class Mt5SignalProcessor(BaseSignalProcessor):
             db_pos, result, self.bridge.get_account_footer()
           )
         )
-      elif db_ticket not in attempted_tickets and db_source_ticket not in attempted_tickets:
+      elif db_ref_id not in attempted_tickets and db_ref_source_id not in attempted_tickets:
         # DB has an open record but the position was never seen in MT5 —
         # it was already closed externally; sync the DB.
         log.warning(
-          "[ADMIN FLAT] ticket=%s in DB but not found in MT5 — marking FLATTED",
-          db_ticket,
+          "[ADMIN FLAT] ref_id=%s in DB but not found in MT5 — marking FLATTED",
+          db_ref_id,
         )
         self.ctx.db_service.update_position_status(
-          source_ticket=db_source_ticket,
+          ref_source_id=db_ref_source_id,
           status=PositionStatusEnum.FLATTED,
           comment="Admin FLAT (position already closed in MT5)",
           message=raw,

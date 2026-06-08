@@ -122,25 +122,25 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     for row in matched:
       self.ctx.db_service.log_position(
         strategy=row["strategy"],
-        ticket=event.order_id,
-        source_ticket=row["source_ticket"],
+        ref_id=event.order_id,
+        ref_source_id=row["ref_source_id"],
         symbol=row["symbol"],
         action=event.reason.value,
         volume=event.close_volume,
         price=event.close_price,
         sl=None,
         tp1=None,
-        mt5_retcode=0,
+        gateway_return_code=0,
         comment=f"Exchange close [{event.reason.value}]",
         author=LogAuthorEnum.EXCHANGE.value,
         market_type=self._market_type,
       )
       self.ctx.db_service.update_position_status(
-        source_ticket=row["source_ticket"],
+        ref_source_id=row["ref_source_id"],
         status=status,
-        new_ticket=event.order_id,
+        ref_id=event.order_id,
         closed_price=event.close_price,
-        mt5_retcode=0,
+        gateway_return_code=0,
         comment=f"Exchange close [{event.reason.value}]",
       )
     self.ctx.channel_notifier.send_message(
@@ -193,11 +193,11 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       result = closed.get(resolved)
       if result is not None:
         self.ctx.db_service.update_position_status(
-          source_ticket=db_pos["source_ticket"],
+          ref_source_id=db_pos["ref_source_id"],
           status=PositionStatusEnum.FLATTED,
-          new_ticket=result.get("ticket"),
+          ref_id=result.get("ticket"),
           closed_price=result.get("price"),
-          mt5_retcode=0,
+          gateway_return_code=0,
           comment=result.get("comment", ""),
           message=raw,
         )
@@ -212,7 +212,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
           db_pos["symbol"],
         )
         self.ctx.db_service.update_position_status(
-          source_ticket=db_pos["source_ticket"],
+          ref_source_id=db_pos["ref_source_id"],
           status=PositionStatusEnum.FLATTED,
           comment="Admin FLAT (position not found on exchange)",
           message=raw,

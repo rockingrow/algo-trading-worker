@@ -47,20 +47,20 @@ class DBService:
 
   def update_position_status(
     self,
-    source_ticket: int,
+    ref_source_id: int,
     status: PositionStatusEnum,
-    new_ticket: Optional[int] = None,
+    ref_id: Optional[int] = None,
     closed_price: Optional[float] = None,
-    mt5_retcode: Optional[int] = None,
+    gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
   ):
     return self.positions.update_position_status(
-      source_ticket, status, new_ticket, closed_price, mt5_retcode, comment, message
+      ref_source_id, status, ref_id, closed_price, gateway_return_code, comment, message
     )
 
-  def get_position(self, source_ticket: int):
-    return self.positions.get_position(source_ticket)
+  def get_position(self, ref_source_id: int):
+    return self.positions.get_position(ref_source_id)
 
   def get_pending_sync_positions(self) -> list:
     return self.positions.get_pending_sync_positions()

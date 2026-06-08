@@ -32,11 +32,11 @@ class PositionStoreProtocol(Protocol):
   ) -> List[Dict[str, Any]]: ...
   def update_position_status(
     self,
-    source_ticket: int,
+    ref_source_id: int,
     status: PositionStatusEnum,
-    new_ticket: Optional[int] = None,
+    ref_id: Optional[int] = None,
     closed_price: Optional[float] = None,
-    mt5_retcode: Optional[int] = None,
+    gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
   ) -> None: ...
@@ -52,29 +52,29 @@ class PositionSyncStoreProtocol(Protocol):
 class TerminalCloseStoreProtocol(Protocol):
   """Position read + log + status update used by MT5EventJob."""
 
-  def get_position(self, source_ticket: int) -> Optional[Dict[str, Any]]: ...
+  def get_position(self, ref_source_id: int) -> Optional[Dict[str, Any]]: ...
   def update_position_status(
     self,
-    source_ticket: int,
+    ref_source_id: int,
     status: PositionStatusEnum,
-    new_ticket: Optional[int] = None,
+    ref_id: Optional[int] = None,
     closed_price: Optional[float] = None,
-    mt5_retcode: Optional[int] = None,
+    gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
   ) -> None: ...
   def log_position(
     self,
     strategy: str,
-    ticket: Optional[int],
-    source_ticket: Optional[int],
+    ref_id: Optional[int],
+    ref_source_id: Optional[int],
     symbol: str,
     action: str,
     volume: float,
     price: float,
     sl: Optional[float],
     tp1: Optional[float],
-    mt5_retcode: int,
+    gateway_return_code: int,
     comment: str = ...,
     message: Optional[str] = ...,
     author: str = ...,

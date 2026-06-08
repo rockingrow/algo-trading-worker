@@ -191,15 +191,15 @@ class BaseSignalProcessor(ABC):
 
     self.ctx.db_service.log_position(
       strategy=signal.strategy,
-      ticket=result.get("ticket"),
-      source_ticket=result.get("source_ticket", result.get("ticket")),
+      ref_id=result.get("ticket"),
+      ref_source_id=result.get("source_ticket", result.get("ticket")),
       symbol=signal.symbol,
       action=signal.action.value,
       volume=result.get("volume", signal.quantity),
       price=result.get("price", signal.price),
       sl=getattr(signal, "sl", None),
       tp1=getattr(signal, "tp1", None),
-      mt5_retcode=result.get("retcode", -1),
+      gateway_return_code=result.get("retcode", -1),
       comment=result.get("comment", ""),
       message=signal.model_dump_json(),
       author=LogAuthorEnum.BROKER.value,
@@ -227,27 +227,27 @@ class BaseSignalProcessor(ABC):
 
     if action_val in ("LONG", "SHORT"):
       self.ctx.db_service.insert_position(
-        ticket=pos_ticket,
+        ref_id=pos_ticket,
         strategy=signal.strategy,
         symbol=signal.symbol,
         action=action_val.lower(),
         volume=result.get("volume", signal.quantity),
         opened_price=result.get("price", signal.price),
-        mt5_retcode=result.get("retcode"),
+        gateway_return_code=result.get("retcode"),
         comment=result.get("comment", ""),
         message=signal_json,
-        magic=self._magic_for(signal.strategy),
+        strategy_code=self._magic_for(signal.strategy),
         market_type=self._market_type,
       )
     else:
       status = _CLOSE_STATUS_MAP.get(action_val)
       if status:
         self.ctx.db_service.update_position_status(
-          source_ticket=pos_ticket,
+          ref_source_id=pos_ticket,
           status=status,
-          new_ticket=result.get("ticket"),
+          ref_id=result.get("ticket"),
           closed_price=result.get("price"),
-          mt5_retcode=result.get("retcode"),
+          gateway_return_code=result.get("retcode"),
           comment=result.get("comment", ""),
           message=signal_json,
         )

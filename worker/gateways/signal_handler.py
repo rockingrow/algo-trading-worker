@@ -84,12 +84,12 @@ class SignalHandler:
         len(positions),
         strategy_name,
         symbol,
-        positions[0]["source_ticket"],
+        positions[0]["ref_source_id"],
         len(positions) - 1,
       )
       for dup in positions[1:]:
         self._db.update_position_status(
-          source_ticket=dup["source_ticket"],
+          ref_source_id=dup["ref_source_id"],
           status=PositionStatusEnum.FORCED_CLOSED,
           comment="Duplicate active position — healed by signal handler",
         )
@@ -126,7 +126,7 @@ class SignalHandler:
 
     logger.info(
       f"[SignalHandler] DB position found | "
-      f"source_ticket={db_pos['source_ticket']} ticket={db_pos['ticket']} status={db_pos['status']}"
+      f"ref_source_id={db_pos['ref_source_id']} ref_id={db_pos['ref_id']} status={db_pos['status']}"
     )
 
     if not self.strategy.get_open_positions(signal.symbol, strategy=signal.strategy):
@@ -139,7 +139,7 @@ class SignalHandler:
 
     result = strategy_fn(signal)
     if result.get("success"):
-      result["source_ticket"] = db_pos["source_ticket"]
+      result["source_ticket"] = db_pos["ref_source_id"]
     return result
 
   # ------------------------------------------------------------------ #
@@ -208,16 +208,16 @@ class SignalHandler:
       db_stale = self._db.get_open_positions_by_strategy(signal.strategy, symbol)
       for pos in db_stale:
         self._db.update_position_status(
-          source_ticket=pos["source_ticket"],
+          ref_source_id=pos["ref_source_id"],
           status=PositionStatusEnum.FORCED_CLOSED,
           closed_price=cleanup.get("price"),
-          mt5_retcode=cleanup.get("retcode"),
+          gateway_return_code=cleanup.get("retcode"),
           comment="Force-closed by new entry signal",
         )
         forced_closed.append(
           {
-            "source_ticket": pos["source_ticket"],
-            "ticket": pos["ticket"],
+            "ref_source_id": pos["ref_source_id"],
+            "ref_id": pos["ref_id"],
             "price": cleanup.get("price"),
             "volume": pos.get("volume"),
             "retcode": cleanup.get("retcode"),
@@ -321,7 +321,7 @@ class SignalHandler:
     if result.get("success"):
       db_pos = self._get_db_position(signal.strategy, signal.symbol)
       if db_pos:
-        result["source_ticket"] = db_pos["source_ticket"]
+        result["source_ticket"] = db_pos["ref_source_id"]
       logger.info(
         "[SignalHandler._handle_flat] FLAT OK | source_ticket=%s vol=%s price=%s",
         result.get("source_ticket"),
@@ -335,11 +335,11 @@ class SignalHandler:
     if db_pos:
       logger.warning(
         "[SignalHandler._handle_flat] No MT5 positions but DB has open record — "
-        "marking source_ticket=%s as FLATTED",
-        db_pos["source_ticket"],
+        "marking ref_source_id=%s as FLATTED",
+        db_pos["ref_source_id"],
       )
       self._db.update_position_status(
-        source_ticket=db_pos["source_ticket"],
+        ref_source_id=db_pos["ref_source_id"],
         status=PositionStatusEnum.FLATTED,
         comment="FLAT signal: position not found in MT5 — DB synced",
         message=signal.model_dump_json(),
