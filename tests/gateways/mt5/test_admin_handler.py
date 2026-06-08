@@ -15,10 +15,10 @@ from worker.schemas.position_schema import PositionStatusEnum
 # ── Fakes ─────────────────────────────────────────────────────────────────── #
 
 
-def _db_pos(ticket=1, source_ticket=1, strategy="strat-A", symbol="XAUUSD"):
+def _db_pos(ref_id=1, ref_source_id=1, strategy="strat-A", symbol="XAUUSD"):
   return {
-    "ticket": ticket,
-    "source_ticket": source_ticket,
+    "ref_id": ref_id,
+    "ref_source_id": ref_source_id,
     "strategy": strategy,
     "symbol": symbol,
     "status": "OPENED",
@@ -56,7 +56,7 @@ class FakeExecutor:
     }
     self.closed = []
 
-  def get_all_open_positions(self):
+  def get_all_open_positions(self, strategy=None):
     return list(self._all)
 
   def get_open_positions(self, symbol, strategy=None):
@@ -117,7 +117,7 @@ def test_wrong_account_id_silently_skips():
 def test_matching_account_id_proceeds():
   proc = FakeProc(
     account_id="100",
-    db_positions=[_db_pos(ticket=1)],
+    db_positions=[_db_pos(ref_id=1)],
     mt5_positions=[_mt5_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload(account_id="100"))
@@ -126,7 +126,7 @@ def test_matching_account_id_proceeds():
 
 def test_absent_account_id_closes_all():
   proc = FakeProc(
-    db_positions=[_db_pos(ticket=1)],
+    db_positions=[_db_pos(ref_id=1)],
     mt5_positions=[_mt5_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload())
@@ -169,20 +169,20 @@ def test_mt5_positions_closed_even_with_no_db_records():
 
 def test_successful_close_updates_db_status():
   proc = FakeProc(
-    db_positions=[_db_pos(ticket=1, source_ticket=1)],
+    db_positions=[_db_pos(ref_id=1, ref_source_id=1)],
     mt5_positions=[_mt5_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload())
   assert len(proc.db.status_updates) == 1
   upd = proc.db.status_updates[0]
-  assert upd["source_ticket"] == 1
+  assert upd["ref_source_id"] == 1
   assert upd["status"] == PositionStatusEnum.FLATTED
   assert upd["closed_price"] == 2000.0
 
 
 def test_successful_close_sends_notification():
   proc = FakeProc(
-    db_positions=[_db_pos(ticket=1)],
+    db_positions=[_db_pos(ref_id=1)],
     mt5_positions=[_mt5_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload())
@@ -191,7 +191,7 @@ def test_successful_close_sends_notification():
 
 
 def test_multiple_positions_all_closed():
-  db_positions = [_db_pos(ticket=i, source_ticket=i) for i in (1, 2, 3)]
+  db_positions = [_db_pos(ref_id=i, ref_source_id=i) for i in (1, 2, 3)]
   mt5_positions = [_mt5_pos(ticket=i) for i in (1, 2, 3)]
   proc = FakeProc(db_positions=db_positions, mt5_positions=mt5_positions)
   proc._handle_admin_message(_payload())
@@ -205,7 +205,7 @@ def test_multiple_positions_all_closed():
 
 def test_failed_close_skips_db_update_and_notification():
   proc = FakeProc(
-    db_positions=[_db_pos(ticket=1)],
+    db_positions=[_db_pos(ref_id=1)],
     mt5_positions=[_mt5_pos(ticket=1)],
     close_result={"success": False, "retcode": -1, "comment": "requote"},
   )
@@ -219,12 +219,12 @@ def test_failed_close_skips_db_update_and_notification():
 
 def test_db_position_absent_from_mt5_still_marked_flatted():
   proc = FakeProc(
-    db_positions=[_db_pos(ticket=1, source_ticket=1)],
+    db_positions=[_db_pos(ref_id=1, ref_source_id=1)],
     mt5_positions=[],  # position already gone from MT5
   )
   proc._handle_admin_message(_payload())
   assert len(proc.db.status_updates) == 1
-  assert proc.db.status_updates[0]["source_ticket"] == 1
+  assert proc.db.status_updates[0]["ref_source_id"] == 1
   assert proc.db.status_updates[0]["status"] == PositionStatusEnum.FLATTED
   assert proc.executor.closed == []  # nothing to close in MT5
 

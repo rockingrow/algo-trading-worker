@@ -167,7 +167,7 @@ def test_entry_signal_inserts_position_with_market_and_magic():
 
   assert len(proc.db.inserted) == 1
   row = proc.db.inserted[0]
-  assert row["magic"] == 777  # came from the broker hook
+  assert row["strategy_code"] == 777  # came from the broker hook (_magic_for)
   assert row["market_type"] == "FAKE_MKT"
   assert row["action"] == "long"
   assert proc.notifications == ["filled:LONG:555"]
@@ -181,7 +181,7 @@ def test_exit_signal_updates_status():
 
   assert proc.db.inserted == []
   assert len(proc.db.updated) == 1
-  assert proc.db.updated[0]["source_ticket"] == 5
+  assert proc.db.updated[0]["ref_source_id"] == 5
   assert proc.notifications == ["filled:SL:5"]
 
 

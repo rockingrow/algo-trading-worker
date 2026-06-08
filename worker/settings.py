@@ -58,6 +58,11 @@ class Settings(BaseSettings):
   binance_api_key: Optional[str] = None
   binance_api_secret: Optional[str] = None
   binance_testnet: bool = False
+  # Binance USDⓈ-M futures use netting mode: all strategies on the same symbol
+  # share one net position, so a second strategy opening on that symbol will
+  # merge positions at the exchange level.  Set to True only if you deliberately
+  # run multiple strategies on the same symbol and understand the implications.
+  crypto_allow_multi_strategy_per_symbol: bool = False
 
   # Strategy configuration
   strategy_magic_map: dict[str, int] = {}

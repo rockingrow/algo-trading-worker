@@ -19,7 +19,7 @@ official SDK — see :mod:`worker.gateways.crypto.binance.user_data_stream`.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -43,7 +43,10 @@ from worker.schemas.trade_result import TradeResult
 logger = get_logger("worker.gateways.crypto.binance.gateway")
 
 
-class _API_Endpoints(StrEnum):
+# ``str``-mixin Enum (not ``enum.StrEnum``, which is 3.11+) so the package keeps
+# working on the declared minimum Python 3.10. ``__str__`` returns the bare value
+# so ``str(endpoint)`` yields the path (matching StrEnum), which ``_send`` relies on.
+class _API_Endpoints(str, Enum):
   BALANCE = "/fapi/v2/balance"
   EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
   PREMIUM_INDEX = "/fapi/v1/premiumIndex"
@@ -51,6 +54,9 @@ class _API_Endpoints(StrEnum):
   ORDER = "/fapi/v1/order"
   ALL_OPEN_ORDERS = "/fapi/v1/allOpenOrders"
   ACCOUNT = "/fapi/v2/account"
+
+  def __str__(self) -> str:
+    return self.value
 
 
 # Binance order side mapping for one-way mode.
@@ -179,7 +185,11 @@ class BinanceFuturesGateway(BaseExchangeGateway):
           side=SIDE_LONG if amt > 0 else SIDE_SHORT,
           quantity=amt,
           entry_price=float(row.get("entryPrice", 0) or 0),
-          # Binance has no per-position ticket; derive a stable synthetic id.
+          # Binance has no per-position ticket; derive a process-local synthetic id.
+          # hash() is randomised per Python process (hash seed), so this value
+          # is NOT stable across restarts.  It is intentional: SignalHandler
+          # overwrites it with ref_source_id from the DB before any DB write,
+          # so it never reaches persistent storage.
           ticket=abs(hash(row["symbol"])) % (10**9),
           unrealized_pnl=float(row.get("unRealizedProfit", 0) or 0),
         )

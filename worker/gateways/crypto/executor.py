@@ -22,6 +22,7 @@ Notes
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from typing import Any, List, Optional
 
 from worker.gateways.config import ExecutionConfig
@@ -68,8 +69,10 @@ class CryptoExecutor:
     step = f.step_size or 0.0
     if step <= 0:
       return round(volume, 8)
-    steps = math.floor(volume / step)
-    decimals = max(0, -int(round(math.log10(step)))) if step < 1 else 0
+    # Epsilon prevents under-floor from float division (e.g. 0.3/0.1 = 2.999…).
+    steps = math.floor(volume / step + 1e-9)
+    # Count decimal places from the canonical string so 0.001→3 without log10 drift.
+    decimals = max(0, -Decimal(str(step)).normalize().as_tuple().exponent)
     return round(steps * step, decimals)
 
   def convert_quantity_to_lots(self, symbol: str, quantity: float) -> float:
@@ -156,6 +159,20 @@ class CryptoExecutor:
     if qty <= 0:
       return TradeResult.fail("Computed quantity is zero")
 
+    # Netting-mode guard: reject if another strategy already holds this symbol,
+    # unless the operator has opted in to multi-strategy-per-symbol.
+    if not self._config.allow_multi_strategy_per_symbol and self._db is not None:
+      get_for_symbol = getattr(self._db, "get_open_positions_for_flat", None)
+      if get_for_symbol is not None:
+        open_rows = get_for_symbol(symbol=signal.symbol)
+        other_strategies = {r["strategy"] for r in open_rows if r["strategy"] != signal.strategy}
+        if other_strategies:
+          return TradeResult.fail(
+            f"Netting conflict: {symbol} already held by {other_strategies}. "
+            "Set CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true to override.",
+            retcode=-1,
+          )
+
     result = self._gateway.place_market_order(
       symbol,
       action,
@@ -166,13 +183,55 @@ class CryptoExecutor:
     if not result.get("success"):
       return result
 
-    # Attach protective stop if the signal carried one.
+    # Attach protective stop if the signal carried one. A position without its
+    # protective stop is unacceptable: if the stop fails to register, roll the
+    # entry back (reduce-only close) rather than leave unprotected exposure.
     if signal.sl:
       sl_res = self._gateway.set_stop_loss(symbol, action, signal.sl, qty)
       result["sl_update"] = sl_res
+      if not sl_res.get("success"):
+        return self._rollback_unprotected_entry(symbol, action, result, sl_res, qty)
 
     result.setdefault("volume", qty)
     return result
+
+  def _rollback_unprotected_entry(
+    self, symbol: str, action: str, entry: TradeResult, sl_res: Any, qty: float
+  ) -> TradeResult:
+    """Close a just-opened position whose protective stop failed to register.
+
+    Returns a *failed* result so the position is never persisted as OPENED — a
+    filled entry with no stop is worse than no entry at all.
+    """
+    close_qty = entry.get("volume") or qty
+    logger.error(
+      "[open_position] SL placement failed (%s) — closing the just-opened %s %s "
+      "(qty=%s) to avoid unprotected exposure.",
+      sl_res.get("comment"), action, symbol, close_qty,
+    )
+    close_res = self._gateway.place_market_order(
+      symbol, action, close_qty, reduce_only=True
+    )
+    if close_res.get("success"):
+      fail = TradeResult.fail(
+        f"Entry rolled back: stop-loss failed ({sl_res.get('comment')})",
+        retcode=sl_res.get("retcode", -1),
+      )
+    else:
+      # Could not flatten — the position is OPEN WITHOUT a stop. Escalate loudly.
+      logger.critical(
+        "[open_position] ROLLBACK FAILED for %s %s: position is OPEN WITHOUT a "
+        "stop and could not be closed (%s). Manual intervention required.",
+        action, symbol, close_res.get("comment"),
+      )
+      fail = TradeResult.fail(
+        f"UNPROTECTED POSITION: stop-loss failed ({sl_res.get('comment')}) and "
+        f"rollback close failed ({close_res.get('comment')}) — close manually",
+        retcode=sl_res.get("retcode", -1),
+      )
+    fail["sl_update"] = sl_res
+    fail["rollback"] = close_res
+    return fail
 
   # ── TP1: partial close ────────────────────────────────────────────────── #
 

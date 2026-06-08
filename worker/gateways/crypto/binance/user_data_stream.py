@@ -27,7 +27,8 @@ from worker.logger import get_logger
 
 log = get_logger("worker.gateways.crypto.binance.user_data_stream")
 
-_KEEPALIVE_INTERVAL = 30 * 60  # seconds (Binance expires the listenKey at 60 min)
+_KEEPALIVE_INTERVAL = 30 * 60   # seconds (Binance expires the listenKey at 60 min)
+_SILENCE_TIMEOUT   = 10 * 60   # seconds without any message → proactive reconnect
 
 
 class ExchangeCloseReason(str, Enum):
@@ -111,6 +112,7 @@ class BinanceUserDataStream:
     self._handler = handler
     self._stop_event = threading.Event()
     self._thread: Optional[threading.Thread] = None
+    self._last_message_time: float = 0.0
 
   # ── lifecycle ─────────────────────────────────────────────────────────── #
 
@@ -193,14 +195,30 @@ class BinanceUserDataStream:
     try:
       stream = await connection.user_data(listenKey=listen_key)
       stream.on("message", self._on_message)
+      # Reset liveness clock after each (re)connect so the timeout counts from
+      # subscription time, not from a previous session or object construction.
+      self._last_message_time = time.monotonic()
       log.info("[BinanceUserDataStream] Subscribed.")
 
       while not self._stop_event.is_set():
         await asyncio.sleep(1.0)
-        if time.monotonic() - last_keepalive >= _KEEPALIVE_INTERVAL:
+        now = time.monotonic()
+
+        # Liveness: if the SDK websocket dropped silently (no exception, no ping)
+        # we'd sleep here indefinitely and miss SL/TP/liquidation events.
+        silence = now - self._last_message_time
+        if silence > _SILENCE_TIMEOUT:
+          log.warning(
+            "[BinanceUserDataStream] No message received for %.0fs (timeout=%ds) "
+            "— reconnecting for liveness.",
+            silence, _SILENCE_TIMEOUT,
+          )
+          break  # exits _stream; _run() will reconnect after a brief backoff
+
+        if now - last_keepalive >= _KEEPALIVE_INTERVAL:
           try:
             await asyncio.to_thread(client.rest_api.keepalive_user_data_stream)
-            last_keepalive = time.monotonic()
+            last_keepalive = now
             log.debug("[BinanceUserDataStream] listenKey kept alive.")
           except Exception as exc:
             log.warning("[BinanceUserDataStream] keepalive failed: %s", exc)
@@ -221,6 +239,7 @@ class BinanceUserDataStream:
     return inst if isinstance(inst, dict) else {}
 
   def _on_message(self, event: Any) -> None:
+    self._last_message_time = time.monotonic()
     try:
       parsed = parse_order_trade_update(self._to_raw_dict(event))
     except Exception as exc:

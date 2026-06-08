@@ -119,6 +119,21 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       log.warning("[Crypto Event] No open DB position for %s — ignoring.", event.symbol)
       return
 
+    if len(matched) > 1:
+      # Multiple strategies held the same symbol simultaneously in netting mode.
+      # One exchange fill closes the shared net position; all matched rows are
+      # marked closed with the same total fill volume.
+      log.warning(
+        "[Crypto Event] %d DB rows matched %s — netting mode: one exchange fill "
+        "closes all. Check CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL config.",
+        len(matched), event.symbol,
+      )
+
+    close_comment = (
+      f"Exchange close [{event.reason.value}] (shared fill — netting mode)"
+      if len(matched) > 1
+      else f"Exchange close [{event.reason.value}]"
+    )
     for row in matched:
       self.ctx.db_service.log_position(
         strategy=row["strategy"],
@@ -126,12 +141,12 @@ class CryptoSignalProcessor(BaseSignalProcessor):
         ref_source_id=row["ref_source_id"],
         symbol=row["symbol"],
         action=event.reason.value,
-        volume=event.close_volume,
+        volume=event.close_volume,  # total exchange fill volume
         price=event.close_price,
         sl=None,
         tp1=None,
         gateway_return_code=0,
-        comment=f"Exchange close [{event.reason.value}]",
+        comment=close_comment,
         author=LogAuthorEnum.EXCHANGE.value,
         market_type=self._market_type,
       )
@@ -141,7 +156,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
         ref_id=event.order_id,
         closed_price=event.close_price,
         gateway_return_code=0,
-        comment=f"Exchange close [{event.reason.value}]",
+        comment=close_comment,
       )
     self.ctx.channel_notifier.send_message(
       CryptoMessagePresenter.exchange_close(event, self.gateway.get_account_footer())

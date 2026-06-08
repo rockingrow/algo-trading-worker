@@ -40,7 +40,7 @@ def test_force_closed_message():
   msg = TradeMessagePresenter.force_closed(
     "XAUUSD",
     "strat-1",
-    {"price": 1999.0, "volume": 0.2, "ticket": 7, "source_ticket": 3},
+    {"price": 1999.0, "volume": 0.2, "ref_id": 7, "ref_source_id": 3},
     "FOOTER",
   )
   assert "Force Closed" in msg
@@ -68,7 +68,7 @@ def test_shutdown_message():
 
 
 def test_admin_flat_closed_contains_key_fields():
-  db_pos = {"symbol": "XAUUSD", "strategy": "strat-A", "source_ticket": 10}
+  db_pos = {"symbol": "XAUUSD", "strategy": "strat-A", "ref_source_id": 10}
   result = {"price": 2001.5, "volume": 0.5, "ticket": 999}
   msg = TradeMessagePresenter.admin_flat_closed(db_pos, result, "FOOTER")
   assert "Admin FLAT" in msg

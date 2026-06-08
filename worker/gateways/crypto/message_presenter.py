@@ -65,8 +65,25 @@ class CryptoMessagePresenter:
       f"Quantity: <b>{result.get('volume')}</b>\n"
       f"Order: <b>{result.get('ticket')}</b>\n"
       f"Source: <b>{pos_ticket}</b>\n"
+      f"{CryptoMessagePresenter._sl_line(signal, result)}"
       f"{_DIVIDER}\n{footer}"
     )
+
+  @staticmethod
+  def _sl_line(signal: SignalSchema, result: dict) -> str:
+    """Render the stop-loss status line, or '' when no SL was involved.
+
+    Present for entries (initial SL) and TP1 (breakeven SL) — both carry an
+    ``sl_update``. Absent for plain full-close exits, which carry none.
+    """
+    sl_res = result.get("sl_update")
+    if sl_res is None:
+      return ""
+    price = sl_res.get("new_sl") or getattr(signal, "sl", None)
+    if sl_res.get("success"):
+      suffix = f" <b>{price}</b>" if price else ""
+      return f"SL:{suffix} ✅\n"
+    return f"⚠️ <b>SL NOT SET</b> ({sl_res.get('comment')})\n"
 
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str:

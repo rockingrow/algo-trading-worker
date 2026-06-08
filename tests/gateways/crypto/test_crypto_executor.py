@@ -10,10 +10,11 @@ from worker.schemas.signal_schema import SignalActionEnum
 
 
 class FakeGateway:
-  def __init__(self, positions=None, mark_price=30000.0, step=0.001):
+  def __init__(self, positions=None, mark_price=30000.0, step=0.001, sl_ok=True):
     self._positions = positions if positions is not None else []
     self._mark = mark_price
     self._filter = SymbolFilter(step_size=step, min_qty=step, tick_size=0.1)
+    self._sl_ok = sl_ok
     self.orders = []
     self.stops = []
     self.cancelled = []
@@ -33,6 +34,8 @@ class FakeGateway:
 
   def set_stop_loss(self, symbol, position_side, stop_price, quantity):
     self.stops.append((symbol, position_side, stop_price, quantity))
+    if not self._sl_ok:
+      return {"success": False, "retcode": -2021, "comment": "SL rejected"}
     return {"success": True, "retcode": 0, "ticket": 100}
 
   def cancel_all_orders(self, symbol):
@@ -60,6 +63,15 @@ def test_normalize_volume_floors_to_step():
   assert ex.normalize_volume("BTCUSD", 0.0239) == 0.023
 
 
+def test_normalize_volume_no_float_underfloor():
+  # 0.3 / 0.1 == 2.9999… in IEEE-754; must floor to 3, not 2.
+  ex = CryptoExecutor(FakeGateway(step=0.1), None)
+  assert ex.normalize_volume("BTCUSD", 0.3) == 0.3
+  # 0.24 / 0.04 is another classic case.
+  ex4 = CryptoExecutor(FakeGateway(step=0.04), None)
+  assert ex4.normalize_volume("BTCUSD", 0.24) == 0.24
+
+
 def test_calculate_quantity_risk_based(config):
   ex = CryptoExecutor(FakeGateway(step=0.001), config)
   # capital=1000, risk=2% → $20 risk; |30000-29000|=1000 → 0.02
@@ -73,6 +85,22 @@ def test_open_position_risk_mode_places_order_and_stop(config):
   assert res["success"] is True
   assert gw.orders == [("BTCUSDT", "LONG", 0.02, False)]
   assert gw.stops and gw.stops[0][2] == 29000.0
+
+
+def test_open_position_rolls_back_when_sl_fails(config):
+  """A filled entry whose protective stop fails must be closed, not persisted."""
+  gw = FakeGateway(sl_ok=False)
+  ex = CryptoExecutor(gw, config)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+
+  assert res["success"] is False
+  assert "stop-loss failed" in res["comment"]
+  # Entry opened (reduce_only=False) then rolled back (reduce_only=True).
+  assert gw.orders == [
+    ("BTCUSDT", "LONG", 0.02, False),
+    ("BTCUSDT", "LONG", 0.02, True),
+  ]
+  assert res["sl_update"]["success"] is False
 
 
 def test_open_position_payload_quantity_mode(config):

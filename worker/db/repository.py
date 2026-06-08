@@ -60,18 +60,24 @@ class PositionRepository:
     author: str = "broker",
     market_type: Optional[str] = None,
   ):
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            INSERT INTO position_logs (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-      (strategy, int_to_string(ref_id), int_to_string(ref_source_id), symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, gateway_return_code, comment, message, author, market_type),
-    )
-    conn.commit()
-    conn.close()
-    logger.debug(f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}")
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              INSERT INTO position_logs (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+        (strategy, int_to_string(ref_id), int_to_string(ref_source_id), symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, gateway_return_code, comment, message, author, market_type),
+      )
+      conn.commit()
+      logger.debug(f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}")
+    except Exception as exc:
+      logger.error("log_position failed (strategy=%s symbol=%s action=%s): %s", strategy, symbol, action, exc)
+    finally:
+      if conn:
+        conn.close()
 
   def insert_position(
     self,
@@ -87,19 +93,30 @@ class PositionRepository:
     strategy_code: Optional[int] = None,
     market_type: Optional[str] = None,
   ):
-    conn = _get_conn()
-    cursor = conn.cursor()
-    ref = int_to_string(ref_id)
-    cursor.execute(
-      """
-            INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-      (ref, ref, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
-    )
-    conn.commit()
-    conn.close()
-    logger.debug(f"Position inserted: ref_source_id={ref}, symbol={symbol}, action={action}")
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      ref = int_to_string(ref_id)
+      cursor.execute(
+        """
+              INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+        (ref, ref, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
+      )
+      conn.commit()
+      logger.debug(f"Position inserted: ref_source_id={ref}, symbol={symbol}, action={action}")
+    except Exception as exc:
+      logger.critical(
+        "insert_position FAILED (ref_id=%s strategy=%s symbol=%s): %s — "
+        "position is open on exchange but NOT tracked in DB. Manual reconciliation required.",
+        ref_id, strategy, symbol, exc,
+      )
+      raise
+    finally:
+      if conn:
+        conn.close()
 
   def update_position_status(
     self,
@@ -111,26 +128,37 @@ class PositionRepository:
     comment: Optional[str] = None,
     message: Optional[str] = None,
   ):
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            UPDATE positions
-            SET status = ?,
-                ref_id = COALESCE(?, ref_id),
-                closed_price = COALESCE(?, closed_price),
-                gateway_return_code = COALESCE(?, gateway_return_code),
-                comment = COALESCE(?, comment),
-                gateway_message = COALESCE(?, gateway_message),
-                sync_status = 'PENDING',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE ref_source_id = ?
-        """,
-      (status.value, int_to_string(ref_id), round(closed_price, 2) if closed_price is not None else None, gateway_return_code, comment, message, int_to_string(ref_source_id)),
-    )
-    conn.commit()
-    conn.close()
-    logger.debug(f"Position updated: ref_source_id={ref_source_id}, new ref_id={ref_id}, status={status}")
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              UPDATE positions
+              SET status = ?,
+                  ref_id = COALESCE(?, ref_id),
+                  closed_price = COALESCE(?, closed_price),
+                  gateway_return_code = COALESCE(?, gateway_return_code),
+                  comment = COALESCE(?, comment),
+                  gateway_message = COALESCE(?, gateway_message),
+                  sync_status = 'PENDING',
+                  updated_at = CURRENT_TIMESTAMP
+              WHERE ref_source_id = ?
+          """,
+        (status.value, int_to_string(ref_id), round(closed_price, 2) if closed_price is not None else None, gateway_return_code, comment, message, int_to_string(ref_source_id)),
+      )
+      conn.commit()
+      logger.debug(f"Position updated: ref_source_id={ref_source_id}, new ref_id={ref_id}, status={status}")
+    except Exception as exc:
+      logger.critical(
+        "update_position_status FAILED (ref_source_id=%s status=%s): %s — "
+        "position status not updated in DB. Manual reconciliation may be required.",
+        ref_source_id, status, exc,
+      )
+      raise
+    finally:
+      if conn:
+        conn.close()
 
   def get_position(self, ref_source_id: int) -> Optional[dict]:
     try:
@@ -159,21 +187,28 @@ class PositionRepository:
       return []
 
   def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            UPDATE positions
-            SET sync_status = 'PUBLISHED',
-                sync_time = CURRENT_TIMESTAMP
-            WHERE id = ? AND updated_at = ? AND sync_status = 'PENDING'
-        """,
-      (position_id, updated_at),
-    )
-    changed = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    return changed
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              UPDATE positions
+              SET sync_status = 'PUBLISHED',
+                  sync_time = CURRENT_TIMESTAMP
+              WHERE id = ? AND updated_at = ? AND sync_status = 'PENDING'
+          """,
+        (position_id, updated_at),
+      )
+      changed = cursor.rowcount > 0
+      conn.commit()
+      return changed
+    except Exception as exc:
+      logger.error("mark_position_synced failed (id=%s): %s", position_id, exc)
+      return False
+    finally:
+      if conn:
+        conn.close()
 
   def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
     try:
@@ -230,17 +265,23 @@ class NotificationOutboxRepository:
     mode: NotificationModeEnum = NotificationModeEnum.VERBOSE,
     max_attempts: int = 5,
   ) -> None:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            INSERT INTO notifications (platform, channel, category, message_text, mode, max_attempts)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """,
-      (platform.value, channel.value, category, message_text, mode.value, max_attempts),
-    )
-    conn.commit()
-    conn.close()
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              INSERT INTO notifications (platform, channel, category, message_text, mode, max_attempts)
+              VALUES (?, ?, ?, ?, ?, ?)
+          """,
+        (platform.value, channel.value, category, message_text, mode.value, max_attempts),
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("enqueue_notification failed (channel=%s): %s", channel, exc)
+    finally:
+      if conn:
+        conn.close()
 
   def get_due_notifications(self, limit: int = 20) -> list:
     try:
@@ -266,25 +307,37 @@ class NotificationOutboxRepository:
       return []
 
   def delete_notification(self, notification_id: int) -> None:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
-    conn.commit()
-    conn.close()
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
+      conn.commit()
+    except Exception as exc:
+      logger.error("delete_notification failed (id=%s): %s", notification_id, exc)
+    finally:
+      if conn:
+        conn.close()
 
   def mark_notification_failed(self, notification_id: int, error: str, next_attempt_at: str) -> None:
-    conn = _get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-      """
-            UPDATE notifications
-            SET attempts = attempts + 1,
-                last_error = ?,
-                next_attempt_at = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """,
-      (error, next_attempt_at, notification_id),
-    )
-    conn.commit()
-    conn.close()
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              UPDATE notifications
+              SET attempts = attempts + 1,
+                  last_error = ?,
+                  next_attempt_at = ?,
+                  updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?
+          """,
+        (error, next_attempt_at, notification_id),
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("mark_notification_failed failed (id=%s): %s", notification_id, exc)
+    finally:
+      if conn:
+        conn.close()
