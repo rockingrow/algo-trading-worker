@@ -23,6 +23,7 @@ safe to import on any market's path.
 from __future__ import annotations
 
 import json
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
@@ -34,6 +35,7 @@ from worker.gateways.market_strategy import MarketStrategyFactory
 from worker.gateways.signal_handler import SignalHandler
 from worker.interfaces.trade_presenter_protocol import TradePresenterProtocol
 from worker.logger import get_logger
+from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
@@ -42,6 +44,12 @@ from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
 
 log = get_logger("worker.gateways.processor")
+
+# How long an account footer is reused before refetching. Signals can arrive in
+# bursts; fetching the live account (a REST round-trip for a CEX) once per signal
+# adds avoidable latency/rate-limit pressure, and a few-seconds-stale balance in a
+# notification is harmless.
+_FOOTER_TTL = 30  # seconds
 
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
@@ -81,6 +89,10 @@ class BaseSignalProcessor(ABC):
   name: str = "BASE"
   #: Concrete presenter (conforms to :class:`TradePresenterProtocol`).
   presenter: type[TradePresenterProtocol]
+  #: Short-TTL account-footer cache (class-level defaults so instances that
+  #: bypass ``__init__`` in tests still resolve them).
+  _footer_cache: Optional[str] = None
+  _footer_cache_at: float = 0.0
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
     self.ctx = ctx
@@ -187,7 +199,7 @@ class BaseSignalProcessor(ABC):
     )
 
     result = self.handler.handle(signal)
-    footer = self._account_footer()
+    footer = self._current_footer()
 
     self.ctx.db_service.log_position(
       strategy=signal.strategy,
@@ -252,11 +264,144 @@ class BaseSignalProcessor(ABC):
           message=signal_json,
         )
 
+  # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
+
+  def _handle_admin_message(self, raw: str) -> None:
+    """Handle a NATS ADMIN ``FLAT``: parse, route by account, close live broker
+    positions, then reconcile the DB.
+
+    The algorithm is identical for every market; only *how a live close maps to a
+    DB row* differs (MT5 matches by ticket, a CEX by resolved symbol). That single
+    variation point is the :meth:`_flat_match_key` / :meth:`_flat_db_match_keys`
+    pair, so the broker is always the source of truth: a row is marked ``FLATTED``
+    only when its close actually succeeded *or* the position was never live on the
+    broker. A row whose close was **attempted but failed** is left OPEN (it is
+    still live), so the DB never claims a position is flat while it is not.
+    """
+    try:
+      admin = AdminSignalSchema(**json.loads(raw))
+    except (json.JSONDecodeError, ValidationError) as err:
+      log.error("[ADMIN] Parse error: %s", err)
+      return
+
+    if admin.action != AdminActionEnum.FLAT:
+      log.warning("[ADMIN] Unknown action: %s", admin.action)
+      return
+
+    if admin.account_id and admin.account_id != self._account_id:
+      log.info(
+        "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
+        admin.account_id, self._account_id,
+      )
+      return
+
+    if not self._ensure_connected():
+      return
+
+    # Close live broker positions first (source of truth), then reconcile the DB.
+    closed, attempted = self._close_live_positions_for_flat(admin)
+    self._reconcile_flat_db(admin, closed, attempted, raw)
+
+  def _close_live_positions_for_flat(self, admin) -> tuple[Dict[Any, dict], set]:
+    """Close every live broker position matching the FLAT filter.
+
+    Returns ``(closed, attempted)``, both keyed by :meth:`_flat_match_key` —
+    ``closed`` maps the key to its successful close result; ``attempted`` is every
+    key we tried (so the reconcile step can tell a failed close from one that was
+    never live).
+    """
+    if admin.symbol:
+      positions = self.executor.get_open_positions(admin.symbol, strategy=admin.strategy)
+    else:
+      positions = self.executor.get_all_open_positions(strategy=admin.strategy)
+
+    if positions:
+      log.info(
+        "[ADMIN FLAT] Closing %d %s position(s) (strategy=%s, symbol=%s)",
+        len(positions), self.name, admin.strategy, admin.symbol,
+      )
+    else:
+      log.warning(
+        "[ADMIN FLAT] No open %s positions (strategy=%s, symbol=%s)",
+        self.name, admin.strategy, admin.symbol,
+      )
+
+    attempted: set = set()
+    closed: Dict[Any, dict] = {}
+    for pos in positions:
+      key = self._flat_match_key(pos)
+      attempted.add(key)
+      result = self.executor.close_single_position(pos, reason="FLAT")
+      if result.get("success"):
+        closed[key] = result
+        log.info("[ADMIN FLAT] Closed %s key=%s vol=%s", self.name, key, result.get("volume"))
+      else:
+        log.error("[ADMIN FLAT] Failed to close %s key=%s: %s", self.name, key, result.get("comment"))
+    return closed, attempted
+
+  def _reconcile_flat_db(self, admin, closed: Dict[Any, dict], attempted: set, raw: str) -> None:
+    """Reconcile DB rows against what actually closed.
+
+    A row is marked ``FLATTED`` only when its close succeeded, or when it was never
+    live on the broker (already closed externally). A row whose close was
+    *attempted but failed* is left OPEN — it is still live — and flagged loudly.
+    """
+    db_positions = self.ctx.db_service.get_open_positions_for_flat(
+      strategy=admin.strategy, symbol=admin.symbol
+    )
+    footer = self._account_footer()
+    for db_pos in db_positions:
+      db_keys = self._flat_db_match_keys(db_pos)
+      matched_key = next((k for k in db_keys if k in closed), None)
+      if matched_key is not None:
+        result = closed[matched_key]
+        self.ctx.db_service.update_position_status(
+          ref_source_id=db_pos.get("ref_source_id"),
+          status=PositionStatusEnum.FLATTED,
+          ref_id=result.get("ticket"),
+          closed_price=result.get("price"),
+          gateway_return_code=result.get("retcode", 0),
+          comment=result.get("comment", ""),
+          message=raw,
+        )
+        self.ctx.channel_notifier.send_message(
+          self.presenter.admin_flat_closed(db_pos, result, footer)
+        )
+      elif db_keys.isdisjoint(attempted):
+        # Never seen live on the broker → already closed externally; sync the DB.
+        log.warning(
+          "[ADMIN FLAT] %s in DB but not found on %s — marking FLATTED",
+          db_pos.get("symbol"), self.name,
+        )
+        self.ctx.db_service.update_position_status(
+          ref_source_id=db_pos.get("ref_source_id"),
+          status=PositionStatusEnum.FLATTED,
+          comment=f"Admin FLAT (position not found on {self.name})",
+          message=raw,
+        )
+      else:
+        # Attempted but the close FAILED → still live on the broker. Leave the DB
+        # row OPEN so it is never falsely reported flat; flag for manual attention.
+        log.error(
+          "[ADMIN FLAT] %s close FAILED — DB row left OPEN (still live on %s, "
+          "manual check required).",
+          db_pos.get("symbol"), self.name,
+        )
+
   # ── Helpers ───────────────────────────────────────────────────────────── #
 
   @staticmethod
   def _market_type_value(mt) -> str:
     return mt.value if isinstance(mt, MarketTypeEnum) else str(mt or "")
+
+  def _current_footer(self) -> str:
+    """Account footer for notifications, cached for ``_FOOTER_TTL`` seconds so a
+    burst of signals doesn't trigger a live account fetch per message."""
+    now = time.monotonic()
+    if self._footer_cache is None or (now - self._footer_cache_at) > _FOOTER_TTL:
+      self._footer_cache = self._account_footer()
+      self._footer_cache_at = now
+    return self._footer_cache
 
   def _ensure_connected(self) -> bool:
     """Verify/restore the broker connection before acting. Default: always ready.
@@ -301,11 +446,12 @@ class BaseSignalProcessor(ABC):
     """Start broker-specific background jobs (health, close detection, …)."""
 
   @abstractmethod
-  def _handle_admin_message(self, raw: str) -> None:
-    """Handle a NATS ADMIN message (e.g. FLAT): parse, route, reconcile the DB.
+  def _flat_match_key(self, pos: Any) -> Any:
+    """Identity used to correlate a *live* broker position with a DB row during a
+    FLAT (MT5 → ticket; a CEX → resolved exchange symbol)."""
 
-    Reconciliation is broker-specific (MT5 matches live tickets; a CEX matches
-    by symbol), so each market defines it. Implementations should validate the
-    action, honor ``account_id`` routing against :attr:`_account_id`, and call
-    :meth:`_ensure_connected` before touching the broker.
-    """
+  @abstractmethod
+  def _flat_db_match_keys(self, db_pos: dict) -> set:
+    """The set of keys a DB row can match a closed live position by — compared
+    against the keys produced by :meth:`_flat_match_key` (MT5 → ``{ref_id,
+    ref_source_id}``; a CEX → ``{resolved symbol}``)."""

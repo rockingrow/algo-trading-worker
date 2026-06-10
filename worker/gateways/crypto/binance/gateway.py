@@ -231,6 +231,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   ) -> TradeResult:
     # STOP_MARKET + closePosition=true closes the whole remaining position when
     # the stop trips — exactly the breakeven-after-TP1 behavior the strategy wants.
+    # NOTE: *quantity* is kept for BaseExchangeGateway parity but is intentionally
+    # unused — closePosition=true always closes the full remaining position.
     payload: Dict[str, Any] = {
       "symbol": symbol,
       "side": _CLOSE_SIDE.get(position_side, "SELL"),

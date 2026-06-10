@@ -4,7 +4,7 @@ worker/interfaces/executor_protocol.py
 Market-agnostic execution contract.
 
 Both the MT5 executor (FOREX) and the crypto executor (CEX) satisfy this
-structurally, so :class:`~worker.core.market_strategy.ExecutorBackedMarket`
+structurally, so :class:`~worker.gateways.market_strategy.ExecutorBackedMarket`
 depends only on this protocol and never on a concrete broker. The legacy
 :class:`~worker.interfaces.mt5_executor_protocol.MT5ExecutorProtocol` is kept as
 an alias for backward compatibility.
@@ -40,5 +40,7 @@ class TradeExecutorProtocol(Protocol):
   def get_open_positions(
     self, symbol: str, strategy: Optional[str] = None
   ) -> List[Any]: ...
+  def get_all_open_positions(self, strategy: Optional[str] = None) -> List[Any]: ...
+  def close_single_position(self, pos: Any, reason: str = "FLAT") -> TradeResult: ...
   def normalize_volume(self, symbol: str, volume: float) -> float: ...
   def convert_quantity_to_lots(self, symbol: str, quantity: float) -> float: ...

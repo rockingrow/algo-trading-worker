@@ -110,6 +110,13 @@ class FakeProcessor(BaseSignalProcessor):
   def _ensure_connected(self):
     return self._connected
 
+  def _flat_match_key(self, pos):  # pragma: no cover - admin routing overridden below
+    return getattr(pos, "ticket", None)
+
+  def _flat_db_match_keys(self, db_pos):  # pragma: no cover
+    return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}
+
+  # Override the (now concrete) shared FLAT handler to assert routing only.
   def _handle_admin_message(self, raw):
     self.admin_calls.append(raw)
 
@@ -127,7 +134,7 @@ def test_incomplete_subclass_is_abstract():
     name = "X"
     presenter = FakePresenter
 
-    # Implement everything EXCEPT _handle_admin_message.
+    # Implement everything EXCEPT the FLAT match-key hooks.
     def _build_executor(self):
       return None
 

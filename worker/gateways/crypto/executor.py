@@ -4,7 +4,7 @@ worker/crypto/executor.py
 Crypto order executor — the CRYPTO counterpart of ``MT5Executor``.
 
 Implements :class:`~worker.interfaces.executor_protocol.TradeExecutorProtocol`
-so :class:`~worker.core.market_strategy.CryptoMarket` drives it exactly like the
+so :class:`~worker.gateways.market_strategy.CryptoMarket` drives it exactly like the
 Forex strategy drives the MT5 executor. All exchange specifics are delegated to
 an injected :class:`~worker.gateways.crypto.base.BaseExchangeGateway`, so the executor is
 exchange-agnostic and unit-testable with a fake gateway.
@@ -126,52 +126,16 @@ class CryptoExecutor:
 
     symbol = self.get_symbol(signal.symbol)
 
-    if self._config.volume_decision_enabled:
-      if signal.sl:
-        price = self._gateway.get_mark_price(symbol)
-        risk = (
-          signal.risk_percent
-          if signal.risk_percent is not None
-          else self._config.risk_percentage
-        )
-        qty = self.calculate_quantity(
-          symbol, price, signal.sl, risk, self._config.capital
-        )
-        logger.info(
-          "[open_position] RISK mode | price=%s sl=%s risk=%s%% → qty=%s",
-          price,
-          signal.sl,
-          risk,
-          qty,
-        )
-      else:
-        f = self._gateway.get_symbol_filter(symbol)
-        qty = f.min_qty or 0.0
-        logger.warning(
-          "[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty
-        )
-    else:
-      if signal.quantity is None:
-        return TradeResult.fail("Missing quantity")
-      qty = self.convert_quantity_to_lots(symbol, signal.quantity)
+    if not self._config.volume_decision_enabled and signal.quantity is None:
+      return TradeResult.fail("Missing quantity")
 
-    qty = self.normalize_volume(symbol, qty)
+    qty = self.normalize_volume(symbol, self._resolve_entry_qty(signal, symbol))
     if qty <= 0:
       return TradeResult.fail("Computed quantity is zero")
 
-    # Netting-mode guard: reject if another strategy already holds this symbol,
-    # unless the operator has opted in to multi-strategy-per-symbol.
-    if not self._config.allow_multi_strategy_per_symbol and self._db is not None:
-      get_for_symbol = getattr(self._db, "get_open_positions_for_flat", None)
-      if get_for_symbol is not None:
-        open_rows = get_for_symbol(symbol=signal.symbol)
-        other_strategies = {r["strategy"] for r in open_rows if r["strategy"] != signal.strategy}
-        if other_strategies:
-          return TradeResult.fail(
-            f"Netting conflict: {symbol} already held by {other_strategies}. "
-            "Set CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true to override.",
-            retcode=-1,
-          )
+    conflict = self._netting_conflict(signal, symbol)
+    if conflict is not None:
+      return conflict
 
     result = self._gateway.place_market_order(
       symbol,
@@ -194,6 +158,49 @@ class CryptoExecutor:
 
     result.setdefault("volume", qty)
     return result
+
+  def _resolve_entry_qty(self, signal: SignalSchema, symbol: str) -> float:
+    """Entry quantity before final step-size normalization: risk-based when
+    VOLUME_DECISION is on (min qty if the signal carries no SL), otherwise the
+    signal's own quantity. Caller guarantees a quantity exists in the latter case."""
+    if not self._config.volume_decision_enabled:
+      return self.convert_quantity_to_lots(symbol, signal.quantity)
+    if signal.sl:
+      price = self._gateway.get_mark_price(symbol)
+      risk = (
+        signal.risk_percent
+        if signal.risk_percent is not None
+        else self._config.risk_percentage
+      )
+      qty = self.calculate_quantity(symbol, price, signal.sl, risk, self._config.capital)
+      logger.info(
+        "[open_position] RISK mode | price=%s sl=%s risk=%s%% → qty=%s",
+        price, signal.sl, risk, qty,
+      )
+      return qty
+    f = self._gateway.get_symbol_filter(symbol)
+    qty = f.min_qty or 0.0
+    logger.warning("[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty)
+    return qty
+
+  def _netting_conflict(self, signal: SignalSchema, symbol: str) -> Optional[TradeResult]:
+    """In netting mode, reject an entry that would merge with another strategy's
+    position on the same symbol — unless the operator opted in. Returns a failed
+    :class:`TradeResult` on conflict, else ``None``."""
+    if self._config.allow_multi_strategy_per_symbol or self._db is None:
+      return None
+    get_for_symbol = getattr(self._db, "get_open_positions_for_flat", None)
+    if get_for_symbol is None:
+      return None
+    open_rows = get_for_symbol(symbol=signal.symbol)
+    other_strategies = {r["strategy"] for r in open_rows if r["strategy"] != signal.strategy}
+    if other_strategies:
+      return TradeResult.fail(
+        f"Netting conflict: {symbol} already held by {other_strategies}. "
+        "Set CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true to override.",
+        retcode=-1,
+      )
+    return None
 
   def _rollback_unprotected_entry(
     self, symbol: str, action: str, entry: TradeResult, sl_res: Any, qty: float

@@ -12,9 +12,10 @@ from worker.worker_runtime import run_worker
 class FakeProcessor:
   """Records the lifecycle calls run_worker makes."""
 
-  def __init__(self, ctx, settings, *, connect_ok=True):
+  def __init__(self, ctx, settings, *, connect_ok=True, jobs_error=False):
     self.calls = []
     self._connect_ok = connect_ok
+    self._jobs_error = jobs_error
 
   def connect(self):
     self.calls.append("connect")
@@ -25,6 +26,8 @@ class FakeProcessor:
 
   def start_market_jobs(self, stop_event):
     self.calls.append("jobs")
+    if self._jobs_error:
+      raise RuntimeError("job startup boom")
 
   def run(self, stop_event):
     self.calls.append("run")
@@ -65,8 +68,27 @@ def test_run_worker_aborts_when_connect_fails(monkeypatch):
   _patch_ctx(monkeypatch)
   proc = FakeProcessor(None, None, connect_ok=False)
   run_worker(lambda ctx, s: proc, {}, stop_event=object(), label="TEST")
-  # No jobs/run/shutdown once connect returns False.
-  assert proc.calls == ["connect"]
+  # connect failed → no startup/jobs/run; shutdown still runs to release the
+  # broker session/bridge, but no shutdown banner (startup never fired).
+  assert proc.calls == ["connect", "shutdown"]
+
+
+def test_run_worker_cleans_up_when_jobs_fail(monkeypatch):
+  _patch_ctx(monkeypatch)
+  proc = FakeProcessor(None, None, jobs_error=True)
+  run_worker(lambda ctx, s: proc, {}, stop_event=object(), label="TEST")
+  # start_market_jobs raised → run never happens, but shutdown + banner still fire.
+  assert proc.calls == ["connect", "startup", "jobs", "shutdown", "shutdown_notify"]
+
+
+def test_run_worker_survives_factory_error(monkeypatch):
+  _patch_ctx(monkeypatch)
+
+  def boom_factory(ctx, settings):
+    raise RuntimeError("factory boom")
+
+  # A construction failure must be logged and swallowed, never propagated.
+  run_worker(boom_factory, {}, stop_event=object(), label="TEST")
 
 
 def test_factory_builds_forex_process_orchestrator():

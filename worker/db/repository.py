@@ -5,14 +5,15 @@ SQLite persistence for positions, position logs, and the notification outbox.
 
 The physical ``positions`` / ``position_logs`` columns are gateway-neutral
 (``ref_id``, ``ref_source_id``, ``strategy_code``, ``gateway_return_code``,
-``gateway_message`` — see :mod:`worker.db.schema`). This repository is the single
-translation boundary between those columns and the application domain, which
-continues to use ``ticket`` / ``source_ticket`` (as ``int``), ``magic``,
-``mt5_retcode`` and ``message`` — so callers and the NATS ``PositionEvent``
-contract are unaffected.
+``gateway_message`` — see :mod:`worker.db.schema`). Callers, the
+``PositionEvent`` NATS contract, and the rest of the worker all speak these same
+generic names, so there is no name translation here.
 
-``ref_id`` / ``ref_source_id`` are stored as TEXT (any gateway's id format fits)
-and parsed text↔int here at the boundary.
+The one boundary concern this repository owns is id representation: ``ref_id`` /
+``ref_source_id`` are stored as TEXT (so any gateway's id format fits) and parsed
+text↔int here — written via :func:`~worker.utils.parsing.int_to_string` and read
+back as ``int`` via :func:`~worker.utils.parsing.string_to_int` in
+:meth:`PositionRepository._row_to_dict`.
 """
 
 import sqlite3

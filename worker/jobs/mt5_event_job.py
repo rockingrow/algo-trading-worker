@@ -130,7 +130,7 @@ class MT5EventJob:
       price=event.close_price,
       sl=event.sl,
       tp1=event.tp,
-      gateway_return_code=0,
+      gateway_return_code=event.deal_reason,
       comment=f"Terminal close [{event.close_reason.value}]",
       author=LogAuthorEnum.TERMINAL.value,
     )
@@ -139,7 +139,7 @@ class MT5EventJob:
       status=PositionStatusEnum.TERMINAL_CLOSED,
       ref_id=event.deal_ticket,
       closed_price=event.close_price,
-      gateway_return_code=0,
+      gateway_return_code=event.deal_reason,
       comment=f"Terminal close [{event.close_reason.value}]",
     )
 

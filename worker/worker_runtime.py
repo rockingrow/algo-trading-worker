@@ -34,29 +34,44 @@ def run_worker(
   *processor_factory* takes ``(ctx, settings_dict)`` and returns an object with
   ``connect()``, ``send_startup_notification()``, ``start_market_jobs(stop_event)``,
   ``run(stop_event)``, ``shutdown()`` and ``send_shutdown_notification()`` — i.e.
-  a :class:`~worker.core.base_signal_processor.BaseSignalProcessor`.
+  a :class:`~worker.gateways.processor.BaseSignalProcessor`.
   """
   log.info("[%s Process] Started (PID=%d)", label, multiprocessing.current_process().pid)
 
   ctx = WorkerContext(settings_dict)
   ctx.start_notification_job(stop_event)
 
-  processor = processor_factory(ctx, settings_dict)
-  if not processor.connect():
-    return
-
-  processor.send_startup_notification()
-  log.info("[%s Process] Worker loop started.", label)
-
-  processor.start_market_jobs(stop_event)
-
+  # Everything after the notification job is started must run through the finally
+  # block so a failure during construction, connect, or job startup never leaves a
+  # half-built processor (open NATS connections / broker session, started jobs) behind.
+  processor = None
+  started = False
   try:
+    processor = processor_factory(ctx, settings_dict)
+    if not processor.connect():
+      log.error("[%s Process] Could not connect to broker. Aborting startup.", label)
+      return
+
+    processor.send_startup_notification()
+    started = True
+    log.info("[%s Process] Worker loop started.", label)
+
+    processor.start_market_jobs(stop_event)
     processor.run(stop_event)
   except KeyboardInterrupt:
     log.info("[%s Process] Received shutdown signal.", label)
   except Exception as e:
     log.exception("[%s Process] Unexpected error: %s", label, e)
   finally:
-    processor.shutdown()
-    processor.send_shutdown_notification()
+    if processor is not None:
+      try:
+        processor.shutdown()
+      except Exception:
+        log.exception("[%s Process] Error during processor shutdown.", label)
+      # Only pair a shutdown banner with a startup banner that actually fired.
+      if started:
+        try:
+          processor.send_shutdown_notification()
+        except Exception:
+          log.exception("[%s Process] Error sending shutdown notification.", label)
     log.info("[%s Process] Exiting.", label)

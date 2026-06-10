@@ -4,7 +4,7 @@ worker/gateways/crypto/signal_processor.py
 CRYPTO/CEX-specific signal processor.
 
 Implements the broker-specific hooks of
-:class:`~worker.core.base_signal_processor.BaseSignalProcessor`: the exchange
+:class:`~worker.gateways.processor.BaseSignalProcessor`: the exchange
 gateway (built by :class:`~worker.gateways.crypto.factory.ExchangeFactory`), the
 crypto executor, and the exchange user-data event stream. Everything
 market-agnostic — the NATS loop, signal persistence, notifications, position CDC
@@ -16,10 +16,7 @@ CRYPTO path never initializes any Forex dependency.
 
 from __future__ import annotations
 
-import json
 from typing import Any, Dict, Optional
-
-from pydantic import ValidationError
 
 from worker.gateways.crypto.binance.user_data_stream import (
   ExchangeCloseEvent,
@@ -30,7 +27,6 @@ from worker.gateways.crypto.factory import ExchangeFactory
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
-from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
 
@@ -162,73 +158,12 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       CryptoMessagePresenter.exchange_close(event, self.gateway.get_account_footer())
     )
 
-  # ── ADMIN FLAT (crypto reconciles by resolved symbol) ─────────────────── #
+  # ── ADMIN FLAT match keys (crypto reconciles by resolved symbol) ──────── #
 
-  def _handle_admin_message(self, raw: str) -> None:
-    try:
-      admin = AdminSignalSchema(**json.loads(raw))
-    except (json.JSONDecodeError, ValidationError) as err:
-      log.error("[ADMIN] Parse error: %s", err)
-      return
+  def _flat_match_key(self, pos: Any) -> Any:
+    # ExchangePosition.symbol is already the resolved exchange symbol.
+    return pos.symbol
 
-    if admin.action != AdminActionEnum.FLAT:
-      log.warning("[ADMIN] Unknown action: %s", admin.action)
-      return
-
-    if admin.account_id and admin.account_id != self._account_id:
-      log.info(
-        "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
-        admin.account_id, self._account_id,
-      )
-      return
-
-    if not self._ensure_connected():
-      return
-
-    if admin.symbol:
-      positions = self.executor.get_open_positions(admin.symbol, strategy=admin.strategy)
-    else:
-      positions = self.executor.get_all_open_positions(strategy=admin.strategy)
-
-    closed: dict[str, dict] = {}
-    for pos in positions:
-      result = self.executor.close_single_position(pos, reason="FLAT")
-      if result.get("success"):
-        closed[pos.symbol] = result
-        log.info("[ADMIN FLAT] Closed %s qty=%s", pos.symbol, result.get("volume"))
-      else:
-        log.error("[ADMIN FLAT] Failed to close %s: %s", pos.symbol, result.get("comment"))
-
-    # Reconcile DB.
-    db_positions = self.ctx.db_service.get_open_positions_for_flat(
-      strategy=admin.strategy, symbol=admin.symbol
-    )
-    for db_pos in db_positions:
-      resolved = self.executor.get_symbol(db_pos["symbol"])
-      result = closed.get(resolved)
-      if result is not None:
-        self.ctx.db_service.update_position_status(
-          ref_source_id=db_pos["ref_source_id"],
-          status=PositionStatusEnum.FLATTED,
-          ref_id=result.get("ticket"),
-          closed_price=result.get("price"),
-          gateway_return_code=0,
-          comment=result.get("comment", ""),
-          message=raw,
-        )
-        self.ctx.channel_notifier.send_message(
-          CryptoMessagePresenter.admin_flat_closed(
-            db_pos, result, self.gateway.get_account_footer()
-          )
-        )
-      else:
-        log.warning(
-          "[ADMIN FLAT] %s in DB but not closed on exchange — marking FLATTED",
-          db_pos["symbol"],
-        )
-        self.ctx.db_service.update_position_status(
-          ref_source_id=db_pos["ref_source_id"],
-          status=PositionStatusEnum.FLATTED,
-          comment="Admin FLAT (position not found on exchange)",
-          message=raw,
-        )
+  def _flat_db_match_keys(self, db_pos: dict) -> set:
+    # The DB stores the original signal symbol; resolve it to the exchange form.
+    return {self.executor.get_symbol(db_pos["symbol"])}

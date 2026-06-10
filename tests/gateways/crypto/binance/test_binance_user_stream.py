@@ -64,6 +64,24 @@ def test_parses_liquidation():
   assert event.reason == ExchangeCloseReason.LIQUIDATION
 
 
+def test_ignores_fill_with_missing_symbol():
+  assert parse_order_trade_update(
+    _frame({"X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0.5"})
+  ) is None
+
+
+def test_ignores_fill_with_zero_price():
+  assert parse_order_trade_update(
+    _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "0", "z": "0.5"})
+  ) is None
+
+
+def test_ignores_fill_with_zero_volume():
+  assert parse_order_trade_update(
+    _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0"})
+  ) is None
+
+
 # ── SDK event adapter (typed event → raw dict → dispatch) ──────────────────── #
 
 

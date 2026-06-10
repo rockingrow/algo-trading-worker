@@ -82,6 +82,7 @@ class TerminalClosedEvent:
   symbol: str
   # Close details
   close_reason: TerminalCloseReason
+  deal_reason: int          # raw MT5 DEAL_REASON_* integer (4=SL, 5=TP, 6=SO, 0-2=MANUAL)
   close_price: float
   close_volume: float
   close_time: datetime
@@ -158,6 +159,7 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
     deal_ticket=str(closing_deal.ticket),
     symbol=closing_deal.symbol,
     close_reason=reason,
+    deal_reason=closing_deal.reason,
     close_price=closing_deal.price,
     close_volume=closing_deal.volume,
     close_time=datetime.fromtimestamp(closing_deal.time),

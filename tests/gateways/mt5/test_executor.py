@@ -1,3 +1,4 @@
+import pytest
 from helpers import FakeMt5, make_order_result, make_position, make_signal
 
 from worker.gateways.mt5.executor import MT5Executor
@@ -217,9 +218,6 @@ def test_magic_for_resolves_mapped_strategy(config):
   ex = _executor_with_map(FakeMt5(), config, {"SCALP": 100, "SWING": 200})
   assert ex._magic_for("SCALP") == 100
   assert ex._magic_for("SWING") == 200
-
-
-import pytest
 
 
 def test_magic_for_raises_for_unmapped(config):

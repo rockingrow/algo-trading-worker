@@ -47,10 +47,16 @@ def _start_heartbeat(stop_event) -> None:
   if not path:
     return
 
+  target = Path(path)
+  tmp = target.with_suffix(target.suffix + ".tmp")
+
   def _beat() -> None:
     while not stop_event.is_set():
       try:
-        Path(path).write_text(str(time.time()))
+        # Write+rename so a healthcheck reading concurrently never sees a
+        # truncated/empty file (os.replace is atomic on the same filesystem).
+        tmp.write_text(str(time.time()))
+        os.replace(tmp, target)
       except OSError as exc:
         log.warning("[Crypto] heartbeat write failed: %s", exc)
       stop_event.wait(_HEARTBEAT_INTERVAL)

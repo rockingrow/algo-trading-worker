@@ -39,6 +39,9 @@ def test_insert_then_get_returns_str_ids(repo):
   assert pos["strategy_code"] == 777
   assert pos["gateway_return_code"] == 10009
   assert pos["gateway_message"] == '{"x":1}'
+  # Old MT5-specific aliases are not part of the gateway-neutral row.
+  for k in ("ticket", "source_ticket", "magic", "mt5_retcode", "message"):
+    assert k not in pos
 
 
 def test_ref_ids_physically_stored_as_text(repo):

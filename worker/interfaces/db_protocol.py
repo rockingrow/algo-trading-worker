@@ -30,6 +30,9 @@ class PositionStoreProtocol(Protocol):
   def get_open_positions_by_strategy(
     self, strategy: str, symbol: str
   ) -> List[Dict[str, Any]]: ...
+  def get_open_positions_for_flat(
+    self, strategy: Optional[str] = None, symbol: Optional[str] = None
+  ) -> List[Dict[str, Any]]: ...
   def update_position_status(
     self,
     ref_source_id: str,

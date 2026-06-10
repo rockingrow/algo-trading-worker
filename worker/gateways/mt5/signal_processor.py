@@ -4,7 +4,7 @@ worker/gateways/mt5/signal_processor.py
 MT5/FOREX-specific signal processor.
 
 Implements the broker-specific hooks of
-:class:`~worker.core.base_signal_processor.BaseSignalProcessor`: the MT5 bridge,
+:class:`~worker.gateways.processor.BaseSignalProcessor`: the MT5 bridge,
 executor, reconnect handling, and the MT5 background jobs (health thread,
 terminal-close detection). Everything market-agnostic — the NATS loop, signal
 persistence, notifications, position CDC — is inherited from the base.
@@ -16,12 +16,9 @@ imported from the child process (lazy-imported inside
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from typing import Any, Dict, Optional
-
-from pydantic import ValidationError
 
 from worker.context import WorkerContext
 from worker.gateways.mt5.bridge import MT5
@@ -30,8 +27,6 @@ from worker.gateways.mt5.message_presenter import TradeMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.jobs.mt5_event_job import MT5EventJob
 from worker.logger import get_logger
-from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
-from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.notification_service import _box
 from worker.settings import MT5_HEALTH_INTERVAL
 
@@ -193,113 +188,12 @@ class Mt5SignalProcessor(BaseSignalProcessor):
       notifier=self.ctx.channel_notifier,
     ).start(stop_event=stop_event)
 
-  # ── ADMIN FLAT (MT5 reconciles against live tickets) ──────────────────── #
+  # ── ADMIN FLAT match keys (MT5 reconciles against live tickets) ───────── #
 
-  def _handle_admin_message(self, raw: str) -> None:
-    try:
-      admin = AdminSignalSchema(**json.loads(raw))
-    except (json.JSONDecodeError, ValidationError) as err:
-      log.error("[ADMIN] Parse error: %s", err)
-      return
+  def _flat_match_key(self, pos: Any) -> Any:
+    return pos.ticket
 
-    if admin.action != AdminActionEnum.FLAT:
-      log.warning("[ADMIN] Unknown action: %s", admin.action)
-      return
-
-    worker_account_id = str(self.settings["mt5_login"])
-    if admin.account_id and admin.account_id != worker_account_id:
-      log.info(
-        "[ADMIN FLAT] Skipping: account_id=%s does not match worker account=%s",
-        admin.account_id,
-        worker_account_id,
-      )
-      return
-
-    if not _ensure_mt5_connected(self.bridge, self.ctx.notifier, self._footer, log):
-      return
-
-    # Step 1: Query MT5 by parameters and close positions first.
-    # Do NOT gate on DB state — MT5 is the source of truth for live positions.
-    if admin.symbol:
-      mt5_positions = self.executor.get_open_positions(admin.symbol, strategy=admin.strategy)
-    else:
-      mt5_positions = self.executor.get_all_open_positions(strategy=admin.strategy)
-
-    if not mt5_positions:
-      log.warning(
-        "[ADMIN FLAT] No open MT5 positions found (strategy=%s, symbol=%s)",
-        admin.strategy, admin.symbol,
-      )
-    else:
-      log.info(
-        "[ADMIN FLAT] Closing %d MT5 position(s) (strategy=%s, symbol=%s)",
-        len(mt5_positions), admin.strategy, admin.symbol,
-      )
-
-    attempted_tickets: set[str] = set()
-    closed_tickets: set[str] = set()
-    close_results: dict[str, dict] = {}
-
-    for pos in mt5_positions:
-      attempted_tickets.add(str(pos.ticket))
-      result = self.executor.close_single_position(pos, reason="FLAT")
-      if result.get("success"):
-        closed_tickets.add(str(pos.ticket))
-        close_results[str(pos.ticket)] = result
-        log.info(
-          "[ADMIN FLAT] Closed MT5 ticket=%s price=%s vol=%s",
-          pos.ticket, result.get("price"), result.get("volume"),
-        )
-      else:
-        log.error(
-          "[ADMIN FLAT] Failed to close ticket=%s: %s",
-          pos.ticket, result.get("comment"),
-        )
-
-    # Step 2: Reconcile DB — find open records matching closed MT5 tickets and update.
-    # Both ticket and source_ticket are checked so re-ticketed positions (after TP1)
-    # are still matched correctly.
-    # Positions in attempted_tickets but not closed_tickets had a failed close order —
-    # they are still open in MT5, so the DB record is left untouched.
-    db_positions = self.ctx.db_service.get_open_positions_for_flat(
-      strategy=admin.strategy,
-      symbol=admin.symbol,
-    )
-
-    for db_pos in db_positions:
-      db_ref_id = db_pos.get("ref_id")
-      db_ref_source_id = db_pos.get("ref_source_id")
-      matched_ticket = (
-        db_ref_id if db_ref_id in closed_tickets
-        else db_ref_source_id if db_ref_source_id in closed_tickets
-        else None
-      )
-      if matched_ticket is not None:
-        result = close_results[matched_ticket]
-        self.ctx.db_service.update_position_status(
-          ref_source_id=db_ref_source_id,
-          status=PositionStatusEnum.FLATTED,
-          ref_id=result.get("ticket"),
-          closed_price=result.get("price"),
-          gateway_return_code=result.get("retcode"),
-          comment=result.get("comment", ""),
-          message=raw,
-        )
-        self.ctx.channel_notifier.send_message(
-          TradeMessagePresenter.admin_flat_closed(
-            db_pos, result, self.bridge.get_account_footer()
-          )
-        )
-      elif db_ref_id not in attempted_tickets and db_ref_source_id not in attempted_tickets:
-        # DB has an open record but the position was never seen in MT5 —
-        # it was already closed externally; sync the DB.
-        log.warning(
-          "[ADMIN FLAT] ref_id=%s in DB but not found in MT5 — marking FLATTED",
-          db_ref_id,
-        )
-        self.ctx.db_service.update_position_status(
-          ref_source_id=db_ref_source_id,
-          status=PositionStatusEnum.FLATTED,
-          comment="Admin FLAT (position already closed in MT5)",
-          message=raw,
-        )
+  def _flat_db_match_keys(self, db_pos: dict) -> set:
+    # Check both ref_id and ref_source_id so re-ticketed positions (after a
+    # partial close) still match the live ticket.
+    return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}

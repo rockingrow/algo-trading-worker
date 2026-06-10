@@ -28,6 +28,7 @@ from worker.logger import get_logger
 log = get_logger("worker.gateways.crypto.binance.user_data_stream")
 
 _KEEPALIVE_INTERVAL = 30 * 60   # seconds (Binance expires the listenKey at 60 min)
+_KEEPALIVE_RETRY   = 30        # seconds — back off this long after a failed keepalive
 _SILENCE_TIMEOUT   = 10 * 60   # seconds without any message → proactive reconnect
 
 
@@ -82,14 +83,28 @@ def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent
   else:
     return None
 
+  symbol = o.get("s", "")
+  close_price = float(o.get("ap") or o.get("L") or 0)
+  close_volume = float(o.get("z") or o.get("q") or 0)
+  # A protective exit must carry a symbol and a non-zero fill price/volume; a
+  # frame missing those is malformed — drop it rather than reconcile a degenerate
+  # (symbol="", price=0) close that could never match a DB row anyway.
+  if not symbol or close_price <= 0 or close_volume <= 0:
+    log.warning(
+      "[parse_order_trade_update] Ignoring %s fill with incomplete fields "
+      "(symbol=%r price=%s volume=%s).",
+      reason.value, symbol, close_price, close_volume,
+    )
+    return None
+
   return ExchangeCloseEvent(
-    symbol=o.get("s", ""),
+    symbol=symbol,
     reason=reason,
-    close_price=float(o.get("ap") or o.get("L") or 0) or 0.0,
-    close_volume=float(o.get("z") or o.get("q") or 0) or 0.0,
+    close_price=close_price,
+    close_volume=close_volume,
     order_id=str(o.get("i") or ""),
     client_order_id=o.get("c", ""),
-    realized_pnl=float(o.get("rp") or 0) or 0.0,
+    realized_pnl=float(o.get("rp") or 0),
   )
 
 
@@ -190,7 +205,7 @@ class BinanceUserDataStream:
       raise RuntimeError("Failed to obtain listenKey")
 
     connection = await client.websocket_streams.create_connection()
-    last_keepalive = time.monotonic()
+    next_keepalive = time.monotonic() + _KEEPALIVE_INTERVAL
     log.info("[BinanceUserDataStream] Connecting to user data stream.")
     try:
       stream = await connection.user_data(listenKey=listen_key)
@@ -215,18 +230,34 @@ class BinanceUserDataStream:
           )
           break  # exits _stream; _run() will reconnect after a brief backoff
 
-        if now - last_keepalive >= _KEEPALIVE_INTERVAL:
+        if now >= next_keepalive:
           try:
             await asyncio.to_thread(client.rest_api.keepalive_user_data_stream)
-            last_keepalive = now
+            next_keepalive = now + _KEEPALIVE_INTERVAL
             log.debug("[BinanceUserDataStream] listenKey kept alive.")
           except Exception as exc:
-            log.warning("[BinanceUserDataStream] keepalive failed: %s", exc)
+            # Back off instead of retrying every loop tick (which would also let
+            # slow calls overlap) — advance the next attempt by a short interval.
+            next_keepalive = now + _KEEPALIVE_RETRY
+            log.warning(
+              "[BinanceUserDataStream] keepalive failed: %s — retrying in %ds.",
+              exc, _KEEPALIVE_RETRY,
+            )
     finally:
       try:
         await client.websocket_streams.close_connection()
       except Exception:  # pragma: no cover - best effort
         pass
+      # Best-effort release of the SDK client's own transports (REST aiohttp
+      # session) so repeated reconnects don't accumulate sockets/connectors.
+      close = getattr(client, "close", None)
+      if close is not None:
+        try:
+          res = close()
+          if asyncio.iscoroutine(res):
+            await res
+        except Exception:  # pragma: no cover - best effort
+          pass
 
   # ── message handling ──────────────────────────────────────────────────── #
 

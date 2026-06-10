@@ -6,7 +6,7 @@ Contract for the per-market Telegram message presenters.
 Both :class:`~worker.gateways.mt5.message_presenter.TradeMessagePresenter` and
 :class:`~worker.gateways.crypto.message_presenter.CryptoMessagePresenter` conform
 to this structurally, so
-:class:`~worker.core.base_signal_processor.BaseSignalProcessor` renders
+:class:`~worker.gateways.processor.BaseSignalProcessor` renders
 lifecycle/trade messages through this interface instead of a concrete presenter
 (Dependency Inversion).
 """

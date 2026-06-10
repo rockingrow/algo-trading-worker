@@ -24,12 +24,12 @@ from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 
 logger = get_logger("worker.gateways.signal_handler")
 
-# Actions that belong to the "full close" group
+# Actions that route to the shared "full close" handler. FLAT is intentionally
+# NOT here — it has its own strategy-scoped handler (_handle_flat).
 _FULL_CLOSE_ACTIONS = {
   SignalActionEnum.TP2,
   SignalActionEnum.SL,
   SignalActionEnum.R_SL,
-  SignalActionEnum.FLAT,
 }
 
 
