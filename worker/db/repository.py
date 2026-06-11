@@ -20,7 +20,6 @@ from typing import Optional
 
 from worker.db.connection import _get_conn
 from worker.logger import get_logger
-from worker.utils.parsing import int_to_string, string_to_int
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationModeEnum,
@@ -36,18 +35,13 @@ class PositionRepository:
 
   @staticmethod
   def _row_to_dict(row: sqlite3.Row) -> dict:
-    d = dict(row)
-    if "ref_id" in d:
-      d["ref_id"] = string_to_int(d["ref_id"])
-    if "ref_source_id" in d:
-      d["ref_source_id"] = string_to_int(d["ref_source_id"])
-    return d
+    return dict(row)
 
   def log_position(
     self,
     strategy: str,
-    ref_id: Optional[int],
-    ref_source_id: Optional[int],
+    ref_id: Optional[str],
+    ref_source_id: Optional[str],
     symbol: str,
     action: str,
     volume: float,
@@ -69,7 +63,7 @@ class PositionRepository:
               INSERT INTO position_logs (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
-        (strategy, int_to_string(ref_id), int_to_string(ref_source_id), symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, gateway_return_code, comment, message, author, market_type),
+        (strategy, ref_id, ref_source_id, symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, gateway_return_code, comment, message, author, market_type),
       )
       conn.commit()
       logger.debug(f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}")
@@ -81,7 +75,7 @@ class PositionRepository:
 
   def insert_position(
     self,
-    ref_id: int,
+    ref_id: str,
     strategy: str,
     symbol: str,
     action: str,
@@ -97,16 +91,15 @@ class PositionRepository:
     try:
       conn = _get_conn()
       cursor = conn.cursor()
-      ref = int_to_string(ref_id)
       cursor.execute(
         """
               INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
-        (ref, ref, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
+        (ref_id, ref_id, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
       )
       conn.commit()
-      logger.debug(f"Position inserted: ref_source_id={ref}, symbol={symbol}, action={action}")
+      logger.debug(f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}")
     except Exception as exc:
       logger.critical(
         "insert_position FAILED (ref_id=%s strategy=%s symbol=%s): %s — "
@@ -120,9 +113,9 @@ class PositionRepository:
 
   def update_position_status(
     self,
-    ref_source_id: int,
+    ref_source_id: str,
     status: PositionStatusEnum,
-    ref_id: Optional[int] = None,
+    ref_id: Optional[str] = None,
     closed_price: Optional[float] = None,
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
@@ -145,7 +138,7 @@ class PositionRepository:
                   updated_at = CURRENT_TIMESTAMP
               WHERE ref_source_id = ?
           """,
-        (status.value, int_to_string(ref_id), round(closed_price, 2) if closed_price is not None else None, gateway_return_code, comment, message, int_to_string(ref_source_id)),
+        (status.value, ref_id, round(closed_price, 2) if closed_price is not None else None, gateway_return_code, comment, message, ref_source_id),
       )
       conn.commit()
       logger.debug(f"Position updated: ref_source_id={ref_source_id}, new ref_id={ref_id}, status={status}")
@@ -160,12 +153,12 @@ class PositionRepository:
       if conn:
         conn.close()
 
-  def get_position(self, ref_source_id: int) -> Optional[dict]:
+  def get_position(self, ref_source_id: str) -> Optional[dict]:
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
       cursor = conn.cursor()
-      cursor.execute("SELECT * FROM positions WHERE ref_source_id = ?", (int_to_string(ref_source_id),))
+      cursor.execute("SELECT * FROM positions WHERE ref_source_id = ?", (ref_source_id,))
       row = cursor.fetchone()
       conn.close()
       return self._row_to_dict(row) if row else None

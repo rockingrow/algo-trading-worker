@@ -186,7 +186,7 @@ class MT5Executor:
       logger.info(f"[close_single] Closed ticket {pos.ticket} successfully")
       return TradeResult.ok(
         retcode=result.retcode,
-        ticket=result.order,
+        ticket=str(result.order),
         price=result.price,
         volume=result.volume,
         comment=f"Closed [{reason}]",
@@ -289,14 +289,14 @@ class MT5Executor:
       logger.error(
         f"Order rejected, retcode={result.retcode}, comment: {result.comment}"
       )
-      return TradeResult.fail(result.comment, retcode=result.retcode, ticket=0)
+      return TradeResult.fail(result.comment, retcode=result.retcode)
 
     logger.info(
       f"[open_position] Filled! Ticket: {result.order}, Price: {result.price}, Vol: {result.volume}"
     )
     return TradeResult.ok(
       retcode=result.retcode,
-      ticket=result.order,
+      ticket=str(result.order),
       price=result.price,
       volume=result.volume,
     )
@@ -378,10 +378,10 @@ class MT5Executor:
     )
     return TradeResult.ok(
       retcode=result.retcode,
-      ticket=result.order,
+      ticket=str(result.order),
       price=result.price,
       volume=result.volume,
-      source_ticket=pos.ticket,
+      source_ticket=str(pos.ticket),
     )
 
   def update_position_sl(
@@ -436,7 +436,7 @@ class MT5Executor:
     logger.info(f"[update_sl] SL updated successfully for ticket {pos.ticket}")
     return TradeResult.ok(
       retcode=result.retcode,
-      ticket=pos.ticket,
+      ticket=str(pos.ticket),
       new_sl=new_sl,
     )
 
@@ -503,8 +503,8 @@ class MT5Executor:
     if success_count > 0:
       return TradeResult.ok(
         retcode=self._mt5.TRADE_RETCODE_DONE,
-        ticket=last_result.order,
-        source_ticket=positions[0].ticket,  # the position's original ticket
+        ticket=str(last_result.order),
+        source_ticket=str(positions[0].ticket),
         price=last_result.price,
         volume=last_result.volume,
         comment=f"Closed {success_count} position(s) [{reason}]",

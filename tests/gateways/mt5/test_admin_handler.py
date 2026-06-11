@@ -15,7 +15,7 @@ from worker.schemas.position_schema import PositionStatusEnum
 # ── Fakes ─────────────────────────────────────────────────────────────────── #
 
 
-def _db_pos(ref_id=1, ref_source_id=1, strategy="strat-A", symbol="XAUUSD"):
+def _db_pos(ref_id="1", ref_source_id="1", strategy="strat-A", symbol="XAUUSD"):
   return {
     "ref_id": ref_id,
     "ref_source_id": ref_source_id,
@@ -49,7 +49,7 @@ class FakeExecutor:
     self._close_result = close_result or {
       "success": True,
       "retcode": 10009,
-      "ticket": 999,
+      "ticket": "999",
       "price": 2000.0,
       "volume": 0.5,
       "comment": "Closed [FLAT]",
@@ -169,13 +169,13 @@ def test_mt5_positions_closed_even_with_no_db_records():
 
 def test_successful_close_updates_db_status():
   proc = FakeProc(
-    db_positions=[_db_pos(ref_id=1, ref_source_id=1)],
+    db_positions=[_db_pos(ref_id="1", ref_source_id="1")],
     mt5_positions=[_mt5_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload())
   assert len(proc.db.status_updates) == 1
   upd = proc.db.status_updates[0]
-  assert upd["ref_source_id"] == 1
+  assert upd["ref_source_id"] == "1"
   assert upd["status"] == PositionStatusEnum.FLATTED
   assert upd["closed_price"] == 2000.0
 
@@ -191,7 +191,7 @@ def test_successful_close_sends_notification():
 
 
 def test_multiple_positions_all_closed():
-  db_positions = [_db_pos(ref_id=i, ref_source_id=i) for i in (1, 2, 3)]
+  db_positions = [_db_pos(ref_id=str(i), ref_source_id=str(i)) for i in (1, 2, 3)]
   mt5_positions = [_mt5_pos(ticket=i) for i in (1, 2, 3)]
   proc = FakeProc(db_positions=db_positions, mt5_positions=mt5_positions)
   proc._handle_admin_message(_payload())
@@ -219,12 +219,12 @@ def test_failed_close_skips_db_update_and_notification():
 
 def test_db_position_absent_from_mt5_still_marked_flatted():
   proc = FakeProc(
-    db_positions=[_db_pos(ref_id=1, ref_source_id=1)],
+    db_positions=[_db_pos(ref_id="1", ref_source_id="1")],
     mt5_positions=[],  # position already gone from MT5
   )
   proc._handle_admin_message(_payload())
   assert len(proc.db.status_updates) == 1
-  assert proc.db.status_updates[0]["ref_source_id"] == 1
+  assert proc.db.status_updates[0]["ref_source_id"] == "1"
   assert proc.db.status_updates[0]["status"] == PositionStatusEnum.FLATTED
   assert proc.executor.closed == []  # nothing to close in MT5
 

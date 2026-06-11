@@ -44,7 +44,7 @@ def test_parses_stop_loss():
   assert event.symbol == "BTCUSDT"
   assert event.close_price == 29000.0
   assert event.close_volume == 0.5
-  assert event.order_id == 42
+  assert event.order_id == "42"
   assert event.realized_pnl == -10.5
 
 

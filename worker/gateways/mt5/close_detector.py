@@ -77,8 +77,8 @@ class TerminalClosedEvent:
   """Event emitted when the MT5 terminal closes a position without a broker-side signal."""
 
   # Position identity
-  source_ticket: int  # position ticket (= source_ticket in our system)
-  deal_ticket: int  # the closing deal ticket
+  source_ticket: str  # position ticket (= source_ticket in our system)
+  deal_ticket: str  # the closing deal ticket
   symbol: str
   # Close details
   close_reason: TerminalCloseReason
@@ -154,8 +154,8 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
   )
 
   return TerminalClosedEvent(
-    source_ticket=position_ticket,
-    deal_ticket=closing_deal.ticket,
+    source_ticket=str(position_ticket),
+    deal_ticket=str(closing_deal.ticket),
     symbol=closing_deal.symbol,
     close_reason=reason,
     close_price=closing_deal.price,

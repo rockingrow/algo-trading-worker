@@ -37,7 +37,7 @@ cp .env.example .env
 | **NATS** | | | |
 | `NATS_URL` | ✅ | — | NATS server URL (e.g. `nats://broker-host:4222`) |
 | `NATS_TOKEN` | | `null` | NATS authentication token |
-| `SIGNAL_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
+| `NATS_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
 | `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
 | **MT5** (required when `MARKET_TYPE=FOREX`) | | | |
 | `MT5_SERVER` | FOREX | — | Broker server name (e.g. `Exness-MT5Trial6`) |
@@ -132,7 +132,7 @@ its native Windows deployment.
 worker** (`MARKET_TYPE=CRYPTO`).
 
 ```bash
-cp .env.example .env          # fill BINANCE_API_KEY / BINANCE_API_SECRET, SIGNAL_SUBJECTS, TELEGRAM_*
+cp .env.example .env          # fill BINANCE_API_KEY / BINANCE_API_SECRET, NATS_SUBJECTS, TELEGRAM_*
 docker compose up -d --build  # or: make docker-up
 docker compose logs -f worker # or: make docker-logs
 ```

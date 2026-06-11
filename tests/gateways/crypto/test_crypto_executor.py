@@ -120,7 +120,7 @@ def test_partial_close_uses_reduce_only(config):
   res = ex.partial_close_position("BTCUSD", close_volume=0.006, position_ticket=7)
   assert res["success"] is True
   assert gw.orders == [("BTCUSDT", "LONG", 0.006, True)]
-  assert res["source_ticket"] == 7
+  assert res["source_ticket"] == "7"
 
 
 def test_update_sl_cancels_then_sets(config):

@@ -1,6 +1,6 @@
 # Crypto (CEX) worker stack for Linux hosts.
 #
-#   cp .env.example .env   # fill BINANCE_*, TELEGRAM_*, SIGNAL_SUBJECTS, ...
+#   cp .env.example .env   # fill BINANCE_*, TELEGRAM_*, NATS_SUBJECTS, ...
 #   docker compose up -d --build
 #
 # The MT5/FOREX worker is NOT containerized (it requires Windows + the MT5

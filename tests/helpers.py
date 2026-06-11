@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 os.environ.setdefault("NATS_URL", "nats://localhost:4222")
-os.environ.setdefault("SIGNAL_SUBJECTS", "signal.test")
+os.environ.setdefault("NATS_SUBJECTS", "signal.test")
 os.environ.setdefault("MT5_SERVER", "TestServer")
 os.environ.setdefault("MT5_LOGIN", "1000")
 os.environ.setdefault("MT5_PASSWORD", "pw")

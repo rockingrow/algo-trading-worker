@@ -60,7 +60,7 @@ def test_place_market_order_open_long(monkeypatch):
   gw, calls = make_gateway(monkeypatch)
   res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, reduce_only=False, client_order_id="x-1")
   assert res["success"] is True
-  assert res["ticket"] == 555 and res["price"] == 30000.0 and res["volume"] == 0.02
+  assert res["ticket"] == "555" and res["price"] == 30000.0 and res["volume"] == 0.02
   c = calls[-1]
   assert c["method"] == "POST" and c["path"] == "/fapi/v1/order" and c["signed"] is True
   assert c["payload"]["side"] == "BUY"

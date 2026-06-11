@@ -30,7 +30,7 @@ def test_position_methods_delegate_to_position_repo():
   svc, positions, _ = make_service()
   svc.get_open_positions_by_strategy("s", "XAUUSD")
   svc.get_open_positions_for_flat(strategy="s", symbol="XAUUSD")
-  svc.update_position_status(source_ticket=1, status=PositionStatusEnum.TP1)
+  svc.update_position_status(ref_source_id="1", status=PositionStatusEnum.TP1)
   svc.get_position(1)
   svc.get_pending_sync_positions()
   svc.mark_position_synced(1, "ts")

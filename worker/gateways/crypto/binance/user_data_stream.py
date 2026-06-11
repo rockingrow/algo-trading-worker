@@ -46,7 +46,7 @@ class ExchangeCloseEvent:
   reason: ExchangeCloseReason
   close_price: float
   close_volume: float
-  order_id: int
+  order_id: str
   client_order_id: str
   realized_pnl: float = 0.0
 
@@ -87,7 +87,7 @@ def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent
     reason=reason,
     close_price=float(o.get("ap") or o.get("L") or 0) or 0.0,
     close_volume=float(o.get("z") or o.get("q") or 0) or 0.0,
-    order_id=int(o.get("i") or 0),
+    order_id=str(o.get("i") or ""),
     client_order_id=o.get("c", ""),
     realized_pnl=float(o.get("rp") or 0) or 0.0,
   )

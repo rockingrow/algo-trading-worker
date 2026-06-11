@@ -280,8 +280,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   @staticmethod
   def _order_result(data: Dict[str, Any]) -> TradeResult:
+    order_id = data.get("orderId")
     return TradeResult.ok(
-      ticket=data.get("orderId"),
+      ticket=str(order_id) if order_id is not None else None,
       price=float(data.get("avgPrice", 0) or 0),
       volume=float(data.get("executedQty", 0) or 0),
       comment=data.get("status", "NEW"),

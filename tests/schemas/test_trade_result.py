@@ -4,10 +4,10 @@ from worker.schemas.trade_result import TradeResult
 
 
 def test_ok_defaults():
-  r = TradeResult.ok(ticket=5, price=100.0, volume=1.0)
+  r = TradeResult.ok(ticket="5", price=100.0, volume=1.0)
   assert r.success is True
   assert r.retcode == 0
-  assert r.ticket == 5
+  assert r.ticket == "5"
   # mapping access mirrors attribute access
   assert r["success"] is True
   assert r.get("price") == 100.0
@@ -34,11 +34,11 @@ def test_unknown_kwargs_go_to_extra():
 
 
 def test_mapping_setitem_known_and_unknown():
-  r = TradeResult.ok(ticket=1)
-  r["source_ticket"] = 9       # known field → attribute
+  r = TradeResult.ok(ticket="1")
+  r["source_ticket"] = "9"     # known field → attribute
   r["custom"] = "y"            # unknown → extra
-  assert r.source_ticket == 9
-  assert r["source_ticket"] == 9
+  assert r.source_ticket == "9"
+  assert r["source_ticket"] == "9"
   assert r.extra["custom"] == "y"
 
 

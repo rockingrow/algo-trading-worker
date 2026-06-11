@@ -104,7 +104,7 @@ class MT5EventJob:
 
   def _handle(self, event: TerminalClosedEvent) -> None:
     log.info(
-      "[MT5EventJob] Handling terminal close | ticket=%d reason=%s",
+      "[MT5EventJob] Handling terminal close | ticket=%s reason=%s",
       event.source_ticket,
       event.close_reason.value,
     )
@@ -113,7 +113,7 @@ class MT5EventJob:
     position = self._db.get_position(ref_source_id=event.source_ticket)
     if not position:
       log.warning(
-        "[MT5EventJob] Position not found in DB | source_ticket=%d",
+        "[MT5EventJob] Position not found in DB | source_ticket=%s",
         event.source_ticket,
       )
       return

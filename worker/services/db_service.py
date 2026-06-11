@@ -47,9 +47,9 @@ class DBService:
 
   def update_position_status(
     self,
-    ref_source_id: int,
+    ref_source_id: str,
     status: PositionStatusEnum,
-    ref_id: Optional[int] = None,
+    ref_id: Optional[str] = None,
     closed_price: Optional[float] = None,
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
@@ -59,7 +59,7 @@ class DBService:
       ref_source_id, status, ref_id, closed_price, gateway_return_code, comment, message
     )
 
-  def get_position(self, ref_source_id: int):
+  def get_position(self, ref_source_id: str):
     return self.positions.get_position(ref_source_id)
 
   def get_pending_sync_positions(self) -> list:

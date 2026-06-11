@@ -260,7 +260,7 @@ class CryptoExecutor:
       resolved, pos.side, safe_volume, reduce_only=True
     )
     if result.get("success"):
-      result["source_ticket"] = pos.ticket
+      result["source_ticket"] = str(pos.ticket)
     return result
 
   def update_position_sl(
@@ -285,7 +285,7 @@ class CryptoExecutor:
     result = self._gateway.set_stop_loss(resolved, pos.side, new_sl, pos.volume)
     if result.get("success"):
       result["new_sl"] = new_sl
-      result["ticket"] = pos.ticket
+      result["ticket"] = str(pos.ticket)
     return result
 
   # ── Full close ────────────────────────────────────────────────────────── #
@@ -316,7 +316,7 @@ class CryptoExecutor:
     if success_count > 0 and last_result is not None:
       return TradeResult.ok(
         ticket=last_result.get("ticket"),
-        source_ticket=positions[0].ticket,
+        source_ticket=str(positions[0].ticket),
         price=last_result.get("price"),
         volume=last_result.get("volume"),
         comment=f"Closed {success_count} position(s) [{reason}]",

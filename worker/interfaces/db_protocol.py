@@ -32,9 +32,9 @@ class PositionStoreProtocol(Protocol):
   ) -> List[Dict[str, Any]]: ...
   def update_position_status(
     self,
-    ref_source_id: int,
+    ref_source_id: str,
     status: PositionStatusEnum,
-    ref_id: Optional[int] = None,
+    ref_id: Optional[str] = None,
     closed_price: Optional[float] = None,
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
@@ -52,12 +52,12 @@ class PositionSyncStoreProtocol(Protocol):
 class TerminalCloseStoreProtocol(Protocol):
   """Position read + log + status update used by MT5EventJob."""
 
-  def get_position(self, ref_source_id: int) -> Optional[Dict[str, Any]]: ...
+  def get_position(self, ref_source_id: str) -> Optional[Dict[str, Any]]: ...
   def update_position_status(
     self,
-    ref_source_id: int,
+    ref_source_id: str,
     status: PositionStatusEnum,
-    ref_id: Optional[int] = None,
+    ref_id: Optional[str] = None,
     closed_price: Optional[float] = None,
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
@@ -66,8 +66,8 @@ class TerminalCloseStoreProtocol(Protocol):
   def log_position(
     self,
     strategy: str,
-    ref_id: Optional[int],
-    ref_source_id: Optional[int],
+    ref_id: Optional[str],
+    ref_source_id: Optional[str],
     symbol: str,
     action: str,
     volume: float,

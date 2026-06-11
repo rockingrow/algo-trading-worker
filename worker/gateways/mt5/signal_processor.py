@@ -236,16 +236,16 @@ class Mt5SignalProcessor(BaseSignalProcessor):
         len(mt5_positions), admin.strategy, admin.symbol,
       )
 
-    attempted_tickets: set[int] = set()
-    closed_tickets: set[int] = set()
-    close_results: dict[int, dict] = {}
+    attempted_tickets: set[str] = set()
+    closed_tickets: set[str] = set()
+    close_results: dict[str, dict] = {}
 
     for pos in mt5_positions:
-      attempted_tickets.add(pos.ticket)
+      attempted_tickets.add(str(pos.ticket))
       result = self.executor.close_single_position(pos, reason="FLAT")
       if result.get("success"):
-        closed_tickets.add(pos.ticket)
-        close_results[pos.ticket] = result
+        closed_tickets.add(str(pos.ticket))
+        close_results[str(pos.ticket)] = result
         log.info(
           "[ADMIN FLAT] Closed MT5 ticket=%s price=%s vol=%s",
           pos.ticket, result.get("price"), result.get("volume"),

@@ -39,9 +39,9 @@ class Settings(BaseSettings):
   # NATS
   nats_url: str
   nats_token: Optional[str] = None
+  nats_subjects: str
 
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
-  signal_subjects: str
 
   # MT5 Credentials — required only when MARKET_TYPE == FOREX. They are optional
   # at the field level so a pure CRYPTO deployment never has to set them (and the

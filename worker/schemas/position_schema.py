@@ -40,8 +40,8 @@ class PositionEvent(BaseModel):
   market_type: MarketTypeEnum
 
   id: int
-  ref_source_id: int
-  ref_id: int
+  ref_source_id: str
+  ref_id: str
   strategy: str
   symbol: str
   action: str

@@ -26,14 +26,14 @@ def repo(tmp_path, monkeypatch):
   db_init()
   r = PositionRepository()
   # Three distinct active positions + one closed one that must never match.
-  r.insert_position(ticket=1, strategy="strat-long", symbol="XAUUSD", action="long", volume=0.5, opened_price=4500.0)
-  r.insert_position(ticket=2, strategy="strat-short", symbol="XAUUSD", action="short", volume=0.3, opened_price=4600.0)
-  r.insert_position(ticket=3, strategy="strat-long", symbol="EURUSD", action="long", volume=0.2, opened_price=1.1)
-  r.insert_position(ticket=4, strategy="strat-long", symbol="GBPUSD", action="long", volume=0.4, opened_price=1.3)
+  r.insert_position(ref_id="1", strategy="strat-long", symbol="XAUUSD", action="long", volume=0.5, opened_price=4500.0)
+  r.insert_position(ref_id="2", strategy="strat-short", symbol="XAUUSD", action="short", volume=0.3, opened_price=4600.0)
+  r.insert_position(ref_id="3", strategy="strat-long", symbol="EURUSD", action="long", volume=0.2, opened_price=1.1)
+  r.insert_position(ref_id="4", strategy="strat-long", symbol="GBPUSD", action="long", volume=0.4, opened_price=1.3)
   # Close the GBPUSD one so it is excluded from every FLAT query.
   from worker.schemas.position_schema import PositionStatusEnum
 
-  r.update_position_status(source_ticket=4, status=PositionStatusEnum.TP2)
+  r.update_position_status(ref_source_id="4", status=PositionStatusEnum.TP2)
   return r
 
 

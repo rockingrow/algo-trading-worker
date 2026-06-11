@@ -110,7 +110,7 @@ class BaseSignalProcessor(ABC):
 
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
-      subjects=parse_nats_subjects(self.settings.get("signal_subjects", "")),
+      subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
       publish_subjects=[NatsSubjectEnum.TRADE],
       token=self.settings.get("nats_token"),
       account_footer_fn=self._account_footer,
@@ -192,7 +192,7 @@ class BaseSignalProcessor(ABC):
     self.ctx.db_service.log_position(
       strategy=signal.strategy,
       ref_id=result.get("ticket"),
-      ref_source_id=result.get("source_ticket", result.get("ticket")),
+      ref_source_id=result.get("source_ticket") or result.get("ticket"),
       symbol=signal.symbol,
       action=signal.action.value,
       volume=result.get("volume", signal.quantity),
@@ -209,7 +209,7 @@ class BaseSignalProcessor(ABC):
     if result.get("success"):
       self._persist_success(signal, result, footer)
       msg = self.presenter.order_filled(
-        signal, result, result.get("source_ticket", result.get("ticket")), footer
+        signal, result, result.get("source_ticket") or result.get("ticket"), footer
       )
     else:
       msg = self.presenter.order_failed(signal, result, footer)
@@ -217,7 +217,7 @@ class BaseSignalProcessor(ABC):
 
   def _persist_success(self, signal: SignalSchema, result: dict, footer: str) -> None:
     action_val = signal.action.value
-    pos_ticket = result.get("source_ticket", result.get("ticket"))
+    pos_ticket = result.get("source_ticket") or result.get("ticket")
     signal_json = signal.model_dump_json()
 
     for fc in result.get("forced_closed", []):

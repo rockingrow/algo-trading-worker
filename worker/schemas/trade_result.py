@@ -46,10 +46,10 @@ class TradeResult:
   success: bool
   retcode: int = -1
   comment: str = ""
-  ticket: Optional[int] = None
+  ticket: Optional[str] = None
   price: Optional[float] = None
   volume: Optional[float] = None
-  source_ticket: Optional[int] = None
+  source_ticket: Optional[str] = None
   new_sl: Optional[float] = None
   sl_update: Any = None  # nested TradeResult from the SL-update step (TP1)
   forced_closed: list = field(default_factory=list)
