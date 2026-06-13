@@ -31,6 +31,7 @@ class CryptoMessagePresenter:
       f"VOLUME_DECISION_ENABLED: <b>{s.get('volume_decision_enabled', False)}</b>\n"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"RISK_PERCENTAGE: <b>{s.get('risk_percentage')}%</b>\n"
+      f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
       f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
     )
     return _box(f"🟢 <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")

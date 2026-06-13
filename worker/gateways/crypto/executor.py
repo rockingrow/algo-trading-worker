@@ -166,22 +166,54 @@ class CryptoExecutor:
     if not self._config.volume_decision_enabled:
       return self.convert_quantity_to_lots(symbol, signal.quantity)
     if signal.sl:
+      capital = self._risk_capital()
+      if capital is None:
+        qty = self._min_qty(symbol)
+        logger.error(
+          "[open_position] USE_ACCOUNT_EQUITY set but equity unavailable — using min qty=%s",
+          qty,
+        )
+        return qty
       price = self._gateway.get_mark_price(symbol)
       risk = (
         signal.risk_percent
         if signal.risk_percent is not None
         else self._config.risk_percentage
       )
-      qty = self.calculate_quantity(symbol, price, signal.sl, risk, self._config.capital)
+      qty = self.calculate_quantity(symbol, price, signal.sl, risk, capital)
       logger.info(
-        "[open_position] RISK mode | price=%s sl=%s risk=%s%% → qty=%s",
-        price, signal.sl, risk, qty,
+        "[open_position] RISK mode | price=%s sl=%s risk=%s%% capital=%s → qty=%s",
+        price, signal.sl, risk, capital, qty,
       )
       return qty
-    f = self._gateway.get_symbol_filter(symbol)
-    qty = f.min_qty or 0.0
+    qty = self._min_qty(symbol)
     logger.warning("[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty)
     return qty
+
+  def _risk_capital(self) -> Optional[float]:
+    """Capital base for risk sizing.
+
+    Mirrors the Forex ``LotSizer``: live account equity when ``USE_ACCOUNT_EQUITY``
+    is set, otherwise the fixed configured ``CAPITAL``. Returns ``None`` when
+    equity is required but cannot be read, signalling the caller to fall back to
+    the symbol's minimum quantity rather than silently sizing off the wrong base.
+    """
+    if not self._config.use_account_equity:
+      return self._config.capital
+    account = self._gateway.get_account()
+    equity = account.get("equity") if account else None
+    if not equity:
+      logger.error(
+        "[open_position] USE_ACCOUNT_EQUITY set but account equity unavailable (%s).",
+        account,
+      )
+      return None
+    return float(equity)
+
+  def _min_qty(self, symbol: str) -> float:
+    """The symbol's minimum order quantity (conservative sizing floor)."""
+    f = self._gateway.get_symbol_filter(symbol)
+    return f.min_qty or 0.0
 
   def _netting_conflict(self, signal: SignalSchema, symbol: str) -> Optional[TradeResult]:
     """In netting mode, reject an entry that would merge with another strategy's

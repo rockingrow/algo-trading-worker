@@ -42,7 +42,7 @@ class FakeGateway:
     self.cancelled.append(symbol)
 
   def get_account(self):
-    return {"balance": 1000.0}
+    return {"balance": 1000.0, "equity": 5000.0}
 
 
 def _long_pos(qty=0.02, entry=30000.0):
@@ -85,6 +85,28 @@ def test_open_position_risk_mode_places_order_and_stop(config):
   assert res["success"] is True
   assert gw.orders == [("BTCUSDT", "LONG", 0.02, False)]
   assert gw.stops and gw.stops[0][2] == 29000.0
+
+
+def test_open_position_sizes_against_account_equity_when_enabled(config):
+  """USE_ACCOUNT_EQUITY=true sizes off live equity, not the fixed CAPITAL."""
+  cfg = replace(config, use_account_equity=True)
+  gw = FakeGateway()  # equity = 5000
+  ex = CryptoExecutor(gw, cfg)
+  # equity=5000, risk=2% → $100 risk; |30000-29000|=1000 → 0.1 (vs 0.02 on CAPITAL=1000)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+  assert res["success"] is True
+  assert gw.orders == [("BTCUSDT", "LONG", 0.1, False)]
+
+
+def test_open_position_account_equity_unavailable_falls_back_to_min_qty(config):
+  """When equity can't be read, fall back to min qty rather than the wrong base."""
+  cfg = replace(config, use_account_equity=True)
+  gw = FakeGateway(step=0.001)
+  gw.get_account = lambda: None
+  ex = CryptoExecutor(gw, cfg)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+  assert res["success"] is True
+  assert gw.orders[0][2] == 0.001  # min_qty
 
 
 def test_open_position_rolls_back_when_sl_fails(config):

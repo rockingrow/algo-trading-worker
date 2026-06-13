@@ -226,15 +226,17 @@ class MT5Executor:
           if signal.risk_percent is not None
           else self._config.risk_percentage
         )
-        volume = self.calculate_lot_size(
-          symbol,
-          price,
-          signal.sl,
-          risk,
-          capital=self._config.capital,
+        # capital=None lets the LotSizer honor USE_ACCOUNT_EQUITY (size against
+        # live account equity vs. the fixed configured CAPITAL); passing capital
+        # explicitly here would bypass that setting.
+        volume = self.calculate_lot_size(symbol, price, signal.sl, risk)
+        capital_src = (
+          "account_equity"
+          if self._config.use_account_equity
+          else f"capital={self._config.capital}"
         )
         logger.info(
-          f"[open_position] VOLUME_DECISION mode | capital={self._config.capital} "
+          f"[open_position] VOLUME_DECISION mode | {capital_src} "
           f"risk={risk}% (source={'signal' if signal.risk_percent is not None else 'config'}) → lot={volume}"
         )
       else:

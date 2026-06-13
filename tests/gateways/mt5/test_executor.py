@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 from helpers import FakeMt5, make_order_result, make_position, make_signal
 
@@ -19,6 +21,18 @@ def test_open_position_long_builds_buy_request(config):
   assert req["magic"] == 42
   assert req["price"] == 2000.0  # ask for buy
   assert "sl" in req and "tp" in req
+
+
+def test_open_position_sizes_against_account_equity_when_enabled(config):
+  """USE_ACCOUNT_EQUITY=true must reach the LotSizer's equity path (executor
+  no longer force-passes the fixed CAPITAL)."""
+  cfg = replace(config, use_account_equity=True)
+  mt5 = FakeMt5()  # account equity = 10000
+  ex = _executor(mt5, cfg)
+  ex.open_position(make_signal(SignalActionEnum.LONG))
+  # equity=10000, risk=2% → risk_cash=200; SL dist=(2000-1990)/0.01=1000 pts;
+  # point_value=1 → lot=200/1000=0.2 (vs 0.02 when sized off CAPITAL=1000).
+  assert mt5.sent_requests[-1]["volume"] == 0.2
 
 
 def test_open_position_short_uses_bid(config):
