@@ -1,6 +1,6 @@
 """
-worker/mt5/manager.py
-─────────────────────
+worker/gateways/forex/mt5/manager.py
+────────────────────────────────────
 Backward-compatible alias for the generic :class:`WorkerProcessManager`.
 
 The supervisor logic is market-agnostic and now lives in

@@ -72,10 +72,9 @@ class ThreadGatewayOrchestrator(MarketOrchestrator):
   """Runs a market worker in a background **thread** in the current process.
 
   For gateways that need no GIL isolation — CRYPTO is pure Python (REST +
-  websocket threads) — so no child process is spawned. This keeps the FastAPI
-  deployment of the crypto worker single-process and consistent with the
-  standalone container entry point (``python -m worker.crypto_worker``). The
-  watchdog restarts the worker thread if its loop exits unexpectedly.
+  websocket threads) — so no child process is spawned. This keeps the crypto
+  worker single-process under the FastAPI app. The watchdog restarts the worker
+  thread if its loop exits unexpectedly.
   """
 
   def __init__(self, settings_dict: dict, worker_fn, *, label: str) -> None:
@@ -138,16 +137,15 @@ def create_market_orchestrator(settings_dict: dict) -> MarketOrchestrator:
 
   FOREX runs in a child **process** (GIL isolation for the MetaTrader5 C
   extension); CRYPTO runs in a background **thread** (pure-Python gateway needs
-  no isolation). The container runs the crypto worker even more directly via
-  ``python -m worker.crypto_worker`` — no FastAPI, no thread orchestrator.
+  no isolation). Both markets are launched the same way via ``make start``.
   """
   market_type = settings_dict.get("market_type", MarketTypeEnum.FOREX)
 
   if market_type == MarketTypeEnum.FOREX:
-    from worker.mt5_worker import mt5_worker_main
+    from worker.forex_worker import forex_worker_main
 
     return GatewayProcessOrchestrator(
-      settings_dict, mt5_worker_main, label="FOREX", process_name="worker_mt5"
+      settings_dict, forex_worker_main, label="FOREX", process_name="worker_forex"
     )
 
   if market_type == MarketTypeEnum.CRYPTO:

@@ -188,6 +188,17 @@ class BaseSignalProcessor(ABC):
       return
     except ValidationError as err:
       log.error("[%s Process] Signal validation failed: %s", self.name, err)
+      # Notify the operator: a malformed signal is otherwise invisible (it never
+      # reaches the handler, so no order_failed notification fires). Send only a
+      # field-level summary — never the raw payload or pydantic's input dump,
+      # which echo the broker token and other secrets into the chat.
+      reason = "; ".join(
+        f"{'.'.join(str(p) for p in e['loc']) or '(root)'}: {e['msg']}"
+        for e in err.errors()
+      )
+      self.ctx.notifier.send_message(
+        self.presenter.signal_rejected(reason, self._current_footer())
+      )
       return
 
     if not self._ensure_connected():

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from helpers import FakeMt5
 
-from worker.gateways.mt5.symbol_resolver import SymbolResolver
+from worker.gateways.forex.mt5.symbol_resolver import SymbolResolver
 
 
 def test_resolves_to_broker_symbol():

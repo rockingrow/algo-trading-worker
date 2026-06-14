@@ -8,7 +8,7 @@ import MetaTrader5 as mt5
 from worker.logger import get_logger
 from worker.utils.logging import build_account_footer
 
-logger = get_logger("worker.gateways.mt5")
+logger = get_logger("worker.gateways.forex.mt5")
 
 
 class MT5:

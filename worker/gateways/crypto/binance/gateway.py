@@ -6,10 +6,12 @@ Binance USDⓈ-M Futures adapter — concrete ``BaseExchangeGateway``.
 REST goes through the **official** ``binance_common`` transport
 (``send_request``): it signs (HMAC), adds the timestamp, applies retries/backoff,
 raises typed rate-limit/error exceptions, and converts snake_case params to the
-Binance wire format. We call it directly (rather than the generated typed
-methods) because the generated ``new_order`` cannot express ``STOP_MARKET`` /
-``closePosition`` — which we need for stop-losses — and because going through one
-transport keeps every endpoint uniform. The worker speaks LONG/SHORT; this
+Binance wire format (``stop_price`` → ``stopPrice`` …). We call it directly
+(rather than the generated typed methods) so every endpoint goes through one
+uniform path. Note stop-losses are conditional orders: Binance no longer accepts
+``STOP_MARKET`` on ``/fapi/v1/order`` (it returns -4120 → "use the Algo Order API
+endpoints instead"), so :meth:`set_stop_loss` posts to ``/fapi/v1/algoOrder``
+(``algoType=CONDITIONAL``). The worker speaks LONG/SHORT; this
 adapter maps that to BUY/SELL and normalizes responses into the broker-neutral
 ``TradeResult`` / ``ExchangePosition`` shapes.
 
@@ -19,9 +21,11 @@ official SDK — see :mod:`worker.gateways.crypto.binance.user_data_stream`.
 
 from __future__ import annotations
 
+import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+import binance_common.utils as _bc_utils
 import requests
 from binance_common.configuration import ConfigurationRestAPI
 from binance_common.constants import (
@@ -43,15 +47,40 @@ from worker.schemas.trade_result import TradeResult
 logger = get_logger("worker.gateways.crypto.binance.gateway")
 
 
+# ── Server-time offset ────────────────────────────────────────────────────── #
+# Binance rejects a signed request whose ``timestamp`` runs more than 1000ms
+# *ahead* of server time (error -1021). ``recvWindow`` only forgives timestamps
+# that are *behind* server time, so it cannot rescue a fast clock — which is the
+# common failure inside containers whose host clock has drifted. The SDK's
+# ``send_request`` stamps every signed request with ``binance_common.utils
+# .get_timestamp()`` (raw local clock) and exposes no offset hook, so we wrap
+# that module-level function to add an offset measured against Binance at
+# ``connect()`` (see :meth:`BinanceFuturesGateway._sync_time`). The wrap reads a
+# module global so re-syncs take effect without re-patching; if a future SDK
+# drops the symbol the wrap simply never runs and we fall back to the raw local
+# clock (today's behavior).
+_TIME_OFFSET_MS = 0
+
+
+def _offset_timestamp() -> int:
+  return int(time.time() * 1000) + _TIME_OFFSET_MS
+
+
+_bc_utils.get_timestamp = _offset_timestamp
+
+
 # ``str``-mixin Enum (not ``enum.StrEnum``, which is 3.11+) so the package keeps
 # working on the declared minimum Python 3.10. ``__str__`` returns the bare value
 # so ``str(endpoint)`` yields the path (matching StrEnum), which ``_send`` relies on.
 class _API_Endpoints(str, Enum):
+  TIME = "/fapi/v1/time"
   BALANCE = "/fapi/v2/balance"
   EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
   PREMIUM_INDEX = "/fapi/v1/premiumIndex"
   POSITION_RISK = "/fapi/v2/positionRisk"
   ORDER = "/fapi/v1/order"
+  ALGO_ORDER = "/fapi/v1/algoOrder"
+  ALGO_OPEN_ORDERS = "/fapi/v1/algoOpenOrders"
   ALL_OPEN_ORDERS = "/fapi/v1/allOpenOrders"
   ACCOUNT = "/fapi/v2/account"
 
@@ -104,31 +133,78 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     *,
     signed: bool = False,
   ) -> Any:
-    """Send one request via the official transport and return its parsed body."""
+    """Send one request via the official transport and return its parsed body.
+
+    Signed requests re-sync the clock and retry once on a -1021 timestamp
+    rejection: the offset is measured at connect(), but an undisciplined host
+    clock keeps drifting, so a long-lived worker can drift back outside Binance's
+    1000ms-ahead window mid-session. Re-syncing on demand keeps the offset honest
+    without a background timer, and one retry turns a would-be order failure into
+    a transparent recovery.
+    """
     params = dict(payload or {})
     if signed:
       params.setdefault("recv_window", self._recv_window)
-    resp = send_request(
-      self._session,
-      self._config,
-      method=method,
-      path=str(path),
-      payload=params,
-      is_signed=signed,
-      response_model=None,
-    )
-    return resp.data()
+
+    def _call() -> Any:
+      return send_request(
+        self._session,
+        self._config,
+        method=method,
+        path=str(path),
+        payload=params,
+        is_signed=signed,
+        response_model=None,
+      ).data()
+
+    try:
+      return _call()
+    except Exception as exc:
+      if signed and getattr(exc, "status_code", None) == -1021:
+        logger.warning(
+          "[Binance] -1021 timestamp rejection on %s; re-syncing clock and retrying once.",
+          path,
+        )
+        self._sync_time()
+        return _call()
+      raise
 
   # ── Lifecycle ─────────────────────────────────────────────────────────── #
 
   def connect(self) -> bool:
     try:
+      self._sync_time()
       self._send("GET", _API_Endpoints.BALANCE, signed=True)
       logger.info("[Binance] Connected (testnet=%s).", self._testnet)
       return True
     except Exception as exc:
       logger.exception("[Binance] connect() failed: %s", exc)
       return False
+
+  def _sync_time(self) -> None:
+    """Align signed-request timestamps to Binance server time.
+
+    Measures the local-vs-server clock offset via the public (unsigned)
+    ``/fapi/v1/time`` endpoint and stores it so :func:`_offset_timestamp` adds it
+    to every signed request, sidestepping -1021 when the container clock drifts.
+    The offset is corrected for transit by anchoring to the midpoint of the
+    round trip rather than to when the reply arrived. Best effort: on failure we
+    log and fall back to the raw local clock.
+    """
+    global _TIME_OFFSET_MS
+    try:
+      t0 = time.time() * 1000
+      data = self._send("GET", _API_Endpoints.TIME)
+      t1 = time.time() * 1000
+      server_time = int(data["serverTime"])
+      _TIME_OFFSET_MS = int(server_time - (t0 + t1) / 2)
+      logger.info(
+        "[Binance] Clock offset vs server: %+d ms (rtt=%.0f ms).",
+        _TIME_OFFSET_MS,
+        t1 - t0,
+      )
+    except Exception as exc:
+      logger.warning("[Binance] time sync failed (%s); using local clock.", exc)
 
   def close(self) -> None:
     try:
@@ -229,28 +305,42 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   def set_stop_loss(
     self, symbol: str, position_side: str, stop_price: float, quantity: float
   ) -> TradeResult:
-    # STOP_MARKET + closePosition=true closes the whole remaining position when
-    # the stop trips — exactly the breakeven-after-TP1 behavior the strategy wants.
-    # NOTE: *quantity* is kept for BaseExchangeGateway parity but is intentionally
-    # unused — closePosition=true always closes the full remaining position.
+    # Conditional orders go on the dedicated Algo Order endpoint
+    # (algoType=CONDITIONAL); Binance rejects STOP_MARKET on /fapi/v1/order with
+    # -4120. The trigger field is `trigger_price` here (vs `stop_price` on the
+    # legacy order endpoint).
+    #
+    # closePosition=true closes the whole remaining position when the stop trips —
+    # exactly the breakeven-after-TP1 behaviour the strategy wants — and must not
+    # be combined with quantity/reduceOnly. NOTE: *quantity* is kept for
+    # BaseExchangeGateway parity but is intentionally unused.
     payload: Dict[str, Any] = {
+      "algo_type": "CONDITIONAL",
       "symbol": symbol,
       "side": _CLOSE_SIDE.get(position_side, "SELL"),
       "type": "STOP_MARKET",
-      "stop_price": stop_price,
+      "trigger_price": stop_price,
       "close_position": "true",
     }
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ORDER, payload, signed=True))
+      return self._order_result(self._send("POST", _API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
       return TradeResult.fail(str(exc))
 
   def cancel_all_orders(self, symbol: str) -> None:
+    # Regular orders and algo (conditional) orders live in separate Binance systems.
+    # allOpenOrders covers standard orders; algoOpenOrders covers STOP_MARKET/TP
+    # conditionals placed via /fapi/v1/algoOrder. Both must be cancelled so an old
+    # SL algo doesn't survive into the next stop-placement (double-stop scenario).
     try:
       self._send("DELETE", _API_Endpoints.ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_all_orders(%s) failed: %s", symbol, exc)
+    try:
+      self._send("DELETE", _API_Endpoints.ALGO_OPEN_ORDERS, {"symbol": symbol}, signed=True)
+    except Exception as exc:
+      logger.warning("[Binance] cancel_algo_orders(%s) failed: %s", symbol, exc)
 
   # ── Account ───────────────────────────────────────────────────────────── #
 
@@ -282,7 +372,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   @staticmethod
   def _order_result(data: Dict[str, Any]) -> TradeResult:
-    order_id = data.get("orderId")
+    # Market/limit orders return `orderId`; conditional algo orders return `algoId`.
+    order_id = data.get("orderId") or data.get("algoId")
     return TradeResult.ok(
       ticket=str(order_id) if order_id is not None else None,
       price=float(data.get("avgPrice", 0) or 0),

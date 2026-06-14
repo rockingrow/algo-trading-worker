@@ -13,7 +13,7 @@ from __future__ import annotations
 import threading
 from typing import Set
 
-from worker.gateways.mt5.close_detector import (
+from worker.gateways.forex.mt5.close_detector import (
   TerminalClosedEvent,
   TerminalCloseReason,
   scan_terminal_closed_positions,

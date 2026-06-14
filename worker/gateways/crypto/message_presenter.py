@@ -3,7 +3,7 @@ worker/crypto/message_presenter.py
 ──────────────────────────────────
 Telegram message strings for the crypto worker's trade lifecycle events.
 
-Mirrors :class:`~worker.gateways.mt5.message_presenter.TradeMessagePresenter` but with
+Mirrors :class:`~worker.gateways.forex.mt5.message_presenter.TradeMessagePresenter` but with
 exchange-appropriate labels (quantity instead of lots, exchange close reasons).
 Pure functions of their inputs — trivial to test without an exchange, NATS, or
 a DB.
@@ -11,6 +11,7 @@ a DB.
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 from worker.schemas.signal_schema import SignalSchema
@@ -109,6 +110,15 @@ class CryptoMessagePresenter:
       f"Quantity: <b>{event.close_volume}</b>\n"
       f"Realized PnL: <b>{event.realized_pnl}</b>\n"
       f"Order: <b>{event.order_id}</b>\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def signal_rejected(reason: str, footer: str) -> str:
+    return _box(
+      f"🚫 <b>Signal Rejected</b>\n\n"
+      f"A signal failed validation and was <b>NOT executed</b>.\n"
+      f"Reason: <b>{html.escape(reason)}</b>\n"
       f"{_DIVIDER}\n{footer}"
     )
 

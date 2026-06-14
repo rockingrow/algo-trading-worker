@@ -3,7 +3,7 @@ worker/worker_runtime.py
 ────────────────────────
 Shared child-process bootstrap for every market.
 
-``mt5_worker_main`` and ``crypto_worker_main`` used to be byte-for-byte identical
+``forex_worker_main`` and ``crypto_worker_main`` used to be byte-for-byte identical
 except for which ``<Market>SignalProcessor`` they built. That common lifecycle —
 build :class:`WorkerContext`, start the notification job, connect, notify, start
 jobs, run the loop, shut down — lives here once. Each market entry point only

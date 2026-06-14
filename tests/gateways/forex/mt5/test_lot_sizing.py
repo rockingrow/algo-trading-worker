@@ -2,8 +2,8 @@ from dataclasses import replace
 
 from helpers import FakeMt5, make_symbol_info
 
-from worker.gateways.mt5.lot_sizing import LotSizer, _decimals_for_step
-from worker.gateways.mt5.symbol_resolver import SymbolResolver
+from worker.gateways.forex.mt5.lot_sizing import LotSizer, _decimals_for_step
+from worker.gateways.forex.mt5.symbol_resolver import SymbolResolver
 
 
 def _sizer(mt5, config):

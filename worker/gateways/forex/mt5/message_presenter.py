@@ -1,6 +1,6 @@
 """
-worker/mt5/message_presenter.py
-───────────────────────────────
+worker/gateways/forex/mt5/message_presenter.py
+──────────────────────────────────────────────
 Builds the Telegram message strings for trade lifecycle events.
 
 Pulled out of ``Mt5SignalProcessor`` so message *formatting* is decoupled from
@@ -10,6 +10,7 @@ functions of their inputs — trivial to test without MT5, NATS, or a DB.
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 from worker.schemas.signal_schema import SignalSchema
@@ -85,6 +86,16 @@ class TradeMessagePresenter:
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
       f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
+      f"{_DIVIDER}\n"
+      f"{footer}"
+    )
+
+  @staticmethod
+  def signal_rejected(reason: str, footer: str) -> str:
+    return _box(
+      f"🚫 <b>Signal Rejected</b>\n\n"
+      f"A signal failed validation and was <b>NOT executed</b>.\n"
+      f"Reason: <b>{html.escape(reason)}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

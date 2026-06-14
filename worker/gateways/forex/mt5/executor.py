@@ -1,16 +1,16 @@
 ﻿from typing import Any, Dict, List, Optional
 
 from worker.gateways.config import ExecutionConfig
-from worker.gateways.mt5.lot_sizing import LotSizer
-from worker.gateways.mt5.stop_validator import StopValidator
-from worker.gateways.mt5.symbol_resolver import SymbolResolver
+from worker.gateways.forex.mt5.lot_sizing import LotSizer
+from worker.gateways.forex.mt5.stop_validator import StopValidator
+from worker.gateways.forex.mt5.symbol_resolver import SymbolResolver
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
 from worker.schemas.trade_result import TradeResult
 
-logger = get_logger("worker.mt5_executor")
+logger = get_logger("worker.gateways.forex.mt5.executor")
 
 _MT5_COMMENT_MAX = 31
 
@@ -221,11 +221,12 @@ class MT5Executor:
     if self._config.volume_decision_enabled:
       # Fixed capital mode: ignore payload quantity, derive lot from config
       if signal.sl:
-        risk = (
-          signal.risk_percent
-          if signal.risk_percent is not None
-          else self._config.risk_percentage
-        )
+        # A missing OR non-positive signal risk (upstream sends 0.0 when it has
+        # no opinion) means "unspecified": fall back to the configured
+        # RISK_PERCENTAGE. A literal 0% would otherwise zero risk_cash and floor
+        # every entry to the broker minimum lot regardless of CAPITAL/equity.
+        use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
+        risk = signal.risk_percent if use_signal_risk else self._config.risk_percentage
         # capital=None lets the LotSizer honor USE_ACCOUNT_EQUITY (size against
         # live account equity vs. the fixed configured CAPITAL); passing capital
         # explicitly here would bypass that setting.
@@ -237,7 +238,7 @@ class MT5Executor:
         )
         logger.info(
           f"[open_position] VOLUME_DECISION mode | {capital_src} "
-          f"risk={risk}% (source={'signal' if signal.risk_percent is not None else 'config'}) → lot={volume}"
+          f"risk={risk}% (source={'signal' if use_signal_risk else 'config'}) → lot={volume}"
         )
       else:
         sym_info = self._mt5.symbol_info(symbol)

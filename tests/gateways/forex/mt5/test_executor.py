@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 from helpers import FakeMt5, make_order_result, make_position, make_signal
 
-from worker.gateways.mt5.executor import MT5Executor
+from worker.gateways.forex.mt5.executor import MT5Executor
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -33,6 +33,17 @@ def test_open_position_sizes_against_account_equity_when_enabled(config):
   # equity=10000, risk=2% → risk_cash=200; SL dist=(2000-1990)/0.01=1000 pts;
   # point_value=1 → lot=200/1000=0.2 (vs 0.02 when sized off CAPITAL=1000).
   assert mt5.sent_requests[-1]["volume"] == 0.2
+
+
+def test_open_position_zero_signal_risk_falls_back_to_config(config):
+  """A signal carrying risk_percent=0.0 (upstream's "no opinion") must size off
+  the configured RISK_PERCENTAGE, not a literal 0% that floors the lot to min."""
+  mt5 = FakeMt5()
+  ex = _executor(mt5, config)
+  ex.open_position(make_signal(SignalActionEnum.LONG, risk_percent=0.0))
+  # config risk=2% on CAPITAL=1000 → risk_cash=20; SL dist=1000 pts → lot=0.02,
+  # NOT the 0.01 broker minimum a 0% risk would collapse to.
+  assert mt5.sent_requests[-1]["volume"] == 0.02
 
 
 def test_open_position_short_uses_bid(config):

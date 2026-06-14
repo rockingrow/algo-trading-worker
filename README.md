@@ -1,6 +1,6 @@
 # 🚀 Algo Trading Worker
 
-This is the execution-end of the Event-Driven trading system. It acts as a NATS subscriber waiting for highly structured trading signals from the central Broker, then executes them on the configured market gateway — **FOREX** via the MetaTrader 5 Terminal (Windows) or **CRYPTO** via a centralized exchange such as Binance (any OS, containerized). The market is selected by `MARKET_TYPE`, and the two paths share the same NATS/SQLite/notification core through a factory + Template-Method design.
+This is the execution-end of the Event-Driven trading system. It acts as a NATS subscriber waiting for highly structured trading signals from the central Broker, then executes them on the configured market gateway — **FOREX** via the MetaTrader 5 Terminal (Windows) or **CRYPTO** via a centralized exchange such as Binance (any OS). The market is selected by `MARKET_TYPE`, and the two paths share the same NATS/SQLite/notification core through a factory + Template-Method design.
 
 ---
 
@@ -11,7 +11,7 @@ This is the execution-end of the Event-Driven trading system. It acts as a NATS 
 Depends on the market:
 
 - **FOREX (`MARKET_TYPE=FOREX`)** must run on **Windows** — the `MetaTrader5` module and the MT5 terminal are Windows-only.
-- **CRYPTO (`MARKET_TYPE=CRYPTO`)** is pure Python (REST + websocket) and runs on **any OS**; the recommended deployment is the Docker setup below — see [🐳 Docker (Crypto worker)](#-docker-crypto-worker).
+- **CRYPTO (`MARKET_TYPE=CRYPTO`)** is pure Python (REST + websocket) and runs on **any OS** (Linux, macOS, Windows) — no MT5/MetaTrader5 dependency.
 
 ### 2. Setup
 
@@ -58,7 +58,7 @@ cp .env.example .env
 | `CAPITAL` | | `1000` | Notional capital used for lot-size calculation |
 | `CAPITAL_CURRENCY` | | `USC` | Currency of `CAPITAL` (informational, shown in startup notification) |
 | `RISK_PERCENTAGE` | | `3.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
-| `USE_ACCOUNT_EQUITY` | | `false` | When `true`, uses live account equity instead of `CAPITAL` for lot-size base |
+| `USE_ACCOUNT_EQUITY` | | `false` | When `true`, sizes entries against live account equity instead of the fixed `CAPITAL`. FOREX reads `account_info().equity` via MT5; CRYPTO reads `totalMarginBalance` from the exchange account endpoint. Falls back to symbol minimum quantity if equity cannot be read. No effect when `VOLUME_DECISION_ENABLED=false`. |
 | `POSITION_TP1_PERCENT` | | `30.0` | % of live volume closed at TP1 when `VOLUME_DECISION_ENABLED=true` |
 | **Telegram** | | | |
 | `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
@@ -90,9 +90,7 @@ The Worker initialises the `worker_data.sqlite` database, starts the market work
 - **FOREX** — in an isolated child **process** (GIL isolation for the MetaTrader5 C extension), supervised by a watchdog. Daemon threads inside it: MT5 health-check, `MT5EventJob` (terminal-close detection), and `PositionCDC`.
 - **CRYPTO** — in a background **thread** (the pure-Python gateway needs no process isolation). Daemon threads: `PositionCDC` and the exchange user-data event stream (Binance websocket).
 
-You can monitor the logs printed directly to the screen.
-
-> For CRYPTO on Linux, prefer the containerized setup, which runs the worker as a **single process** (`python -m worker.crypto_worker`, no FastAPI/uvicorn) — see [🐳 Docker (Crypto worker)](#-docker-crypto-worker).
+You can monitor the logs printed directly to the screen. Both markets start the same way (`make start`); `MARKET_TYPE` decides which gateway is loaded.
 
 ---
 
@@ -107,7 +105,7 @@ The `MARKET_TYPE` environment variable defines which trading market the worker o
 | `FOREX` | Foreign exchange — instruments like `XAUUSD`, `EURUSD`, etc. Execution goes through the **MT5** gateway (Windows only). |
 | `CRYPTO` | Cryptocurrency — perpetual futures on instruments like `BTCUSDT`. Execution goes through a **CEX** gateway (any OS). |
 
-The market type drives the entire execution path: which gateway is loaded, which environment variables are required, and whether the worker runs as a subprocess (FOREX) or a thread/container (CRYPTO).
+The market type drives the entire execution path: which gateway is loaded, which environment variables are required, and whether the worker runs as a subprocess (FOREX) or a background thread (CRYPTO).
 
 ### Gateway
 
@@ -115,47 +113,35 @@ A gateway is the integration layer between this worker and the actual trading pl
 
 | Market | Gateway | Technology |
 | --- | --- | --- |
-| `FOREX` | **MT5** (`worker/gateways/mt5/`) | MetaTrader 5 terminal via the `MetaTrader5` C extension. Windows-only. Managed as an isolated child process due to GIL constraints. |
+| `FOREX` | **MT5** (`worker/gateways/forex/mt5/`) | MetaTrader 5 terminal via the `MetaTrader5` C extension. Windows-only. Managed as an isolated child process due to GIL constraints. |
 | `CRYPTO` | **CEX** (`worker/gateways/crypto/`) | Centralized Exchange via REST + WebSocket. Exchange-agnostic by design — the first concrete implementation is **Binance** Futures (`worker/gateways/crypto/binance/`). Adding a new exchange only requires implementing `BaseExchangeGateway` and registering it in `ExchangeFactory`. |
 
 The selected gateway handles all order execution, position queries, and real-time event streaming (MT5 terminal events for FOREX; exchange user-data WebSocket for CRYPTO). Business logic above the gateway layer is market-agnostic.
 
 ---
 
-## 🐳 Docker (Crypto worker)
+## ⏰ Clock sync / NTP requirement (CRYPTO)
 
-The CRYPTO market runs on any OS, so it ships as a container. The MT5/FOREX
-worker is **not** containerized (it needs Windows + the MT5 terminal) and keeps
-its native Windows deployment.
+Binance rejects any **signed** request whose timestamp runs more than **1000 ms
+ahead** of server time (error `-1021`); `recvWindow` only forgives a clock that
+is *behind*, so it cannot rescue a fast clock. The worker self-defends — it
+measures the offset against Binance at `connect()` and re-syncs + retries once on
+a `-1021` — but that is a safety net, not a substitute for a correct host clock.
 
-`docker-compose.yml` brings up two services: a **NATS** broker and the **crypto
-worker** (`MARKET_TYPE=CRYPTO`).
+**Fix the source: keep the host clock disciplined by NTP.**
 
-```bash
-cp .env.example .env          # fill BINANCE_API_KEY / BINANCE_API_SECRET, NATS_SUBJECTS, TELEGRAM_*
-docker compose up -d --build  # or: make docker-up
-docker compose logs -f worker # or: make docker-logs
-```
+- **Linux host (VPS / server):** enable a time daemon —
+  `sudo timedatectl set-ntp true` (systemd-timesyncd), or install `chrony`
+  (`sudo apt install -y chrony && sudo systemctl enable --now chrony`). Verify
+  with `timedatectl` / `chronyc tracking`.
+- **Windows host:** make sure the Windows Time service is running and synced —
+  `w32tm /resync` (and `w32tm /query /status` to verify). Clocks commonly drift
+  after the machine sleeps/hibernates, the usual cause of `-1021` in dev.
 
-Notes:
-
-- **Single process.** The container runs the worker directly via
-  `python -m worker.crypto_worker` — no FastAPI/uvicorn and no multiprocessing
-  child. The crypto gateway is pure Python (REST + websocket threads), so the
-  GIL-isolating subprocess that MT5 needs is redundant here; dropping it keeps
-  the container minimal. `docker stop` (SIGTERM) triggers a graceful shutdown.
-- **Liveness via heartbeat.** With no HTTP server, the worker touches
-  `HEARTBEAT_FILE` (`/app/data/heartbeat`) every 15 s and the compose
-  healthcheck verifies it stays fresh; a hung worker goes `unhealthy`, a crashed
-  one is restarted by `restart: unless-stopped`.
-- The image installs from `uv.lock`; `MetaTrader5` is skipped automatically on
-  Linux (marked `sys_platform == 'win32'` in `pyproject.toml`), so the crypto
-  image carries no Forex dependency.
-- Compose overrides `NATS_URL=nats://nats:4222`, `MARKET_TYPE=CRYPTO`,
-  `DB_FILE=/app/data/worker_data.sqlite`, `HEARTBEAT_FILE=/app/data/heartbeat`;
-  the SQLite DB + heartbeat persist in the `worker-data` volume.
-- Point an external broker/strategy at the same NATS (`SIGNAL` / `ADMIN`
-  subjects). `4222` is mapped for a self-contained host.
+**Verify:** the worker logs the measured skew at startup —
+`[Binance] Clock offset vs server: <X> ms (rtt=… ms)`. After NTP is healthy this
+should be a few tens of ms (≈ rtt), not seconds. A large offset there, or
+repeated `-1021 … re-syncing` warnings, means the host clock is not disciplined.
 
 ---
 
@@ -220,15 +206,15 @@ credentials are **not** required. See `.env.example`.
 
 ---
 
-## 🧩 MT5 Gateway Module Flow (`worker/gateways/mt5/`)
+## 🧩 MT5 Gateway Module Flow (`worker/gateways/forex/mt5/`)
 
-How the files inside `worker/gateways/mt5/` wire together at runtime. `Mt5SignalProcessor` is the hub: it owns the connection (`bridge`), the order layer (`executor` + its three collaborators), the message formatter (`message_presenter`), and starts the background jobs. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
+How the files inside `worker/gateways/forex/mt5/` wire together at runtime. `Mt5SignalProcessor` is the hub: it owns the connection (`bridge`), the order layer (`executor` + its three collaborators), the message formatter (`message_presenter`), and starts the background jobs. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
 
 ```mermaid
 graph TD
     Manager["manager.py<br/>MT5Manager (parent process)"]
 
-    subgraph Child["Child process — worker/gateways/mt5/"]
+    subgraph Child["Child process — worker/gateways/forex/mt5/"]
         SP["signal_processor.py<br/>Mt5SignalProcessor — hub"]
         Bridge["bridge.py<br/>MT5 (terminal connection)"]
         Presenter["message_presenter.py<br/>TradeMessagePresenter"]
@@ -239,7 +225,7 @@ graph TD
         CloseDet["close_detector.py<br/>scan_terminal_closed_positions"]
     end
 
-    Manager -. "spawns child (mt5_worker)" .-> SP
+    Manager -. "spawns child (forex_worker)" .-> SP
 
     %% Composition — signal_processor builds the stack
     SP -. "owns" .-> Bridge
@@ -279,13 +265,14 @@ worker/
 │   ├── market_strategy.py        # MarketStrategyFactory + ExecutorBackedMarket / Forex / Crypto
 │   └── signal_handler.py         # Routes signals to the correct execution flow
 ├── gateways/            # External trading-platform integrations
-│   ├── mt5/             # FOREX — MetaTrader 5 (Windows only)
-│   │   ├── bridge.py                 # MT5 terminal connection bridge
-│   │   ├── executor.py               # MT5 trade execution primitives
-│   │   ├── close_detector.py         # Terminal-close event scanner (polling)
-│   │   ├── manager.py                # MT5Manager (alias of WorkerProcessManager)
-│   │   ├── message_presenter.py      # TradeMessagePresenter (Telegram strings)
-│   │   └── signal_processor.py       # Mt5SignalProcessor — MT5 hooks over the base
+│   ├── forex/           # FOREX — one subpackage per platform (mt6 slots in beside mt5)
+│   │   └── mt5/             # FOREX — MetaTrader 5 (Windows only)
+│   │       ├── bridge.py                 # MT5 terminal connection bridge
+│   │       ├── executor.py               # MT5 trade execution primitives
+│   │       ├── close_detector.py         # Terminal-close event scanner (polling)
+│   │       ├── manager.py                # MT5Manager (alias of WorkerProcessManager)
+│   │       ├── message_presenter.py      # TradeMessagePresenter (Telegram strings)
+│   │       └── signal_processor.py       # Mt5SignalProcessor — MT5 hooks over the base
 │   └── crypto/          # CRYPTO — centralized exchanges (CEX); any OS
 │       ├── base.py                   # BaseExchangeGateway (ABC) + ExchangePosition
 │       ├── executor.py               # CryptoExecutor (TradeExecutorProtocol)
@@ -332,8 +319,8 @@ worker/
 ├── market.py            # Gateway orchestrators (FOREX=process, CRYPTO=thread) + factory
 ├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
 ├── worker_runtime.py    # run_worker() — shared child-process bootstrap
-├── mt5_worker.py        # FOREX child-process entry point
-├── crypto_worker.py     # CRYPTO child-process entry point
+├── forex_worker.py      # FOREX child-process entry point
+├── crypto_worker.py     # CRYPTO worker entry point (background thread)
 └── settings.py          # Environment & app configuration (per-market validation)
 ```
 
@@ -438,7 +425,7 @@ All fields except `action` and `timestamp` are optional.
 
 - **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 
-- **GIL-isolated subprocess (FOREX only):** All MT5 and NATS blocking code runs in a separate OS process (`mt5_worker.mt5_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable. **CRYPTO** skips this entirely: the pure-Python gateway runs in a background thread (`ThreadGatewayOrchestrator`) under the app, or as a single process via `python -m worker.crypto_worker` in the container.
+- **GIL-isolated subprocess (FOREX only):** All MT5 and NATS blocking code runs in a separate OS process (`forex_worker.forex_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable. **CRYPTO** skips this entirely: the pure-Python gateway runs in a background thread (`ThreadGatewayOrchestrator`) under the app.
 
 - **Dependency-injection boundary — why only the executor takes an injected gateway:** The `MetaTrader5` module is a native C extension that exposes a single **process-global** connection — `mt5.initialize()` / `mt5.login()` mutate ambient process state, and every `mt5.*` call implicitly targets that one connection. There is no connection *object* to construct or pass around, and because the calls are GIL-blocking the connection is confined to the child process and its daemon threads (the parent FastAPI process never imports the module at all). This dictates where dependency injection actually pays off:
 
@@ -455,7 +442,7 @@ All fields except `action` and `timestamp` are optional.
 
 #### How it works
 
-Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/gateways/mt5/close_detector.py`), which:
+Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/gateways/forex/mt5/close_detector.py`), which:
 
 1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (all `STRATEGY_MAGIC_MAP` values, via `MT5Executor.owned_magics()`) → `current_tickets`
 2. Diffs against an internal `seen_tickets` set maintained across polls
@@ -538,7 +525,7 @@ Two notification paths intentionally bypass the outbox:
 1. **Startup / shutdown banners** sent via `ctx.direct_notifier` — must surface even before `NotificationJob` is running or after it has been torn down.
 2. **NATS connection events** still go through the outbox via `ctx.nats_enqueue`, but they use the `NATS_EVENT` category so they can be filtered out of analytics if desired.
 
-### MT5Executor Primitives (`worker/gateways/mt5/executor.py`)
+### MT5Executor Primitives (`worker/gateways/forex/mt5/executor.py`)
 
 | Method                                                        | Used By                                          |
 | ------------------------------------------------------------- | ------------------------------------------------ |
@@ -548,7 +535,7 @@ Two notification paths intentionally bypass the outbox:
 | `close_all_positions(symbol, reason, strategy?)`              | Full exit (Group 3) & broker FLAT                |
 | `close_single_position(pos, reason)`                          | Admin FLAT — closes one position by MT5 object   |
 | `get_open_positions(symbol, strategy?)`                       | Pre-flight guard in all groups                   |
-| `get_all_open_positions(strategy?)`                           | Admin FLAT — fetch all positions across symbols, optionally scoped by strategy |
+| `get_all_open_positions(strategy?)`                           | Admin FLAT — all positions, by strategy          |
 | `convert_quantity_to_lots(symbol, quantity)`                  | Entry & TP1 volume calc                          |
 | `calculate_lot_size(symbol, entry, sl, risk_pct)`             | Entry volume calc (risk-based)                   |
 | `normalize_volume(symbol, volume)`                            | Rounds/clamps volume to broker lot step & limits |
@@ -671,7 +658,7 @@ How the worker is hosted depends on the market (`create_market_orchestrator`):
           └── WorkerProcessManager.stop()   — on FastAPI shutdown
   ```
 
-- **CRYPTO** — no GIL isolation needed (pure-Python gateway), so it runs in a background **thread** when launched via the FastAPI app (`ThreadGatewayOrchestrator`, same watchdog/restart contract), or — in the container — as a **single process** via `python -m worker.crypto_worker` (no FastAPI, no thread orchestrator), with SIGTERM → graceful shutdown and a heartbeat file for liveness.
+- **CRYPTO** — no GIL isolation needed (pure-Python gateway), so it runs in a background **thread** under the FastAPI app (`ThreadGatewayOrchestrator`, same watchdog/restart contract as FOREX), launched the same way via `make start`.
 
 Daemon threads running alongside the NATS message loop:
 

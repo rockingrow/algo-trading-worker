@@ -36,6 +36,10 @@ class FakePresenter:
     return f"failed:{signal.action.value}"
 
   @staticmethod
+  def signal_rejected(reason, footer):
+    return f"rejected:{reason}"
+
+  @staticmethod
   def admin_flat_closed(db_pos, result, footer):
     return "admin_flat"
 
@@ -67,10 +71,14 @@ class FakeProcessor(BaseSignalProcessor):
     # algorithm can be exercised without a broker/NATS/factory.
     self.db = FakeDb()
     self.notifications = []
+    self.mgmt_notifications = []
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
         send_message=lambda m: self.notifications.append(m)
+      ),
+      notifier=SimpleNamespace(
+        send_message=lambda m: self.mgmt_notifications.append(m)
       ),
       direct_notifier=SimpleNamespace(send_message=lambda m: None),
     )
@@ -204,6 +212,39 @@ def test_admin_subject_routed_to_hook():
   proc._process_message(NatsSubjectEnum.ADMIN, '{"action":"FLAT"}')
   assert proc.admin_calls == ['{"action":"FLAT"}']
   assert proc.db.logged == []  # not treated as a signal
+
+
+def test_invalid_signal_notifies_operator_and_skips_execution():
+  """A signal that fails validation must not silently vanish: it never reaches
+  the handler/DB, and the operator is told *which* field was wrong via the
+  management channel (never the community channel or the raw payload)."""
+  proc = FakeProcessor({"success": True})
+  # Broker's nested-`position` format → `action` is missing at the top level.
+  raw = (
+    '{"strategy":"S","symbol":"X","timestamp":"2026-01-01T00:00:00",'
+    '"position":{"action":"LONG"}}'
+  )
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  # Never executed / persisted.
+  assert proc.db.logged == []
+  assert proc.db.inserted == []
+  # Nothing leaked to the community channel.
+  assert proc.notifications == []
+  # Operator alerted on the management channel, naming the offending field.
+  assert len(proc.mgmt_notifications) == 1
+  assert proc.mgmt_notifications[0].startswith("rejected:")
+  assert "action" in proc.mgmt_notifications[0]
+
+
+def test_malformed_json_signal_is_dropped_without_notification():
+  """Non-JSON payloads are logged and dropped — no notification path is taken
+  (only the ValidationError branch was wired for alerts)."""
+  proc = FakeProcessor({"success": True})
+  proc._process_message(NatsSubjectEnum.SIGNAL, "not-json{")
+  assert proc.db.logged == []
+  assert proc.mgmt_notifications == []
+  assert proc.notifications == []
 
 
 def test_not_connected_short_circuits():

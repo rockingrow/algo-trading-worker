@@ -1,6 +1,6 @@
 """
-worker/gateways/mt5/signal_processor.py
-───────────────────────────────────────
+worker/gateways/forex/mt5/signal_processor.py
+─────────────────────────────────────────────
 MT5/FOREX-specific signal processor.
 
 Implements the broker-specific hooks of
@@ -11,7 +11,7 @@ persistence, notifications, position CDC — is inherited from the base.
 
 All heavy MetaTrader5 imports are at module level, so this module must only be
 imported from the child process (lazy-imported inside
-:func:`worker.mt5_worker.mt5_worker_main`) — never by the parent FastAPI process.
+:func:`worker.forex_worker.forex_worker_main`) — never by the parent FastAPI process.
 """
 
 from __future__ import annotations
@@ -21,16 +21,16 @@ import time
 from typing import Any, Dict, Optional
 
 from worker.context import WorkerContext
-from worker.gateways.mt5.bridge import MT5
-from worker.gateways.mt5.executor import MT5Executor
-from worker.gateways.mt5.message_presenter import TradeMessagePresenter
+from worker.gateways.forex.mt5.bridge import MT5
+from worker.gateways.forex.mt5.executor import MT5Executor
+from worker.gateways.forex.mt5.message_presenter import TradeMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.jobs.mt5_event_job import MT5EventJob
 from worker.logger import get_logger
 from worker.services.notification_service import _box
 from worker.settings import MT5_HEALTH_INTERVAL
 
-log = get_logger("worker.gateways.mt5.signal_processor")
+log = get_logger("worker.gateways.forex.mt5.signal_processor")
 
 
 # ── Child-process helpers ────────────────────────────────────────────────── #
@@ -191,9 +191,16 @@ class Mt5SignalProcessor(BaseSignalProcessor):
   # ── ADMIN FLAT match keys (MT5 reconciles against live tickets) ───────── #
 
   def _flat_match_key(self, pos: Any) -> Any:
-    return pos.ticket
+    # The live MT5 ticket is an int, but ref_id/ref_source_id are stored as str
+    # throughout the app layer — normalise so the two sides actually compare equal.
+    return str(pos.ticket)
 
   def _flat_db_match_keys(self, db_pos: dict) -> set:
     # Check both ref_id and ref_source_id so re-ticketed positions (after a
-    # partial close) still match the live ticket.
-    return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}
+    # partial close) still match the live ticket. Already str, but coerce
+    # defensively and drop None so the set never carries a non-matching key.
+    return {
+      str(k)
+      for k in (db_pos.get("ref_id"), db_pos.get("ref_source_id"))
+      if k is not None
+    }

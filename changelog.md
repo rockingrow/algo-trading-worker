@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Renamed the FOREX gateway namespace to express market → platform.** `worker/gateways/mt5/` moved to `worker/gateways/forex/mt5/`, and `worker/mt5_worker.py` became `worker/forex_worker.py` (`mt5_worker_main` → `forex_worker_main`). This mirrors `worker/gateways/crypto/`: FOREX is the *market*, MT5 is one *platform* gateway under it, and a future platform (e.g. mt6) slots in as `worker/gateways/forex/mt6/`. Pure relocation/rename — no behaviour change. MT5 credentials (`MT5_*`) and all MetaTrader5 integration internals are unchanged; the FOREX child process is now named `worker_forex` and its shared-runtime lifecycle logs use the `[FOREX Process]` label.
+
+---
+
+## [1.3.0] — 2026-06-14
+
+### Removed
+
+- **Dropped the Docker deployment for the crypto worker.** Deleted `Dockerfile`, `docker-compose.yml`, `.dockerignore`, and the `make docker-*` targets. The containerized stack bundled its own NATS, which silently created a *second* NATS server: a local Broker publishing to the host NATS never reached the worker subscribed to the compose-internal `nats://nats:4222`. Both markets now deploy the same way — `make start`, with `MARKET_TYPE` selecting the gateway — so a single NATS is shared by the Broker and all workers.
+- **Removed the standalone crypto entry point.** `worker/crypto_worker.py` no longer defines `main()` / `_start_heartbeat()` (the container-only single-process runner + heartbeat-file liveness). It now mirrors `mt5_worker.py` — just `crypto_worker_main`, the binding used by the FastAPI thread orchestrator. Dropped the corresponding heartbeat tests.
+
+### Notes
+
+- CRYPTO still runs on **any OS** (pure Python, no MetaTrader5). It launches in a background thread under the FastAPI app (`ThreadGatewayOrchestrator`); FOREX keeps its child process. To deploy the crypto worker on a separate host, point its `NATS_URL` at the shared NATS the Broker publishes to.
+
+---
+
 ## [1.2.0] — 2026-06-07
 
 ### Changed
@@ -8,6 +29,11 @@
   - **REST → `binance_common.send_request`.** Every endpoint (orders, positions, account, exchangeInfo, mark price, cancel) goes through the official transport: HMAC signing, automatic timestamps, retries/backoff, typed rate-limit/error exceptions, and snake_case→wire conversion. We call `send_request` directly rather than the generated typed methods because the generated `new_order` cannot express `STOP_MARKET` / `closePosition` (needed for stop-losses), and going through one transport keeps every endpoint uniform.
   - **User Data Stream → official SDK websocket.** `BinanceUserDataStream` now drives `binance_sdk_derivatives_trading_usds_futures` (auto-reconnect/renew) and only manages the `listenKey` (start + 30-min keepalive). The pure, unit-tested `parse_order_trade_update` is unchanged; a small adapter unwraps the SDK's typed event back to the raw payload before parsing.
   - Fixed a latent bug surfaced during the swap: futures `exchangeInfo` returns *all* symbols (the `symbol` query is ignored), so `get_symbol_filter` now indexes the full list instead of assuming `symbols[0]`.
+  - **`USE_ACCOUNT_EQUITY` now works for both FOREX and CRYPTO.** The setting was defined and displayed in startup notifications but never actually applied to entry sizing on either market:
+  - **FOREX (`MT5Executor`):** `open_position` was force-passing `capital=config.capital` into `LotSizer.calculate_lot_size`, bypassing the `use_account_equity` branch that reads live `account_info().equity`. Removed the forced override so `LotSizer` now honours the flag as designed.
+  - **CRYPTO (`CryptoExecutor`):** Added `_risk_capital()` — mirrors `LotSizer`'s logic: returns live account equity (`totalMarginBalance` from the exchange account endpoint) when the flag is set, otherwise the fixed `CAPITAL`. If equity is required but cannot be read, falls back to the symbol's minimum quantity and logs an error, rather than silently sizing off the wrong base.
+  - **Crypto startup notification:** Added the missing `USE_ACCOUNT_EQUITY:` line to `CryptoMessagePresenter.startup()` to match the FOREX startup message.
+  - No behaviour change when `USE_ACCOUNT_EQUITY=false` (the default).
 
 ### Dependencies
 

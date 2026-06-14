@@ -113,7 +113,7 @@ def test_factory_rejects_unknown_market():
     create_market_orchestrator({"market_type": "OPTIONS"})
 
 
-# ── Standalone crypto entry point ──────────────────────────────────────────── #
+# ── Crypto worker entry point ───────────────────────────────────────────────── #
 
 
 def test_crypto_worker_main_uses_crypto_processor(monkeypatch):
@@ -132,33 +132,3 @@ def test_crypto_worker_main_uses_crypto_processor(monkeypatch):
 
   assert captured["factory"] is CryptoSignalProcessor
   assert captured["label"] == "Crypto"
-
-
-def test_heartbeat_writes_fresh_timestamp(tmp_path, monkeypatch):
-  import threading
-  import time
-
-  from worker.crypto_worker import _start_heartbeat
-
-  hb = tmp_path / "heartbeat"
-  monkeypatch.setenv("HEARTBEAT_FILE", str(hb))
-  stop = threading.Event()
-  _start_heartbeat(stop)
-  try:
-    for _ in range(100):  # wait up to ~2s for the first beat
-      if hb.exists():
-        break
-      time.sleep(0.02)
-    assert hb.exists()
-    assert time.time() - float(hb.read_text()) < 5  # a real, fresh timestamp
-  finally:
-    stop.set()
-
-
-def test_heartbeat_noop_without_env(monkeypatch):
-  import threading
-
-  from worker.crypto_worker import _start_heartbeat
-
-  monkeypatch.delenv("HEARTBEAT_FILE", raising=False)
-  _start_heartbeat(threading.Event())  # must not raise / not start a thread

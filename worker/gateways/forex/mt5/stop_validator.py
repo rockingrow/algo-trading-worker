@@ -1,6 +1,6 @@
 ﻿"""
-worker/mt5/stop_validator.py
-────────────────────────────
+worker/gateways/forex/mt5/stop_validator.py
+───────────────────────────────────────────
 Validates SL/TP levels against the broker's minimum stop distance, extracted
 from ``MT5Executor``.
 
@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
 
-logger = get_logger("worker.gateways.mt5.stop_validator")
+logger = get_logger("worker.gateways.forex.mt5.stop_validator")
 
 
 class StopValidator:

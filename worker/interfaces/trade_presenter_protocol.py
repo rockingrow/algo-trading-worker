@@ -3,7 +3,7 @@ worker/interfaces/trade_presenter_protocol.py
 ─────────────────────────────────────────────
 Contract for the per-market Telegram message presenters.
 
-Both :class:`~worker.gateways.mt5.message_presenter.TradeMessagePresenter` and
+Both :class:`~worker.gateways.forex.mt5.message_presenter.TradeMessagePresenter` and
 :class:`~worker.gateways.crypto.message_presenter.CryptoMessagePresenter` conform
 to this structurally, so
 :class:`~worker.gateways.processor.BaseSignalProcessor` renders
@@ -31,5 +31,7 @@ class TradePresenterProtocol(Protocol):
   ) -> str: ...
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str: ...
+  @staticmethod
+  def signal_rejected(reason: str, footer: str) -> str: ...
   @staticmethod
   def admin_flat_closed(db_pos: dict, result: dict, footer: str) -> str: ...

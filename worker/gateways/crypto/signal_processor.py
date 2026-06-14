@@ -10,7 +10,7 @@ crypto executor, and the exchange user-data event stream. Everything
 market-agnostic — the NATS loop, signal persistence, notifications, position CDC
 — is inherited from the base.
 
-This module imports **no** MetaTrader5 / ``worker.gateways.mt5.*`` code, so the
+This module imports **no** MetaTrader5 / ``worker.gateways.forex.mt5.*`` code, so the
 CRYPTO path never initializes any Forex dependency.
 """
 
