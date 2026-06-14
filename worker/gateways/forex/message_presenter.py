@@ -1,11 +1,13 @@
 """
-worker/gateways/forex/mt5/message_presenter.py
-──────────────────────────────────────────────
-Builds the Telegram message strings for trade lifecycle events.
+worker/gateways/forex/message_presenter.py
+──────────────────────────────────────────
+Builds the Telegram message strings for FOREX trade lifecycle events.
 
-Pulled out of ``Mt5SignalProcessor`` so message *formatting* is decoupled from
-signal *processing* and persistence (Single Responsibility). These are pure
-functions of their inputs — trivial to test without MT5, NATS, or a DB.
+Platform-agnostic (lots terminology, no MetaTrader5 dependency); it is the
+forex-market counterpart of ``CryptoMessagePresenter`` and is bound by
+``ForexSignalProcessor``. Message *formatting* is decoupled from signal
+*processing* and persistence (Single Responsibility). These are pure functions of
+their inputs — trivial to test without a platform, NATS, or a DB.
 """
 
 from __future__ import annotations
@@ -39,12 +41,12 @@ class TradeMessagePresenter:
       f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
     )
     return _box(
-      f"🟢 <b>[Connected] MT5 Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
+      f"🟢 <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
     )
 
   @staticmethod
   def shutdown(footer: str) -> str:
-    return _box(f"🛑 <b>[Disconnected] MT5 Worker</b>{footer}")
+    return _box(f"🛑 <b>[Disconnected] FOREX Worker</b>{footer}")
 
   @staticmethod
   def force_closed(symbol: str, strategy: str, fc: dict, footer: str) -> str:

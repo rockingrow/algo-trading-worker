@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- **Deleted `worker/crypto_worker.py` and `worker/forex_worker.py`.** Both were thin shims that only bound their processor to `run_worker`. The functions `crypto_worker_main` and `forex_worker_main` have been consolidated into `worker/market.py` (alongside the orchestrator classes that call them), making the dedicated entry-point files redundant. All internal cross-references (`worker_runtime.py` docstring, `gateways/forex/signal_processor.py` docstring, `README.md`, and tests) updated to reflect the new canonical location.
+
 ### Changed
 
 - **Renamed the FOREX gateway namespace to express market → platform.** `worker/gateways/mt5/` moved to `worker/gateways/forex/mt5/`, and `worker/mt5_worker.py` became `worker/forex_worker.py` (`mt5_worker_main` → `forex_worker_main`). This mirrors `worker/gateways/crypto/`: FOREX is the *market*, MT5 is one *platform* gateway under it, and a future platform (e.g. mt6) slots in as `worker/gateways/forex/mt6/`. Pure relocation/rename — no behaviour change. MT5 credentials (`MT5_*`) and all MetaTrader5 integration internals are unchanged; the FOREX child process is now named `worker_forex` and its shared-runtime lifecycle logs use the `[FOREX Process]` label.

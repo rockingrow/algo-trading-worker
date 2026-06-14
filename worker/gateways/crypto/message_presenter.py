@@ -3,7 +3,7 @@ worker/crypto/message_presenter.py
 ──────────────────────────────────
 Telegram message strings for the crypto worker's trade lifecycle events.
 
-Mirrors :class:`~worker.gateways.forex.mt5.message_presenter.TradeMessagePresenter` but with
+Mirrors :class:`~worker.gateways.forex.message_presenter.TradeMessagePresenter` but with
 exchange-appropriate labels (quantity instead of lots, exchange close reasons).
 Pure functions of their inputs — trivial to test without an exchange, NATS, or
 a DB.

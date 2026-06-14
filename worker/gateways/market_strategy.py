@@ -8,7 +8,7 @@ Architecture
   BaseMarketStrategy     Abstract interface every market must implement.
   ExecutorBackedMarket   Shared concrete logic for any market that drives an
                          executor satisfying ``TradeExecutorProtocol``.
-  ForexMarket            FOREX implementation backed by MT5Executor.
+  ForexMarket            FOREX implementation backed by ForexExecutor.
   CryptoMarket           CRYPTO implementation backed by CryptoExecutor.
   MarketStrategyFactory  Factory that reads ``settings.market_type`` and
                          returns the correct concrete strategy.
@@ -203,7 +203,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 
 
 class ForexMarket(ExecutorBackedMarket):
-  """FOREX / CFD market via MetaTrader 5 (backed by ``MT5Executor``)."""
+  """FOREX / CFD market via a trading platform (backed by ``ForexExecutor``)."""
 
 
 class CryptoMarket(ExecutorBackedMarket):
@@ -247,7 +247,7 @@ class MarketStrategyFactory:
         A :class:`MarketTypeEnum` (or its string value) selecting the market.
     executor:
         The broker executor. Must satisfy :class:`TradeExecutorProtocol`.
-        Required for both FOREX (``MT5Executor``) and CRYPTO (``CryptoExecutor``).
+        Required for both FOREX (``ForexExecutor``) and CRYPTO (``CryptoExecutor``).
     config:
         Execution/risk configuration. Required for every market.
     """

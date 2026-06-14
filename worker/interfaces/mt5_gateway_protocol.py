@@ -9,7 +9,7 @@ exposes the same handful of functions and constants — without this seam the
 executor could only be imported (let alone exercised) on Windows where the
 native ``MetaTrader5`` package is installable.
 
-Only the surface actually used by :class:`~worker.gateways.forex.mt5.executor.MT5Executor` and
+Only the surface actually used by :class:`~worker.gateways.forex.mt5.gateway.MT5Gateway` and
 its collaborators is declared here (Interface Segregation).
 """
 

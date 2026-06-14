@@ -1,7 +1,7 @@
 """
 worker/crypto/executor.py
 ─────────────────────────
-Crypto order executor — the CRYPTO counterpart of ``MT5Executor``.
+Crypto order executor — the CRYPTO counterpart of ``ForexExecutor``.
 
 Implements :class:`~worker.interfaces.executor_protocol.TradeExecutorProtocol`
 so :class:`~worker.gateways.market_strategy.CryptoMarket` drives it exactly like the

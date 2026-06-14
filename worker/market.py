@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 
 from worker.logger import get_logger
 from worker.settings import WATCHDOG_INTERVAL, MarketTypeEnum
+from worker.worker_runtime import run_worker
 
 log = get_logger("worker.market")
 
@@ -128,6 +129,40 @@ class ThreadGatewayOrchestrator(MarketOrchestrator):
           log.exception("[%s] Failed to restart worker thread: %s", self._label, exc)
 
 
+def crypto_worker_main(settings_dict: dict, stop_event) -> None:
+  """
+  Entry point for the CRYPTO worker.
+
+  The full worker lifecycle lives in :func:`worker.worker_runtime.run_worker`; this
+  module only binds the crypto processor. ``CryptoSignalProcessor`` is imported
+  *inside* the function so the crypto stack is loaded only on the CRYPTO path.
+
+  The crypto gateway is pure Python (signed REST + a websocket user-data stream,
+  both in daemon threads), so — unlike MT5 — it needs **no** GIL-isolating child
+  process: the FastAPI/uvicorn app (``make start``) runs it in a background thread
+  via the thread orchestrator. Nothing here imports ``worker.gateways.forex.mt5.*`` /
+  MetaTrader5 — the CRYPTO path carries no Forex dependencies.
+  """
+  from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
+
+  run_worker(CryptoSignalProcessor, settings_dict, stop_event, label="Crypto")
+
+
+def forex_worker_main(settings_dict: dict, stop_event) -> None:
+  """
+  Entry point for the FOREX child process.
+
+  The full child lifecycle lives in :func:`worker.worker_runtime.run_worker`; this
+  module only binds the FOREX platform processor. ``ForexSignalProcessor`` is
+  imported *inside* the function so the heavy MetaTrader5 stack is never loaded by
+  the parent FastAPI process. MT5 is the first platform serving the FOREX market;
+  future platforms live beside it under ``worker.gateways.forex.<platform>``.
+  """
+  from worker.gateways.forex.signal_processor import ForexSignalProcessor
+
+  run_worker(ForexSignalProcessor, settings_dict, stop_event, label="FOREX")
+
+
 def create_market_orchestrator(settings_dict: dict) -> MarketOrchestrator:
   """Build the orchestrator for the configured market.
 
@@ -142,15 +177,11 @@ def create_market_orchestrator(settings_dict: dict) -> MarketOrchestrator:
   market_type = settings_dict.get("market_type", MarketTypeEnum.FOREX)
 
   if market_type == MarketTypeEnum.FOREX:
-    from worker.forex_worker import forex_worker_main
-
     return GatewayProcessOrchestrator(
       settings_dict, forex_worker_main, label="FOREX", process_name="worker_forex"
     )
 
   if market_type == MarketTypeEnum.CRYPTO:
-    from worker.crypto_worker import crypto_worker_main
-
     return ThreadGatewayOrchestrator(settings_dict, crypto_worker_main, label="CRYPTO")
 
   raise ValueError(f"Unsupported MARKET_TYPE: {market_type!r}")

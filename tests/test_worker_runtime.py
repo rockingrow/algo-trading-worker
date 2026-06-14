@@ -113,11 +113,11 @@ def test_factory_rejects_unknown_market():
     create_market_orchestrator({"market_type": "OPTIONS"})
 
 
-# ── Crypto worker entry point ───────────────────────────────────────────────── #
+# ── Worker entry points (now in worker.market) ──────────────────────────────── #
 
 
 def test_crypto_worker_main_uses_crypto_processor(monkeypatch):
-  import worker.crypto_worker as cw
+  import worker.market as m
 
   captured = {}
 
@@ -125,10 +125,28 @@ def test_crypto_worker_main_uses_crypto_processor(monkeypatch):
     captured["factory"] = factory
     captured["label"] = label
 
-  monkeypatch.setattr(cw, "run_worker", fake_run)
-  cw.crypto_worker_main({}, object())
+  monkeypatch.setattr(m, "run_worker", fake_run)
+  m.crypto_worker_main({}, object())
 
   from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
 
   assert captured["factory"] is CryptoSignalProcessor
   assert captured["label"] == "Crypto"
+
+
+def test_forex_worker_main_uses_forex_processor(monkeypatch):
+  import worker.market as m
+
+  captured = {}
+
+  def fake_run(factory, settings, stop, *, label):
+    captured["factory"] = factory
+    captured["label"] = label
+
+  monkeypatch.setattr(m, "run_worker", fake_run)
+  m.forex_worker_main({}, object())
+
+  from worker.gateways.forex.signal_processor import ForexSignalProcessor
+
+  assert captured["factory"] is ForexSignalProcessor
+  assert captured["label"] == "FOREX"

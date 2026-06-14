@@ -225,7 +225,7 @@ graph TD
         CloseDet["close_detector.py<br/>scan_terminal_closed_positions"]
     end
 
-    Manager -. "spawns child (forex_worker)" .-> SP
+    Manager -. "spawns child (market.forex_worker_main)" .-> SP
 
     %% Composition — signal_processor builds the stack
     SP -. "owns" .-> Bridge
@@ -316,11 +316,9 @@ worker/
 ├── context.py           # WorkerContext — market-agnostic services (DB, notifiers, outbox)
 ├── logger.py            # Structured logging configuration
 ├── main.py              # Application entry point
-├── market.py            # Gateway orchestrators (FOREX=process, CRYPTO=thread) + factory
+├── market.py            # Gateway orchestrators (FOREX=process, CRYPTO=thread) + worker entry points + factory
 ├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
 ├── worker_runtime.py    # run_worker() — shared child-process bootstrap
-├── forex_worker.py      # FOREX child-process entry point
-├── crypto_worker.py     # CRYPTO worker entry point (background thread)
 └── settings.py          # Environment & app configuration (per-market validation)
 ```
 
@@ -425,7 +423,7 @@ All fields except `action` and `timestamp` are optional.
 
 - **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 
-- **GIL-isolated subprocess (FOREX only):** All MT5 and NATS blocking code runs in a separate OS process (`forex_worker.forex_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable. **CRYPTO** skips this entirely: the pure-Python gateway runs in a background thread (`ThreadGatewayOrchestrator`) under the app.
+- **GIL-isolated subprocess (FOREX only):** All MT5 and NATS blocking code runs in a separate OS process (`market.forex_worker_main`, via the shared `worker_runtime.run_worker`). The parent FastAPI process only manages subprocess lifetime via `GatewayProcessOrchestrator` + the generic `WorkerProcessManager` (`MT5Manager` is a thin alias), keeping the event loop fully responsive. The manager accepts a `worker_fn` parameter so the entry point is injectable and testable. **CRYPTO** skips this entirely: the pure-Python gateway runs in a background thread (`ThreadGatewayOrchestrator`) under the app.
 
 - **Dependency-injection boundary — why only the executor takes an injected gateway:** The `MetaTrader5` module is a native C extension that exposes a single **process-global** connection — `mt5.initialize()` / `mt5.login()` mutate ambient process state, and every `mt5.*` call implicitly targets that one connection. There is no connection *object* to construct or pass around, and because the calls are GIL-blocking the connection is confined to the child process and its daemon threads (the parent FastAPI process never imports the module at all). This dictates where dependency injection actually pays off:
 

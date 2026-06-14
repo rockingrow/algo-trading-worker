@@ -1,6 +1,6 @@
 from helpers import make_signal
 
-from worker.gateways.forex.mt5.message_presenter import (
+from worker.gateways.forex.message_presenter import (
   TradeMessagePresenter,
   format_volume,
 )
@@ -61,7 +61,7 @@ def test_startup_message_includes_config():
     "position_tp1_percent": 30,
   }
   msg = TradeMessagePresenter.startup(settings_dict, "FOOTER")
-  assert "MT5 Worker" in msg
+  assert "FOREX Worker" in msg
   assert "RISK_PERCENTAGE" in msg
   assert "FOOTER" in msg
 

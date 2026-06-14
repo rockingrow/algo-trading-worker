@@ -25,6 +25,17 @@ class CryptoExchangeEnum(str, Enum):
   BINANCE = "BINANCE"
 
 
+class ForexPlatformEnum(str, Enum):
+  """Supported FOREX trading platforms.
+
+  The factory in :mod:`worker.gateways.forex.factory` maps each member to a concrete
+  :class:`~worker.gateways.forex.base.BasePlatformGateway`, so adding a platform
+  (e.g. MT6) means adding a member here and a gateway — no call site changes.
+  """
+
+  MT5 = "MT5"
+
+
 NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN}
 WATCHDOG_INTERVAL = 10  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
@@ -46,6 +57,7 @@ class Settings(BaseSettings):
   # MT5 Credentials — required only when MARKET_TYPE == FOREX. They are optional
   # at the field level so a pure CRYPTO deployment never has to set them (and the
   # MT5 / MetaTrader5 stack is never initialized). See the model validator below.
+  forex_platform: ForexPlatformEnum = ForexPlatformEnum.MT5
   mt5_server: Optional[str] = None
   mt5_login: Optional[int] = None
   mt5_password: Optional[str] = None

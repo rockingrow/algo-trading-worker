@@ -3,7 +3,7 @@ worker/interfaces/trade_presenter_protocol.py
 ─────────────────────────────────────────────
 Contract for the per-market Telegram message presenters.
 
-Both :class:`~worker.gateways.forex.mt5.message_presenter.TradeMessagePresenter` and
+Both :class:`~worker.gateways.forex.message_presenter.TradeMessagePresenter` and
 :class:`~worker.gateways.crypto.message_presenter.CryptoMessagePresenter` conform
 to this structurally, so
 :class:`~worker.gateways.processor.BaseSignalProcessor` renders
