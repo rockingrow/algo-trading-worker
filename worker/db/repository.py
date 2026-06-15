@@ -64,7 +64,11 @@ class PositionRepository:
               INSERT INTO position_logs (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
-        (strategy, ref_id, ref_source_id, symbol, action, volume, round(price, 2) if price is not None else None, sl, tp1, gateway_return_code, comment, message, author, market_type),
+        # Store the broker-native price as-is. Rounding to 2 decimals (a forex-era
+        # assumption) corrupts low-priced crypto (e.g. SHIB → 0.00) and is
+        # inconsistent with sl/tp1, which are already stored unrounded. The caller
+        # supplies a price already quantized to the instrument's tick.
+        (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, message, author, market_type),
       )
       conn.commit()
       logger.debug(f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}")
@@ -97,7 +101,8 @@ class PositionRepository:
               INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
-        (ref_id, ref_id, strategy, symbol, action, volume, round(opened_price, 2), "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
+        # Broker-native price, no rounding — see log_position for the rationale.
+        (ref_id, ref_id, strategy, symbol, action, volume, opened_price, "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
       )
       conn.commit()
       logger.debug(f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}")
@@ -139,7 +144,8 @@ class PositionRepository:
                   updated_at = CURRENT_TIMESTAMP
               WHERE ref_source_id = ?
           """,
-        (status.value, ref_id, round(closed_price, 2) if closed_price is not None else None, gateway_return_code, comment, message, ref_source_id),
+        # Broker-native close price, no rounding — see log_position for the rationale.
+        (status.value, ref_id, closed_price, gateway_return_code, comment, message, ref_source_id),
       )
       conn.commit()
       logger.debug(f"Position updated: ref_source_id={ref_source_id}, new ref_id={ref_id}, status={status}")

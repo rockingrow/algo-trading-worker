@@ -1,6 +1,6 @@
 """
 Tests for the *real* MT5 ADMIN FLAT match-key hooks
-(``Mt5SignalProcessor._flat_match_key`` / ``_flat_db_match_keys``).
+(``ForexSignalProcessor._flat_match_key`` / ``_flat_db_match_keys``).
 
 The broker-agnostic FLAT skeleton itself is covered by
 ``tests/gateways/test_admin_flat.py``, but that suite *fakes* the per-market
@@ -14,7 +14,7 @@ mis-reconciled as "position not found on MT5". These tests pin the real hooks
 import json
 from types import SimpleNamespace
 
-from worker.gateways.forex.mt5.signal_processor import Mt5SignalProcessor
+from worker.gateways.forex.signal_processor import ForexSignalProcessor
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.position_schema import PositionStatusEnum
 
@@ -23,11 +23,11 @@ from worker.schemas.position_schema import PositionStatusEnum
 
 def _match_key(ticket):
   # The hooks don't touch self, so call them unbound with self=None.
-  return Mt5SignalProcessor._flat_match_key(None, SimpleNamespace(ticket=ticket))
+  return ForexSignalProcessor._flat_match_key(None, SimpleNamespace(ticket=ticket))
 
 
 def _db_keys(ref_id, ref_source_id):
-  return Mt5SignalProcessor._flat_db_match_keys(
+  return ForexSignalProcessor._flat_db_match_keys(
     None, {"ref_id": ref_id, "ref_source_id": ref_source_id}
   )
 
@@ -88,15 +88,15 @@ class _FakeProc:
   """Drives the base FLAT handler through the REAL MT5 match-key hooks."""
 
   # Real per-market hooks — this is the seam the shared suite fakes.
-  _flat_match_key = Mt5SignalProcessor._flat_match_key
-  _flat_db_match_keys = Mt5SignalProcessor._flat_db_match_keys
+  _flat_match_key = ForexSignalProcessor._flat_match_key
+  _flat_db_match_keys = ForexSignalProcessor._flat_db_match_keys
   # Real broker-agnostic skeleton.
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
 
   def __init__(self, db_positions, positions, close_result):
-    self.name = "MT5"
+    self.name = "FOREX"
     self.presenter = SimpleNamespace(
       admin_flat_closed=lambda db_pos, result, footer: f"Admin FLAT {db_pos['symbol']}"
     )

@@ -70,6 +70,32 @@ def test_update_status_matches_by_ref_source_id(repo):
   assert pos["ref_source_id"] == "100"
 
 
+def test_prices_persisted_without_lossy_rounding(repo):
+  """Regression: prices must keep full precision. A 2-decimal round (forex-era)
+  collapsed low-priced crypto (e.g. SHIB ~0.00002345 → 0.00), corrupting the
+  stored opened/closed price and every downstream PositionEvent."""
+  entry = 0.00002345
+  close = 0.00002567
+  repo.insert_position(
+    ref_id="42", strategy="strat-a", symbol="SHIBUSD", action="long",
+    volume=1_000_000.0, opened_price=entry,
+  )
+  repo.update_position_status(
+    ref_source_id="42", status=PositionStatusEnum.SL, closed_price=close,
+  )
+  pos = repo.get_position("42")
+  assert pos["opened_price"] == entry  # not rounded to 0.0
+  assert pos["closed_price"] == close
+
+  repo.log_position(
+    strategy="strat-a", ref_id="42", ref_source_id="42", symbol="SHIBUSD",
+    action="SL", volume=1_000_000.0, price=close, sl=None, tp1=None,
+    gateway_return_code=0, comment="", market_type="CRYPTO",
+  )
+  rows = _raw(settings.db_file, "SELECT price FROM position_logs")
+  assert rows[0]["price"] == close
+
+
 def test_log_position_persists_generic_columns(repo):
   repo.log_position(
     strategy="strat-a", ref_id="5", ref_source_id="5", symbol="XAUUSD",
