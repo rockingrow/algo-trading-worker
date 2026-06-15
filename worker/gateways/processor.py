@@ -120,11 +120,14 @@ class BaseSignalProcessor(ABC):
       log.error("[%s Process] Could not connect to broker. Exiting.", self.name)
       return False
 
+    _tok = self.settings.get("nats_token")
+    nats_token = _tok.get_secret_value() if _tok is not None else None
+
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
       subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
       publish_subjects=[NatsSubjectEnum.TRADE],
-      token=self.settings.get("nats_token"),
+      token=nats_token,
       account_footer_fn=self._account_footer,
       enqueue_fn=self.ctx.nats_enqueue,
     )
@@ -133,7 +136,7 @@ class BaseSignalProcessor(ABC):
     self.publisher = NATSPublisher(
       url=self.settings["nats_url"],
       publish_subjects=[NatsSubjectEnum.TRADE],
-      token=self.settings.get("nats_token"),
+      token=nats_token,
     )
     self.publisher.connect()
 

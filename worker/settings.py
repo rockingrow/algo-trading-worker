@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional
 
-from pydantic import field_validator, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -49,7 +49,7 @@ class Settings(BaseSettings):
 
   # NATS
   nats_url: str
-  nats_token: Optional[str] = None
+  nats_token: Optional[SecretStr] = None
   nats_subjects: str
 
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
@@ -60,15 +60,15 @@ class Settings(BaseSettings):
   forex_platform: ForexPlatformEnum = ForexPlatformEnum.MT5
   mt5_server: Optional[str] = None
   mt5_login: Optional[int] = None
-  mt5_password: Optional[str] = None
+  mt5_password: Optional[SecretStr] = None
   mt5_path: Optional[str] = None
   mt5_name: Optional[str] = None
 
   # Crypto CEX — required only when MARKET_TYPE == CRYPTO.
   crypto_exchange: CryptoExchangeEnum = CryptoExchangeEnum.BINANCE
   crypto_quote_asset: str = "USDT"  # quote currency appended to bare symbols
-  binance_api_key: Optional[str] = None
-  binance_api_secret: Optional[str] = None
+  binance_api_key: Optional[SecretStr] = None
+  binance_api_secret: Optional[SecretStr] = None
   binance_account_id: Optional[str] = None
   binance_testnet: bool = False
   # Binance USDⓈ-M futures use netting mode: all strategies on the same symbol
@@ -91,7 +91,7 @@ class Settings(BaseSettings):
 
   # Telegram
   telegram_enabled: bool
-  telegram_bot_token: str
+  telegram_bot_token: SecretStr
   telegram_chat_id: str  # management: NATS events, service start/stop, MT5 health
   telegram_chat_channel_id: list[str] = []  # signals: order fills/failures, terminal closes
 
@@ -118,7 +118,7 @@ class Settings(BaseSettings):
 
   # Broker
   broker_api_url: str
-  broker_api_key: str
+  broker_api_key: SecretStr
 
   @model_validator(mode="after")
   def _validate_market_requirements(self):

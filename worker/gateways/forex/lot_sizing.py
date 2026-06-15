@@ -17,6 +17,7 @@ the global ``settings`` singleton (Dependency Inversion).
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from typing import Optional
 
 from worker.gateways.config import ExecutionConfig
@@ -29,12 +30,11 @@ logger = get_logger("worker.gateways.forex.lot_sizing")
 def _decimals_for_step(step: float) -> int:
   """Number of decimal places implied by a volume step (e.g. 0.01 -> 2).
 
-  Prevents floating-point artifacts like 0.020000000000000004 from causing
-  platform errors.
+  Uses Decimal to handle sci-notation repr (e.g. 1e-5) that would IndexError
+  a naive str.split('.') approach.
   """
-  if step >= 1.0:
-    return 0
-  return len(str(step).rstrip("0").split(".")[1])
+  exp = Decimal(str(step)).normalize().as_tuple().exponent
+  return max(0, -exp)
 
 
 class LotSizer:
@@ -59,6 +59,10 @@ class LotSizer:
     risk_cash = capital * (risk_percent / 100.0)
 
     point = spec.point
+    if point <= 0:
+      logger.error("Symbol spec has invalid point value. Falling back to minimum lot size.")
+      return spec.volume_min
+
     sl_distance_points = abs(entry_price - sl_price) / point
 
     if sl_distance_points <= 0:

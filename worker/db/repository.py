@@ -10,10 +10,8 @@ The physical ``positions`` / ``position_logs`` columns are gateway-neutral
 generic names, so there is no name translation here.
 
 The one boundary concern this repository owns is id representation: ``ref_id`` /
-``ref_source_id`` are stored as TEXT (so any gateway's id format fits) and parsed
-text↔int here — written via :func:`~worker.utils.parsing.int_to_string` and read
-back as ``int`` via :func:`~worker.utils.parsing.string_to_int` in
-:meth:`PositionRepository._row_to_dict`.
+``ref_source_id`` are stored as TEXT (so any gateway's id format fits) and
+returned as strings; callers cast to their preferred numeric type as needed.
 """
 
 import sqlite3

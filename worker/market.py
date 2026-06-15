@@ -19,13 +19,13 @@ class MarketOrchestrator(ABC):
 
 
 class GatewayProcessOrchestrator(MarketOrchestrator):
-  """Supervises a market's worker child process.
+  """Supervises a market's worker in a **child process** (FOREX only).
 
-  Both markets spawn a child process (so the GIL-holding MT5 extension or a
-  long-lived websocket loop never blocks the FastAPI event loop) and supervise it
-  with the same watchdog/restart loop — only the worker function, label, and
-  process name differ. Parameterizing those collapses what used to be two nearly
-  identical orchestrator classes into one (composition over duplication).
+  FOREX requires GIL isolation because the MetaTrader5 C extension blocks the
+  interpreter; spawning a child process keeps the FastAPI event loop responsive.
+  Only the worker function, label, and process name differ between deployments —
+  parameterizing those collapses what used to be two nearly identical classes.
+  CRYPTO uses :class:`ThreadGatewayOrchestrator` instead (pure-Python, no GIL issue).
   """
 
   def __init__(

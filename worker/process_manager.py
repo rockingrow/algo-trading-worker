@@ -8,8 +8,9 @@ extension (the MetaTrader5 C extension for FOREX) or a long-lived
 websocket/REST loop (for CRYPTO) never freezes the FastAPI/uvicorn event loop.
 
 Market-agnostic: it only manages the subprocess lifetime. All broker/exchange
-specifics live in the worker function executed inside the child process. Both
-:class:`ForexMarketOrchestrator` and :class:`CryptoMarketOrchestrator` use it.
+specifics live in the worker function executed inside the child process.
+:class:`~worker.market.GatewayProcessOrchestrator` (FOREX) uses this; CRYPTO
+runs via :class:`~worker.market.ThreadGatewayOrchestrator` (thread, not process).
 """
 
 from __future__ import annotations

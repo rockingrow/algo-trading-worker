@@ -237,18 +237,25 @@ class MT5Gateway(BasePlatformGateway):
     logger.info(f"[close_position] Closing ticket {position.ticket}, vol={close_volume}")
     result = self._mt5.order_send(request)
 
-    if result and result.retcode == self._mt5.TRADE_RETCODE_DONE:
-      logger.info(f"[close_position] Closed ticket {position.ticket} successfully")
-      return TradeResult.ok(
-        retcode=result.retcode,
-        ticket=str(result.order),
-        price=result.price,
-        volume=result.volume,
+    if result is None:
+      logger.error(f"[close_position] order_send failed. error: {self._mt5.last_error()}")
+      return TradeResult.fail(
+        "Close Failed", retcode=_mt5_error_code(self._mt5.last_error())
       )
 
-    err = result.comment if result else self._mt5.last_error()
-    logger.error(f"[close_position] Failed to close ticket {position.ticket}. Error: {err}")
-    return TradeResult.fail(str(err))
+    if result.retcode != self._mt5.TRADE_RETCODE_DONE:
+      logger.error(
+        f"[close_position] Rejected, retcode={result.retcode}, comment: {result.comment}"
+      )
+      return TradeResult.fail(result.comment, retcode=result.retcode)
+
+    logger.info(f"[close_position] Closed ticket {position.ticket} successfully")
+    return TradeResult.ok(
+      retcode=result.retcode,
+      ticket=str(result.order),
+      price=result.price,
+      volume=result.volume,
+    )
 
   def modify_sl(self, position: PlatformPosition, new_sl: float) -> TradeResult:
     request: Dict[str, Any] = {

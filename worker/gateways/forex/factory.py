@@ -28,7 +28,7 @@ def _build_mt5(settings_dict: dict) -> BasePlatformGateway:
   return MT5Gateway(
     server=settings_dict["mt5_server"],
     login=settings_dict["mt5_login"],
-    password=settings_dict["mt5_password"],
+    password=settings_dict["mt5_password"].get_secret_value(),
     path=settings_dict.get("mt5_path"),
     slippage_deviation=settings_dict["slippage_deviation"],
   )
