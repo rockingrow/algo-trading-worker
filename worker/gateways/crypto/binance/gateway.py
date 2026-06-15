@@ -22,6 +22,7 @@ official SDK — see :mod:`worker.gateways.crypto.binance.user_data_stream`.
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -245,6 +246,22 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     data = self._send("GET", _API_Endpoints.PREMIUM_INDEX, {"symbol": symbol})
     return float(data["markPrice"])
 
+  def _round_to_tick(self, symbol: str, price: float) -> float:
+    """Snap *price* to the symbol's ``tick_size`` grid.
+
+    Binance rejects any order price that is not an exact multiple of the
+    symbol's PRICE_FILTER tick with -1111 ("Precision is over the maximum
+    defined for this asset"). A round SL like 63500 passes by luck, but a
+    breakeven stop placed at a live entry price (e.g. 63764.73) does not — so
+    every price we send to the wire must be snapped here first.
+    """
+    tick = self.get_symbol_filter(symbol).tick_size
+    if not tick or tick <= 0:
+      return price
+    steps = round(price / tick)
+    decimals = max(0, -Decimal(str(tick)).normalize().as_tuple().exponent)
+    return round(steps * tick, decimals)
+
   # ── Positions ─────────────────────────────────────────────────────────── #
 
   def get_positions(self, symbol: Optional[str] = None) -> List[ExchangePosition]:
@@ -291,6 +308,10 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "side": order_side,
       "type": "MARKET",
       "quantity": quantity,
+      # Ask for the filled order back (avgPrice / executedQty). The default ACK
+      # response omits both, so without this the recorded fill price and volume
+      # are persisted as 0 — corrupting the DB row and every downstream event.
+      "new_order_resp_type": "RESULT",
     }
     if reduce_only:
       payload["reduce_only"] = "true"
@@ -319,7 +340,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "symbol": symbol,
       "side": _CLOSE_SIDE.get(position_side, "SELL"),
       "type": "STOP_MARKET",
-      "trigger_price": stop_price,
+      # Snap to tick_size — an off-grid trigger price is rejected with -1111.
+      "trigger_price": self._round_to_tick(symbol, stop_price),
       "close_position": "true",
     }
     try:

@@ -93,6 +93,35 @@ class TradeMessagePresenter:
     )
 
   @staticmethod
+  def position_unprotected_closed(
+    signal: SignalSchema, result: dict, footer: str
+  ) -> str:
+    """Breakeven SL after TP1 could not be placed; the now-unprotected position
+    was force-closed (or the close itself failed — manual action needed)."""
+    failsafe = result.get("sl_failsafe_close") or {}
+    sl_res = result.get("sl_update") or {}
+    if failsafe.get("success"):
+      head = "🛡️ <b>Unprotected Position — Emergency Closed</b>"
+      outcome = (
+        f"Closed: <b>{failsafe.get('volume')}</b> @ <b>{failsafe.get('price')}</b>\n"
+      )
+    else:
+      head = "🚨 <b>UNPROTECTED POSITION — STILL OPEN</b>"
+      outcome = (
+        f"Emergency close <b>FAILED</b>: {failsafe.get('comment')}\n"
+        f"<b>Manual intervention required.</b>\n"
+      )
+    return _box(
+      f"{head}\n\n"
+      f"Symbol: <b>{signal.symbol}</b>\n"
+      f"Strategy: <b>{signal.strategy}</b>\n"
+      f"Reason: breakeven SL failed (<b>{sl_res.get('comment')}</b>)\n"
+      f"{outcome}"
+      f"{_DIVIDER}\n"
+      f"{footer}"
+    )
+
+  @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
       f"🚫 <b>Signal Rejected</b>\n\n"

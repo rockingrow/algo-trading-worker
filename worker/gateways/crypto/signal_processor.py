@@ -29,6 +29,7 @@ from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
+from worker.settings import CryptoExchangeEnum
 
 log = get_logger("worker.gateways.crypto.signal_processor")
 
@@ -69,7 +70,11 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   @property
   def _account_id(self) -> str:
-    return str(self.settings.get("crypto_exchange", "CRYPTO"))
+    # str(CryptoExchangeEnum.BINANCE) yields "CryptoExchangeEnum.BINANCE" (the
+    # Enum __str__), not "BINANCE" — use .value so the published account_id is the
+    # bare exchange name that downstream upsert keys on.
+    exchange = self.settings.get("crypto_exchange", "CRYPTO")
+    return exchange.value if isinstance(exchange, CryptoExchangeEnum) else str(exchange)
 
   def _magic_for(self, strategy: str) -> Optional[int]:
     return None  # crypto exchanges have no magic-number equivalent

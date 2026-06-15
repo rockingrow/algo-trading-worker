@@ -172,8 +172,39 @@ class ExecutorBackedMarket(BaseMarketStrategy):
       position_ticket=pos.ticket,
       strategy=signal.strategy,
     )
-
     close_result["sl_update"] = sl_result
+
+    if not sl_result.get("success"):
+      # Safety invariant: a live position must never run without a protective
+      # stop. The breakeven SL could not be placed, so the remaining volume is
+      # now unprotected — close it immediately rather than let it run naked.
+      logger.critical(
+        "[handle_tp1] Breakeven SL FAILED (%s) for %s — remaining position is "
+        "unprotected; closing it immediately.",
+        sl_result.get("comment"),
+        symbol,
+      )
+      failsafe = self._executor.close_all_positions(
+        symbol, reason="SL_FAILSAFE", strategy=signal.strategy
+      )
+      close_result["sl_failsafe_close"] = failsafe
+      if failsafe.get("success"):
+        close_result["comment"] = (
+          f"TP1 partial filled but breakeven SL failed "
+          f"({sl_result.get('comment')}) — unprotected position emergency-closed"
+        )
+      else:
+        logger.critical(
+          "[handle_tp1] FAILSAFE CLOSE FAILED for %s (%s) — position is OPEN "
+          "WITHOUT a stop. Manual intervention required.",
+          symbol,
+          failsafe.get("comment"),
+        )
+        close_result["comment"] = (
+          f"UNPROTECTED POSITION: breakeven SL failed ({sl_result.get('comment')}) "
+          f"AND emergency close failed ({failsafe.get('comment')}) — close manually"
+        )
+
     return close_result
 
   # ── Group 3 ──────────────────────────────────────────────────────────── #

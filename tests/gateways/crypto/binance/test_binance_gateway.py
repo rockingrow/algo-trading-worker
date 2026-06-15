@@ -74,6 +74,8 @@ def test_place_market_order_open_long(monkeypatch):
   assert "reduce_only" not in c["payload"]
   assert c["payload"]["new_client_order_id"] == "x-1"
   assert c["payload"]["recv_window"] == 5000  # added for signed requests
+  # RESULT response type so the fill (avgPrice/executedQty) comes back, not ACK.
+  assert c["payload"]["new_order_resp_type"] == "RESULT"
 
 
 def test_place_market_order_reduce_only_long_sells(monkeypatch):
@@ -100,6 +102,14 @@ def test_set_stop_loss_is_conditional_algo_order_close_position(monkeypatch):
   assert c["payload"]["close_position"] == "true"
   assert "stop_price" not in c["payload"]      # legacy field must not leak through
   assert "quantity" not in c["payload"]        # closePosition forbids quantity
+
+
+def test_set_stop_loss_snaps_trigger_price_to_tick(monkeypatch):
+  # A breakeven stop at a live entry price (63764.73) is off the 0.10 tick grid;
+  # Binance rejects off-grid prices with -1111, so the gateway must snap it first.
+  gw, calls = make_gateway(monkeypatch)
+  gw.set_stop_loss("BTCUSDT", SIDE_LONG, stop_price=63764.73, quantity=0.02)
+  assert calls[-1]["payload"]["trigger_price"] == 63764.7
 
 
 def test_get_positions_maps_and_filters_zero(monkeypatch):

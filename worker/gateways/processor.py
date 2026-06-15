@@ -231,9 +231,15 @@ class BaseSignalProcessor(ABC):
 
     if result.get("success"):
       self._persist_success(signal, result, footer)
-      msg = self.presenter.order_filled(
-        signal, result, result.get("source_ticket") or result.get("ticket"), footer
-      )
+      if result.get("sl_failsafe_close") is not None:
+        # A breakeven SL could not be placed and the position was force-closed
+        # (or could not be) to avoid running unprotected — alert loudly instead
+        # of reporting a normal fill.
+        msg = self.presenter.position_unprotected_closed(signal, result, footer)
+      else:
+        msg = self.presenter.order_filled(
+          signal, result, result.get("source_ticket") or result.get("ticket"), footer
+        )
     else:
       msg = self.presenter.order_failed(signal, result, footer)
     self.ctx.channel_notifier.send_message(msg)
@@ -264,12 +270,21 @@ class BaseSignalProcessor(ABC):
       )
     else:
       status = _CLOSE_STATUS_MAP.get(action_val)
+      closed_price = result.get("price")
+      # If a breakeven SL failed and the now-unprotected position was
+      # emergency-closed, it is fully flat — persist it as FORCED_CLOSED rather
+      # than a still-open TP1 partial. (A failed failsafe close leaves the row at
+      # its mapped status; the comment flags it for manual attention.)
+      failsafe = result.get("sl_failsafe_close")
+      if failsafe is not None and failsafe.get("success"):
+        status = PositionStatusEnum.FORCED_CLOSED
+        closed_price = failsafe.get("price") or closed_price
       if status:
         self.ctx.db_service.update_position_status(
           ref_source_id=pos_ticket,
           status=status,
           ref_id=result.get("ticket"),
-          closed_price=result.get("price"),
+          closed_price=closed_price,
           gateway_return_code=result.get("retcode"),
           comment=result.get("comment", ""),
           message=signal_json,
