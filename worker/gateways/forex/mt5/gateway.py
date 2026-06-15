@@ -214,7 +214,9 @@ class MT5Gateway(BasePlatformGateway):
       if position.side == SIDE_LONG
       else self._mt5.ORDER_TYPE_BUY
     )
-    tick = self._mt5.symbol_info_tick(position.symbol)
+    tick = self.get_tick(position.symbol)
+    if tick is None:
+      return TradeResult.fail("No tick / market data unavailable")
     price = tick.bid if close_type == self._mt5.ORDER_TYPE_SELL else tick.ask
     close_volume = position.volume if volume is None else volume
 

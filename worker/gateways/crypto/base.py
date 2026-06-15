@@ -30,6 +30,7 @@ class SymbolFilter:
   step_size: float = 0.0  # quantity increment (LOT_SIZE.stepSize)
   min_qty: float = 0.0  # minimum order quantity
   tick_size: float = 0.0  # price increment (PRICE_FILTER.tickSize)
+  min_notional: float = 0.0  # minimum order notional (MIN_NOTIONAL/NOTIONAL.minNotional)
 
 
 @dataclass

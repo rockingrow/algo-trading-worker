@@ -134,6 +134,10 @@ class CryptoExecutor:
     if qty <= 0:
       return TradeResult.fail("Computed quantity is zero")
 
+    qty = self._enforce_min_notional(symbol, qty)
+    if qty is None:
+      return TradeResult.fail("Computed quantity below MIN_NOTIONAL and cannot be bumped")
+
     conflict = self._netting_conflict(signal, symbol)
     if conflict is not None:
       return conflict
@@ -215,6 +219,33 @@ class CryptoExecutor:
     """The symbol's minimum order quantity (conservative sizing floor)."""
     f = self._gateway.get_symbol_filter(symbol)
     return f.min_qty or 0.0
+
+  def _enforce_min_notional(self, symbol: str, qty: float) -> Optional[float]:
+    """Bump *qty* up to the MIN_NOTIONAL floor if needed.
+
+    Returns the (possibly bumped) qty, or None if a price cannot be fetched
+    so the caller can fail cleanly rather than sending a doomed order.
+    """
+    f = self._gateway.get_symbol_filter(symbol)
+    if not f.min_notional or f.min_notional <= 0:
+      return qty
+    try:
+      price = self._gateway.get_mark_price(symbol)
+    except Exception:
+      logger.exception("[open_position] Could not fetch mark price for notional check (%s)", symbol)
+      return None
+    if price <= 0 or qty * price >= f.min_notional:
+      return qty
+    bumped = self.normalize_volume(symbol, f.min_notional / price)
+    if bumped <= qty:
+      # step-size rounding floored us back below notional — go one step higher
+      step = f.step_size or 0.0
+      bumped = self.normalize_volume(symbol, bumped + step) if step > 0 else bumped
+    logger.warning(
+      "[open_position] qty %.8f * price %.4f = %.4f below MIN_NOTIONAL %.4f — bumped to %.8f",
+      qty, price, qty * price, f.min_notional, bumped,
+    )
+    return bumped
 
   def _netting_conflict(self, signal: SignalSchema, symbol: str) -> Optional[TradeResult]:
     """In netting mode, reject an entry that would merge with another strategy's

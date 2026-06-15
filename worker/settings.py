@@ -151,7 +151,6 @@ class Settings(BaseSettings):
             ("BINANCE_API_KEY", self.binance_api_key),
             ("BINANCE_API_SECRET", self.binance_api_secret),
             ("BINANCE_ACCOUNT_ID", self.binance_account_id),
-            ("BINANCE_TESTNET", self.binance_testnet),
           )
           if not value
         ]

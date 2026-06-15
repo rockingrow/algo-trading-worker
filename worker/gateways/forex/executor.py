@@ -145,6 +145,8 @@ class ForexExecutor:
     symbol = self.get_symbol(signal.symbol)
     spec = self._gateway.get_symbol_spec(symbol)
     tick = self._gateway.get_tick(symbol)
+    if tick is None:
+      return TradeResult.fail("No tick / market data unavailable")
     price = tick.ask if side == SIDE_LONG else tick.bid
 
     volume = self._resolve_entry_volume(signal, side, spec, price)

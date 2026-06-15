@@ -172,7 +172,14 @@ class BaseSignalProcessor(ABC):
 
   def run(self, stop_event) -> None:
     for subject, raw in self.subscriber.listen(stop_event=stop_event):
-      self._process_message(subject, raw)
+      try:
+        self._process_message(subject, raw)
+      except Exception:
+        log.exception(
+          "[%s Process] Unhandled error processing message — skipping. "
+          "CRITICAL: manual reconciliation may be required. raw=%r",
+          self.name, raw,
+        )
 
   # ── Shared message processing ─────────────────────────────────────────── #
 

@@ -161,30 +161,36 @@ class PositionRepository:
         conn.close()
 
   def get_position(self, ref_source_id: str) -> Optional[dict]:
+    conn = None
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
       cursor = conn.cursor()
       cursor.execute("SELECT * FROM positions WHERE ref_source_id = ?", (ref_source_id,))
       row = cursor.fetchone()
-      conn.close()
       return self._row_to_dict(row) if row else None
     except Exception as e:
       logger.exception(f"Failed to fetch position ref_source_id={ref_source_id}: {e}")
       return None
+    finally:
+      if conn:
+        conn.close()
 
   def get_pending_sync_positions(self) -> list:
+    conn = None
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
       cursor = conn.cursor()
       cursor.execute("SELECT * FROM positions WHERE sync_status = 'PENDING'")
       rows = cursor.fetchall()
-      conn.close()
       return [self._row_to_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch pending sync positions: {e}")
       return []
+    finally:
+      if conn:
+        conn.close()
 
   def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
     conn = None
@@ -211,6 +217,7 @@ class PositionRepository:
         conn.close()
 
   def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
+    conn = None
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
@@ -220,11 +227,13 @@ class PositionRepository:
         (strategy, symbol),
       )
       rows = cursor.fetchall()
-      conn.close()
       return [self._row_to_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
       return []
+    finally:
+      if conn:
+        conn.close()
 
   def get_open_positions_for_flat(
     self,
@@ -232,6 +241,7 @@ class PositionRepository:
     symbol: Optional[str] = None,
   ) -> list:
     """Fetch all OPENED/TP1 positions, optionally filtered by strategy and/or symbol."""
+    conn = None
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
@@ -246,11 +256,13 @@ class PositionRepository:
         params.append(symbol)
       cursor.execute(f"SELECT * FROM positions WHERE {' AND '.join(conditions)}", params)
       rows = cursor.fetchall()
-      conn.close()
       return [self._row_to_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch open positions for flat (strategy={strategy}, symbol={symbol}): {e}")
       return []
+    finally:
+      if conn:
+        conn.close()
 
 
 class NotificationOutboxRepository:
@@ -284,6 +296,7 @@ class NotificationOutboxRepository:
         conn.close()
 
   def get_due_notifications(self, limit: int = 20) -> list:
+    conn = None
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
@@ -300,11 +313,13 @@ class NotificationOutboxRepository:
         (limit,),
       )
       rows = cursor.fetchall()
-      conn.close()
       return [dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch due notifications: {e}")
       return []
+    finally:
+      if conn:
+        conn.close()
 
   def delete_notification(self, notification_id: int) -> None:
     conn = None

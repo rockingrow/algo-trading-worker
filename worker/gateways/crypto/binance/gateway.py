@@ -235,10 +235,12 @@ class BinanceFuturesGateway(BaseExchangeGateway):
         filters = {f["filterType"]: f for f in s.get("filters", [])}
         lot = filters.get("LOT_SIZE", {})
         price = filters.get("PRICE_FILTER", {})
+        notional = filters.get("MIN_NOTIONAL", filters.get("NOTIONAL", {}))
         out[s["symbol"]] = SymbolFilter(
           step_size=float(lot.get("stepSize", 0) or 0),
           min_qty=float(lot.get("minQty", 0) or 0),
           tick_size=float(price.get("tickSize", 0) or 0),
+          min_notional=float(notional.get("minNotional", 0) or 0),
         )
     except Exception as exc:
       logger.exception("[Binance] exchangeInfo failed: %s", exc)

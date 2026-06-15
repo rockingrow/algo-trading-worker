@@ -200,6 +200,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
           symbol,
           failsafe.get("comment"),
         )
+        close_result["position_unprotected"] = True
         close_result["comment"] = (
           f"UNPROTECTED POSITION: breakeven SL failed ({sl_result.get('comment')}) "
           f"AND emergency close failed ({failsafe.get('comment')}) — close manually"
