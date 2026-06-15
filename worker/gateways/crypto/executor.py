@@ -22,6 +22,7 @@ Notes
 from __future__ import annotations
 
 import math
+import re
 from decimal import Decimal
 from typing import Any, List, Optional
 
@@ -375,6 +376,7 @@ class CryptoExecutor:
 
   @staticmethod
   def _client_order_id(strategy: str, signal_id: Optional[str]) -> str:
-    # Binance clientOrderId max length is 36; keep it short and unique-ish.
+    # Binance clientOrderId charset: ^[\.A-Z\:/a-z0-9_-]{1,36}$
+    safe = re.sub(r"[^\w.:/\-]", "_", strategy)
     suffix = (signal_id or "")[-6:]
-    return f"{strategy[:20]}-{suffix}".strip("-")[:36]
+    return f"{safe[:20]}-{suffix}".strip("-")[:36]

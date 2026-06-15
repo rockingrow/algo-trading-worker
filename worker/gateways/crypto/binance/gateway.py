@@ -11,7 +11,9 @@ Binance wire format (``stop_price`` → ``stopPrice`` …). We call it directly
 uniform path. Note stop-losses are conditional orders: Binance no longer accepts
 ``STOP_MARKET`` on ``/fapi/v1/order`` (it returns -4120 → "use the Algo Order API
 endpoints instead"), so :meth:`set_stop_loss` posts to ``/fapi/v1/algoOrder``
-(``algoType=CONDITIONAL``). The worker speaks LONG/SHORT; this
+(``algoType=CONDITIONAL``; docs:
+https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order).
+The worker speaks LONG/SHORT; this
 adapter maps that to BUY/SELL and normalizes responses into the broker-neutral
 ``TradeResult`` / ``ExchangePosition`` shapes.
 
@@ -328,8 +330,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   ) -> TradeResult:
     # Conditional orders go on the dedicated Algo Order endpoint
     # (algoType=CONDITIONAL); Binance rejects STOP_MARKET on /fapi/v1/order with
-    # -4120. The trigger field is `trigger_price` here (vs `stop_price` on the
-    # legacy order endpoint).
+    # -4120. Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
+    # The trigger field is `trigger_price` here (vs `stop_price` on the legacy order endpoint).
     #
     # closePosition=true closes the whole remaining position when the stop trips —
     # exactly the breakeven-after-TP1 behaviour the strategy wants — and must not

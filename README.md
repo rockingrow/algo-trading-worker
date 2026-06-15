@@ -50,7 +50,9 @@ cp .env.example .env
 | `CRYPTO_QUOTE_ASSET` | | `USDT` | Quote currency appended to bare symbols (`BTCUSD` → `BTCUSDT`) |
 | `BINANCE_API_KEY` | CRYPTO | — | Binance API key |
 | `BINANCE_API_SECRET` | CRYPTO | — | Binance API secret |
+| `BINANCE_ACCOUNT_NAME` | | `null` | Display name shown in the startup notification (mirrors `MT5_NAME`) |
 | `BINANCE_TESTNET` | | `false` | Use the Binance Futures testnet when `true` |
+| `CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL` | | `false` | Allow multiple strategies to trade the same symbol concurrently. Binance USDⓈ-M uses one-way (netting) mode, so two strategies on the same symbol merge at the exchange level — only enable this if you understand the implications |
 | `STRATEGY_MAGIC_MAP` | FOREX | `{}` | JSON mapping each strategy to its dedicated MT5 magic number (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). Each strategy's orders are stamped with — and filtered by — its own magic, giving native MT5-level isolation without a DB lookup. Every FOREX strategy that trades must be listed here. |
 | `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
 | **Risk Management** | | | |
@@ -189,6 +191,7 @@ imports MetaTrader5 or any `worker.mt5.*` module:
 | `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Official-SDK websocket User Data Stream ingesting fills / SL / TP / liquidation (+ pure parser) |
 | `worker/gateways/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
 | `worker/gateways/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
+| `worker/gateways/crypto/reconcile_job.py` | `CryptoReconcileJob` | Periodic missed-fill reconciler — diffs DB-open rows against live exchange positions; two-scan confirmation before marking closed |
 
 Adding a new exchange = implement `BaseExchangeGateway` + register it in
 `ExchangeFactory`. No business-logic change.
@@ -278,6 +281,7 @@ worker/
 │       ├── executor.py               # CryptoExecutor (TradeExecutorProtocol)
 │       ├── factory.py                # ExchangeFactory — selects the CEX
 │       ├── message_presenter.py      # CryptoMessagePresenter
+│       ├── reconcile_job.py          # CryptoReconcileJob — missed-fill safety-net (two-scan confirmation)
 │       ├── signal_processor.py       # CryptoSignalProcessor — crypto hooks over the base
 │       └── binance/                  # First concrete exchange
 │           ├── gateway.py            # BinanceFuturesGateway (official binance_common transport)
@@ -665,6 +669,7 @@ Daemon threads running alongside the NATS message loop:
 | `mt5-health` | FOREX | 15 s (`MT5_HEALTH_INTERVAL`) | Checks MT5 connection; sends Telegram alert on disconnect/reconnect |
 | `MT5EventJob` | FOREX | 5 s | Detects terminal-side position closes (SL/TP/Stop-Out) |
 | `binance-user-stream` | CRYPTO | push | Websocket user-data stream → exchange-side fills / SL / TP / liquidation |
+| `crypto-reconcile` | CRYPTO | 45 s | `CryptoReconcileJob` — polls live positions; reconciles DB-open rows that are exchange-flat on two consecutive scans (missed-fill safety net) |
 | `PositionCDC` | both | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
 | `NotificationJob` | both | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
 

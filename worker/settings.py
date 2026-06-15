@@ -69,7 +69,7 @@ class Settings(BaseSettings):
   crypto_quote_asset: str = "USDT"  # quote currency appended to bare symbols
   binance_api_key: Optional[str] = None
   binance_api_secret: Optional[str] = None
-  binance_account_name: Optional[str] = None
+  binance_account_id: Optional[str] = None
   binance_testnet: bool = False
   # Binance USDⓈ-M futures use netting mode: all strategies on the same symbol
   # share one net position, so a second strategy opening on that symbol will
@@ -147,8 +147,11 @@ class Settings(BaseSettings):
         missing = [
           name
           for name, value in (
+            ("CRYPTO_QUOTE_ASSET", self.crypto_quote_asset),
             ("BINANCE_API_KEY", self.binance_api_key),
             ("BINANCE_API_SECRET", self.binance_api_secret),
+            ("BINANCE_ACCOUNT_ID", self.binance_account_id),
+            ("BINANCE_TESTNET", self.binance_testnet),
           )
           if not value
         ]

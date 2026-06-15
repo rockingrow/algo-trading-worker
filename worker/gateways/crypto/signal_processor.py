@@ -29,7 +29,6 @@ from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.settings import CryptoExchangeEnum
 
 log = get_logger("worker.gateways.crypto.signal_processor")
 
@@ -70,11 +69,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   @property
   def _account_id(self) -> str:
-    # str(CryptoExchangeEnum.BINANCE) yields "CryptoExchangeEnum.BINANCE" (the
-    # Enum __str__), not "BINANCE" — use .value so the published account_id is the
-    # bare exchange name that downstream upsert keys on.
-    exchange = self.settings.get("crypto_exchange", "CRYPTO")
-    return exchange.value if isinstance(exchange, CryptoExchangeEnum) else str(exchange)
+    return self.settings.get("binance_account_id")
 
   def _magic_for(self, strategy: str) -> Optional[int]:
     return None  # crypto exchanges have no magic-number equivalent
@@ -82,7 +77,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   def _position_cdc_kwargs(self) -> Dict[str, Any]:
     return {
       "account_info_fn": self._account_snapshot,
-      "account_name": self.settings.get("mt5_name"),
+      "account_name": self.settings.get("binance_account_id"),
       "strategy_magic_map": {},
     }
 
@@ -99,6 +94,18 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       event_stream.start(stop_event=stop_event)
     else:
       log.info("[CRYPTO Process] Exchange has no push event stream; skipping.")
+
+    # Durability backstop: the push stream above can miss a close (reconnect gap,
+    # handler error, downtime). This periodic reconciler marks any DB-open
+    # position that no longer exists on the exchange as closed, so a missed event
+    # self-heals instead of leaving the row stuck OPEN forever.
+    from worker.gateways.crypto.reconcile_job import CryptoReconcileJob
+
+    CryptoReconcileJob(
+      db_service=self.ctx.db_service,
+      executor=self.executor,
+      handler=self._on_missed_close,
+    ).start(stop_event=stop_event)
 
   # ── Exchange-triggered close handler (from the user data stream) ──────── #
 
@@ -162,6 +169,57 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     self.ctx.channel_notifier.send_message(
       CryptoMessagePresenter.exchange_close(event, self.gateway.get_account_footer())
     )
+
+  # ── Reconciler backstop (from CryptoReconcileJob) ─────────────────────── #
+
+  def _on_missed_close(self, row: Dict[str, Any]) -> None:
+    """Mark a DB-open position closed after the reconciler confirmed it no longer
+    exists on the exchange (a fill event the user-data stream never delivered).
+
+    The exact reason/price is unknown — the live event is what carries those — so
+    the close is recorded as ``TERMINAL_CLOSED`` (the same status used for a
+    CEX-side MANUAL close) with a best-effort mark price and a comment flagging it
+    as reconciled. The CDC job then propagates the status downstream as usual.
+    """
+    resolved = self.executor.get_symbol(row["symbol"])
+    close_price = self._best_effort_price(resolved)
+    comment = "Reconciled: closed on exchange (fill event missed)"
+
+    self.ctx.db_service.log_position(
+      strategy=row.get("strategy"),
+      ref_id=None,
+      ref_source_id=row.get("ref_source_id"),
+      symbol=row["symbol"],
+      action=PositionStatusEnum.TERMINAL_CLOSED.value,
+      volume=row.get("volume"),
+      price=close_price,
+      sl=None,
+      tp1=None,
+      gateway_return_code=0,
+      comment=comment,
+      author=LogAuthorEnum.EXCHANGE.value,
+      market_type=self._market_type,
+    )
+    self.ctx.db_service.update_position_status(
+      ref_source_id=row.get("ref_source_id"),
+      status=PositionStatusEnum.TERMINAL_CLOSED,
+      closed_price=close_price,
+      gateway_return_code=0,
+      comment=comment,
+    )
+    self.ctx.channel_notifier.send_message(
+      CryptoMessagePresenter.position_reconciled_closed(
+        row, close_price, self.gateway.get_account_footer()
+      )
+    )
+
+  def _best_effort_price(self, resolved_symbol: str) -> Optional[float]:
+    """Mark price as an approximate close price; ``None`` if it can't be read."""
+    try:
+      return self.gateway.get_mark_price(resolved_symbol)
+    except Exception as exc:  # pragma: no cover - best effort
+      log.warning("[Crypto Reconcile] mark price unavailable for %s: %s", resolved_symbol, exc)
+      return None
 
   # ── ADMIN FLAT match keys (crypto reconciles by resolved symbol) ──────── #
 

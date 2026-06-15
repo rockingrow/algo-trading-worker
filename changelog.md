@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Periodic position reconciler for CRYPTO (`CryptoReconcileJob`).** The exchange user-data stream is the primary source of close events, but it can miss a fill — a websocket reconnect gap, a handler exception, or worker downtime while an SL/TP/liquidation triggers — leaving the DB row stuck `OPENED`/`TP1` forever (CRYPTO had no equivalent of the FOREX `close_detector`). A new daemon polls live exchange positions and, when a DB-open position no longer exists on the exchange, marks it `TERMINAL_CLOSED` (best-effort mark price + reconciled comment) and notifies the operator, so a missed event self-heals. Safety: a row must be DB-open *and* exchange-flat on **two consecutive scans** before it reconciles (absorbs the lag between an entry fill and `positionRisk` reflecting it), and a failed live-position fetch skips the scan entirely so an API blip can never be read as "everything is flat".
+
+### Fixed
+
+- **Stopped rounding persisted prices to 2 decimals.** `PositionRepository` rounded `price`/`opened_price`/`closed_price` to 2 dp (a forex-era assumption), corrupting low-priced crypto (e.g. SHIB ~0.00002345 → `0.00`) in the DB and every downstream `PositionEvent`, and was inconsistent with `sl`/`tp1` (already stored raw). Prices are now persisted as the broker supplies them (already quantized to the instrument tick).
+
 ### Removed
 
 - **Deleted `worker/crypto_worker.py` and `worker/forex_worker.py`.** Both were thin shims that only bound their processor to `run_worker`. The functions `crypto_worker_main` and `forex_worker_main` have been consolidated into `worker/market.py` (alongside the orchestrator classes that call them), making the dedicated entry-point files redundant. All internal cross-references (`worker_runtime.py` docstring, `gateways/forex/signal_processor.py` docstring, `README.md`, and tests) updated to reflect the new canonical location.

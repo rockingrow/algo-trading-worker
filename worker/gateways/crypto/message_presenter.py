@@ -127,6 +127,20 @@ class CryptoMessagePresenter:
     )
 
   @staticmethod
+  def position_reconciled_closed(db_pos: dict, close_price: Any, footer: str) -> str:
+    """The periodic reconciler found a DB-open position that no longer exists on
+    the exchange (a missed fill event) and synced the DB to live state."""
+    return _box(
+      f"🔄 <b>Position Reconciled — Closed on Exchange</b>\n\n"
+      f"A fill event was <b>missed</b>; the DB was synced from live exchange state.\n"
+      f"Symbol: <b>{db_pos.get('symbol')}</b>\n"
+      f"Strategy: <b>{db_pos.get('strategy')}</b>\n"
+      f"Approx Close: <b>{close_price}</b>\n"
+      f"Source: <b>{db_pos.get('ref_source_id')}</b>\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
   def exchange_close(event: Any, footer: str) -> str:
     icon = {"SL": "🛑", "TP": "✅", "LIQUIDATION": "⚠️", "MANUAL": "🖐"}.get(
       event.reason.value, "❓"

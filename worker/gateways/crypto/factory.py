@@ -41,7 +41,7 @@ class ExchangeFactory:
 
   @staticmethod
   def create(settings_dict: dict) -> BaseExchangeGateway:
-    raw = settings_dict.get("crypto_exchange", CryptoExchangeEnum.BINANCE)
+    raw = settings_dict.get("crypto_exchange", CryptoExchangeEnum.BINANCE.value)
     exchange = raw if isinstance(raw, CryptoExchangeEnum) else CryptoExchangeEnum(raw)
 
     builder = _BUILDERS.get(exchange)
