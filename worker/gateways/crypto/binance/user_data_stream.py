@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
+from worker.gateways.crypto.base import WORKER_ORDER_PREFIX
 from worker.logger import get_logger
 
 log = get_logger("worker.gateways.crypto.binance.user_data_stream")
@@ -53,20 +54,26 @@ class ExchangeCloseEvent:
   realized_pnl: float = 0.0
 
 
-# Original order types that represent an exchange-managed protective exit. A plain
-# ``MARKET`` reduce-only fill is the worker closing a position itself and is
-# ignored here to avoid double-handling.
+# Original order types that represent an exchange-managed protective exit.
 _STOP_TYPES = {"STOP_MARKET", "STOP"}
 _TP_TYPES = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}
 _LIQUIDATION_TYPES = {"LIQUIDATION"}
+
+# Binance system-generated clientOrderId prefixes for forced/automatic exits. A
+# reduce-only MARKET fill bearing one of these is a liquidation/ADL/settlement,
+# not a discretionary manual close.
+_LIQUIDATION_PREFIXES = ("autoclose-", "adl_autoclose", "settlement_autoclose")
 
 
 def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent]:
   """Translate one Binance frame into an :class:`ExchangeCloseEvent`, or None.
 
-  Returns an event only for *exchange-triggered* protective exits that have
-  actually filled (stop-loss / take-profit / liquidation). Worker-initiated
-  market closes and non-fill updates are ignored.
+  Returns an event for any *exchange-side* close that has actually filled:
+  stop-loss / take-profit / liquidation, **and** a discretionary manual close
+  done outside the worker (web UI, mobile, a third-party API client). The only
+  fills ignored are the worker's own reduce-only MARKET closes — identified by
+  the ``WORKER_ORDER_PREFIX`` clientOrderId marker — and non-fill updates, since
+  those are already handled by the normal signal flow.
   """
   if msg.get("e") != "ORDER_TRADE_UPDATE":
     return None
@@ -75,12 +82,25 @@ def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent
     return None
 
   original_type = o.get("ot") or o.get("o")
+  client_id = o.get("c") or ""
   if original_type in _STOP_TYPES:
     reason = ExchangeCloseReason.SL
   elif original_type in _TP_TYPES:
     reason = ExchangeCloseReason.TP
   elif original_type in _LIQUIDATION_TYPES:
     reason = ExchangeCloseReason.LIQUIDATION
+  elif original_type == "MARKET" and o.get("R"):
+    # A reduce-only MARKET fill. If the worker placed it, it carries our marker
+    # and is dropped (already handled by the signal flow). Otherwise it is an
+    # external close: a Binance auto-exit prefix means liquidation/ADL, anything
+    # else is a discretionary manual close.
+    if client_id.startswith(WORKER_ORDER_PREFIX):
+      return None
+    reason = (
+      ExchangeCloseReason.LIQUIDATION
+      if client_id.startswith(_LIQUIDATION_PREFIXES)
+      else ExchangeCloseReason.MANUAL
+    )
   else:
     return None
 
@@ -104,7 +124,7 @@ def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent
     close_price=close_price,
     close_volume=close_volume,
     order_id=str(o.get("i") or ""),
-    client_order_id=o.get("c", ""),
+    client_order_id=client_id,
     realized_pnl=float(o.get("rp") or 0),
   )
 

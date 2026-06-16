@@ -78,16 +78,20 @@ class Settings(BaseSettings):
   crypto_allow_multi_strategy_per_symbol: bool = False
 
   # Strategy configuration
+  slippage_deviation: int = 100
   strategy_magic_map: dict[str, int] = {}
-  slippage_deviation: int = 20
+  position_tp1_percent: float = 30.0
+  # When True, TP1 partial-closes and then moves the stop to breakeven (entry).
+  # When False, TP1 only partial-closes and leaves the original entry SL
+  # untouched, so the runner keeps its initial protection.
+  tp1_move_sl_to_breakeven: bool = True
 
   # Init capital and risk management
   capital: float = 1000
-  capital_currency: str = "USC"
+  capital_currency: str = "USD"
   volume_decision_enabled: bool = True
-  risk_percentage: float = 3.0  # Risk 1% of capital per trade
+  risk_percentage: float = 2.0  # Risk 2% of capital per trade
   use_account_equity: bool = False  # If true, use account equity instead of initial capital for entry volume calculation
-  position_tp1_percent: float = 30.0
 
   # Telegram
   telegram_enabled: bool

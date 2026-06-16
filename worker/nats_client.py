@@ -6,7 +6,7 @@ import nats
 
 from worker.logger import get_logger
 
-logger = get_logger("worker.nats")
+logger = get_logger("worker.nats_client")
 
 
 class NatsClient:

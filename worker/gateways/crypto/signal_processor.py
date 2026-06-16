@@ -65,7 +65,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     self.gateway.close()
 
   def _account_footer(self) -> str:
-    return self.gateway.get_account_footer()
+    return self.gateway.get_account_footer(account_id=self._account_id)
 
   @property
   def _account_id(self) -> str:

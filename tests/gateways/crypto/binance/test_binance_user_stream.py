@@ -20,8 +20,74 @@ def test_ignores_unfilled_orders():
 
 
 def test_ignores_worker_market_close():
-  # A reduce-only MARKET fill is the worker closing a position itself.
-  assert parse_order_trade_update(_frame({"X": "FILLED", "ot": "MARKET", "R": True})) is None
+  # A reduce-only MARKET fill the worker placed itself carries the worker marker
+  # on its clientOrderId — it is already handled by the signal flow, so dropped.
+  assert parse_order_trade_update(
+    _frame(
+      {
+        "s": "BTCUSDT",
+        "X": "FILLED",
+        "ot": "MARKET",
+        "R": True,
+        "ap": "29000",
+        "z": "0.5",
+        "c": "awkr_deadbeefcafe0001",
+      }
+    )
+  ) is None
+
+
+def test_parses_external_manual_close():
+  # A reduce-only MARKET fill WITHOUT the worker marker = an external close
+  # (web UI / mobile / third-party API), reported as MANUAL.
+  event = parse_order_trade_update(
+    _frame(
+      {
+        "s": "BTCUSDT",
+        "X": "FILLED",
+        "ot": "MARKET",
+        "R": True,
+        "ap": "66153.99",
+        "z": "0.5",
+        "i": 7,
+        "c": "web_abc123",
+        "rp": "12.3",
+      }
+    )
+  )
+  assert event is not None
+  assert event.reason == ExchangeCloseReason.MANUAL
+  assert event.symbol == "BTCUSDT"
+  assert event.close_price == 66153.99
+  assert event.close_volume == 0.5
+  assert event.realized_pnl == 12.3
+
+
+def test_non_reduce_only_market_is_ignored():
+  # An opening MARKET fill (reduce-only false) is an entry, never a close.
+  assert parse_order_trade_update(
+    _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "ap": "29000", "z": "0.5"})
+  ) is None
+
+
+def test_market_autoclose_prefix_is_liquidation():
+  # A reduce-only MARKET fill with a Binance auto-exit prefix is a liquidation,
+  # not a discretionary manual close.
+  event = parse_order_trade_update(
+    _frame(
+      {
+        "s": "BTCUSDT",
+        "X": "FILLED",
+        "ot": "MARKET",
+        "R": True,
+        "ap": "100",
+        "z": "1",
+        "c": "autoclose-123",
+      }
+    )
+  )
+  assert event is not None
+  assert event.reason == ExchangeCloseReason.LIQUIDATION
 
 
 def test_parses_stop_loss():
@@ -131,5 +197,34 @@ def test_on_message_dispatches_stop_loss():
 def test_on_message_ignores_worker_market_close():
   seen = []
   stream = _stream(seen.append)
-  stream._on_message(_FakeWrapper({"e": "ORDER_TRADE_UPDATE", "o": {"X": "FILLED", "ot": "MARKET"}}))
+  stream._on_message(
+    _FakeWrapper(
+      {
+        "e": "ORDER_TRADE_UPDATE",
+        "o": {
+          "s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "R": True,
+          "ap": "29000", "z": "0.5", "c": "awkr_deadbeefcafe0001",
+        },
+      }
+    )
+  )
   assert seen == []
+
+
+def test_on_message_dispatches_external_manual_close():
+  seen = []
+  stream = _stream(seen.append)
+  stream._on_message(
+    _FakeWrapper(
+      {
+        "e": "ORDER_TRADE_UPDATE",
+        "o": {
+          "s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "R": True,
+          "ap": "66153.99", "z": "0.5", "i": 7, "c": "web_x",
+        },
+      }
+    )
+  )
+  assert len(seen) == 1
+  assert seen[0].reason == ExchangeCloseReason.MANUAL
+  assert seen[0].symbol == "BTCUSDT"

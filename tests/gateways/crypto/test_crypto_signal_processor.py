@@ -41,7 +41,7 @@ def _reconcile_proc():
   proc.executor = SimpleNamespace(get_symbol=lambda s: s.replace("USD", "USDT"))
   proc.gateway = SimpleNamespace(
     get_mark_price=lambda sym: 64000.0,
-    get_account_footer=lambda: "FOOTER",
+    get_account_footer=lambda account_id=None: "FOOTER",
   )
   updates, logs, notes = [], [], []
   proc.ctx = SimpleNamespace(

@@ -25,6 +25,9 @@ class ExecutionConfig:
   risk_percentage: float
   use_account_equity: bool
   position_tp1_percent: float
+  # When True, TP1 moves the stop to breakeven after the partial close; when
+  # False, TP1 only partial-closes and leaves the original entry SL in place.
+  tp1_move_sl_to_breakeven: bool = True
   # Crypto-only: allow multiple strategies to trade the same symbol simultaneously.
   # In Binance netting mode this merges positions at the exchange level; default False
   # enforces one-strategy-per-symbol and aborts new entries that would violate it.
@@ -40,6 +43,7 @@ class ExecutionConfig:
       risk_percentage=settings.risk_percentage,
       use_account_equity=settings.use_account_equity,
       position_tp1_percent=settings.position_tp1_percent,
+      tp1_move_sl_to_breakeven=getattr(settings, "tp1_move_sl_to_breakeven", True),
       allow_multi_strategy_per_symbol=getattr(settings, "crypto_allow_multi_strategy_per_symbol", False),
     )
 
@@ -53,5 +57,6 @@ class ExecutionConfig:
       risk_percentage=settings_dict.get("risk_percentage", 1.0),
       use_account_equity=settings_dict.get("use_account_equity", False),
       position_tp1_percent=settings_dict.get("position_tp1_percent", 0.0),
+      tp1_move_sl_to_breakeven=settings_dict.get("tp1_move_sl_to_breakeven", True),
       allow_multi_strategy_per_symbol=settings_dict.get("crypto_allow_multi_strategy_per_symbol", False),
     )

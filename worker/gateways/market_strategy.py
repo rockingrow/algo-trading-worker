@@ -64,7 +64,7 @@ class BaseMarketStrategy(ABC):
 
   @abstractmethod
   def handle_tp1(self, signal: SignalSchema) -> TradeResult:
-    """Partial close + move SL to breakeven."""
+    """Partial close, then optionally move SL to breakeven (see config)."""
 
   # ── Group 3: Full exits ───────────────────────────────────────────────── #
 
@@ -125,12 +125,14 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 
   def handle_tp1(self, signal: SignalSchema) -> TradeResult:
     """
-    Partial close at TP1 then move SL to position entry (breakeven).
+    Partial close at TP1, then (optionally) move SL to entry (breakeven).
 
     Steps delegated to executor:
       1. Derive close volume (% of position or signal quantity).
       2. partial_close_position
-      3. update_position_sl to breakeven (pos.price_open)
+      3. update_position_sl to breakeven (pos.price_open) — only when
+         ``config.tp1_move_sl_to_breakeven`` is True. When False, the original
+         entry SL is left untouched and keeps protecting the runner.
     """
     symbol = signal.symbol
     positions = self._executor.get_open_positions(symbol, strategy=signal.strategy)
@@ -164,6 +166,15 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     )
 
     if not close_result.get("success"):
+      return close_result
+
+    if not self._config.tp1_move_sl_to_breakeven:
+      # TP1 is partial-close-only: the original entry SL stays in place and keeps
+      # protecting the runner, so there is no breakeven move to attempt.
+      logger.info(
+        "[handle_tp1] Breakeven move disabled — keeping original entry SL for %s.",
+        symbol,
+      )
       return close_result
 
     sl_result = self._executor.update_position_sl(

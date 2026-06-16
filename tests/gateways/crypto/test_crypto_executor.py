@@ -16,6 +16,7 @@ class FakeGateway:
     self._filter = SymbolFilter(step_size=step, min_qty=step, tick_size=0.1)
     self._sl_ok = sl_ok
     self.orders = []
+    self.client_order_ids = []
     self.stops = []
     self.cancelled = []
 
@@ -30,6 +31,7 @@ class FakeGateway:
 
   def place_market_order(self, symbol, side, quantity, reduce_only=False, client_order_id=None):
     self.orders.append((symbol, side, quantity, reduce_only))
+    self.client_order_ids.append(client_order_id)
     return {"success": True, "retcode": 0, "ticket": 99, "price": self._mark, "volume": quantity}
 
   def set_stop_loss(self, symbol, position_side, stop_price, quantity):
@@ -56,6 +58,26 @@ def test_get_symbol_appends_quote():
   assert ex.get_symbol("BTCUSD") == "BTCUSDT"
   assert ex.get_symbol("BTCUSDT") == "BTCUSDT"
   assert ex.get_symbol("eth") == "ETHUSDT"
+
+
+def test_get_symbol_strips_perpetual_suffix():
+  ex = CryptoExecutor(FakeGateway(), None, quote_asset="USDT")
+  assert ex.get_symbol("BTCUSDT.P") == "BTCUSDT"
+  assert ex.get_symbol("BTCUSD.P") == "BTCUSDT"
+
+
+def test_get_symbol_strips_exchange_prefix():
+  ex = CryptoExecutor(FakeGateway(), None, quote_asset="USDT")
+  assert ex.get_symbol("BINANCE:BTCUSDT.P") == "BTCUSDT"
+  assert ex.get_symbol("BINANCE:BTCUSDT") == "BTCUSDT"
+  assert ex.get_symbol("OANDA:XAUUSD") == "XAUUSDT"
+
+
+def test_get_symbol_respects_quote_asset():
+  ex = CryptoExecutor(FakeGateway(), None, quote_asset="USDC")
+  assert ex.get_symbol("BTCUSD") == "BTCUSDC"
+  assert ex.get_symbol("BTCUSDC") == "BTCUSDC"
+  assert ex.get_symbol("BINANCE:ETHUSDC.P") == "ETHUSDC"
 
 
 def test_normalize_volume_floors_to_step():
@@ -161,6 +183,20 @@ def test_close_all_positions_reduce_only(config):
   assert res["success"] is True
   assert gw.orders == [("BTCUSDT", "LONG", 0.02, True)]
   assert "SL" in res["comment"]
+
+
+def test_close_orders_carry_worker_marker(config):
+  # Reduce-only closes must tag their clientOrderId with WORKER_ORDER_PREFIX so
+  # the exchange event stream can tell them apart from an external manual close.
+  from worker.gateways.crypto.base import WORKER_ORDER_PREFIX
+
+  gw = FakeGateway(positions=[_long_pos(qty=0.02)])
+  ex = CryptoExecutor(gw, config)
+  ex.partial_close_position("BTCUSD", close_volume=0.006, position_ticket=7)
+  ex.close_all_positions("BTCUSD", reason="SL")
+
+  assert gw.client_order_ids  # both closes recorded an id
+  assert all(cid and cid.startswith(WORKER_ORDER_PREFIX) for cid in gw.client_order_ids)
 
 
 def test_close_all_no_positions(config):

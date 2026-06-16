@@ -22,6 +22,14 @@ from worker.schemas.trade_result import TradeResult
 SIDE_LONG = "LONG"
 SIDE_SHORT = "SHORT"
 
+# Marker prepended to the clientOrderId of every reduce-only close the worker
+# places itself. The exchange event parser uses it to tell the worker's own
+# closes apart from an external close (web UI / mobile / third-party / liquidation),
+# which are otherwise an identical MARKET reduce-only fill. Kept here (agnostic
+# layer) so both the executor and a concrete exchange's event stream share one
+# source of truth without the executor importing a concrete exchange module.
+WORKER_ORDER_PREFIX = "awkr_"
+
 
 @dataclass
 class SymbolFilter:
@@ -123,12 +131,14 @@ class BaseExchangeGateway(ABC):
   def get_account(self) -> Optional[Dict[str, Any]]:
     """Return an account snapshot (balance, equity/leverage where available)."""
 
-  def get_account_footer(self) -> str:
+  def get_account_footer(self, account_id: Optional[str] = None) -> str:
     """Human-readable account footer appended to notifications."""
     info = self.get_account() or {}
     balance = info.get("balance")
+    account_line = f"<b>Account ID:</b> {account_id}\n" if account_id else ""
     return (
       f"\n<b>Exchange:</b> {self.name}\n"
+      f"{account_line}"
       f"<b>Balance:</b> {balance}\n"
       "----------------------------------"
     )

@@ -248,3 +248,25 @@ def test_order_failure_returns_trade_result_fail(monkeypatch):
   res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02)
   assert res["success"] is False
   assert "rejected" in res["comment"]
+
+
+def test_order_result_falls_back_to_cumquote_when_avgprice_zero(monkeypatch):
+  # Binance Futures testnet (and occasionally live) returns avgPrice="0" for
+  # MARKET orders even when the fill is complete. _order_result must fall back to
+  # cumQuote / executedQty to recover the real average price.
+  gw, _ = make_gateway(monkeypatch)
+
+  def fake_send(session, config, *, method, path, payload, is_signed, response_model):
+    return FakeResp({
+      "orderId": 999,
+      "avgPrice": "0",
+      "executedQty": "0.0333",
+      "cumQuote": "2179.15",
+      "status": "FILLED",
+    })
+
+  monkeypatch.setattr(gw_mod, "send_request", fake_send)
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.0333)
+  assert res["success"] is True
+  assert res["volume"] == 0.0333
+  assert abs(res["price"] - 2179.15 / 0.0333) < 0.01

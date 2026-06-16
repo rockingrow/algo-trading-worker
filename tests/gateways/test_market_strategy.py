@@ -65,6 +65,20 @@ def test_handle_tp1_payload_quantity_mode(config):
   assert res["success"] is True
 
 
+def test_handle_tp1_keeps_original_sl_when_breakeven_disabled(config):
+  cfg = replace(config, tp1_move_sl_to_breakeven=False)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1))
+  assert res["success"] is True
+  # Partial close still happens...
+  assert ("partial", 0.3, 7, "strat-1") in ex.calls
+  # ...but the SL is left untouched (no breakeven move).
+  assert not any(call[0] == "sl" for call in ex.calls)
+  assert "sl_update" not in res
+
+
 def test_handle_tp1_no_positions(config):
   ex = FakeExecutor(positions=[])
   market = ForexMarket(ex, config)

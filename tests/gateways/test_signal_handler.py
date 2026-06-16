@@ -120,6 +120,22 @@ def test_entry_force_closes_stale_and_marks_db():
   assert res["forced_closed"][0]["ref_source_id"] == "9"
 
 
+def test_entry_clears_orphaned_db_row_when_broker_has_no_position():
+  """Regression: a prior position closed externally (SL/liquidation) leaves an
+  OPENED DB row the broker no longer reports. The new entry must still mark it
+  FORCED_CLOSED, otherwise insert_position collides on the one-active-per-
+  (strategy,symbol) unique index and the new trade goes untracked."""
+  strat = FakeStrategy(open_positions=[])  # broker reports nothing live
+  store = FakeStore(positions=[{"ref_source_id": "9", "ref_id": "9", "volume": 1.0}])
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.LONG))
+  assert res["success"] is True
+  assert "entry" in strat.calls
+  assert "close_all:STALE_CLEANUP:strat-1" not in strat.calls  # nothing to close
+  assert store.status_updates[0]["status"] == PositionStatusEnum.FORCED_CLOSED
+  assert res["forced_closed"][0]["ref_source_id"] == "9"
+
+
 def test_entry_scopes_preflight_to_signal_strategy():
   """Stale check + force-close must be scoped to the signal's strategy so a
   concurrent strategy on the same symbol is never touched."""

@@ -220,6 +220,15 @@ class BaseSignalProcessor(ABC):
     )
 
     result = self.handler.handle(signal)
+    # Some exchanges (notably Binance testnet) return a 0 fill price on a filled
+    # MARKET order — for entries *and* closes (FLAT/TP2/SL/...). Fall back to the
+    # signal's price so the notification and DB never record a misleading 0.0.
+    # NB: result.get("price", signal.price) does NOT help — the key is present
+    # but zero, not missing. This is the single funnel for every signal action,
+    # so the fallback belongs here rather than in each executor close path (which
+    # has no access to the signal anyway).
+    if result.get("success") and not result.get("price") and signal.price:
+      result["price"] = signal.price
     footer = self._current_footer()
 
     self.ctx.db_service.log_position(

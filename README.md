@@ -56,14 +56,15 @@ cp .env.example .env
 | `BINANCE_TESTNET` | | `false` | Use the Binance Futures testnet when `true` |
 | `CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL` | | `false` | Allow multiple strategies to trade the same symbol concurrently. Binance USDⓈ-M uses one-way (netting) mode, so two strategies on the same symbol merge at the exchange level — only enable this if you understand the implications |
 | `STRATEGY_MAGIC_MAP` | FOREX | `{}` | JSON mapping each strategy to its dedicated MT5 magic number (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). Each strategy's orders are stamped with — and filtered by — its own magic, giving native MT5-level isolation without a DB lookup. Every FOREX strategy that trades must be listed here. |
-| `SLIPPAGE_DEVIATION` | | `20` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
+| `SLIPPAGE_DEVIATION` | | `100` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
 | **Risk Management** | | | |
 | `VOLUME_DECISION_ENABLED` | | `true` | When `true`, lot size is calculated from capital + risk % instead of signal `quantity` |
 | `CAPITAL` | | `1000` | Notional capital used for lot-size calculation |
-| `CAPITAL_CURRENCY` | | `USC` | Currency of `CAPITAL` (informational, shown in startup notification) |
-| `RISK_PERCENTAGE` | | `3.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
+| `CAPITAL_CURRENCY` | | `USD` | Currency of `CAPITAL` (informational, shown in startup notification) |
+| `RISK_PERCENTAGE` | | `2.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
 | `USE_ACCOUNT_EQUITY` | | `false` | When `true`, sizes entries against live account equity instead of the fixed `CAPITAL`. FOREX reads `account_info().equity` via MT5; CRYPTO reads `totalMarginBalance` from the exchange account endpoint. Falls back to symbol minimum quantity if equity cannot be read. No effect when `VOLUME_DECISION_ENABLED=false`. |
 | `POSITION_TP1_PERCENT` | | `30.0` | % of live volume closed at TP1 when `VOLUME_DECISION_ENABLED=true` |
+| `TP1_MOVE_SL_TO_BREAKEVEN` | | `true` | When `true`, TP1 partial-closes **and** moves the remaining SL to breakeven (entry). When `false`, TP1 only partial-closes and leaves the original entry SL in place so the runner keeps its initial protection |
 | **Telegram** | | | |
 | `NOTIFICATION_MODE` | | `VERBOSE` | `VERBOSE` / `SILENT` / `ERROR` — applies to the **COMMUNITY** (signal channel) feed only; `INDIVIDUAL` management alerts are always delivered regardless of this setting |
 | `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
@@ -191,7 +192,7 @@ imports MetaTrader5 or any `worker.gateways.forex.mt5.*` module:
 | `worker/gateways/crypto/base.py` | `BaseExchangeGateway` (ABC) | CEX contract: orders, positions, stops, account |
 | `worker/gateways/crypto/factory.py` | `ExchangeFactory` | Builds the configured exchange (first: Binance) |
 | `worker/gateways/crypto/binance/gateway.py` | `BinanceFuturesGateway` | Binance USDⓈ-M Futures REST via the official `binance_common` transport (signing, retries, rate-limit errors) |
-| `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Official-SDK websocket User Data Stream ingesting fills / SL / TP / liquidation (+ pure parser) |
+| `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Official-SDK websocket User Data Stream ingesting fills / SL / TP / liquidation / external manual closes (+ pure parser) |
 | `worker/gateways/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
 | `worker/gateways/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
 | `worker/gateways/crypto/reconcile_job.py` | `CryptoReconcileJob` | Periodic missed-fill reconciler — diffs DB-open rows against live exchange positions; two-scan confirmation before marking closed |
@@ -339,7 +340,7 @@ worker/
 ├── logger.py            # Structured logging configuration
 ├── main.py              # Application entry point
 ├── market.py            # Gateway orchestrators (FOREX=process, CRYPTO=thread) + worker entry points + factory
-├── nats.py              # NatsClient — single NATS connection lifecycle in a daemon thread
+├── nats_client.py       # NatsClient — single NATS connection lifecycle in a daemon thread
 ├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
 ├── worker_runtime.py    # run_worker() — shared child-process bootstrap
 └── settings.py          # Environment & app configuration (per-market validation)
@@ -356,7 +357,7 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 | Group | Action(s) | Behaviour |
 | --- | --- | --- |
 | **1 — Entry** | `LONG` / `SHORT` | Force-close any stale position for the same strategy → open a fresh market order with a hard SL set on the broker/exchange server |
-| **2 — Partial Exit** | `TP1` | Partial close using `POSITION_TP1_PERCENT` % of live volume (or signal `quantity` if disabled) → move remaining SL to breakeven (`price_open`) |
+| **2 — Partial Exit** | `TP1` | Partial close using `POSITION_TP1_PERCENT` % of live volume (or signal `quantity` if disabled) → move remaining SL to breakeven (`price_open`), unless `TP1_MOVE_SL_TO_BREAKEVEN=false` (then the original entry SL is kept) |
 | **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open volume using the **actual live `position.volume`** — signal `quantity` is intentionally ignored |
 | **4 — Flat** | `FLAT` | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED` |
 
@@ -430,7 +431,7 @@ The broker/exchange is always the source of truth: live positions are closed **f
   - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number via `STRATEGY_MAGIC_MAP`. `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
   - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol)` DB invariant and the `strategy` column.
 
-- **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries the broker/exchange for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. After the close succeeds, the corresponding SQLite record(s) are immediately updated to `FORCED_CLOSED` so the DB stays consistent. Only then is the new position opened.
+- **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries the broker/exchange for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. It then reconciles **every** active (`OPENED`/`TP1`) DB row for that `(strategy, symbol)` to `FORCED_CLOSED`, independently of whether the broker still reported a live position: a prior position may have been closed externally (exchange SL/liquidation, a manual close, or a missed close event), leaving an orphaned `OPENED` row the broker no longer reports. Clearing it is required — otherwise the fresh entry below would collide with the one-active-per-`(strategy, symbol)` unique index on insert and leave the new trade live but untracked. Only then is the new position opened.
 
 - **Data self-healing on inconsistency:** `SignalHandler._get_db_position` enforces the one-active-position-per-(strategy, symbol) invariant at read time. If more than one `OPENED`/`TP1` row is found (possible after a crash before the unique index existed), the oldest row is kept and all extras are immediately marked `FORCED_CLOSED` with an explanatory comment, so the DB self-heals on the next signal rather than silently producing split-brain state.
 
@@ -444,7 +445,7 @@ The broker/exchange is always the source of truth: live positions are closed **f
 
 - **Actual volume on full close (TP2/SL/R_SL):** The signal `quantity` is **never used** for full exit calculations. The handler reads the live `position.volume` directly from the broker/exchange to avoid dust-lot rounding errors.
 
-- **Breakeven SL after TP1:** After the partial close succeeds, the executor's `update_position_sl` moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss (a `TRADE_ACTION_SLTP` on MT5, a `STOP_MARKET` on a CEX). If the breakeven SL cannot be placed, the still-open runner is immediately emergency-closed rather than left to run unprotected.
+- **Breakeven SL after TP1 (configurable):** When `TP1_MOVE_SL_TO_BREAKEVEN=true` (default), after the partial close succeeds the executor's `update_position_sl` moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss (a `TRADE_ACTION_SLTP` on MT5, a `STOP_MARKET` on a CEX). If the breakeven SL cannot be placed, the still-open runner is immediately emergency-closed rather than left to run unprotected. When `TP1_MOVE_SL_TO_BREAKEVEN=false`, TP1 is partial-close-only: the original entry SL stays in place and keeps protecting the runner, so no breakeven move (and no emergency-close fallback) is attempted.
 
 - **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 

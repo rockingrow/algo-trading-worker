@@ -184,6 +184,8 @@ class SignalHandler:
     # Scoped to signal.strategy so a concurrent strategy holding a position on
     # the same symbol (e.g. a Long-only vs a Short-only strategy) is untouched.
     forced_closed: list[dict] = []
+    cleanup_price: Optional[float] = None
+    cleanup_retcode: Optional[int] = None
     stale = self.strategy.get_open_positions(symbol, strategy=strategy)
     if stale:
       logger.warning(
@@ -203,29 +205,44 @@ class SignalHandler:
           f"Stale position cleanup failed: {cleanup.get('comment')}",
           retcode=cleanup.get("retcode", -1),
         )
+      cleanup_price = cleanup.get("price")
+      cleanup_retcode = cleanup.get("retcode")
 
-      # Update DB records for force-closed positions
-      db_stale = self._db.get_open_positions_by_strategy(signal.strategy, symbol)
+    # Reconcile DB records for any active (OPENED/TP1) row on this (strategy,
+    # symbol) — independently of whether the broker still had a live position.
+    # A prior position may have been closed externally (SL/liquidation on the
+    # exchange, manual close, or a missed close event), leaving an orphaned
+    # OPENED row that the broker no longer reports. If we skip it here, the
+    # fresh position below would violate the one-active-per-(strategy,symbol)
+    # unique index on insert, leaving the new trade live but untracked.
+    db_stale = self._db.get_open_positions_by_strategy(signal.strategy, symbol)
+    if db_stale:
+      comment = (
+        "Force-closed by new entry signal"
+        if stale
+        else "Orphaned DB row cleared by new entry (not live on broker)"
+      )
       for pos in db_stale:
         self._db.update_position_status(
           ref_source_id=pos["ref_source_id"],
           status=PositionStatusEnum.FORCED_CLOSED,
-          closed_price=cleanup.get("price"),
-          gateway_return_code=cleanup.get("retcode"),
-          comment="Force-closed by new entry signal",
+          closed_price=cleanup_price,
+          gateway_return_code=cleanup_retcode,
+          comment=comment,
         )
         forced_closed.append(
           {
             "ref_source_id": pos["ref_source_id"],
             "ref_id": pos["ref_id"],
-            "price": cleanup.get("price"),
+            "price": cleanup_price,
             "volume": pos.get("volume"),
-            "retcode": cleanup.get("retcode"),
+            "retcode": cleanup_retcode,
           }
         )
       logger.info(
-        f"[SignalHandler._handle_entry] Stale positions cleared, "
-        f"{len(db_stale)} DB record(s) marked FORCED_CLOSED."
+        f"[SignalHandler._handle_entry] Cleared {len(db_stale)} active DB "
+        f"record(s) for strategy={strategy} symbol={symbol} "
+        f"(broker_had_position={bool(stale)})."
       )
 
     # Step 2 — Open new position

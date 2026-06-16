@@ -224,7 +224,7 @@ class FakePlatformGateway:
   def close(self):
     pass
 
-  def get_account_footer(self):
+  def get_account_footer(self, account_id=None):
     return "FOOTER"
 
   def create_close_detection_job(self, magic_numbers, db_service, notifier):

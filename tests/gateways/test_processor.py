@@ -200,6 +200,33 @@ def test_exit_signal_updates_status():
   assert proc.notifications == ["filled:SL:5"]
 
 
+def test_zero_fill_price_falls_back_to_signal_price():
+  # Binance testnet can return price=0 on a filled MARKET order (entries AND
+  # closes such as FLAT). The processor must substitute signal.price so neither
+  # the DB row nor the notification records a misleading 0.0.
+  result = {"success": True, "ticket": 9, "source_ticket": 5, "price": 0.0, "volume": 0.02}
+  proc = FakeProcessor(result)
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.FLAT, price=65000.0).model_dump_json(),
+  )
+  # Both the position log and the close-status update record the signal price.
+  assert proc.db.logged[0]["price"] == 65000.0
+  assert proc.db.updated[0]["closed_price"] == 65000.0
+
+
+def test_zero_fill_price_with_no_signal_price_stays_zero():
+  # No fallback available (signal carries no price) → leave the result untouched
+  # rather than inventing a price.
+  result = {"success": True, "ticket": 9, "source_ticket": 5, "price": 0.0, "volume": 0.02}
+  proc = FakeProcessor(result)
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.FLAT, price=None).model_dump_json(),
+  )
+  assert proc.db.logged[0]["price"] == 0.0
+
+
 def test_failed_result_sends_failure_notification():
   proc = FakeProcessor({"success": False, "retcode": -1, "comment": "boom"})
   proc._process_message(NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json())

@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import math
 import re
+import uuid
 from decimal import Decimal
 from typing import Any, List, Optional
 
 from worker.gateways.config import ExecutionConfig
-from worker.gateways.crypto.base import BaseExchangeGateway, ExchangePosition
+from worker.gateways.crypto.base import (
+  WORKER_ORDER_PREFIX,
+  BaseExchangeGateway,
+  ExchangePosition,
+)
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
@@ -54,8 +59,14 @@ class CryptoExecutor:
   # ── Symbol / quantity helpers ─────────────────────────────────────────── #
 
   def get_symbol(self, base_symbol: str) -> str:
-    """Resolve a signal symbol to the exchange symbol (e.g. BTCUSDT.P → BTCUSDT)."""
-    s = base_symbol.upper().replace("/", "").replace(":", "")
+    """Resolve a signal symbol to the exchange symbol.
+
+    Handles the common upstream forms: an exchange prefix (``BINANCE:BTCUSDT.P``,
+    ``OANDA:XAUUSD``) is dropped to its last ``:``-segment, a ``.P`` perpetual
+    suffix is stripped, and a ``USD`` quote is normalized to the configured quote
+    asset (e.g. ``BTCUSD`` → ``BTCUSDT``).
+    """
+    s = base_symbol.upper().split(":")[-1].replace("/", "")
     if s.endswith(".P"):
       s = s[:-2]
     if s.endswith(self._quote):
@@ -281,7 +292,8 @@ class CryptoExecutor:
       sl_res.get("comment"), action, symbol, close_qty,
     )
     close_res = self._gateway.place_market_order(
-      symbol, action, close_qty, reduce_only=True
+      symbol, action, close_qty, reduce_only=True,
+      client_order_id=self._close_client_order_id(),
     )
     if close_res.get("success"):
       fail = TradeResult.fail(
@@ -328,7 +340,8 @@ class CryptoExecutor:
       return TradeResult.fail("Close volume rounds to zero")
 
     result = self._gateway.place_market_order(
-      resolved, pos.side, safe_volume, reduce_only=True
+      resolved, pos.side, safe_volume, reduce_only=True,
+      client_order_id=self._close_client_order_id(),
     )
     if result.get("success"):
       result["source_ticket"] = str(pos.ticket)
@@ -374,7 +387,8 @@ class CryptoExecutor:
     last_result: Optional[Any] = None
     for pos in positions:
       result = self._gateway.place_market_order(
-        resolved, pos.side, pos.volume, reduce_only=True
+        resolved, pos.side, pos.volume, reduce_only=True,
+        client_order_id=self._close_client_order_id(),
       )
       if result.get("success"):
         success_count += 1
@@ -397,7 +411,8 @@ class CryptoExecutor:
   def close_single_position(self, pos: Any, reason: str = "FLAT") -> TradeResult:
     """Close one :class:`ExchangePosition` (its ``symbol`` is already resolved)."""
     result = self._gateway.place_market_order(
-      pos.symbol, pos.side, pos.volume, reduce_only=True
+      pos.symbol, pos.side, pos.volume, reduce_only=True,
+      client_order_id=self._close_client_order_id(),
     )
     if result.get("success"):
       result.setdefault("comment", f"Closed [{reason}]")
@@ -411,3 +426,14 @@ class CryptoExecutor:
     safe = re.sub(r"[^\w.:/\-]", "_", strategy)
     suffix = (signal_id or "")[-6:]
     return f"{safe[:20]}-{suffix}".strip("-")[:36]
+
+  @staticmethod
+  def _close_client_order_id() -> str:
+    """A unique clientOrderId tagging a worker-placed reduce-only close.
+
+    The ``WORKER_ORDER_PREFIX`` marker lets the exchange event stream recognise
+    this fill as the worker's own close and skip it, so it is not re-handled as
+    an external (manual/liquidation) close. A uuid suffix keeps it unique among
+    open orders; total length (5 + 16 = 21) stays within Binance's 36-char limit.
+    """
+    return f"{WORKER_ORDER_PREFIX}{uuid.uuid4().hex[:16]}"

@@ -400,9 +400,18 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   def _order_result(data: Dict[str, Any]) -> TradeResult:
     # Market/limit orders return `orderId`; conditional algo orders return `algoId`.
     order_id = data.get("orderId") or data.get("algoId")
+    avg_price = float(data.get("avgPrice", 0) or 0)
+    exec_qty = float(data.get("executedQty", 0) or 0)
+    # Binance Futures testnet (and occasionally live) returns avgPrice="0" on
+    # MARKET fills even though the order was fully executed.  cumQuote (total
+    # quote asset transacted) / executedQty always gives the correct average.
+    if avg_price == 0 and exec_qty > 0:
+      cum_quote = float(data.get("cumQuote", 0) or 0)
+      if cum_quote > 0:
+        avg_price = cum_quote / exec_qty
     return TradeResult.ok(
       ticket=str(order_id) if order_id is not None else None,
-      price=float(data.get("avgPrice", 0) or 0),
-      volume=float(data.get("executedQty", 0) or 0),
+      price=avg_price,
+      volume=exec_qty,
       comment=data.get("status", "NEW"),
     )
