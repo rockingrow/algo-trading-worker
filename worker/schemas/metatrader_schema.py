@@ -1,19 +1,13 @@
-from typing import Any, TypedDict
+"""
+worker/schemas/metatrader_schema.py
+───────────────────────────────────
+Backward-compatibility shim.
 
+``TradeResult`` is now a broker-neutral value object living in
+:mod:`worker.schemas.trade_result`. It is re-exported here so the many existing
+``from worker.schemas.metatrader_schema import TradeResult`` imports keep working.
+"""
 
-class _TradeResultRequired(TypedDict):
-  """Required fields present on every TradeResult."""
+from worker.schemas.trade_result import TradeResult
 
-  success: bool
-  retcode: int
-
-
-class TradeResult(_TradeResultRequired, total=False):
-  """Return value from all MT5Executor trade operations; optional fields are populated only when the order fills."""
-  comment: str
-  ticket: int
-  price: float
-  volume: float
-  source_ticket: int
-  new_sl: float
-  sl_update: Any  # nested TradeResult from SL update step
+__all__ = ["TradeResult"]

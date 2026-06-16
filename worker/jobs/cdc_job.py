@@ -27,8 +27,8 @@ _POLL_INTERVAL = 2  # seconds
 # Position-row columns that map 1-to-1 to PositionEvent fields.
 _EVENT_FIELDS = {
   "id",
-  "source_ticket",
-  "ticket",
+  "ref_source_id",
+  "ref_id",
   "strategy",
   "symbol",
   "action",
@@ -36,10 +36,10 @@ _EVENT_FIELDS = {
   "opened_price",
   "closed_price",
   "status",
-  "mt5_retcode",
+  "gateway_return_code",
   "comment",
   "message",
-  "magic",
+  "strategy_code",
   "created_at",
   "updated_at",
   "sync_status",
@@ -118,8 +118,8 @@ class PositionCDC:
       )
       payload = {k: row[k] for k in _EVENT_FIELDS if k in row}
       payload.update(self._extract_signal_fields(row.get("message")))
-      magic = payload.get("magic")
-      payload["magic"] = str(magic) if magic is not None else str(self._magic_for(row.get("strategy")))
+      strategy_code = payload.get("strategy_code")
+      payload["strategy_code"] = str(strategy_code) if strategy_code is not None else str(self._magic_for(row.get("strategy")))
       payload.update(account_snapshot)
       event = PositionEvent(
         event=event_type,
@@ -133,7 +133,7 @@ class PositionCDC:
         "[PositionCDC] Publishing TRADE event | event=%s status=%s source_ticket=%s\n%s",
         event_type.value,
         row.get("status"),
-        row.get("source_ticket"),
+        row.get("ref_source_id"),
         event_json,
       )
       self._publisher.publish(NatsSubjectEnum.TRADE, event_json)

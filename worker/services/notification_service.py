@@ -42,7 +42,7 @@ class TelegramNotification(Notification):
       )
       return False
 
-    url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+    url = f"https://api.telegram.org/bot{self.bot_token.get_secret_value()}/sendMessage"
     success = True
     for chat_id in self.chat_ids:
       payload = {

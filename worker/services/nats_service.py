@@ -3,7 +3,7 @@ import queue
 from typing import Callable, Generator, Optional
 
 from worker.logger import get_logger
-from worker.nats import NatsClient
+from worker.nats_client import NatsClient
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.utils.logging import get_footer
 
@@ -50,7 +50,7 @@ class NATSSubscriber:
       self._enqueue_fn(message_text)
 
   async def _on_error(self, e) -> None:
-    logger.error("NATS error: %s", e)
+    logger.error("NATS error: %r", e)
 
   async def _on_disconnect(self) -> None:
     logger.warning("NATS disconnected from %s. Retrying...", self.url)

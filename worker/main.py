@@ -10,7 +10,7 @@ import uvicorn
 
 from worker.app import create_app
 from worker.logger import get_logger
-from worker.settings import settings
+from worker.settings import MarketTypeEnum, settings
 
 log = get_logger("worker")
 
@@ -22,9 +22,12 @@ def main() -> None:
   # Required on Windows: use 'spawn' (the default) and protect entry point.
   multiprocessing.freeze_support()
 
-  log.info("Starting Algo Trading MT5 Worker v1.0")
+  log.info("Starting Algo Trading Worker v1.0 (market=%s)", settings.market_type.value)
   log.info("API Server -> http://%s:%d", settings.app_host, settings.app_port)
-  log.info("MT5 Server -> %s (login: %d)", settings.mt5_server, settings.mt5_login)
+  if settings.market_type == MarketTypeEnum.FOREX:
+    log.info("MT5 Server -> %s (login: %s)", settings.mt5_server, settings.mt5_login)
+  else:
+    log.info("Crypto Exchange -> %s", settings.crypto_exchange.value)
 
   import copy
 
