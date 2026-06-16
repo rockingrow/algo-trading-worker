@@ -12,9 +12,6 @@ start:
 dev:
 	uv run python -m uvicorn main:app --reload --app-dir worker --host 0.0.0.0 --port 8000 --reload-include "*.py" --reload-include ".env"
 
-e2e:
-	uv run e2e/main.py
-
 test:
 	uv run pytest
 
@@ -26,6 +23,3 @@ lint:
 
 fix:
 	uv run ruff check --fix .
-
-generate-keys:
-	.venv\Scripts\python.exe scripts/generate_curve_keypair.py

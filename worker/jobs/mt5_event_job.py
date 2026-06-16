@@ -13,14 +13,14 @@ from __future__ import annotations
 import threading
 from typing import Set
 
-from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
-from worker.interfaces.message_sender_protocol import MessageSenderProtocol
-from worker.logger import get_logger
-from worker.mt5.close_detector import (
+from worker.gateways.forex.mt5.close_detector import (
   TerminalClosedEvent,
   TerminalCloseReason,
   scan_terminal_closed_positions,
 )
+from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
+from worker.interfaces.message_sender_protocol import MessageSenderProtocol
+from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.notification_service import _box
@@ -104,16 +104,16 @@ class MT5EventJob:
 
   def _handle(self, event: TerminalClosedEvent) -> None:
     log.info(
-      "[MT5EventJob] Handling terminal close | ticket=%d reason=%s",
+      "[MT5EventJob] Handling terminal close | ticket=%s reason=%s",
       event.source_ticket,
       event.close_reason.value,
     )
 
     # Fetch position from DB to get strategy
-    position = self._db.get_position(source_ticket=event.source_ticket)
+    position = self._db.get_position(ref_source_id=event.source_ticket)
     if not position:
       log.warning(
-        "[MT5EventJob] Position not found in DB | source_ticket=%d",
+        "[MT5EventJob] Position not found in DB | source_ticket=%s",
         event.source_ticket,
       )
       return
@@ -122,24 +122,24 @@ class MT5EventJob:
     # 4.2 — Write to DB with author='terminal'
     self._db.log_position(
       strategy=strategy,
-      ticket=event.deal_ticket,
-      source_ticket=event.source_ticket,
+      ref_id=event.deal_ticket,
+      ref_source_id=event.source_ticket,
       symbol=event.symbol,
       action=event.close_reason.value,
       volume=event.close_volume,
       price=event.close_price,
       sl=event.sl,
       tp1=event.tp,
-      mt5_retcode=0,
+      gateway_return_code=event.deal_reason,
       comment=f"Terminal close [{event.close_reason.value}]",
       author=LogAuthorEnum.TERMINAL.value,
     )
     self._db.update_position_status(
-      source_ticket=event.source_ticket,
+      ref_source_id=event.source_ticket,
       status=PositionStatusEnum.TERMINAL_CLOSED,
-      new_ticket=event.deal_ticket,
+      ref_id=event.deal_ticket,
       closed_price=event.close_price,
-      mt5_retcode=0,
+      gateway_return_code=event.deal_reason,
       comment=f"Terminal close [{event.close_reason.value}]",
     )
 

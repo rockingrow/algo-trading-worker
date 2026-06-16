@@ -40,8 +40,8 @@ class PositionEvent(BaseModel):
   market_type: MarketTypeEnum
 
   id: int
-  source_ticket: int
-  ticket: int
+  ref_source_id: str
+  ref_id: str
   strategy: str
   symbol: str
   action: str
@@ -49,7 +49,7 @@ class PositionEvent(BaseModel):
   opened_price: float
   closed_price: Optional[float] = None
   status: str
-  mt5_retcode: Optional[int] = None
+  gateway_return_code: Optional[int] = None
   comment: Optional[str] = None
   message: Optional[str] = None
   created_at: Optional[str] = None
@@ -60,7 +60,7 @@ class PositionEvent(BaseModel):
   # Signal-derived fields (parsed from `message` JSON) needed for broker upsert
   # the first time a position is seen.
   signal_id: Optional[str] = None
-  magic: Optional[str] = None
+  strategy_code: Optional[str] = None
   sl: Optional[float] = None
   tp1: Optional[float] = None
   tp2: Optional[float] = None
