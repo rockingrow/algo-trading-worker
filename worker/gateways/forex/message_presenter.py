@@ -15,7 +15,18 @@ from __future__ import annotations
 import html
 from typing import Any
 
-from worker.icons import ADMIN, ALARM, CONNECTED, FAILED, GEAR, REJECTED, SHIELD, STOP, SUCCESS, WARNING
+from worker.icons import (
+  ADMIN,
+  ALARM,
+  CONNECTED,
+  FAILED,
+  GEAR,
+  REJECTED,
+  SHIELD,
+  STOP,
+  SUCCESS,
+  WARNING,
+)
 from worker.schemas.signal_schema import SignalSchema
 from worker.services.notification_service import _box
 
