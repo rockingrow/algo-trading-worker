@@ -23,11 +23,11 @@ import time
 from typing import Any, Dict, Optional
 
 from worker.context import WorkerContext
-from worker.icons import CONNECTED, DISCONNECTED, WARNING
 from worker.gateways.forex.executor import ForexExecutor
 from worker.gateways.forex.factory import PlatformFactory
 from worker.gateways.forex.message_presenter import TradeMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
+from worker.icons import CONNECTED, DISCONNECTED, WARNING
 from worker.logger import get_logger
 from worker.services.notification_service import _box
 from worker.settings import MT5_HEALTH_INTERVAL
