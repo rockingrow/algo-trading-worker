@@ -10,10 +10,12 @@ install-dev:
 	uv sync --dev
 
 start:
-	uv run python -m uvicorn worker.main:app --host 0.0.0.0 --port 8000 --log-level info
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	uv run python -m uvicorn worker.main:app --host "$${APP_HOST:-0.0.0.0}" --port "$${APP_PORT:-8000}" --log-level info
 
 dev:
-	uv run python -m uvicorn main:app --reload --app-dir worker --host 0.0.0.0 --port 8000 --reload-include "*.py" --reload-include ".env"
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	uv run python -m uvicorn main:app --reload --app-dir worker --host "$${APP_HOST:-0.0.0.0}" --port "$${APP_PORT:-8000}" --reload-include "*.py" --reload-include ".env"
 
 test:
 	uv run pytest
