@@ -48,6 +48,7 @@ worker_data.sqlite
 
 # Environments
 .env
+.env.bak*
 .env.local
 .env.*.local
 

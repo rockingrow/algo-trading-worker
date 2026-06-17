@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.1] — 2026-06-17
+
+### Added
+
+- **Interactive `.env` initializer (`scripts/init_env.py`, `make init`).** A guided setup that builds `.env` from `.env.example` instead of a manual `cp` + hand-editing. It derives the canonical key set, order, and defaults from `.env.example`, prompts for each value with a one-line description, and writes the result. `MARKET_TYPE` and `NOTIFICATION_MODE` are presented as fixed-choice menus (pick by number or name); choosing `MARKET_TYPE` then prompts **only** the matching credential group — MT5 connection for `FOREX`, Crypto CEX / exchange API keys for `CRYPTO` — leaving the other group at its existing/default value. Every variable carries a default (press Enter to keep it): the current `.env` value when present, otherwise the `.env.example` default.
+- **In-place, re-runnable editing with safety rails.** Re-running against an existing `.env` edits it in place — each key is written exactly once (no duplicates) and existing values are reused as the prompt defaults, so nothing is silently lost; keys newly introduced in `.env.example` are appended. A timestamped `.env.bak-*` backup is written before each update (now git-ignored), the source file's line endings are preserved (no LF→CRLF flip on Windows), and console output is UTF-8-safe on legacy code pages.
+
+### Changed
+
+- **README Quick Start — `make init` replaces the manual `.env` steps.** "3. Configure .env" now points at `make init` (creates or updates `.env`, prompts per market, defaults everywhere, re-runnable). Dropped the full "All Environment Variables" reference table and the Telegram dual-channel note from the README — `.env.example` is the single source for the variable list and defaults. The FOREX "Allow Algo Trading" terminal prerequisite is kept.
+
+---
+
 ## [1.1.0] — 2026-06-14
 
 ### Added
