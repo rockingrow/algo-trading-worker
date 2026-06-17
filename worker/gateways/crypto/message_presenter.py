@@ -19,7 +19,6 @@ from worker.icons import (
   ALARM,
   CONNECTED,
   FAILED,
-  GEAR,
   MANUAL,
   REJECTED,
   SHIELD,

@@ -95,6 +95,25 @@ DESCRIPTIONS = {
 KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 SECTION_RULE = "# " + "─" * 65
 
+# Values for these keys are always written with double quotes in .env
+# so special characters (spaces, commas, colons, JSON braces) are protected.
+QUOTED_KEYS = {
+  "BROKER_API_KEY",
+  "NATS_TOKEN",
+  "NATS_SUBJECTS",
+  "BINANCE_API_KEY",
+  "BINANCE_API_SECRET",
+  "BINANCE_ACCOUNT_ID",
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_CHAT_ID",
+  "TELEGRAM_CHAT_CHANNEL_ID",
+}
+
+# Values for these keys are written with single quotes (JSON content with double quotes inside).
+SINGLE_QUOTED_KEYS = {
+  "STRATEGY_MAGIC_MAP",
+}
+
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 def split_value_comment(raw: str) -> tuple[str, str]:
@@ -209,6 +228,12 @@ def section(title: str) -> None:
 
 # ── Rendering ────────────────────────────────────────────────────────────────
 def format_kv(key: str, value: str, comment: str) -> str:
+  already_quoted = value[:1] in ('"', "'") and value[-1:] == value[:1]
+  if not already_quoted:
+    if key in SINGLE_QUOTED_KEYS:
+      value = f"'{value}'"
+    elif key in QUOTED_KEYS:
+      value = f'"{value}"'
   line = f"{key}={value}"
   return f"{line}  {comment}" if comment else line
 

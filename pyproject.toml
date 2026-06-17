@@ -1,7 +1,7 @@
 [project]
-name = "algo-trading-mt5"
+name = "algo-trading-worker"
 version = "0.1.0"
-description = "MT5 execution worker listening to NATS signals"
+description = "Market execution worker listening to NATS signals"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
