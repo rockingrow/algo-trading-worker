@@ -14,6 +14,21 @@ from __future__ import annotations
 import html
 from typing import Any
 
+from worker.icons import (
+  ADMIN,
+  ALARM,
+  CONNECTED,
+  FAILED,
+  GEAR,
+  MANUAL,
+  REJECTED,
+  SHIELD,
+  STOP,
+  SUCCESS,
+  SYNC,
+  UNKNOWN,
+  WARNING,
+)
 from worker.schemas.signal_schema import SignalSchema
 from worker.services.notification_service import _box
 
@@ -35,16 +50,16 @@ class CryptoMessagePresenter:
       f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
       f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
     )
-    return _box(f"🟢 <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")
+    return _box(f"{CONNECTED} <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")
 
   @staticmethod
   def shutdown(footer: str) -> str:
-    return _box(f"🛑 <b>[Disconnected] Crypto Worker</b>{footer}")
+    return _box(f"{STOP} <b>[Disconnected] Crypto Worker</b>{footer}")
 
   @staticmethod
   def force_closed(symbol: str, strategy: str, fc: dict, footer: str) -> str:
     return _box(
-      f"⚠️ <b>Force Closed (New Entry)</b>\n\n"
+      f"{WARNING} <b>Force Closed (New Entry)</b>\n\n"
       f"Symbol: <b>{symbol}</b>\n"
       f"Strategy: <b>{strategy}</b>\n"
       f"Price: <b>{fc.get('price')}</b>\n"
@@ -59,7 +74,7 @@ class CryptoMessagePresenter:
     signal: SignalSchema, result: dict, pos_ticket: Any, footer: str
   ) -> str:
     return _box(
-      f"✅ <b>Order Filled</b>\n\n"
+      f"{SUCCESS} <b>Order Filled</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
@@ -84,13 +99,13 @@ class CryptoMessagePresenter:
     price = sl_res.get("new_sl") or getattr(signal, "sl", None)
     if sl_res.get("success"):
       suffix = f" <b>{price}</b>" if price else ""
-      return f"SL:{suffix} ✅\n"
-    return f"⚠️ <b>SL NOT SET</b> ({sl_res.get('comment')})\n"
+      return f"SL:{suffix} {SUCCESS}\n"
+    return f"{WARNING} <b>SL NOT SET</b> ({sl_res.get('comment')})\n"
 
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str:
     return _box(
-      f"❌ <b>Order Failed</b>\n\n"
+      f"{FAILED} <b>Order Failed</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
@@ -107,12 +122,12 @@ class CryptoMessagePresenter:
     failsafe = result.get("sl_failsafe_close") or {}
     sl_res = result.get("sl_update") or {}
     if failsafe.get("success"):
-      head = "🛡️ <b>Unprotected Position — Emergency Closed</b>"
+      head = f"{SHIELD} <b>Unprotected Position — Emergency Closed</b>"
       outcome = (
         f"Closed: <b>{failsafe.get('volume')}</b> @ <b>{failsafe.get('price')}</b>\n"
       )
     else:
-      head = "🚨 <b>UNPROTECTED POSITION — STILL OPEN</b>"
+      head = f"{ALARM} <b>UNPROTECTED POSITION — STILL OPEN</b>"
       outcome = (
         f"Emergency close <b>FAILED</b>: {failsafe.get('comment')}\n"
         f"<b>Manual intervention required.</b>\n"
@@ -131,7 +146,7 @@ class CryptoMessagePresenter:
     """The periodic reconciler found a DB-open position that no longer exists on
     the exchange (a missed fill event) and synced the DB to live state."""
     return _box(
-      f"🔄 <b>Position Reconciled — Closed on Exchange</b>\n\n"
+      f"{SYNC} <b>Position Reconciled — Closed on Exchange</b>\n\n"
       f"A fill event was <b>missed</b>; the DB was synced from live exchange state.\n"
       f"Symbol: <b>{db_pos.get('symbol')}</b>\n"
       f"Strategy: <b>{db_pos.get('strategy')}</b>\n"
@@ -142,8 +157,8 @@ class CryptoMessagePresenter:
 
   @staticmethod
   def exchange_close(event: Any, footer: str) -> str:
-    icon = {"SL": "🛑", "TP": "✅", "LIQUIDATION": "⚠️", "MANUAL": "🖐"}.get(
-      event.reason.value, "❓"
+    icon = {"SL": STOP, "TP": SUCCESS, "LIQUIDATION": WARNING, "MANUAL": MANUAL}.get(
+      event.reason.value, UNKNOWN
     )
     return _box(
       f"{icon} <b>Exchange Close [{event.reason.value}]</b>\n\n"
@@ -158,7 +173,7 @@ class CryptoMessagePresenter:
   @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
-      f"🚫 <b>Signal Rejected</b>\n\n"
+      f"{REJECTED} <b>Signal Rejected</b>\n\n"
       f"A signal failed validation and was <b>NOT executed</b>.\n"
       f"Reason: <b>{html.escape(reason)}</b>\n"
       f"{_DIVIDER}\n{footer}"
@@ -167,7 +182,7 @@ class CryptoMessagePresenter:
   @staticmethod
   def admin_flat_closed(db_pos: dict, result: dict, footer: str) -> str:
     return _box(
-      f"⚡ <b>Admin FLAT Closed</b>\n\n"
+      f"{ADMIN} <b>Admin FLAT Closed</b>\n\n"
       f"Symbol: <b>{db_pos['symbol']}</b>\n"
       f"Strategy: <b>{db_pos['strategy']}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
