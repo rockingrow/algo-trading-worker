@@ -18,6 +18,7 @@ from worker.gateways.forex.mt5.close_detector import (
   TerminalCloseReason,
   scan_terminal_closed_positions,
 )
+from worker.icons import MANUAL, STOP, SUCCESS, UNKNOWN, WARNING
 from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
 from worker.interfaces.message_sender_protocol import MessageSenderProtocol
 from worker.logger import get_logger
@@ -30,10 +31,10 @@ log = get_logger("worker.jobs.mt5_event_job")
 _POLL_INTERVAL = 5  # seconds
 
 _REASON_ICON = {
-  TerminalCloseReason.SL: "🛑",
-  TerminalCloseReason.TP: "✅",
-  TerminalCloseReason.STOP_OUT: "⚠️",
-  TerminalCloseReason.MANUAL: "🖐",
+  TerminalCloseReason.SL: STOP,
+  TerminalCloseReason.TP: SUCCESS,
+  TerminalCloseReason.STOP_OUT: WARNING,
+  TerminalCloseReason.MANUAL: MANUAL,
 }
 
 
@@ -158,7 +159,7 @@ class MT5EventJob:
       if acct
       else ""
     )
-    icon = _REASON_ICON.get(event.close_reason, "❓")
+    icon = _REASON_ICON.get(event.close_reason, UNKNOWN)
     msg = _box(
       f"{icon} <b>Terminal Close [{event.close_reason.value}]</b>\n\n"
       f"Symbol: <b>{event.symbol}</b>\n"

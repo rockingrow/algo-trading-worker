@@ -2,6 +2,7 @@ import asyncio
 import queue
 from typing import Callable, Generator, Optional
 
+from worker.icons import BROKER, DISCONNECTED, RETRYING
 from worker.logger import get_logger
 from worker.nats_client import NatsClient
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -55,13 +56,13 @@ class NATSSubscriber:
   async def _on_disconnect(self) -> None:
     logger.warning("NATS disconnected from %s. Retrying...", self.url)
     self._notify(
-      f"<pre>🔴 [Disconnected] NATS Broker\nEndpoint: {self.url}\n⏳ Retrying connection...{self._footer}</pre>"
+      f"<pre>{DISCONNECTED} [Disconnected] NATS Broker\nEndpoint: {self.url}\n{RETRYING} Retrying connection...{self._footer}</pre>"
     )
 
   async def _on_reconnect(self) -> None:
     logger.info("NATS reconnected to %s", self.url)
     self._notify(
-      f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}{self._footer}</pre>"
+      f"<pre>{BROKER} [Connected] NATS Worker to Broker\nEndpoint: {self.url}{self._footer}</pre>"
     )
 
   def connect(self) -> None:
@@ -75,7 +76,7 @@ class NATSSubscriber:
         else ""
       )
       self._notify(
-        f"<pre>🔌 [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{self._footer}</pre>"
+        f"<pre>{BROKER} [Connected] NATS Worker to Broker\nEndpoint: {self.url}\nListening Subjects: {', '.join(subject_names)}{pub_line}{self._footer}</pre>"
       )
       logger.info(
         "Connected to NATS at %s, listening=[%s] publishing=[%s]",
