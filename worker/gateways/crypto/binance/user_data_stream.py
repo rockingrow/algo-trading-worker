@@ -176,6 +176,9 @@ class BinanceUserDataStream:
 
   def _build_client(self):
     # Lazy import so the SDK (aiohttp etc.) loads only when the stream runs.
+    import ssl
+
+    import certifi
     from binance_common.configuration import (
       ConfigurationRestAPI,
       ConfigurationWebSocketStreams,
@@ -189,6 +192,10 @@ class BinanceUserDataStream:
     from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futures import (
       DerivativesTradingUsdsFutures,
     )
+
+    # Create explicit SSL context with certifi CA bundle — required on Windows Server
+    # where the default SSL context fails certificate verification for aiohttp
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     rest_cfg = ConfigurationRestAPI(
       api_key=self._api_key,
@@ -204,7 +211,8 @@ class BinanceUserDataStream:
         DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_TESTNET_URL
         if self._testnet
         else DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_PROD_URL
-      )
+      ),
+      https_agent=ssl_context
     )
     return DerivativesTradingUsdsFutures(
       config_rest_api=rest_cfg, config_ws_streams=ws_cfg
