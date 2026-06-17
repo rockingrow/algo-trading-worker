@@ -1,4 +1,7 @@
-.PHONY: install install-dev run dev test format lint fix
+.PHONY: init install install-dev run dev test format lint fix
+
+init:
+	uv run python scripts/init_env.py
 
 install:
 	uv sync

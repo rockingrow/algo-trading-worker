@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 from typing import Any
 
+from worker.icons import ADMIN, ALARM, CONNECTED, FAILED, GEAR, REJECTED, SHIELD, STOP, SUCCESS, WARNING
 from worker.schemas.signal_schema import SignalSchema
 from worker.services.notification_service import _box
 
@@ -23,7 +24,7 @@ _DIVIDER = "----------------------------------"
 
 def format_volume(volume: Any, auto_calculated: bool = False) -> str:
   """Format volume with a gear icon when it was auto-calculated."""
-  icon = "⚙️" if auto_calculated else ""
+  icon = GEAR if auto_calculated else ""
   return f"{volume} lot {icon}".strip() if auto_calculated else f"{volume} lot"
 
 
@@ -41,17 +42,17 @@ class TradeMessagePresenter:
       f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
     )
     return _box(
-      f"🟢 <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
+      f"{CONNECTED} <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
     )
 
   @staticmethod
   def shutdown(footer: str) -> str:
-    return _box(f"🛑 <b>[Disconnected] FOREX Worker</b>{footer}")
+    return _box(f"{STOP} <b>[Disconnected] FOREX Worker</b>{footer}")
 
   @staticmethod
   def force_closed(symbol: str, strategy: str, fc: dict, footer: str) -> str:
     return _box(
-      f"⚠️ <b>Force Closed (New Entry)</b>\n\n"
+      f"{WARNING} <b>Force Closed (New Entry)</b>\n\n"
       f"Symbol: <b>{symbol}</b>\n"
       f"Strategy: <b>{strategy}</b>\n"
       f"Price: <b>{fc.get('price')}</b>\n"
@@ -67,7 +68,7 @@ class TradeMessagePresenter:
     signal: SignalSchema, result: dict, pos_ticket: Any, footer: str
   ) -> str:
     return _box(
-      f"✅ <b>Order Filled</b>\n\n"
+      f"{SUCCESS} <b>Order Filled</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
@@ -82,7 +83,7 @@ class TradeMessagePresenter:
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str:
     return _box(
-      f"❌ <b>Order Failed</b>\n\n"
+      f"{FAILED} <b>Order Failed</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
@@ -101,12 +102,12 @@ class TradeMessagePresenter:
     failsafe = result.get("sl_failsafe_close") or {}
     sl_res = result.get("sl_update") or {}
     if failsafe.get("success"):
-      head = "🛡️ <b>Unprotected Position — Emergency Closed</b>"
+      head = f"{SHIELD} <b>Unprotected Position — Emergency Closed</b>"
       outcome = (
         f"Closed: <b>{failsafe.get('volume')}</b> @ <b>{failsafe.get('price')}</b>\n"
       )
     else:
-      head = "🚨 <b>UNPROTECTED POSITION — STILL OPEN</b>"
+      head = f"{ALARM} <b>UNPROTECTED POSITION — STILL OPEN</b>"
       outcome = (
         f"Emergency close <b>FAILED</b>: {failsafe.get('comment')}\n"
         f"<b>Manual intervention required.</b>\n"
@@ -124,7 +125,7 @@ class TradeMessagePresenter:
   @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
-      f"🚫 <b>Signal Rejected</b>\n\n"
+      f"{REJECTED} <b>Signal Rejected</b>\n\n"
       f"A signal failed validation and was <b>NOT executed</b>.\n"
       f"Reason: <b>{html.escape(reason)}</b>\n"
       f"{_DIVIDER}\n"
@@ -134,7 +135,7 @@ class TradeMessagePresenter:
   @staticmethod
   def admin_flat_closed(db_pos: dict, result: dict, footer: str) -> str:
     return _box(
-      f"⚡ <b>Admin FLAT Closed</b>\n\n"
+      f"{ADMIN} <b>Admin FLAT Closed</b>\n\n"
       f"Symbol: <b>{db_pos['symbol']}</b>\n"
       f"Strategy: <b>{db_pos['strategy']}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"

@@ -24,64 +24,19 @@ uv sync
 
 ### 3. Configure .env
 
-Copy `.env.example` to `.env` and fill in the NATS/Broker configuration plus the credentials for your `MARKET_TYPE` — MT5 connection details for FOREX, or the exchange API keys for CRYPTO.
+Run the interactive initializer — it creates `.env` from `.env.example` (or updates an existing one in place) and walks you through every setting:
 
 ```bash
-cp .env.example .env
+make init
 ```
 
-#### All Environment Variables
+- **Defaults everywhere** — each variable shows a default (your current `.env` value if present, otherwise the `.env.example` default); press Enter to keep it.
+- **Market-aware** — pick `MARKET_TYPE` (`FOREX` or `CRYPTO`) and it prompts only for the matching credential group: **MT5 connection** for FOREX, or **Crypto CEX / exchange API keys** for CRYPTO.
+- **Re-runnable** — existing values are reused as defaults and edited in place (no duplicates); a timestamped `.env.bak-*` backup is written before each update.
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| **NATS** | | | |
-| `NATS_URL` | ✅ | — | NATS server URL (e.g. `nats://broker-host:4222`) |
-| `NATS_TOKEN` | | `null` | NATS authentication token |
-| `NATS_SUBJECTS` | ✅ | — | Comma-separated NATS subjects to subscribe (e.g. `MT5_GOLD,MT5_BTCUSD`) |
-| `MARKET_TYPE` | | `FOREX` | `FOREX` or `CRYPTO` — selects the market orchestrator |
-| **Forex platform** (used when `MARKET_TYPE=FOREX`) | | | |
-| `FOREX_PLATFORM` | | `MT5` | Which forex platform to use; resolved by `PlatformFactory` (mirror of `CRYPTO_EXCHANGE`). Currently only `MT5`. |
-| **MT5** (required when `MARKET_TYPE=FOREX`) | | | |
-| `MT5_SERVER` | FOREX | — | Broker server name (e.g. `Exness-MT5Trial6`) |
-| `MT5_LOGIN` | FOREX | — | MT5 account number |
-| `MT5_PASSWORD` | FOREX | — | MT5 account password |
-| `MT5_PATH` | | auto-detect | Full path to `terminal64.exe`; if omitted the module reads from Windows registry |
-| `MT5_NAME` | | `null` | Display name sent in every `PositionEvent` to the Broker |
-| **Crypto CEX** (required when `MARKET_TYPE=CRYPTO`) | | | |
-| `CRYPTO_EXCHANGE` | | `BINANCE` | Which CEX to use; resolved by `ExchangeFactory` |
-| `CRYPTO_QUOTE_ASSET` | | `USDT` | Quote currency appended to bare symbols (`BTCUSD` → `BTCUSDT`) |
-| `BINANCE_API_KEY` | CRYPTO | — | Binance API key |
-| `BINANCE_API_SECRET` | CRYPTO | — | Binance API secret |
-| `BINANCE_ACCOUNT_ID` | CRYPTO | — | Account identifier included in every `PositionEvent` sent to the Broker |
-| `BINANCE_TESTNET` | | `false` | Use the Binance Futures testnet when `true` |
-| `CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL` | | `false` | Allow multiple strategies to trade the same symbol concurrently. Binance USDⓈ-M uses one-way (netting) mode, so two strategies on the same symbol merge at the exchange level — only enable this if you understand the implications |
-| `STRATEGY_MAGIC_MAP` | FOREX | `{}` | JSON mapping each strategy to its dedicated MT5 magic number (e.g. `{"SCALP": 20260001, "SWING": 20260002}`). Each strategy's orders are stamped with — and filtered by — its own magic, giving native MT5-level isolation without a DB lookup. Every FOREX strategy that trades must be listed here. |
-| `SLIPPAGE_DEVIATION` | | `100` | Max allowed slippage in points (100 points ≈ \$1.00 on most Forex instruments) |
-| **Risk Management** | | | |
-| `VOLUME_DECISION_ENABLED` | | `true` | When `true`, lot size is calculated from capital + risk % instead of signal `quantity` |
-| `CAPITAL` | | `1000` | Notional capital used for lot-size calculation |
-| `CAPITAL_CURRENCY` | | `USD` | Currency of `CAPITAL` (informational, shown in startup notification) |
-| `RISK_PERCENTAGE` | | `2.0` | % of capital risked per trade when `VOLUME_DECISION_ENABLED=true` |
-| `USE_ACCOUNT_EQUITY` | | `false` | When `true`, sizes entries against live account equity instead of the fixed `CAPITAL`. FOREX reads `account_info().equity` via MT5; CRYPTO reads `totalMarginBalance` from the exchange account endpoint. Falls back to symbol minimum quantity if equity cannot be read. No effect when `VOLUME_DECISION_ENABLED=false`. |
-| `POSITION_TP1_PERCENT` | | `30.0` | % of live volume closed at TP1 when `VOLUME_DECISION_ENABLED=true` |
-| `TP1_MOVE_SL_TO_BREAKEVEN` | | `true` | When `true`, TP1 partial-closes **and** moves the remaining SL to breakeven (entry). When `false`, TP1 only partial-closes and leaves the original entry SL in place so the runner keeps its initial protection |
-| **Telegram** | | | |
-| `NOTIFICATION_MODE` | | `VERBOSE` | `VERBOSE` / `SILENT` / `ERROR` — applies to the **COMMUNITY** (signal channel) feed only; `INDIVIDUAL` management alerts are always delivered regardless of this setting |
-| `TELEGRAM_ENABLED` | ✅ | — | `true` / `false` — master switch for all Telegram notifications |
-| `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot API token from @BotFather |
-| `TELEGRAM_CHAT_ID` | ✅ | — | **Management chat**: service start/stop, MT5 health, NATS events |
-| `TELEGRAM_CHAT_CHANNEL_ID` | | `""` | **Signal channels**: comma-separated channel IDs (e.g. `-1001234,-1009876`). Broadcasts order fills/failures, terminal closes, and force-close events to all listed channels |
-| **Broker** | | | |
-| `BROKER_API_URL` | ✅ | — | Base URL of the central Broker API (used by `PositionCDC` HTTP fallback) |
-| `BROKER_API_KEY` | ✅ | — | API key sent as Bearer token to the Broker API |
-| **App** | | | |
-| `APP_HOST` | | `0.0.0.0` | FastAPI bind host |
-| `APP_PORT` | | `8000` | FastAPI bind port |
-| `LOG_LEVEL` | | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+The full list of variables and their defaults lives in [`.env.example`](.env.example).
 
-> **Telegram dual-channel setup:** `TELEGRAM_CHAT_ID` is for private management alerts (sent to you as the operator). `TELEGRAM_CHAT_CHANNEL_ID` accepts a comma-separated list of channel IDs for broadcasting to multiple communities — each receives every order fill, failure, terminal close, and force-close event. If `TELEGRAM_CHAT_CHANNEL_ID` is left empty, it falls back to `TELEGRAM_CHAT_ID`.
-
-Please ensure that you have enabled "Allow Algo Trading" inside Options > Expert Advisors of the MetaTrader 5 Terminal.
+> **FOREX only:** enable **Allow Algo Trading** under *Options → Expert Advisors* in the MetaTrader 5 Terminal before starting the worker.
 
 ### 4. Operation
 

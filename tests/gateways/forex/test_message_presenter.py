@@ -4,6 +4,7 @@ from worker.gateways.forex.message_presenter import (
   TradeMessagePresenter,
   format_volume,
 )
+from worker.icons import GEAR
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -13,7 +14,7 @@ def test_format_volume_plain():
 
 def test_format_volume_auto_calculated_has_icon():
   out = format_volume(0.5, auto_calculated=True)
-  assert "0.5 lot" in out and "⚙️" in out
+  assert "0.5 lot" in out and GEAR in out
 
 
 def test_order_filled_contains_key_fields():

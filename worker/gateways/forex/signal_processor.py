@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, Optional
 
 from worker.context import WorkerContext
+from worker.icons import CONNECTED, DISCONNECTED, WARNING
 from worker.gateways.forex.executor import ForexExecutor
 from worker.gateways.forex.factory import PlatformFactory
 from worker.gateways.forex.message_presenter import TradeMessagePresenter
@@ -54,12 +55,12 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
           "[%s Health] %s disconnected — attempting to relaunch/reconnect...", name, name
         )
         notifier.send_message(
-          _box(f"⚠️ <b>[Disconnected] {name} — reconnecting…</b>{footer_fn()}")
+          _box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer_fn()}")
         )
         reconnected = gateway.reconnect(max_attempts=15, delay_seconds=10.0)
         if reconnected:
           log.info("[%s Health] %s reconnected successfully.", name, name)
-          notifier.send_message(_box(f"🟢 <b>[Connected] {name}</b>{footer_fn()}"))
+          notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer_fn()}"))
         else:
           log.error(
             "[%s Health] %s reconnect failed after 15 attempts — killing and restarting terminal...",
@@ -67,7 +68,7 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
           )
           notifier.send_message(
             _box(
-              f"🔴 <b>[Disconnected] {name} reconnect failed</b>\n\n"
+              f"{DISCONNECTED} <b>[Disconnected] {name} reconnect failed</b>\n\n"
               f"Killing and restarting terminal…{footer_fn()}"
             )
           )
@@ -78,7 +79,7 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
             if reconnected:
               log.info("[%s Health] %s reconnected after terminal restart.", name, name)
               notifier.send_message(
-                _box(f"🟢 <b>[Connected] {name} after terminal restart</b>{footer_fn()}")
+                _box(f"{CONNECTED} <b>[Connected] {name} after terminal restart</b>{footer_fn()}")
               )
             else:
               log.error(
@@ -87,7 +88,7 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
               )
               notifier.send_message(
                 _box(
-                  f"🔴 <b>{name} CRASHED</b>\n\n"
+                  f"{DISCONNECTED} <b>{name} CRASHED</b>\n\n"
                   f"Failed to reconnect even after restarting the terminal.\n"
                   f"Please restart the terminal manually.{footer_fn()}"
                 )
@@ -99,7 +100,7 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
             )
             notifier.send_message(
               _box(
-                f"🔴 <b>{name} CRASHED</b>\n\n"
+                f"{DISCONNECTED} <b>{name} CRASHED</b>\n\n"
                 f"terminal restart failed — path not configured or exe missing.\n"
                 f"Please restart the terminal manually.{footer_fn()}"
               )
@@ -114,13 +115,13 @@ def _ensure_gateway_connected(gateway, notifier, footer: str, log) -> bool:
   if gateway.is_connected():
     return True
   log.warning("[%s Process] %s connection lost. Reconnecting...", name, name)
-  notifier.send_message(_box(f"⚠️ <b>[Disconnected] {name} — reconnecting…</b>{footer}"))
+  notifier.send_message(_box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer}"))
   reconnected = gateway.reconnect(max_attempts=0, delay_seconds=10.0)
   if reconnected:
-    notifier.send_message(_box(f"🟢 <b>[Connected] {name}</b>{footer}"))
+    notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer}"))
   else:
     notifier.send_message(
-      _box(f"🔴 <b>[Disconnected] {name} reconnect failed — signal dropped</b>{footer}")
+      _box(f"{DISCONNECTED} <b>[Disconnected] {name} reconnect failed — signal dropped</b>{footer}")
     )
   return reconnected
 
