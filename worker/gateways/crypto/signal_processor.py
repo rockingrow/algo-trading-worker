@@ -78,7 +78,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     return {
       "account_info_fn": self._account_snapshot,
       "account_name": self.settings.get("binance_account_id"),
-      "strategy_magic_map": {},
+      "strategy_magic_map": self.settings.get("strategy_magic_map") or {},
     }
 
   def _account_snapshot(self) -> Optional[dict]:
