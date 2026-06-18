@@ -77,10 +77,10 @@ class PositionCDC:
     self._stop_event = threading.Event()
     self._thread: threading.Thread | None = None
 
-  def _magic_for(self, strategy: Optional[str]) -> int:
+  def _magic_for(self, strategy: Optional[str]) -> Optional[int]:
     if not strategy:
-      return 0
-    return self._strategy_magic_map.get(strategy, 0)
+      return None
+    return self._strategy_magic_map.get(strategy)
 
 
   def start(self, stop_event=None) -> None:
@@ -119,7 +119,11 @@ class PositionCDC:
       payload = {k: row[k] for k in _EVENT_FIELDS if k in row}
       payload.update(self._extract_signal_fields(row.get("message")))
       strategy_code = payload.get("strategy_code")
-      payload["strategy_code"] = str(strategy_code) if strategy_code is not None else str(self._magic_for(row.get("strategy")))
+      if strategy_code is None:
+        magic = self._magic_for(row.get("strategy"))
+        payload["strategy_code"] = str(magic) if magic is not None else None
+      else:
+        payload["strategy_code"] = str(strategy_code)
       payload.update(account_snapshot)
       event = PositionEvent(
         event=event_type,
