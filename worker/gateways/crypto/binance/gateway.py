@@ -354,6 +354,31 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
       return TradeResult.fail(str(exc))
 
+  def set_take_profit(
+    self, symbol: str, position_side: str, tp_price: float, quantity: float
+  ) -> TradeResult:
+    # Take-profit targets are conditional orders too, so they go on the same Algo
+    # Order endpoint as the stop (algoType=CONDITIONAL, TAKE_PROFIT_MARKET is one
+    # of the supported types). closePosition=true closes the whole remaining
+    # position when the target trips — so after a TP1 partial close it still flat-
+    # tens the runner — and must not be combined with quantity/reduceOnly, so
+    # *quantity* is accepted for BaseExchangeGateway parity but intentionally
+    # unused. The user-data stream maps a TAKE_PROFIT_MARKET fill to a TP close.
+    payload: Dict[str, Any] = {
+      "algo_type": "CONDITIONAL",
+      "symbol": symbol,
+      "side": _CLOSE_SIDE.get(position_side, "SELL"),
+      "type": "TAKE_PROFIT_MARKET",
+      # Snap to tick_size — an off-grid trigger price is rejected with -1111.
+      "trigger_price": self._round_to_tick(symbol, tp_price),
+      "close_position": "true",
+    }
+    try:
+      return self._order_result(self._send("POST", _API_Endpoints.ALGO_ORDER, payload, signed=True))
+    except Exception as exc:
+      logger.exception("[Binance] set_take_profit failed: %s", exc)
+      return TradeResult.fail(str(exc))
+
   def cancel_all_orders(self, symbol: str) -> None:
     # Regular orders and algo (conditional) orders live in separate Binance systems.
     # allOpenOrders covers standard orders; algoOpenOrders covers STOP_MARKET/TP

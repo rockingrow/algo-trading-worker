@@ -21,6 +21,7 @@ Notes
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import uuid
@@ -163,14 +164,27 @@ class CryptoExecutor:
     if not result.get("success"):
       return result
 
-    # Attach protective stop if the signal carried one. A position without its
-    # protective stop is unacceptable: if the stop fails to register, roll the
-    # entry back (reduce-only close) rather than leave unprotected exposure.
+    return self._attach_entry_orders(symbol, action, qty, signal, result)
+
+  def _attach_entry_orders(
+    self, symbol: str, action: str, qty: float, signal: SignalSchema, result: dict
+  ) -> TradeResult:
+    """Place SL and TP2 resting orders after the entry market order succeeds."""
     if signal.sl:
       sl_res = self._gateway.set_stop_loss(symbol, action, signal.sl, qty)
       result["sl_update"] = sl_res
       if not sl_res.get("success"):
         return self._rollback_unprotected_entry(symbol, action, result, sl_res, qty)
+
+    if signal.tp2:
+      tp_res = self._gateway.set_take_profit(symbol, action, signal.tp2, qty)
+      result["tp_update"] = tp_res
+      if not tp_res.get("success"):
+        logger.warning(
+          "[open_position] TP placement failed (%s) for %s — position remains "
+          "SL-protected; continuing without a resting take-profit.",
+          tp_res.get("comment"), symbol,
+        )
 
     result.setdefault("volume", qty)
     return result
@@ -364,13 +378,57 @@ class CryptoExecutor:
       if position_ticket
       else positions[0]
     )
-    # Replace any resting stop with the new one (breakeven after TP1).
+    # Moving the stop to breakeven cancels all resting orders (the old stop) —
+    # which on Binance also clears the resting take-profit. Re-place the breakeven
+    # stop, then re-establish the TP2 target so it survives the move: the strategy
+    # keeps the runner's take-profit intact; only the stop changes.
     self._gateway.cancel_all_orders(resolved)
     result = self._gateway.set_stop_loss(resolved, pos.side, new_sl, pos.volume)
     if result.get("success"):
       result["new_sl"] = new_sl
       result["ticket"] = str(pos.ticket)
+      tp2 = self._recover_entry_tp2(symbol, strategy)
+      if tp2:
+        tp_res = self._gateway.set_take_profit(resolved, pos.side, tp2, pos.volume)
+        result["tp_update"] = tp_res
+        if not tp_res.get("success"):
+          logger.warning(
+            "[update_position_sl] TP2 re-placement failed (%s) for %s — breakeven "
+            "stop is set but the take-profit target is no longer resting.",
+            tp_res.get("comment"), resolved,
+          )
     return result
+
+  def _recover_entry_tp2(self, symbol: str, strategy: Optional[str]) -> Optional[float]:
+    """Recover the original TP2 target from the persisted entry signal.
+
+    The breakeven SL move cancels all resting orders (including the take-profit),
+    so re-establishing TP2 needs its price. The active position row stores the
+    original entry signal JSON in ``gateway_message``; read TP2 back from there so
+    no extra schema column or exchange round-trip is required. *symbol* is the
+    raw signal symbol (matching what the DB stores), not the resolved one.
+    """
+    if self._db is None or not strategy:
+      return None
+    getter = getattr(self._db, "get_open_positions_by_strategy", None)
+    if getter is None:
+      return None
+    try:
+      rows = getter(strategy, symbol)
+    except Exception:
+      logger.exception("[update_position_sl] Could not read DB to recover TP2 (%s).", symbol)
+      return None
+    for row in rows:
+      raw = row.get("gateway_message")
+      if not raw:
+        continue
+      try:
+        tp2 = json.loads(raw).get("tp2")
+      except (TypeError, ValueError):
+        continue
+      if tp2:
+        return float(tp2)
+    return None
 
   # ── Full close ────────────────────────────────────────────────────────── #
 

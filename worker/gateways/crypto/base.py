@@ -122,6 +122,12 @@ class BaseExchangeGateway(ABC):
     """Place / replace a reduce-only stop order protecting an open position."""
 
   @abstractmethod
+  def set_take_profit(
+    self, symbol: str, position_side: str, tp_price: float, quantity: float
+  ) -> TradeResult:
+    """Place / replace a reduce-only take-profit order for an open position."""
+
+  @abstractmethod
   def cancel_all_orders(self, symbol: str) -> None:
     """Cancel all open (e.g. resting stop) orders for *symbol*."""
 
