@@ -164,18 +164,18 @@ class CryptoExecutor:
     if not result.get("success"):
       return result
 
-    # Attach protective stop if the signal carried one. A position without its
-    # protective stop is unacceptable: if the stop fails to register, roll the
-    # entry back (reduce-only close) rather than leave unprotected exposure.
+    return self._attach_entry_orders(symbol, action, qty, signal, result)
+
+  def _attach_entry_orders(
+    self, symbol: str, action: str, qty: float, signal: SignalSchema, result: dict
+  ) -> TradeResult:
+    """Place SL and TP2 resting orders after the entry market order succeeds."""
     if signal.sl:
       sl_res = self._gateway.set_stop_loss(symbol, action, signal.sl, qty)
       result["sl_update"] = sl_res
       if not sl_res.get("success"):
         return self._rollback_unprotected_entry(symbol, action, result, sl_res, qty)
 
-    # Attach the take-profit target (TP2) if the signal carried one. Unlike the
-    # stop, a missing TP is not unprotected exposure, so a TP failure is logged
-    # and tolerated rather than rolled back — the position stays SL-guarded.
     if signal.tp2:
       tp_res = self._gateway.set_take_profit(symbol, action, signal.tp2, qty)
       result["tp_update"] = tp_res
