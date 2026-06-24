@@ -285,3 +285,46 @@ def test_malformed_json_ignored():
   proc = FakeProcessor({"success": True})
   proc._process_message(NatsSubjectEnum.SIGNAL, "not json {{")
   assert proc.db.logged == []
+
+
+# ── Scale-in (averaging) adjustment ────────────────────────────────────────── #
+
+
+def _capture_signal_processor():
+  """A FakeProcessor whose handler records the (possibly scaled) signal it sees."""
+  result = {"success": True, "ticket": 1, "price": 66000.0, "volume": 0.5}
+  proc = FakeProcessor(result)
+  seen = []
+  proc.handler = SimpleNamespace(handle=lambda sig: seen.append(sig) or result)
+  return proc, seen
+
+
+def test_scale_position_rescales_tp_sl_quantity_before_handler():
+  proc, seen = _capture_signal_processor()
+  raw = make_signal(
+    SignalActionEnum.LONG,
+    quantity=0.5,
+    sl=64000.0,
+    tp1=65000.0,
+    tp2=67000.0,
+    is_scale_position=True,
+    scaling={"tp": 1.1, "sl": 0.9, "quantity": 2.0},
+  ).model_dump_json()
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  assert len(seen) == 1
+  sig = seen[0]
+  assert sig.tp1 == 65000.0 * 1.1
+  assert sig.tp2 == 67000.0 * 1.1
+  assert sig.sl == 64000.0 * 0.9
+  assert sig.quantity == 1.0
+
+
+def test_non_scale_position_signal_is_untouched():
+  proc, seen = _capture_signal_processor()
+  raw = make_signal(
+    SignalActionEnum.LONG, tp1=65000.0, scaling={"tp": 1.1}
+  ).model_dump_json()
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  assert seen[0].tp1 == 65000.0  # scaling ignored without is_scale_position=True

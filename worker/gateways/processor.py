@@ -214,6 +214,24 @@ class BaseSignalProcessor(ABC):
     if not self._ensure_connected():
       return
 
+    # Scale-in (averaging) adjustment: when the broker flags this as a scale
+    # position, rescale TP/SL/quantity off the original values by the multipliers
+    # in `scaling` BEFORE the handler executes, so every downstream step (sizing,
+    # SL/TP placement, persistence) sees the adjusted signal. A non-scale signal
+    # is returned unchanged.
+    if signal.is_scale_position:
+      scaled = signal.apply_scaling()
+      if scaled is not signal:
+        log.info(
+          "[%s Process] Scale-in adjustment | %s | scaling=%s | "
+          "tp1=%s→%s tp2=%s→%s sl=%s→%s qty=%s→%s risk=%s→%s",
+          self.name, signal.symbol, signal.scaling,
+          signal.tp1, scaled.tp1, signal.tp2, scaled.tp2,
+          signal.sl, scaled.sl, signal.quantity, scaled.quantity,
+          signal.risk_percent, scaled.risk_percent,
+        )
+        signal = scaled
+
     log.info(
       "[%s Process] Processing Signal: %s | %s | TV Time: %s",
       self.name, signal.symbol, signal.action.value, signal.timestamp,
