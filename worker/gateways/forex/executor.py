@@ -191,6 +191,11 @@ class ForexExecutor:
     # minimum lot regardless of CAPITAL/equity.
     use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
     risk = signal.risk_percent if use_signal_risk else self._config.risk_percentage
+    # Scale-in: the broker's pre-scaled signal.quantity is ignored in risk mode,
+    # so re-apply the scale-in factor here (1.0 for a normal entry). Sizing is
+    # linear in risk, so scaling risk scales the resulting lot by the same factor.
+    scale_factor = signal.scale_quantity_factor()
+    risk *= scale_factor
 
     capital = self._resolve_capital()
     if capital is None:
@@ -203,7 +208,8 @@ class ForexExecutor:
     capital_src = "account_equity" if self._config.use_account_equity else f"capital={self._config.capital}"
     logger.info(
       f"[open_position] VOLUME_DECISION mode | {capital_src} "
-      f"risk={risk}% (source={'signal' if use_signal_risk else 'config'}) → lot={volume}"
+      f"risk={risk}% (source={'signal' if use_signal_risk else 'config'}, "
+      f"scale_factor={scale_factor}) → lot={volume}"
     )
     return volume
 

@@ -174,15 +174,36 @@ class SignalHandler:
 
   def _handle_entry(self, signal: SignalSchema) -> TradeResult:
     """
-    1. Check for any stale position on this symbol and force-close it.
-    2. Open a fresh position via strategy.entry (direction in signal.action).
+    1. Reject if another strategy already holds this symbol (netting conflict).
+    2. Check for any stale position on this symbol and force-close it.
+    3. Open a fresh position via strategy.entry (direction in signal.action).
     """
     symbol = signal.symbol
     strategy = signal.strategy
 
+    # Guard: reject if another strategy already holds this symbol in the DB.
+    # This MUST run before the stale-cleanup below because cancel_all_orders is
+    # symbol-scoped, not strategy-scoped — proceeding while another strategy has
+    # resting orders on the symbol would silently wipe their SL/TP.
+    other_holders = {
+      r["strategy"]
+      for r in self._db.get_open_positions_for_flat(symbol=symbol)
+      if r.get("strategy") != strategy
+    }
+    if other_holders:
+      logger.warning(
+        "[SignalHandler._handle_entry] Netting conflict for %s: already held by "
+        "%s — rejecting %s entry to protect their orders.",
+        symbol, sorted(other_holders), strategy,
+      )
+      return TradeResult.fail(
+        f"Netting conflict: {symbol} already held by {sorted(other_holders)}.",
+        retcode=-1,
+      )
+
     # Step 1 — Pre-flight: close this strategy's stale position to start clean.
     # Scoped to signal.strategy so a concurrent strategy holding a position on
-    # the same symbol (e.g. a Long-only vs a Short-only strategy) is untouched.
+    # the same symbol is untouched (enforced by the guard above).
     forced_closed: list[dict] = []
     cleanup_price: Optional[float] = None
     cleanup_retcode: Optional[int] = None

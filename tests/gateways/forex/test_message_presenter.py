@@ -1,7 +1,7 @@
 from helpers import make_signal
 
 from worker.gateways.forex.message_presenter import (
-  TradeMessagePresenter,
+  ForexMessagePresenter,
   format_volume,
 )
 from worker.icons import GEAR
@@ -19,7 +19,7 @@ def test_format_volume_auto_calculated_has_icon():
 
 def test_order_filled_contains_key_fields():
   signal = make_signal(SignalActionEnum.LONG)
-  msg = TradeMessagePresenter.order_filled(
+  msg = ForexMessagePresenter.order_filled(
     signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
   )
   assert "Order Filled" in msg
@@ -29,9 +29,37 @@ def test_order_filled_contains_key_fields():
   assert msg.startswith("<pre>") and msg.endswith("</pre>")
 
 
+def test_order_filled_shows_scale_position_block():
+  # The broker pre-scales the signal, so tp1/tp2/sl here are already the final
+  # values and are displayed verbatim; volume is the executed lot.
+  signal = make_signal(
+    SignalActionEnum.LONG,
+    is_scale_position=True,
+    tp1=2040.0,
+    tp2=2100.0,
+    sl=1980.0,
+  )
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.2, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "Scale Position" in msg
+  assert "TP1:" in msg and "2040.0" in msg
+  assert "TP2:" in msg and "2100.0" in msg
+  assert "SL:" in msg and "1980.0" in msg
+  assert "0.2 lot" in msg  # final scaled volume
+
+
+def test_order_filled_no_scale_block_for_normal_entry():
+  signal = make_signal(SignalActionEnum.LONG)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "Scale Position" not in msg
+
+
 def test_order_failed_contains_error():
   signal = make_signal(SignalActionEnum.SL)
-  msg = TradeMessagePresenter.order_failed(
+  msg = ForexMessagePresenter.order_failed(
     signal, {"comment": "rejected", "retcode": 10016, "price": None}, "FOOTER"
   )
   assert "Order Failed" in msg
@@ -41,7 +69,7 @@ def test_order_failed_contains_error():
 
 
 def test_force_closed_message():
-  msg = TradeMessagePresenter.force_closed(
+  msg = ForexMessagePresenter.force_closed(
     "XAUUSD",
     "strat-1",
     {"price": 1999.0, "volume": 0.2, "ref_id": 7, "ref_source_id": 3},
@@ -61,20 +89,20 @@ def test_startup_message_includes_config():
     "use_account_equity": False,
     "position_tp1_percent": 30,
   }
-  msg = TradeMessagePresenter.startup(settings_dict, "FOOTER")
+  msg = ForexMessagePresenter.startup(settings_dict, "FOOTER")
   assert "FOREX Worker" in msg
   assert "RISK_PERCENTAGE" in msg
   assert "FOOTER" in msg
 
 
 def test_shutdown_message():
-  assert "Disconnected" in TradeMessagePresenter.shutdown("FOOTER")
+  assert "Disconnected" in ForexMessagePresenter.shutdown("FOOTER")
 
 
 def test_admin_flat_closed_contains_key_fields():
   db_pos = {"symbol": "XAUUSD", "strategy": "strat-A", "ref_source_id": 10}
   result = {"price": 2001.5, "volume": 0.5, "ticket": 999}
-  msg = TradeMessagePresenter.admin_flat_closed(db_pos, result, "FOOTER")
+  msg = ForexMessagePresenter.admin_flat_closed(db_pos, result, "FOOTER")
   assert "Admin FLAT" in msg
   assert "XAUUSD" in msg
   assert "strat-A" in msg

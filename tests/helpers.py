@@ -344,6 +344,7 @@ class FakeExchangeGateway(BaseExchangeGateway):
     self._sl_results = list(sl_results or [])
     self.orders: List[tuple] = []     # (symbol, side, quantity, reduce_only)
     self.stops: List[tuple] = []      # (symbol, position_side, stop_price, quantity)
+    self.takes: List[tuple] = []      # (symbol, position_side, tp_price, quantity)
     self.cancelled: List[str] = []    # symbols whose open orders were cancelled
 
   # ── Lifecycle ─────────────────────────────────────────────────────────── #
@@ -384,6 +385,12 @@ class FakeExchangeGateway(BaseExchangeGateway):
     if self._sl_results:
       return self._sl_results.pop(0)
     return TradeResult.ok(retcode=0, ticket="100")
+
+  def set_take_profit(
+    self, symbol, position_side, tp_price, quantity
+  ) -> TradeResult:
+    self.takes.append((symbol, position_side, tp_price, quantity))
+    return TradeResult.ok(retcode=0, ticket="101")
 
   def cancel_all_orders(self, symbol: str) -> None:
     self.cancelled.append(symbol)

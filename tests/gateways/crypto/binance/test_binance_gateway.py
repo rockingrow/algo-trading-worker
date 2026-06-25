@@ -112,6 +112,31 @@ def test_set_stop_loss_snaps_trigger_price_to_tick(monkeypatch):
   assert calls[-1]["payload"]["trigger_price"] == 63764.7
 
 
+def test_set_take_profit_is_conditional_algo_order_close_position(monkeypatch):
+  # Take-profit targets are conditional orders on the Algo Order endpoint
+  # (TAKE_PROFIT_MARKET, algoType=CONDITIONAL), mirroring the stop but on the
+  # opposite trigger direction. closePosition=true flattens whatever remains.
+  gw, calls = make_gateway(monkeypatch)
+  res = gw.set_take_profit("BTCUSDT", SIDE_LONG, tp_price=31000.0, quantity=0.02)
+  assert res["success"] is True
+  assert res["ticket"] == "777"                # algoId mapped to ticket
+  c = calls[-1]
+  assert c["path"] == "/fapi/v1/algoOrder" and c["signed"] is True
+  assert c["payload"]["algo_type"] == "CONDITIONAL"
+  assert c["payload"]["type"] == "TAKE_PROFIT_MARKET"
+  assert c["payload"]["side"] == "SELL"        # close a LONG
+  assert c["payload"]["trigger_price"] == 31000.0
+  assert c["payload"]["close_position"] == "true"
+  assert "quantity" not in c["payload"]        # closePosition forbids quantity
+
+
+def test_set_take_profit_snaps_trigger_price_to_tick(monkeypatch):
+  # Off-grid TP trigger (0.10 tick) would be rejected with -1111 — snap it first.
+  gw, calls = make_gateway(monkeypatch)
+  gw.set_take_profit("BTCUSDT", SIDE_LONG, tp_price=63764.73, quantity=0.02)
+  assert calls[-1]["payload"]["trigger_price"] == 63764.7
+
+
 def test_get_positions_maps_and_filters_zero(monkeypatch):
   gw, _ = make_gateway(monkeypatch)
   positions = gw.get_positions("BTCUSDT")

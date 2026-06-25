@@ -1,6 +1,10 @@
 """Tests for the pure Binance user-data-stream event parser."""
 
+import asyncio
+
 from worker.gateways.crypto.binance.user_data_stream import (
+  _KEEPALIVE_INTERVAL,
+  _KEEPALIVE_RETRY,
   BinanceUserDataStream,
   ExchangeCloseReason,
   parse_order_trade_update,
@@ -228,3 +232,60 @@ def test_on_message_dispatches_external_manual_close():
   assert len(seen) == 1
   assert seen[0].reason == ExchangeCloseReason.MANUAL
   assert seen[0].symbol == "BTCUSDT"
+
+
+# ── keepalive failure handling (listenKey renew / reconnect decision) ──────── #
+
+
+class _FakeRestApi:
+  """Stand-in for the SDK rest_api whose keepalive call may raise."""
+
+  def __init__(self, exc=None):
+    self._exc = exc
+    self.calls = 0
+
+  def keepalive_user_data_stream(self):
+    self.calls += 1
+    if self._exc is not None:
+      raise self._exc
+
+
+class _FakeClient:
+  def __init__(self, exc=None):
+    self.rest_api = _FakeRestApi(exc)
+
+
+def test_keepalive_success_schedules_next_interval():
+  stream = _stream(lambda e: None)
+  client = _FakeClient()
+  next_ka, ok = asyncio.run(stream._keepalive_check(client, now=100.0))
+  assert ok is True
+  assert next_ka == 100.0 + _KEEPALIVE_INTERVAL
+  assert client.rest_api.calls == 1
+
+
+def test_keepalive_expired_listenkey_signals_reconnect():
+  # Binance -1125 (HTTP 400, body code -1125) → the listenKey is gone, so the
+  # caller must reconnect; signalled by returning (None, False).
+  from binance_common.errors import BadRequestError
+
+  stream = _stream(lambda e: None)
+  client = _FakeClient(
+    BadRequestError(error_message="This listenKey does not exist.", status_code=-1125)
+  )
+  next_ka, ok = asyncio.run(stream._keepalive_check(client, now=100.0))
+  assert next_ka is None
+  assert ok is False
+
+
+def test_keepalive_forbidden_backs_off_without_reconnect():
+  # A 403 (status_code None, not -1125) should back off and retry, not reconnect.
+  from binance_common.errors import ForbiddenError
+
+  stream = _stream(lambda e: None)
+  client = _FakeClient(
+    ForbiddenError(error_message="Access ... forbidden.", status_code=None)
+  )
+  next_ka, ok = asyncio.run(stream._keepalive_check(client, now=100.0))
+  assert next_ka == 100.0 + _KEEPALIVE_RETRY
+  assert ok is False

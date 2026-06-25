@@ -28,10 +28,11 @@ from worker.logger import get_logger
 
 log = get_logger("worker.gateways.crypto.binance.user_data_stream")
 
-_KEEPALIVE_INTERVAL = 30 * 60   # seconds (Binance expires the listenKey at 60 min)
-_KEEPALIVE_RETRY   = 30        # seconds — back off this long after a failed keepalive
-_PING_INTERVAL     =  3 * 60   # seconds between active WS ping probes
-_PING_TIMEOUT      = 15        # seconds to wait for the ping frame to be written
+_KEEPALIVE_INTERVAL    = 30 * 60   # seconds (Binance expires the listenKey at 60 min)
+_KEEPALIVE_RETRY       = 30        # seconds — back off this long after a failed keepalive
+_KEEPALIVE_MAX_FAILURES = 5        # reconnect after this many consecutive keepalive failures
+_PING_INTERVAL         =  3 * 60   # seconds between active WS ping probes
+_PING_TIMEOUT          = 15        # seconds to wait for the ping frame to be written
 
 
 class ExchangeCloseReason(str, Enum):
@@ -252,19 +253,75 @@ class BinanceUserDataStream:
       )
       return True
 
-  async def _keepalive_check(self, client: Any, now: float) -> float:
-    """Refresh the listenKey and return the timestamp for the next keepalive."""
+  async def _keepalive_check(self, client: Any, now: float) -> tuple[Optional[float], bool]:
+    """Refresh the listenKey. Returns (next_keepalive_time, succeeded).
+
+    Returns (None, False) when the listenKey no longer exists on Binance (-1125)
+    and the caller must reconnect immediately to obtain a new one.
+    """
     try:
       await asyncio.to_thread(client.rest_api.keepalive_user_data_stream)
       log.debug("[BinanceUserDataStream] listenKey kept alive.")
-      return now + _KEEPALIVE_INTERVAL
+      return now + _KEEPALIVE_INTERVAL, True
     except Exception as exc:
-      # Back off instead of retrying every loop tick — advance the next attempt.
+      # SDK errors expose the Binance business code via .status_code (despite the
+      # name, for HTTP 4xx it holds the body's "code" field, not the HTTP status).
+      code = getattr(exc, "status_code", None)
       log.warning(
         "[BinanceUserDataStream] keepalive failed: %s — retrying in %ds.",
         exc, _KEEPALIVE_RETRY,
       )
-      return now + _KEEPALIVE_RETRY
+      if code == -1125:
+        # listenKey already expired on Binance — retrying is pointless, reconnect.
+        return None, False
+      return now + _KEEPALIVE_RETRY, False
+
+  async def _run_loop(self, connection: Any, client: Any) -> None:
+    """Tick the ping and keepalive timers until a stop/reconnect condition is met."""
+    next_keepalive = time.monotonic() + _KEEPALIVE_INTERVAL
+    next_ping      = time.monotonic() + _PING_INTERVAL
+    keepalive_failures = 0
+    while not self._stop_event.is_set():
+      await asyncio.sleep(1.0)
+      now = time.monotonic()
+
+      if now >= next_ping:
+        if await self._ping_check(connection):
+          break
+        next_ping = now + _PING_INTERVAL
+
+      if now >= next_keepalive:
+        next_keepalive, ka_ok = await self._keepalive_check(client, now)
+        if next_keepalive is None:
+          log.warning("[BinanceUserDataStream] listenKey expired — reconnecting.")
+          break
+        if ka_ok:
+          keepalive_failures = 0
+        else:
+          keepalive_failures += 1
+          if keepalive_failures >= _KEEPALIVE_MAX_FAILURES:
+            log.warning(
+              "[BinanceUserDataStream] %d consecutive keepalive failures — reconnecting.",
+              keepalive_failures,
+            )
+            break
+
+  async def _close_client(self, client: Any) -> None:
+    """Best-effort teardown of the SDK client's WebSocket and REST transports."""
+    try:
+      await client.websocket_streams.close_connection()
+    except Exception:  # pragma: no cover - best effort
+      pass
+    # Release the SDK's internal REST aiohttp session so repeated reconnects
+    # don't accumulate open sockets/connectors.
+    close = getattr(client, "close", None)
+    if close is not None:
+      try:
+        res = close()
+        if asyncio.iscoroutine(res):
+          await res
+      except Exception:  # pragma: no cover - best effort
+        pass
 
   async def _stream(self) -> None:
     client = self._build_client()
@@ -273,41 +330,14 @@ class BinanceUserDataStream:
       raise RuntimeError("Failed to obtain listenKey")
 
     connection = await client.websocket_streams.create_connection()
-    next_keepalive = time.monotonic() + _KEEPALIVE_INTERVAL
-    next_ping = time.monotonic() + _PING_INTERVAL
     log.info("[BinanceUserDataStream] Connecting to user data stream.")
     try:
       stream = await connection.user_data(listenKey=listen_key)
       stream.on("message", self._on_message)
       log.info("[BinanceUserDataStream] Subscribed.")
-
-      while not self._stop_event.is_set():
-        await asyncio.sleep(1.0)
-        now = time.monotonic()
-
-        if now >= next_ping:
-          if await self._ping_check(connection):
-            break
-          next_ping = now + _PING_INTERVAL
-
-        if now >= next_keepalive:
-          next_keepalive = await self._keepalive_check(client, now)
-
+      await self._run_loop(connection, client)
     finally:
-      try:
-        await client.websocket_streams.close_connection()
-      except Exception:  # pragma: no cover - best effort
-        pass
-      # Best-effort release of the SDK client's own transports (REST aiohttp
-      # session) so repeated reconnects don't accumulate sockets/connectors.
-      close = getattr(client, "close", None)
-      if close is not None:
-        try:
-          res = close()
-          if asyncio.iscoroutine(res):
-            await res
-        except Exception:  # pragma: no cover - best effort
-          pass
+      await self._close_client(client)
 
   # ── message handling ──────────────────────────────────────────────────── #
 

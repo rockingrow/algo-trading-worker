@@ -38,12 +38,16 @@ class FakeStrategy(BaseMarketStrategy):
 
 
 class FakeStore:
-  def __init__(self, positions=None):
+  def __init__(self, positions=None, flat_positions=None):
     self._positions = positions if positions is not None else []
+    self._flat = flat_positions if flat_positions is not None else []
     self.status_updates = []
 
   def get_open_positions_by_strategy(self, strategy, symbol):
     return list(self._positions)
+
+  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+    return list(self._flat)
 
   def update_position_status(self, **kwargs):
     self.status_updates.append(kwargs)
@@ -145,6 +149,23 @@ def test_entry_scopes_preflight_to_signal_strategy():
   handler.handle(make_signal(SignalActionEnum.SHORT, strategy="strat-short"))
   assert "get_open:strat-short" in strat.calls
   assert "close_all:STALE_CLEANUP:strat-short" in strat.calls
+
+
+def test_entry_rejected_when_other_strategy_holds_symbol():
+  """Entry must be rejected — and no orders touched — when another strategy
+  already holds the same symbol. cancel_all_orders is symbol-scoped, so even
+  a stale-cleanup call would silently wipe the other strategy's SL/TP."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)])
+  store = FakeStore(
+    flat_positions=[{"strategy": "strat-A", "ref_source_id": "9", "ref_id": "9"}],
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="BTCUSD"))
+  assert res["success"] is False
+  assert "strat-A" in res["comment"]
+  # No exchange calls — stale cleanup must never run when a conflict exists.
+  assert not any("close_all" in c for c in strat.calls)
+  assert "entry" not in strat.calls
 
 
 def test_entry_aborts_when_cleanup_fails():
