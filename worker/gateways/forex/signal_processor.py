@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional
 from worker.context import WorkerContext
 from worker.gateways.forex.executor import ForexExecutor
 from worker.gateways.forex.factory import PlatformFactory
-from worker.gateways.forex.message_presenter import TradeMessagePresenter
+from worker.gateways.forex.message_presenter import ForexMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.icons import CONNECTED, DISCONNECTED, WARNING
 from worker.logger import get_logger
@@ -133,7 +133,7 @@ class ForexSignalProcessor(BaseSignalProcessor):
   """Platform gateway + forex executor + platform jobs over the shared skeleton."""
 
   name = "FOREX"
-  presenter = TradeMessagePresenter
+  presenter = ForexMessagePresenter
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
     super().__init__(ctx, settings_dict)
