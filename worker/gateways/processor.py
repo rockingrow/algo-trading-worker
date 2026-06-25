@@ -214,6 +214,19 @@ class BaseSignalProcessor(ABC):
     if not self._ensure_connected():
       return
 
+    # Scale-in (averaging): the broker has already scaled SL/TP1/TP2/quantity in
+    # the payload, so every downstream step (SL/TP placement, persistence,
+    # notifications) consumes them verbatim. The only re-derivation happens inside
+    # the executor when VOLUME_DECISION sizes the entry from risk — see
+    # SignalSchema.scale_quantity_factor. Log the broker-reported multipliers for
+    # traceability.
+    if signal.is_scale_position:
+      log.info(
+        "[%s Process] Scale-in position | %s | scaling=%s | sl=%s tp1=%s tp2=%s qty=%s",
+        self.name, signal.symbol, signal.scaling,
+        signal.sl, signal.tp1, signal.tp2, signal.quantity,
+      )
+
     log.info(
       "[%s Process] Processing Signal: %s | %s | TV Time: %s",
       self.name, signal.symbol, signal.action.value, signal.timestamp,

@@ -163,6 +163,45 @@ def test_open_position_payload_quantity_mode(config):
   assert gw.orders[0][2] == 0.05  # quantity used directly
 
 
+def test_open_position_risk_mode_applies_scale_in_factor(config):
+  """VOLUME_DECISION sizes from risk, so the scale-in quantity factor must be
+  re-applied to the computed qty (the broker's pre-scaled qty is ignored here)."""
+  gw = FakeGateway()
+  ex = CryptoExecutor(gw, config)
+  res = ex.open_position(
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="BTCUSD",
+      sl=29000.0,
+      is_scale_position=True,
+      scaling={"quantity": 0.5},
+    )
+  )
+  assert res["success"] is True
+  # Base risk qty is 0.02 (risk=2%); scale factor 0.5 halves it to 0.01.
+  assert gw.orders == [("BTCUSDT", "LONG", 0.01, False)]
+
+
+def test_open_position_payload_mode_ignores_scale_factor(config):
+  """In payload-quantity mode the broker's scaled quantity is used verbatim — the
+  scale factor must NOT be re-applied (that would double-scale)."""
+  cfg = replace(config, volume_decision_enabled=False)
+  gw = FakeGateway()
+  ex = CryptoExecutor(gw, cfg)
+  res = ex.open_position(
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="BTCUSD",
+      quantity=0.05,
+      sl=None,
+      is_scale_position=True,
+      scaling={"quantity": 0.5},
+    )
+  )
+  assert res["success"] is True
+  assert gw.orders[0][2] == 0.05  # broker-scaled quantity used as-is, not 0.025
+
+
 def test_open_position_places_tp_from_signal_tp2(config):
   """When the entry signal carries TP2, a resting take-profit is placed alongside SL."""
   gw = FakeGateway()

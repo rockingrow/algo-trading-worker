@@ -210,10 +210,16 @@ class CryptoExecutor:
       # sizing at 0%, which would zero risk_cash and floor entry to the min qty.
       use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
       risk = signal.risk_percent if use_signal_risk else self._config.risk_percentage
+      # Scale-in: the broker's pre-scaled signal.quantity is ignored in risk mode,
+      # so re-apply the scale-in factor here (1.0 for a normal entry). Sizing is
+      # linear in risk, so scaling risk scales the resulting qty by the same factor.
+      scale_factor = signal.scale_quantity_factor()
+      risk *= scale_factor
       qty = self.calculate_quantity(symbol, price, signal.sl, risk, capital)
       logger.info(
-        "[open_position] RISK mode | price=%s sl=%s risk=%s%% capital=%s → qty=%s",
-        price, signal.sl, risk, capital, qty,
+        "[open_position] RISK mode | price=%s sl=%s risk=%s%% capital=%s "
+        "scale_factor=%s → qty=%s",
+        price, signal.sl, risk, capital, scale_factor, qty,
       )
       return qty
     qty = self._min_qty(symbol)
