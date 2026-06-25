@@ -316,6 +316,36 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 | **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open volume using the **actual live `position.volume`** — signal `quantity` is intentionally ignored |
 | **4 — Flat** | `FLAT` | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED` |
 
+#### Scale-In (Averaging) Positions
+
+A signal may carry an optional `is_scale_position` boolean and a nested `scaling` object (`tp`, `sl`, `quantity`). When `is_scale_position` is `true`, `_process_message` calls `SignalSchema.apply_scaling()` to rescale the signal **before** it reaches `SignalHandler.handle()`, so every downstream step (sizing, SL/TP placement, persistence) sees the adjusted values. Each multiplier is applied to the original signal value:
+
+| Multiplier | Targets | Effect |
+| --- | --- | --- |
+| `scaling.tp` | `tp1`, `tp2` | `tp1 → tp1 × scaling.tp`, `tp2 → tp2 × scaling.tp` |
+| `scaling.sl` | `sl` | `sl → sl × scaling.sl` |
+| `scaling.quantity` | `quantity` **and** `risk_percent` | `quantity → quantity × scaling.quantity` (payload-quantity mode) and `risk_percent → risk_percent × scaling.quantity` (self-determined / risk-sizing mode), so position size scales in **both** sizing modes |
+
+A multiplier that is absent (`null`), or whose target field is itself absent, is a no-op. A signal without `is_scale_position: true` is passed through untouched (any `scaling` object is ignored).
+
+```json
+{
+  "strategy": "MT5_GOLD_M5_V1",
+  "timestamp": "2026-04-18T21:55:00Z",
+  "action": "LONG",
+  "symbol": "XAUUSD",
+  "price": 2000.0,
+  "quantity": 0.5,
+  "sl": 1990.0,
+  "tp1": 2020.0,
+  "tp2": 2050.0,
+  "is_scale_position": true,
+  "scaling": { "tp": 1.1, "sl": 0.9, "quantity": 2.0 }
+}
+```
+
+With the payload above, the worker executes against `tp1=2222.0`, `tp2=2255.0`, `sl=1791.0`, and `quantity=1.0`.
+
 #### FLAT Payload (minimal — no price/quantity required)
 
 ```json
