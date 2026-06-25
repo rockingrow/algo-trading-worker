@@ -299,7 +299,9 @@ def _capture_signal_processor():
   return proc, seen
 
 
-def test_scale_position_rescales_tp_sl_quantity_before_handler():
+def test_scale_position_signal_passed_to_handler_verbatim():
+  # The broker already scaled SL/TP/quantity; the processor must NOT re-scale —
+  # the handler sees the payload values unchanged.
   proc, seen = _capture_signal_processor()
   raw = make_signal(
     SignalActionEnum.LONG,
@@ -314,10 +316,13 @@ def test_scale_position_rescales_tp_sl_quantity_before_handler():
 
   assert len(seen) == 1
   sig = seen[0]
-  assert sig.tp1 == 65000.0 * 1.1
-  assert sig.tp2 == 67000.0 * 1.1
-  assert sig.sl == 64000.0 * 0.9
-  assert sig.quantity == 1.0
+  assert sig.tp1 == 65000.0
+  assert sig.tp2 == 67000.0
+  assert sig.sl == 64000.0
+  assert sig.quantity == 0.5
+  # The scaling metadata is preserved for the executor's self-sizing path.
+  assert sig.is_scale_position is True
+  assert sig.scale_quantity_factor() == 2.0
 
 
 def test_non_scale_position_signal_is_untouched():
@@ -328,3 +333,4 @@ def test_non_scale_position_signal_is_untouched():
   proc._process_message(NatsSubjectEnum.SIGNAL, raw)
 
   assert seen[0].tp1 == 65000.0  # scaling ignored without is_scale_position=True
+  assert seen[0].scale_quantity_factor() == 1.0

@@ -8,29 +8,28 @@ forex-market counterpart of ``CryptoMessagePresenter`` and is bound by
 ``ForexSignalProcessor``. Message *formatting* is decoupled from signal
 *processing* and persistence (Single Responsibility). These are pure functions of
 their inputs — trivial to test without a platform, NATS, or a DB.
+
+The market-agnostic messages (``signal_rejected``, ``position_unprotected_closed``)
+are inherited from
+:class:`~worker.gateways.message_presenter.BaseMessagePresenter`.
 """
 
 from __future__ import annotations
 
-import html
 from typing import Any
 
+from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter
 from worker.icons import (
   ADMIN,
-  ALARM,
   CONNECTED,
   FAILED,
   GEAR,
-  REJECTED,
-  SHIELD,
   STOP,
   SUCCESS,
   WARNING,
 )
 from worker.schemas.signal_schema import SignalSchema
 from worker.services.notification_service import _box
-
-_DIVIDER = "----------------------------------"
 
 
 def format_volume(volume: Any, auto_calculated: bool = False) -> str:
@@ -39,8 +38,8 @@ def format_volume(volume: Any, auto_calculated: bool = False) -> str:
   return f"{volume} lot {icon}".strip() if auto_calculated else f"{volume} lot"
 
 
-class TradeMessagePresenter:
-  """Renders boxed HTML Telegram messages for the signal processor."""
+class ForexMessagePresenter(BaseMessagePresenter):
+  """Renders boxed HTML Telegram messages for the forex signal processor."""
 
   @staticmethod
   def startup(settings_dict: dict, footer: str) -> str:
@@ -87,9 +86,30 @@ class TradeMessagePresenter:
       f"Volume: <b>{format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
       f"Source Ticket: <b>{pos_ticket}</b>\n"
+      f"{ForexMessagePresenter._scale_lines(signal)}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )
+
+  @staticmethod
+  def _scale_lines(signal: SignalSchema) -> str:
+    """Render the scale-in (averaging) block, or '' for a normal entry.
+
+    Shown only when the signal is flagged ``is_scale_position``. TP1/TP2/SL are
+    the broker's already-scaled values and are displayed verbatim. The volume
+    shown above is the executed lot (auto-sized × scale factor in VOLUME_DECISION
+    mode, or the broker's scaled quantity in payload mode).
+    """
+    if not getattr(signal, "is_scale_position", False):
+      return ""
+    lines = f"{GEAR} <b>Scaled Position</b>\n"
+    if signal.tp1 is not None:
+      lines += f"TP1: <b>{signal.tp1}</b>\n"
+    if signal.tp2 is not None:
+      lines += f"TP2: <b>{signal.tp2}</b>\n"
+    if signal.sl is not None:
+      lines += f"SL: <b>{signal.sl}</b>\n"
+    return lines
 
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str:
@@ -100,45 +120,6 @@ class TradeMessagePresenter:
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
       f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
-      f"{_DIVIDER}\n"
-      f"{footer}"
-    )
-
-  @staticmethod
-  def position_unprotected_closed(
-    signal: SignalSchema, result: dict, footer: str
-  ) -> str:
-    """Breakeven SL after TP1 could not be placed; the now-unprotected position
-    was force-closed (or the close itself failed — manual action needed)."""
-    failsafe = result.get("sl_failsafe_close") or {}
-    sl_res = result.get("sl_update") or {}
-    if failsafe.get("success"):
-      head = f"{SHIELD} <b>Unprotected Position — Emergency Closed</b>"
-      outcome = (
-        f"Closed: <b>{failsafe.get('volume')}</b> @ <b>{failsafe.get('price')}</b>\n"
-      )
-    else:
-      head = f"{ALARM} <b>UNPROTECTED POSITION — STILL OPEN</b>"
-      outcome = (
-        f"Emergency close <b>FAILED</b>: {failsafe.get('comment')}\n"
-        f"<b>Manual intervention required.</b>\n"
-      )
-    return _box(
-      f"{head}\n\n"
-      f"Symbol: <b>{signal.symbol}</b>\n"
-      f"Strategy: <b>{signal.strategy}</b>\n"
-      f"Reason: breakeven SL failed (<b>{sl_res.get('comment')}</b>)\n"
-      f"{outcome}"
-      f"{_DIVIDER}\n"
-      f"{footer}"
-    )
-
-  @staticmethod
-  def signal_rejected(reason: str, footer: str) -> str:
-    return _box(
-      f"{REJECTED} <b>Signal Rejected</b>\n\n"
-      f"A signal failed validation and was <b>NOT executed</b>.\n"
-      f"Reason: <b>{html.escape(reason)}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

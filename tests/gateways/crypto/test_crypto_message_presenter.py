@@ -35,3 +35,29 @@ def test_order_filled_no_sl_line_for_full_close():
   result = {"price": 32000.0, "volume": 0.02, "ticket": 11}  # no sl_update
   msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER")
   assert "SL:" not in msg and "SL NOT SET" not in msg
+
+
+def test_order_filled_shows_scale_position_block():
+  # The broker pre-scales the signal, so tp1/tp2/quantity here are already the
+  # final values and are displayed verbatim.
+  signal = make_signal(
+    SignalActionEnum.LONG,
+    symbol="BTCUSD",
+    is_scale_position=True,
+    tp1=31000.0,
+    tp2=32000.0,
+  )
+  result = {"price": 30000.0, "volume": 0.04, "ticket": 7, "sl_update": {"success": True}}
+  msg = CryptoMessagePresenter.order_filled(signal, result, 7, "FOOTER")
+  assert "Scaled Position" in msg
+  assert "TP1:" in msg and "31000.0" in msg
+  assert "TP2:" in msg and "32000.0" in msg
+  assert "0.04" in msg  # final scaled quantity
+
+
+def test_order_filled_no_scale_block_for_normal_entry():
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD")
+  result = {"price": 30000.0, "volume": 0.02, "ticket": 5, "sl_update": {"success": True}}
+  msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER")
+  assert "Scaled Position" not in msg
+  assert "TP1:" not in msg and "TP2:" not in msg

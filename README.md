@@ -172,7 +172,7 @@ See `.env.example`.
 
 ## 🧩 FOREX Gateway Module Flow (`worker/gateways/forex/`)
 
-How the FOREX files wire together at runtime. `ForexSignalProcessor` is the hub: it builds the platform gateway via `PlatformFactory` (today an `MT5Gateway` — the **only** MT5-coupled code), wraps it in a platform-agnostic `ForexExecutor` (with `LotSizer` + `StopValidator`), formats messages via `TradeMessagePresenter`, and starts the background jobs. The `MT5Gateway` owns the terminal connection (`bridge`) and symbol resolution (`SymbolResolver`). The handler and market strategy are market-agnostic and shared with CRYPTO. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
+How the FOREX files wire together at runtime. `ForexSignalProcessor` is the hub: it builds the platform gateway via `PlatformFactory` (today an `MT5Gateway` — the **only** MT5-coupled code), wraps it in a platform-agnostic `ForexExecutor` (with `LotSizer` + `StopValidator`), formats messages via `ForexMessagePresenter`, and starts the background jobs. The `MT5Gateway` owns the terminal connection (`bridge`) and symbol resolution (`SymbolResolver`). The handler and market strategy are market-agnostic and shared with CRYPTO. Solid arrows are the live signal path; dotted arrows are composition (who builds/owns whom).
 
 ```mermaid
 graph TD
@@ -182,7 +182,7 @@ graph TD
         SP["signal_processor.py<br/>ForexSignalProcessor — hub"]
         Factory["factory.py<br/>PlatformFactory"]
         Executor["executor.py<br/>ForexExecutor"]
-        Presenter["message_presenter.py<br/>TradeMessagePresenter"]
+        Presenter["message_presenter.py<br/>ForexMessagePresenter"]
         LotSizer["lot_sizing.py<br/>LotSizer"]
         StopVal["stop_validator.py<br/>StopValidator"]
 
@@ -241,7 +241,7 @@ worker/
 │   │   ├── executor.py               # ForexExecutor (TradeExecutorProtocol)
 │   │   ├── lot_sizing.py             # LotSizer — risk-based lot-size math
 │   │   ├── stop_validator.py         # StopValidator — SL/TP distance validation
-│   │   ├── message_presenter.py      # TradeMessagePresenter (Telegram strings)
+│   │   ├── message_presenter.py      # ForexMessagePresenter (Telegram strings)
 │   │   ├── signal_processor.py       # ForexSignalProcessor — forex hooks over the base
 │   │   └── mt5/             # First concrete platform — MetaTrader 5 (Windows only)
 │   │       ├── gateway.py            # MT5Gateway (BasePlatformGateway over the MetaTrader5 C extension)
@@ -318,15 +318,16 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 #### Scale-In (Averaging) Positions
 
-A signal may carry an optional `is_scale_position` boolean and a nested `scaling` object (`tp`, `sl`, `quantity`). When `is_scale_position` is `true`, `_process_message` calls `SignalSchema.apply_scaling()` to rescale the signal **before** it reaches `SignalHandler.handle()`, so every downstream step (sizing, SL/TP placement, persistence) sees the adjusted values. Each multiplier is applied to the original signal value:
+A signal may carry an optional `is_scale_position` boolean and a nested `scaling` object (`tp`, `sl`, `quantity`). **The broker has already applied these multipliers** — `sl`, `tp1`, `tp2`, and `quantity` arrive as their final, scaled values. The `scaling` object is passed through as metadata only. The worker therefore uses the payload's SL/TP/quantity **verbatim** for order entry, notifications, and persistence; it never re-scales them.
 
-| Multiplier | Targets | Effect |
+The one exception is risk-based sizing. When `VOLUME_DECISION_ENABLED=true`, the worker computes the entry volume itself from risk/capital/SL and **ignores** `signal.quantity`. To keep a scale-in entry proportional, the executor re-applies `scaling.quantity` to that self-computed volume (sizing is linear in risk, so the lot/qty scales by the same factor). `scaling.tp`/`scaling.sl` are never re-applied.
+
+| Mode | What sizes the entry | Where `scaling.quantity` applies |
 | --- | --- | --- |
-| `scaling.tp` | `tp1`, `tp2` | `tp1 → tp1 × scaling.tp`, `tp2 → tp2 × scaling.tp` |
-| `scaling.sl` | `sl` | `sl → sl × scaling.sl` |
-| `scaling.quantity` | `quantity` **and** `risk_percent` | `quantity → quantity × scaling.quantity` (payload-quantity mode) and `risk_percent → risk_percent × scaling.quantity` (self-determined / risk-sizing mode), so position size scales in **both** sizing modes |
+| `VOLUME_DECISION_ENABLED=false` (payload-quantity) | `signal.quantity` (already broker-scaled) | Not re-applied — used as-is |
+| `VOLUME_DECISION_ENABLED=true` (risk sizing) | risk % / capital / SL → computed volume | Re-applied to the computed volume |
 
-A multiplier that is absent (`null`), or whose target field is itself absent, is a no-op. A signal without `is_scale_position: true` is passed through untouched (any `scaling` object is ignored).
+A signal without `is_scale_position: true` is passed through untouched (any `scaling` object is ignored), and an absent `scaling.quantity` leaves the computed volume unchanged.
 
 ```json
 {
@@ -335,16 +336,16 @@ A multiplier that is absent (`null`), or whose target field is itself absent, is
   "action": "LONG",
   "symbol": "XAUUSD",
   "price": 2000.0,
-  "quantity": 0.5,
-  "sl": 1990.0,
-  "tp1": 2020.0,
-  "tp2": 2050.0,
+  "quantity": 1.0,
+  "sl": 1791.0,
+  "tp1": 2222.0,
+  "tp2": 2255.0,
   "is_scale_position": true,
   "scaling": { "tp": 1.1, "sl": 0.9, "quantity": 2.0 }
 }
 ```
 
-With the payload above, the worker executes against `tp1=2222.0`, `tp2=2255.0`, `sl=1791.0`, and `quantity=1.0`.
+With the payload above, the worker executes against the SL/TP/quantity exactly as sent (`tp1=2222.0`, `tp2=2255.0`, `sl=1791.0`, `quantity=1.0`). In payload-quantity mode it enters `1.0`; in risk-sizing mode it computes the lot from risk and then multiplies by `scaling.quantity` (`2.0`).
 
 #### FLAT Payload (minimal — no price/quantity required)
 

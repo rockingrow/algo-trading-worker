@@ -167,7 +167,7 @@ wheels = [
 
 [[package]]
 name = "algo-trading-worker"
-version = "1.1.2"
+version = "1.1.5"
 source = { editable = "." }
 dependencies = [
     { name = "binance-sdk-derivatives-trading-usds-futures" },
