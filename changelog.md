@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] - 2026-06-26
+
+### Added
+
+- Code-quality audit report (`AUDIT.md`) from a full review of the `worker/` package (static reading, `ruff`, `pytest`, and two runtime probes). It documents — but does not yet fix — the findings, prioritised by severity:
+  - **Critical:** `PositionCDC` publishes every NATS `TRADE` event without `message`/`sl`/`tp1`/`tp2`/`signal_id`/`risk_percent`, because the `positions` column is `gateway_message` while the job reads the key `message`. Affects both FOREX and CRYPTO and went uncaught (no CDC test).
+  - **High:** `NOTIFICATION_MODE=SILENT|ERROR` enqueues COMMUNITY rows that the dispatcher's `WHERE mode = 'VERBOSE'` poll never selects — they are never sent, never deleted, and never dead-lettered, so the `notifications` table grows unbounded; `ERROR` mode also suppresses error notifications.
+  - **Medium:** CDC "at-least-once" delivery is effectively at-most-once (fire-and-forget publish marked `PUBLISHED` immediately); a red test suite (7 failures from test/code drift + non-hermetic settings tests); and a CRYPTO thread-orchestrator restart that can spawn duplicate daemon jobs.
+  - A "Part B" of design / best-practice enhancements (centralise the gateway-neutral column mapping in the repository, type `TradeResult`, reduce SQLite boilerplate, isolate the Binance global monkey-patch, add CDC/outbox test coverage).
+
 ## [1.1.5] - 2026-06-26
 
 ### Added
@@ -54,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
+[1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.5...dev
 [1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...dev
 [1.1.4]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.3...dev
 [1.1.3]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.2...v1.1.3
