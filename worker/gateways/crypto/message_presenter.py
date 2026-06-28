@@ -40,14 +40,17 @@ class CryptoMessagePresenter(BaseMessagePresenter):
   @staticmethod
   def startup(settings_dict: dict, footer: str) -> str:
     s = settings_dict
+    exchange = s.get("crypto_exchange")
+    exchange_display = getattr(exchange, "value", exchange)
     cfg = (
-      f"EXCHANGE: <b>{s.get('crypto_exchange')}</b>\n"
+      f"EXCHANGE: <b>{exchange_display}</b>\n"
       f"TESTNET: <b>{s.get('binance_testnet', False)}</b>\n"
       f"VOLUME_DECISION_ENABLED: <b>{s.get('volume_decision_enabled', False)}</b>\n"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
-      f"RISK_PERCENTAGE: <b>{s.get('risk_percentage')}%</b>\n"
+      f"{CryptoMessagePresenter._risk_percentage_line(s)}"
       f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
-      f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
+      f"{CryptoMessagePresenter._tp1_percent_line(s)}"
+      f"{CryptoMessagePresenter._tp1_be_line(s)}"
     )
     return _box(f"{CONNECTED} <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")
 
@@ -70,7 +73,8 @@ class CryptoMessagePresenter(BaseMessagePresenter):
 
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str
+    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
+    risk_info=None,
   ) -> str:
     return _box(
       f"{SUCCESS} <b>Order Filled</b>\n\n"
@@ -83,6 +87,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Source: <b>{pos_ticket}</b>\n"
       f"{CryptoMessagePresenter._scale_lines(signal)}"
       f"{CryptoMessagePresenter._sl_line(signal, result)}"
+      f"{CryptoMessagePresenter._risk_line(risk_info)}"
       f"{_DIVIDER}\n{footer}"
     )
 

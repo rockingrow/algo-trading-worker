@@ -42,7 +42,7 @@ def test_order_filled_shows_scale_position_block():
   msg = ForexMessagePresenter.order_filled(
     signal, {"price": 2000.0, "volume": 0.2, "ticket": 5}, 5, "FOOTER"
   )
-  assert "Scale Position" in msg
+  assert "Scaled Position" in msg
   assert "TP1:" in msg and "2040.0" in msg
   assert "TP2:" in msg and "2100.0" in msg
   assert "SL:" in msg and "1980.0" in msg
@@ -54,7 +54,7 @@ def test_order_filled_no_scale_block_for_normal_entry():
   msg = ForexMessagePresenter.order_filled(
     signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
   )
-  assert "Scale Position" not in msg
+  assert "Scaled Position" not in msg
 
 
 def test_order_failed_contains_error():
@@ -93,6 +93,49 @@ def test_startup_message_includes_config():
   assert "FOREX Worker" in msg
   assert "RISK_PERCENTAGE" in msg
   assert "FOOTER" in msg
+  # Override lines are always shown; unset ones read DISABLED.
+  assert "RISK_PERCENTAGE: <b>DISABLED</b>" in msg
+  assert "POSITION_TP1_PERCENT: <b>DISABLED</b>" in msg
+  assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>DISABLED</b>" in msg
+
+
+def test_startup_message_override_lines_enabled():
+  base = {
+    "volume_decision_enabled": True,
+    "capital": 1000,
+    "capital_currency": "USD",
+    "risk_percentage": 2.0,
+    "use_account_equity": False,
+  }
+  msg = ForexMessagePresenter.startup(
+    {
+      **base,
+      "use_custom_risk_percentage": True,
+      "use_custom_position_tp1_percent": True,
+      "position_tp1_percent": 50,
+      "tp1_move_sl_to_breakeven": False,
+    },
+    "F",
+  )
+  assert "RISK_PERCENTAGE: <b>ENABLED (2.0%)</b>" in msg
+  assert "POSITION_TP1_PERCENT: <b>ENABLED (50%)</b>" in msg
+  # A declared boolean override is ENABLED even when its value is false.
+  assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (false)</b>" in msg
+
+
+def test_startup_message_tp1_be_line():
+  base = {
+    "volume_decision_enabled": True,
+    "capital": 1000,
+    "capital_currency": "USD",
+    "risk_percentage": 2.0,
+    "use_account_equity": False,
+  }
+  msg_on = ForexMessagePresenter.startup({**base, "tp1_move_sl_to_breakeven": True}, "F")
+  assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (true)</b>" in msg_on
+
+  msg_off = ForexMessagePresenter.startup({**base, "tp1_move_sl_to_breakeven": False}, "F")
+  assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (false)</b>" in msg_off
 
 
 def test_shutdown_message():

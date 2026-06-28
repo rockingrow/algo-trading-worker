@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import html
 
-from worker.icons import ALARM, REJECTED, SHIELD
+from worker.icons import ALARM, GEAR, REJECTED, SHIELD
 from worker.schemas.signal_schema import SignalSchema
 from worker.services.notification_service import _box
 
@@ -27,6 +27,74 @@ _DIVIDER = "----------------------------------"
 
 class BaseMessagePresenter:
   """Market-agnostic message fragments shared by every concrete presenter."""
+
+  @staticmethod
+  def _risk_line(risk_info) -> str:
+    """Render the risk percent line, or '' when risk info is unavailable.
+
+    ``risk_info`` is a ``(risk_percent, is_custom)`` tuple produced by the
+    processor for LONG/SHORT entries when VOLUME_DECISION_ENABLED is on.
+    ``is_custom`` is True when USE_CUSTOM_RISK_PERCENTAGE overrides the signal.
+    """
+    if risk_info is None:
+      return ""
+    risk_percent, is_custom = risk_info
+    gear = f" {GEAR}" if is_custom else ""
+    return f"Risk: <b>{risk_percent}%</b>{gear}\n"
+
+  @staticmethod
+  def _override_line(label: str, enabled: bool, value: str) -> str:
+    """Render a settings line that overrides-or-falls-back-to the signal.
+
+    These settings are always shown so the operator can see, at a glance, which
+    mode is active for the connected worker:
+      - declared/active → ``LABEL: ENABLED (<value>)``
+      - not declared    → ``LABEL: DISABLED`` (the signal's own value is used)
+    """
+    body = f"ENABLED ({value})" if enabled else "DISABLED"
+    return f"{label}: <b>{body}</b>\n"
+
+  @staticmethod
+  def _risk_percentage_line(settings_dict: dict) -> str:
+    """Render the RISK_PERCENTAGE override line.
+
+    Enabled when ``use_custom_risk_percentage`` is set; the custom risk percent
+    then overrides the signal's own ``risk_percent``.
+    """
+    s = settings_dict
+    return BaseMessagePresenter._override_line(
+      "RISK_PERCENTAGE",
+      enabled=bool(s.get("use_custom_risk_percentage", False)),
+      value=f"{s.get('risk_percentage')}%",
+    )
+
+  @staticmethod
+  def _tp1_percent_line(settings_dict: dict) -> str:
+    """Render the POSITION_TP1_PERCENT override line.
+
+    Enabled when ``use_custom_position_tp1_percent`` is set; the custom percent
+    then overrides the signal's own ``tp1_percent`` at TP1 time.
+    """
+    s = settings_dict
+    return BaseMessagePresenter._override_line(
+      "POSITION_TP1_PERCENT",
+      enabled=bool(s.get("use_custom_position_tp1_percent", False)),
+      value=f"{s.get('position_tp1_percent')}%",
+    )
+
+  @staticmethod
+  def _tp1_be_line(settings_dict: dict) -> str:
+    """Render the TP1_MOVE_SL_TO_BREAKEVEN override line.
+
+    Enabled when ``tp1_move_sl_to_breakeven`` is explicitly set (True/False) in
+    the environment; a ``None`` value means the signal's own flag is used.
+    """
+    val = settings_dict.get("tp1_move_sl_to_breakeven")
+    return BaseMessagePresenter._override_line(
+      "TP1_MOVE_SL_TO_BREAKEVEN",
+      enabled=val is not None,
+      value="true" if val else "false",
+    )
 
   @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:

@@ -205,11 +205,14 @@ class CryptoExecutor:
         )
         return qty
       price = self._gateway.get_mark_price(symbol)
-      # A missing OR non-positive signal risk (upstream sends 0.0 when it has no
-      # opinion) means "unspecified": fall back to RISK_PERCENTAGE rather than
-      # sizing at 0%, which would zero risk_cash and floor entry to the min qty.
-      use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
-      risk = signal.risk_percent if use_signal_risk else self._config.risk_percentage
+      if self._config.use_custom_risk_percentage:
+        risk = self._config.risk_percentage
+      else:
+        # A missing OR non-positive signal risk (upstream sends 0.0 when it has no
+        # opinion) means "unspecified": fall back to RISK_PERCENTAGE rather than
+        # sizing at 0%, which would zero risk_cash and floor entry to the min qty.
+        use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
+        risk = signal.risk_percent if use_signal_risk else self._config.risk_percentage
       # Scale-in: the broker's pre-scaled signal.quantity is ignored in risk mode,
       # so re-apply the scale-in factor here (1.0 for a normal entry). Sizing is
       # linear in risk, so scaling risk scales the resulting qty by the same factor.

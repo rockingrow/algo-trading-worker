@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from helpers import make_signal
 
+from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
@@ -28,7 +29,7 @@ class FakePresenter:
     return f"force_closed:{symbol}"
 
   @staticmethod
-  def order_filled(signal, result, pos_ticket, footer):
+  def order_filled(signal, result, pos_ticket, footer, risk_info=None):
     return f"filled:{signal.action.value}:{pos_ticket}"
 
   @staticmethod
@@ -83,6 +84,12 @@ class FakeProcessor(BaseSignalProcessor):
       direct_notifier=SimpleNamespace(send_message=lambda m: None),
     )
     self.handler = SimpleNamespace(handle=lambda sig: handle_result)
+    self.config = ExecutionConfig(
+      volume_decision_enabled=True,
+      capital=1000.0,
+      risk_percentage=2.0,
+      use_account_equity=False,
+    )
     self._market_type = "FAKE_MKT"
     self._connected = connected
     self.admin_calls = []

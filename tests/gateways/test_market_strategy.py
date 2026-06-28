@@ -103,6 +103,92 @@ def test_factory_requires_config():
     MarketStrategyFactory.create(MarketTypeEnum.FOREX, executor=FakeExecutor(), config=None)
 
 
+# ── Signal-level tp1_percent / move_sl_to_be fallback ────────────────────── #
+
+def test_handle_tp1_uses_signal_tp1_percent_when_config_is_none(config):
+  """signal.tp1_percent is used when config.position_tp1_percent is None."""
+  cfg = replace(config, position_tp1_percent=None)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1, tp1_percent=40.0))
+  assert res["success"] is True
+  # 1.0 * 40% = 0.4
+  assert ("partial", 0.4, 7, "strat-1") in ex.calls
+
+
+def test_handle_tp1_falls_back_to_config_when_signal_has_no_tp1_percent(config):
+  """When use_custom=False and signal has no tp1_percent, config.position_tp1_percent is used."""
+  cfg = replace(config, use_custom_position_tp1_percent=False, position_tp1_percent=50.0)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1))
+  assert res["success"] is True
+  # no signal tp1_percent → fallback to config: 1.0 * 50% = 0.5
+  assert ("partial", 0.5, 7, "strat-1") in ex.calls
+
+
+def test_handle_tp1_signal_tp1_percent_used_when_not_custom(config):
+  """use_custom_position_tp1_percent=False: signal.tp1_percent wins over config."""
+  cfg = replace(config, use_custom_position_tp1_percent=False)  # config has position_tp1_percent=30
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1, tp1_percent=75.0))
+  assert res["success"] is True
+  # signal wins: 1.0 * 75% = 0.75, not 30%
+  assert ("partial", 0.75, 7, "strat-1") in ex.calls
+  assert not any(c == ("partial", 0.3, 7, "strat-1") for c in ex.calls)
+
+
+def test_handle_tp1_custom_tp1_percent_overrides_signal(config):
+  """use_custom_position_tp1_percent=True: config.position_tp1_percent wins over signal.tp1_percent."""
+  cfg = replace(config, use_custom_position_tp1_percent=True)  # config has position_tp1_percent=30
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1, tp1_percent=75.0))
+  assert res["success"] is True
+  # config wins: 1.0 * 30% = 0.3, not 75%
+  assert ("partial", 0.3, 7, "strat-1") in ex.calls
+  assert not any(c == ("partial", 0.75, 7, "strat-1") for c in ex.calls)
+
+
+def test_handle_tp1_uses_signal_move_sl_to_be_when_config_is_none(config):
+  """signal.move_sl_to_be=True triggers breakeven move when config is None."""
+  cfg = replace(config, tp1_move_sl_to_breakeven=None)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1, move_sl_to_be=True))
+  assert res["success"] is True
+  assert ("sl", 2000.0, 7, "strat-1") in ex.calls
+
+
+def test_handle_tp1_defaults_no_breakeven_when_both_none(config):
+  """Default move_sl_to_be=False when neither config nor signal provides one."""
+  cfg = replace(config, tp1_move_sl_to_breakeven=None)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1))
+  assert res["success"] is True
+  assert not any(call[0] == "sl" for call in ex.calls)
+
+
+def test_handle_tp1_config_move_sl_overrides_signal(config):
+  """config.tp1_move_sl_to_breakeven=False wins over signal.move_sl_to_be=True."""
+  cfg = replace(config, tp1_move_sl_to_breakeven=False)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1, move_sl_to_be=True))
+  assert res["success"] is True
+  # config.False wins — no SL update despite signal saying True
+  assert not any(call[0] == "sl" for call in ex.calls)
+
+
 def test_factory_builds_forex_market(config):
   market = MarketStrategyFactory.create(
     MarketTypeEnum.FOREX, executor=FakeExecutor(), config=config
