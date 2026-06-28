@@ -187,6 +187,7 @@ class ForexExecutor:
 
     if self._config.use_custom_risk_percentage:
       risk = self._config.risk_percentage
+      risk_source = "config(custom)"
     else:
       # A missing OR non-positive signal risk (upstream sends 0.0 when it has no
       # opinion) means "unspecified": fall back to the configured RISK_PERCENTAGE.
@@ -194,6 +195,7 @@ class ForexExecutor:
       # minimum lot regardless of CAPITAL/equity.
       use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
       risk = signal.risk_percent if use_signal_risk else self._config.risk_percentage
+      risk_source = "signal" if use_signal_risk else "config"
     # Scale-in: the broker's pre-scaled signal.quantity is ignored in risk mode,
     # so re-apply the scale-in factor here (1.0 for a normal entry). Sizing is
     # linear in risk, so scaling risk scales the resulting lot by the same factor.
@@ -211,7 +213,7 @@ class ForexExecutor:
     capital_src = "account_equity" if self._config.use_account_equity else f"capital={self._config.capital}"
     logger.info(
       f"[open_position] VOLUME_DECISION mode | {capital_src} "
-      f"risk={risk}% (source={'signal' if use_signal_risk else 'config'}, "
+      f"risk={risk}% (source={risk_source}, "
       f"scale_factor={scale_factor}) → lot={volume}"
     )
     return volume

@@ -42,22 +42,6 @@ class ExecutionConfig:
   use_custom_risk_percentage: bool = False
 
   @classmethod
-  def from_settings(cls, settings) -> "ExecutionConfig":
-    """Build from the pydantic ``Settings`` singleton (or any object exposing
-    the same attributes)."""
-    return cls(
-      volume_decision_enabled=settings.volume_decision_enabled,
-      capital=settings.capital,
-      risk_percentage=settings.risk_percentage,
-      use_account_equity=settings.use_account_equity,
-      use_custom_position_tp1_percent=getattr(settings, "use_custom_position_tp1_percent", False),
-      position_tp1_percent=settings.position_tp1_percent,
-      tp1_move_sl_to_breakeven=getattr(settings, "tp1_move_sl_to_breakeven", None),
-      allow_multi_strategy_per_symbol=getattr(settings, "crypto_allow_multi_strategy_per_symbol", False),
-      use_custom_risk_percentage=getattr(settings, "use_custom_risk_percentage", False),
-    )
-
-  @classmethod
   def from_dict(cls, settings_dict: dict) -> "ExecutionConfig":
     """Build from the plain ``settings.model_dump()`` dict passed across the
     multiprocessing fork boundary."""
