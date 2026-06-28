@@ -147,6 +147,14 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     """Derive close volume; returns TradeResult.fail on error, float on success."""
     symbol = signal.symbol
     if self._config.volume_decision_enabled:
+      if tp1_percent is None:
+        # Neither config.position_tp1_percent nor signal.tp1_percent supplied a
+        # percentage, so there is nothing to size the partial close from. Fail
+        # cleanly instead of crashing on ``None / 100``.
+        return TradeResult.fail(
+          "No TP1 percent available — set POSITION_TP1_PERCENT or include "
+          "tp1_percent in the signal."
+        )
       calculated = pos.volume * (tp1_percent / 100)
       close_volume = self._executor.normalize_volume(symbol, calculated)
       logger.info(
@@ -179,7 +187,10 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     tp1_percent, move_sl_to_be = self._resolve_tp1_params(signal)
 
     volume_result = self._resolve_tp1_volume(signal, pos, tp1_percent)
-    if isinstance(volume_result, dict):
+    if isinstance(volume_result, TradeResult):
+      # _resolve_tp1_volume returns a TradeResult (a dataclass, *not* a dict) on
+      # failure. ``isinstance(..., dict)`` would never match it, silently passing
+      # the failure object through as the close volume.
       return volume_result
     close_volume: float = volume_result
 

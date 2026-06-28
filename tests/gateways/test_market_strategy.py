@@ -189,6 +189,40 @@ def test_handle_tp1_config_move_sl_overrides_signal(config):
   assert not any(call[0] == "sl" for call in ex.calls)
 
 
+def test_handle_tp1_missing_quantity_fails_cleanly(config):
+  """Payload-quantity mode with no quantity must return a failure TradeResult,
+  not pass the failure object through as the close volume.
+
+  Regression: the early-return guarded on ``isinstance(volume_result, dict)``,
+  but ``_resolve_tp1_volume`` returns a ``TradeResult`` (a dataclass, not a
+  dict), so the guard never matched and a TradeResult reached partial_close.
+  """
+  cfg = replace(config, volume_decision_enabled=False)
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1, quantity=None))
+  assert res["success"] is False
+  assert "quantity" in res["comment"].lower()
+  # No partial-close attempt should have been made.
+  assert not any(call[0] == "partial" for call in ex.calls)
+
+
+def test_handle_tp1_fails_when_no_tp1_percent_anywhere(config):
+  """VOLUME_DECISION mode with no tp1_percent in config *or* signal must fail
+  cleanly instead of crashing on ``None / 100``."""
+  cfg = replace(
+    config, volume_decision_enabled=True,
+    use_custom_position_tp1_percent=False, position_tp1_percent=None,
+  )
+  pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
+  ex = FakeExecutor(positions=[pos])
+  market = ForexMarket(ex, cfg)
+  res = market.handle_tp1(make_signal(SignalActionEnum.TP1))  # no tp1_percent
+  assert res["success"] is False
+  assert not any(call[0] == "partial" for call in ex.calls)
+
+
 def test_factory_builds_forex_market(config):
   market = MarketStrategyFactory.create(
     MarketTypeEnum.FOREX, executor=FakeExecutor(), config=config
