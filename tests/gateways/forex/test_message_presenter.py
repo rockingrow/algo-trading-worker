@@ -123,6 +123,30 @@ def test_startup_message_override_lines_enabled():
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (false)</b>" in msg
 
 
+def test_startup_message_enabled_override_with_unset_percent_reads_na():
+  # use_custom_position_tp1_percent on but POSITION_TP1_PERCENT never configured:
+  # render "ENABLED (n/a)" rather than a literal "None%".
+  base = {
+    "volume_decision_enabled": True,
+    "capital": 1000,
+    "capital_currency": "USD",
+    "use_account_equity": False,
+  }
+  msg = ForexMessagePresenter.startup(
+    {
+      **base,
+      "use_custom_risk_percentage": True,
+      "risk_percentage": None,
+      "use_custom_position_tp1_percent": True,
+      "position_tp1_percent": None,
+    },
+    "F",
+  )
+  assert "RISK_PERCENTAGE: <b>ENABLED (n/a)</b>" in msg
+  assert "POSITION_TP1_PERCENT: <b>ENABLED (n/a)</b>" in msg
+  assert "None%" not in msg
+
+
 def test_startup_message_tp1_be_line():
   base = {
     "volume_decision_enabled": True,

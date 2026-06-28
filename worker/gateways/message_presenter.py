@@ -43,6 +43,15 @@ class BaseMessagePresenter:
     return f"Risk: <b>{risk_percent}%</b>{gear}\n"
 
   @staticmethod
+  def _fmt_percent(value) -> str:
+    """Render a percent value, or 'n/a' when it is unset (None).
+
+    Guards the override lines against printing a literal ``None%`` when a custom
+    override is toggled on but its percent was never configured.
+    """
+    return "n/a" if value is None else f"{value}%"
+
+  @staticmethod
   def _override_line(label: str, enabled: bool, value: str) -> str:
     """Render a settings line that overrides-or-falls-back-to the signal.
 
@@ -71,7 +80,7 @@ class BaseMessagePresenter:
     return BaseMessagePresenter._override_line(
       "RISK_PERCENTAGE",
       enabled=bool(s.get("use_custom_risk_percentage", False)),
-      value=f"{s.get('risk_percentage')}%",
+      value=BaseMessagePresenter._fmt_percent(s.get("risk_percentage")),
     )
 
   @staticmethod
@@ -85,7 +94,7 @@ class BaseMessagePresenter:
     return BaseMessagePresenter._override_line(
       "POSITION_TP1_PERCENT",
       enabled=bool(s.get("use_custom_position_tp1_percent", False)),
-      value=f"{s.get('position_tp1_percent')}%",
+      value=BaseMessagePresenter._fmt_percent(s.get("position_tp1_percent")),
     )
 
   @staticmethod
@@ -123,19 +132,33 @@ class BaseMessagePresenter:
   def _tp1_qty_suffix(signal, settings_dict: dict | None) -> str:
     """Append the TP1 close-percent to the quantity/volume line for TP1 actions only.
 
-    Only shown when the signal action is TP1. Returns '' for LONG/SHORT and all
-    other actions, or when no TP1 percent applies.
+    Mirrors ``ExecutorBackedMarket._resolve_tp1_params`` so the displayed percent
+    always matches the percent actually used to size the partial close:
+
+      - non-TP1 action, or no settings              → ''
+      - VOLUME_DECISION_ENABLED off                 → '' (the close is sized from
+        ``signal.quantity``, not a percent, so no percent applies)
+      - use_custom=True                             → config percent + gear
+      - use_custom=False, signal.tp1_percent set    → signal percent
+      - use_custom=False, signal.tp1_percent unset  → config percent (fallback)
+      - percent still unresolved (None)             → ''
     """
     if getattr(signal, "action", None) != SignalActionEnum.TP1:
       return ""
     if settings_dict is None:
       return ""
     s = settings_dict
+    if not s.get("volume_decision_enabled", False):
+      return ""
     if s.get("use_custom_position_tp1_percent", False):
       pct = s.get("position_tp1_percent")
       gear = f" {GEAR}"
     else:
       pct = getattr(signal, "tp1_percent", None)
+      if pct is None:
+        # Same fallback the executor applies: an absent signal percent defers to
+        # the configured POSITION_TP1_PERCENT rather than dropping the suffix.
+        pct = s.get("position_tp1_percent")
       gear = ""
     if pct is None:
       return ""
