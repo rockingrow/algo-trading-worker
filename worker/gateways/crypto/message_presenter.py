@@ -45,7 +45,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
     cfg = (
       f"EXCHANGE: <b>{exchange_display}</b>\n"
       f"TESTNET: <b>{s.get('binance_testnet', False)}</b>\n"
-      f"VOLUME_DECISION_ENABLED: <b>{s.get('volume_decision_enabled', False)}</b>\n"
+      f"{CryptoMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"{CryptoMessagePresenter._risk_percentage_line(s)}"
       f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"

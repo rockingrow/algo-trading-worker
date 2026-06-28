@@ -76,8 +76,9 @@ def test_order_filled_shows_override_section_and_tp1_qty_when_settings_given():
   }
   msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER", settings_dict=settings)
   # Override section sits between the position block and the footer.
+  assert "VOLUME_DECISION_ENABLED: <b>DISABLED</b>" in msg
   assert "RISK_PERCENTAGE: <b>ENABLED (3.0%)</b>" in msg
-  assert "USE_ACCOUNT_EQUITY: <b>True</b>" in msg
+  assert "USE_ACCOUNT_EQUITY: <b>ENABLED</b>" in msg
   assert "POSITION_TP1_PERCENT: <b>ENABLED (50.0%)</b>" in msg
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>DISABLED</b>" in msg
   # Quantity line shows "TP1 <pct>%" with a gear only for TP1 action.

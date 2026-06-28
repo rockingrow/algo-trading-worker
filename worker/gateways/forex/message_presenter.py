@@ -45,7 +45,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
   def startup(settings_dict: dict, footer: str) -> str:
     s = settings_dict
     volume_config = (
-      f"VOLUME_DECISION_ENABLED: <b>{s.get('volume_decision_enabled', False)}</b>\n"
+      f"{ForexMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"{ForexMessagePresenter._risk_percentage_line(s)}"
       f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"

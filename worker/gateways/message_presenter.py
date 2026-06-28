@@ -55,6 +55,12 @@ class BaseMessagePresenter:
     return f"{label}: <b>{body}</b>\n"
 
   @staticmethod
+  def _volume_decision_line(settings_dict: dict) -> str:
+    s = settings_dict
+    enabled = bool(s.get("volume_decision_enabled", False))
+    return f"VOLUME_DECISION_ENABLED: <b>{'ENABLED' if enabled else 'DISABLED'}</b>\n"
+
+  @staticmethod
   def _risk_percentage_line(settings_dict: dict) -> str:
     """Render the RISK_PERCENTAGE override line.
 
@@ -106,6 +112,7 @@ class BaseMessagePresenter:
     s = settings_dict
     return (
       f"{_DIVIDER}\n"
+      f"{BaseMessagePresenter._volume_decision_line(s)}"
       f"{BaseMessagePresenter._risk_percentage_line(s)}"
       f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
       f"{BaseMessagePresenter._tp1_percent_line(s)}"
