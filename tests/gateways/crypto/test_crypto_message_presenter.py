@@ -64,7 +64,7 @@ def test_order_filled_no_scale_block_for_normal_entry():
 
 
 def test_order_filled_shows_override_section_and_tp1_qty_when_settings_given():
-  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD")
+  signal = make_signal(SignalActionEnum.TP1, symbol="BTCUSD")
   result = {"price": 30000.0, "volume": 0.1353, "ticket": 5, "sl_update": {"success": True}}
   settings = {
     "use_custom_risk_percentage": True,
@@ -80,16 +80,27 @@ def test_order_filled_shows_override_section_and_tp1_qty_when_settings_given():
   assert "USE_ACCOUNT_EQUITY: <b>True</b>" in msg
   assert "POSITION_TP1_PERCENT: <b>ENABLED (50.0%)</b>" in msg
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>DISABLED</b>" in msg
-  # Quantity line shows the custom TP1 percent with a gear.
-  assert "Quantity: <b>0.1353 (50.0% " in msg
+  # Quantity line shows "TP1 <pct>%" with a gear only for TP1 action.
+  assert "Quantity: <b>0.1353 (TP1 50.0% " in msg
 
 
 def test_order_filled_tp1_qty_uses_signal_percent_without_gear():
-  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD", tp1_percent=40.0)
+  signal = make_signal(SignalActionEnum.TP1, symbol="BTCUSD", tp1_percent=40.0)
   result = {"price": 30000.0, "volume": 0.02, "ticket": 5, "sl_update": {"success": True}}
   settings = {"use_custom_position_tp1_percent": False}
   msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER", settings_dict=settings)
-  assert "Quantity: <b>0.02 (40.0%)</b>" in msg
+  assert "Quantity: <b>0.02 (TP1 40.0%)</b>" in msg
+
+
+def test_order_filled_long_short_no_qty_suffix():
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD", tp1_percent=50.0)
+  result = {"price": 30000.0, "volume": 0.1353, "ticket": 5, "sl_update": {"success": True}}
+  settings = {
+    "use_custom_position_tp1_percent": True,
+    "position_tp1_percent": 50.0,
+  }
+  msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER", settings_dict=settings)
+  assert "Quantity: <b>0.1353</b>" in msg
 
 
 def test_order_filled_no_override_section_without_settings():

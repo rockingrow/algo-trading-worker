@@ -19,7 +19,7 @@ from __future__ import annotations
 import html
 
 from worker.icons import ALARM, GEAR, REJECTED, SHIELD
-from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 from worker.services.notification_service import _box
 
 _DIVIDER = "----------------------------------"
@@ -94,7 +94,7 @@ class BaseMessagePresenter:
 
         ----------------------------------
         RISK_PERCENTAGE: ENABLED (3.0%)
-        USE_ACCOUNT_EQUITY: True
+        USE_ACCOUNT_EQUITY: ENABLED
         POSITION_TP1_PERCENT: ENABLED (50.0%)
         TP1_MOVE_SL_TO_BREAKEVEN: DISABLED
 
@@ -107,19 +107,20 @@ class BaseMessagePresenter:
     return (
       f"{_DIVIDER}\n"
       f"{BaseMessagePresenter._risk_percentage_line(s)}"
-      f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
+      f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
       f"{BaseMessagePresenter._tp1_percent_line(s)}"
       f"{BaseMessagePresenter._tp1_be_line(s)}"
     )
 
   @staticmethod
   def _tp1_qty_suffix(signal, settings_dict: dict | None) -> str:
-    """Append the effective TP1 close-percent to the quantity/volume line.
+    """Append the TP1 close-percent to the quantity/volume line for TP1 actions only.
 
-    Shows the percent of the position that will be closed at TP1, with a gear
-    when POSITION_TP1_PERCENT overrides the signal's own value. Returns '' when
-    no TP1 percent applies (e.g. a close event carrying none, or no settings).
+    Only shown when the signal action is TP1. Returns '' for LONG/SHORT and all
+    other actions, or when no TP1 percent applies.
     """
+    if getattr(signal, "action", None) != SignalActionEnum.TP1:
+      return ""
     if settings_dict is None:
       return ""
     s = settings_dict
@@ -131,7 +132,7 @@ class BaseMessagePresenter:
       gear = ""
     if pct is None:
       return ""
-    return f" ({pct}%{gear})"
+    return f" (TP1 {pct}%{gear})"
 
   @staticmethod
   def _tp1_be_line(settings_dict: dict) -> str:
