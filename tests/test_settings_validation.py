@@ -23,6 +23,7 @@ def test_crypto_ok_with_keys_and_no_mt5(monkeypatch):
   monkeypatch.setenv("MARKET_TYPE", "CRYPTO")
   monkeypatch.setenv("BINANCE_API_KEY", "key")
   monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+  monkeypatch.setenv("BINANCE_ACCOUNT_ID", "acct-1")
   # MT5 creds intentionally absent — must NOT be required for crypto.
   monkeypatch.delenv("MT5_SERVER", raising=False)
   monkeypatch.delenv("MT5_LOGIN", raising=False)

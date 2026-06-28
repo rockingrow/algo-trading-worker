@@ -76,6 +76,8 @@ class SignalSchema(BaseModel):
   # :meth:`scale_quantity_factor`.
   is_scale_position: Optional[bool] = None
   scaling: Optional[ScalingSchema] = None
+  tp1_percent: Optional[float] = None
+  move_sl_to_be: Optional[bool] = None
 
   def scale_quantity_factor(self) -> float:
     """Quantity multiplier to apply to a *self-computed* entry volume.

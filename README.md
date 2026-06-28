@@ -312,7 +312,7 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 | Group | Action(s) | Behaviour |
 | --- | --- | --- |
 | **1 — Entry** | `LONG` / `SHORT` | Force-close any stale position for the same strategy → open a fresh market order with a hard SL set on the broker/exchange server |
-| **2 — Partial Exit** | `TP1` | Partial close using `POSITION_TP1_PERCENT` % of live volume (or signal `quantity` if disabled) → move remaining SL to breakeven (`price_open`), unless `TP1_MOVE_SL_TO_BREAKEVEN=false` (then the original entry SL is kept) |
+| **2 — Partial Exit** | `TP1` | Partial close using the resolved TP1 percent of live volume (or signal `quantity` when `VOLUME_DECISION_ENABLED=false`) → optionally move remaining SL to breakeven (`price_open`). TP1 percent and breakeven flag are resolved from the signal (`tp1_percent`, `move_sl_to_be`) or overridden by config (`USE_CUSTOM_POSITION_TP1_PERCENT` / `TP1_MOVE_SL_TO_BREAKEVEN`). |
 | **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open volume using the **actual live `position.volume`** — signal `quantity` is intentionally ignored |
 | **4 — Flat** | `FLAT` | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED` |
 
@@ -427,11 +427,11 @@ The broker/exchange is always the source of truth: live positions are closed **f
 
 - **Ticket-linked partial close (TP1):** The partial close request always carries the original `position=ticket` so MT5 correctly treats it as a partial close rather than an opposing hedge order.
 
-- **TP1 volume — percent-based or signal quantity:** When `VOLUME_DECISION_ENABLED=true`, TP1 closes `POSITION_TP1_PERCENT` % of the current live position volume instead of using `signal.quantity`. The executor's `normalize_volume()` rounds the result to the broker/exchange's quantity step and clamps it to the `[min, max]` range before sending the order.
+- **TP1 volume — percent-based or signal quantity:** When `VOLUME_DECISION_ENABLED=true`, TP1 closes a percentage of the current live position volume instead of using `signal.quantity`. The percentage is resolved in priority order: if `USE_CUSTOM_POSITION_TP1_PERCENT=true`, always use `POSITION_TP1_PERCENT` from config; otherwise use `signal.tp1_percent` if present, falling back to `POSITION_TP1_PERCENT`. The executor's `normalize_volume()` rounds the result to the broker/exchange's quantity step and clamps it to the `[min, max]` range before sending the order.
 
 - **Actual volume on full close (TP2/SL/R_SL):** The signal `quantity` is **never used** for full exit calculations. The handler reads the live `position.volume` directly from the broker/exchange to avoid dust-lot rounding errors.
 
-- **Breakeven SL after TP1 (configurable):** When `TP1_MOVE_SL_TO_BREAKEVEN=true` (default), after the partial close succeeds the executor's `update_position_sl` moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss (a `TRADE_ACTION_SLTP` on MT5, a `STOP_MARKET` on a CEX). If the breakeven SL cannot be placed, the still-open runner is immediately emergency-closed rather than left to run unprotected. When `TP1_MOVE_SL_TO_BREAKEVEN=false`, TP1 is partial-close-only: the original entry SL stays in place and keeps protecting the runner, so no breakeven move (and no emergency-close fallback) is attempted.
+- **Breakeven SL after TP1 (configurable):** After the partial close succeeds, whether to move the server-side SL to `price_open` (entry price) is resolved in priority order: `TP1_MOVE_SL_TO_BREAKEVEN` in config (if set, overrides everything) → `signal.move_sl_to_be` (per-trade flag from the broker) → `false` (default when neither is set). When the resolved value is `true`, `update_position_sl` moves the SL to `price_open`, protecting the remaining runner against connectivity loss (a `TRADE_ACTION_SLTP` on MT5, a `STOP_MARKET` on a CEX); if the breakeven SL cannot be placed, the runner is immediately emergency-closed. When `false`, TP1 is partial-close-only: the original entry SL stays in place.
 
 - **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 

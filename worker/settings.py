@@ -80,16 +80,18 @@ class Settings(BaseSettings):
   # Strategy configuration
   slippage_deviation: int = 100
   strategy_magic_map: dict[str, int] = {}
-  position_tp1_percent: float = 30.0
+  use_custom_position_tp1_percent: bool = False  # If true, use custom TP1 percentage instead of signal's tp1_percent
+  position_tp1_percent: Optional[float] = 50  # Only defined if you want custom TP1 percentage, otherwise default is tp1_percent in signal
   # When True, TP1 partial-closes and then moves the stop to breakeven (entry).
   # When False, TP1 only partial-closes and leaves the original entry SL
   # untouched, so the runner keeps its initial protection.
-  tp1_move_sl_to_breakeven: bool = True
+  tp1_move_sl_to_breakeven: Optional[bool] = None  # Only defined if you want to move SL to breakeven when TP1 is hit, otherwise default is move_sl_to_be in signal
 
   # Init capital and risk management
   capital: float = 1000
   capital_currency: str = "USD"
   volume_decision_enabled: bool = True
+  use_custom_risk_percentage: bool = False  # If true, use custom risk percentage instead of signal's risk percentage
   risk_percentage: float = 2.0  # Risk 2% of capital per trade
   use_account_equity: bool = False  # If true, use account equity instead of initial capital for entry volume calculation
 

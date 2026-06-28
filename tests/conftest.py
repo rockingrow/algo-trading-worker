@@ -21,7 +21,9 @@ def config():
     capital=1000.0,
     risk_percentage=2.0,
     use_account_equity=False,
+    use_custom_position_tp1_percent=False,
     position_tp1_percent=30.0,
+    tp1_move_sl_to_breakeven=True,
   )
 
 

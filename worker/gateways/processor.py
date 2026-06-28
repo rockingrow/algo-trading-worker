@@ -269,8 +269,10 @@ class BaseSignalProcessor(ABC):
         # of reporting a normal fill.
         msg = self.presenter.position_unprotected_closed(signal, result, footer)
       else:
+        risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
-          signal, result, result.get("source_ticket") or result.get("ticket"), footer
+          signal, result, result.get("source_ticket") or result.get("ticket"), footer,
+          risk_info=risk_info, settings_dict=self.settings,
         )
     else:
       msg = self.presenter.order_failed(signal, result, footer)
@@ -451,6 +453,20 @@ class BaseSignalProcessor(ABC):
   @staticmethod
   def _market_type_value(mt) -> str:
     return mt.value if isinstance(mt, MarketTypeEnum) else str(mt or "")
+
+  def _resolve_risk_info(self, signal: SignalSchema):
+    """Return ``(risk_percent, is_custom)`` for entry signals when VDE is on, else None.
+
+    ``is_custom`` is True when USE_CUSTOM_RISK_PERCENTAGE overrides the signal's
+    own risk_percent (so the gear icon is shown in notifications).
+    """
+    if signal.action.value not in ("LONG", "SHORT") or not self.config.volume_decision_enabled:
+      return None
+    if self.config.use_custom_risk_percentage:
+      return (self.config.risk_percentage, True)
+    use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
+    risk = signal.risk_percent if use_signal_risk else self.config.risk_percentage
+    return (risk, False)
 
   def _current_footer(self) -> str:
     """Account footer for notifications, cached for ``_FOOTER_TTL`` seconds so a
