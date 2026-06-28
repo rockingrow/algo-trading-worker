@@ -22,5 +22,3 @@ GEAR         = _e.emojize(":gear:")                            # ⚙️
 MANUAL       = _e.emojize(":hand_with_fingers_splayed:")       # 🖐
 BROKER       = _e.emojize(":electric_plug:")                   # 🔌
 RETRYING     = _e.emojize(":hourglass_not_done:")              # ⏳
-LONG         = _e.emojize(":chart_increasing:")                # 📈
-SHORT        = _e.emojize(":chart_decreasing:")                # 📉

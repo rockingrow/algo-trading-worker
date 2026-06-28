@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.settings import CryptoExchangeEnum
 
 
 def _proc(settings: dict) -> CryptoSignalProcessor:
@@ -14,21 +13,18 @@ def _proc(settings: dict) -> CryptoSignalProcessor:
   return proc
 
 
-def test_account_id_uses_enum_value_not_repr():
-  # str(CryptoExchangeEnum.BINANCE) would leak "CryptoExchangeEnum.BINANCE";
-  # the published account_id must be the bare exchange name.
-  proc = _proc({"crypto_exchange": CryptoExchangeEnum.BINANCE.value})
-  assert proc._account_id == "BINANCE"
+def test_account_id_returns_configured_binance_account_id():
+  # _account_id is the explicit BINANCE_ACCOUNT_ID (required for crypto), used
+  # for ADMIN FLAT routing and the account footer.
+  proc = _proc({"binance_account_id": "acct-123"})
+  assert proc._account_id == "acct-123"
 
 
-def test_account_id_accepts_plain_string():
-  proc = _proc({"crypto_exchange": "BINANCE"})
-  assert proc._account_id == "BINANCE"
-
-
-def test_account_id_defaults_when_missing():
+def test_account_id_none_when_unset():
+  # Settings validation requires BINANCE_ACCOUNT_ID for crypto, so this is
+  # unreachable in production; the property just surfaces what is configured.
   proc = _proc({})
-  assert proc._account_id == "CRYPTO"
+  assert proc._account_id is None
 
 
 # ── reconciler handler ─────────────────────────────────────────────────────── #
