@@ -117,7 +117,11 @@ class PositionCDC:
         else PositionEventType.UPDATED
       )
       payload = {k: row[k] for k in _EVENT_FIELDS if k in row}
-      payload.update(self._extract_signal_fields(row.get("message")))
+      # DB stores the raw signal JSON in "gateway_message"; PositionEvent calls it "message".
+      gateway_msg = row.get("gateway_message")
+      if gateway_msg is not None:
+        payload["message"] = gateway_msg
+      payload.update(self._extract_signal_fields(gateway_msg))
       strategy_code = payload.get("strategy_code")
       if strategy_code is None:
         magic = self._magic_for(row.get("strategy"))
