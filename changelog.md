@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] - 2026-06-28
+
+### Added
+
+- `tp1_percent` and `move_sl_to_be` fields on `SignalSchema` — signals can now carry a per-trade TP1 close percentage and a move-SL-to-breakeven flag. The broker encodes both in the payload; the worker reads them at TP1 time and combines them with the config overrides below.
+- `USE_CUSTOM_POSITION_TP1_PERCENT` (bool, default `false`) env var — when `true`, always uses `POSITION_TP1_PERCENT` from config regardless of `signal.tp1_percent`; when `false`, prefers `signal.tp1_percent` and falls back to `POSITION_TP1_PERCENT` when the signal omits it.
+- `USE_CUSTOM_RISK_PERCENTAGE` (bool, default `false`) env var — when `true`, always uses `RISK_PERCENTAGE` from config; when `false`, prefers `signal.risk_percent` and falls back to the config value when the signal omits or zeroes it.
+- `TP1_MOVE_SL_TO_BREAKEVEN` is now optional (previously a required `bool`). When absent (the new default), the signal's own `move_sl_to_be` field governs whether the stop is moved to breakeven after TP1. When explicitly set in config, it overrides the signal.
+- Order fill notifications now show: the effective risk percent with a gear icon when the config overrides the signal; the TP1 close-percent appended to the volume/quantity line on TP1 fills; and an override-settings block listing VOLUME_DECISION_ENABLED, RISK_PERCENTAGE, USE_ACCOUNT_EQUITY, POSITION_TP1_PERCENT, and TP1_MOVE_SL_TO_BREAKEVEN states (ENABLED/DISABLED with value) so operators can see, on each trade notification, which modes are active for the connected worker.
+- Startup banner now renders all override settings as ENABLED/DISABLED (consistent with the order fill block) instead of raw boolean values.
+
+### Fixed
+
+- `PositionCDC` was calling `row.get("message")` to extract signal fields for TRADE events, but the DB column is `gateway_message`. As a result, `signal_id`, `sl`, `tp1`, `risk_percent`, and other fields published in the NATS TRADE event were always `null`. Now correctly reads `gateway_message` and forwards it as `message` in the PositionEvent payload.
+
 ## [1.1.5] - 2026-06-26
 
 ### Added
@@ -54,7 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
-[1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...dev
+[1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.5...dev
+[1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.3...dev
 [1.1.3]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.1...v1.1.2
