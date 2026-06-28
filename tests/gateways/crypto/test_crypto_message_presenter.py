@@ -61,3 +61,40 @@ def test_order_filled_no_scale_block_for_normal_entry():
   msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER")
   assert "Scaled Position" not in msg
   assert "TP1:" not in msg and "TP2:" not in msg
+
+
+def test_order_filled_shows_override_section_and_tp1_qty_when_settings_given():
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD")
+  result = {"price": 30000.0, "volume": 0.1353, "ticket": 5, "sl_update": {"success": True}}
+  settings = {
+    "use_custom_risk_percentage": True,
+    "risk_percentage": 3.0,
+    "use_account_equity": True,
+    "use_custom_position_tp1_percent": True,
+    "position_tp1_percent": 50.0,
+    "tp1_move_sl_to_breakeven": None,
+  }
+  msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER", settings_dict=settings)
+  # Override section sits between the position block and the footer.
+  assert "RISK_PERCENTAGE: <b>ENABLED (3.0%)</b>" in msg
+  assert "USE_ACCOUNT_EQUITY: <b>True</b>" in msg
+  assert "POSITION_TP1_PERCENT: <b>ENABLED (50.0%)</b>" in msg
+  assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>DISABLED</b>" in msg
+  # Quantity line shows the custom TP1 percent with a gear.
+  assert "Quantity: <b>0.1353 (50.0% " in msg
+
+
+def test_order_filled_tp1_qty_uses_signal_percent_without_gear():
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD", tp1_percent=40.0)
+  result = {"price": 30000.0, "volume": 0.02, "ticket": 5, "sl_update": {"success": True}}
+  settings = {"use_custom_position_tp1_percent": False}
+  msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER", settings_dict=settings)
+  assert "Quantity: <b>0.02 (40.0%)</b>" in msg
+
+
+def test_order_filled_no_override_section_without_settings():
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD")
+  result = {"price": 30000.0, "volume": 0.02, "ticket": 5, "sl_update": {"success": True}}
+  msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER")
+  assert "RISK_PERCENTAGE" not in msg
+  assert "Quantity: <b>0.02</b>" in msg

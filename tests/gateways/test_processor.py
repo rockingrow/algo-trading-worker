@@ -29,7 +29,7 @@ class FakePresenter:
     return f"force_closed:{symbol}"
 
   @staticmethod
-  def order_filled(signal, result, pos_ticket, footer, risk_info=None):
+  def order_filled(signal, result, pos_ticket, footer, risk_info=None, settings_dict=None):
     return f"filled:{signal.action.value}:{pos_ticket}"
 
   @staticmethod
@@ -84,6 +84,7 @@ class FakeProcessor(BaseSignalProcessor):
       direct_notifier=SimpleNamespace(send_message=lambda m: None),
     )
     self.handler = SimpleNamespace(handle=lambda sig: handle_result)
+    self.settings = {}
     self.config = ExecutionConfig(
       volume_decision_enabled=True,
       capital=1000.0,

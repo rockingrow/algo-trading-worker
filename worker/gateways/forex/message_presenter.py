@@ -77,19 +77,22 @@ class ForexMessagePresenter(BaseMessagePresenter):
   @staticmethod
   def order_filled(
     signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None,
+    risk_info=None, settings_dict: dict | None = None,
   ) -> str:
+    volume = format_volume(result.get("volume"), auto_calculated=True)
+    qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)
     return _box(
       f"{SUCCESS} <b>Order Filled</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
-      f"Volume: <b>{format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
+      f"Volume: <b>{volume}{qty_suffix}</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
       f"Source Ticket: <b>{pos_ticket}</b>\n"
       f"{ForexMessagePresenter._scale_lines(signal)}"
       f"{ForexMessagePresenter._risk_line(risk_info)}"
+      f"{ForexMessagePresenter._override_section(settings_dict)}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

@@ -28,7 +28,7 @@ class TradePresenterProtocol(Protocol):
   @staticmethod
   def order_filled(
     signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None,
+    risk_info=None, settings_dict: dict | None = None,
   ) -> str: ...
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str: ...

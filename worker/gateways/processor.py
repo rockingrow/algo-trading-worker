@@ -272,7 +272,7 @@ class BaseSignalProcessor(ABC):
         risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
           signal, result, result.get("source_ticket") or result.get("ticket"), footer,
-          risk_info=risk_info,
+          risk_info=risk_info, settings_dict=self.settings,
         )
     else:
       msg = self.presenter.order_failed(signal, result, footer)

@@ -74,20 +74,23 @@ class CryptoMessagePresenter(BaseMessagePresenter):
   @staticmethod
   def order_filled(
     signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None,
+    risk_info=None, settings_dict: dict | None = None,
   ) -> str:
+    qty = result.get("volume")
+    qty_suffix = CryptoMessagePresenter._tp1_qty_suffix(signal, settings_dict)
     return _box(
       f"{SUCCESS} <b>Order Filled</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
-      f"Quantity: <b>{result.get('volume')}</b>\n"
+      f"Quantity: <b>{qty}{qty_suffix}</b>\n"
       f"Order: <b>{result.get('ticket')}</b>\n"
       f"Source: <b>{pos_ticket}</b>\n"
       f"{CryptoMessagePresenter._scale_lines(signal)}"
       f"{CryptoMessagePresenter._sl_line(signal, result)}"
       f"{CryptoMessagePresenter._risk_line(risk_info)}"
+      f"{CryptoMessagePresenter._override_section(settings_dict)}"
       f"{_DIVIDER}\n{footer}"
     )
 

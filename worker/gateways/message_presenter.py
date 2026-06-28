@@ -83,6 +83,57 @@ class BaseMessagePresenter:
     )
 
   @staticmethod
+  def _override_section(settings_dict: dict | None) -> str:
+    """Render the override-settings block shown on every order fill, or '' when
+    no settings are available.
+
+    Mirrors the config lines of the startup banner so the operator can see, on
+    each trade event in the community channel, which override modes are active
+    for the connected worker. Emitted as its own divider-wrapped section that
+    sits between the position block and the account footer:
+
+        ----------------------------------
+        RISK_PERCENTAGE: ENABLED (3.0%)
+        USE_ACCOUNT_EQUITY: True
+        POSITION_TP1_PERCENT: ENABLED (50.0%)
+        TP1_MOVE_SL_TO_BREAKEVEN: DISABLED
+
+    Only the leading divider is rendered here; the caller's trailing divider
+    closes the section before the footer.
+    """
+    if settings_dict is None:
+      return ""
+    s = settings_dict
+    return (
+      f"{_DIVIDER}\n"
+      f"{BaseMessagePresenter._risk_percentage_line(s)}"
+      f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
+      f"{BaseMessagePresenter._tp1_percent_line(s)}"
+      f"{BaseMessagePresenter._tp1_be_line(s)}"
+    )
+
+  @staticmethod
+  def _tp1_qty_suffix(signal, settings_dict: dict | None) -> str:
+    """Append the effective TP1 close-percent to the quantity/volume line.
+
+    Shows the percent of the position that will be closed at TP1, with a gear
+    when POSITION_TP1_PERCENT overrides the signal's own value. Returns '' when
+    no TP1 percent applies (e.g. a close event carrying none, or no settings).
+    """
+    if settings_dict is None:
+      return ""
+    s = settings_dict
+    if s.get("use_custom_position_tp1_percent", False):
+      pct = s.get("position_tp1_percent")
+      gear = f" {GEAR}"
+    else:
+      pct = getattr(signal, "tp1_percent", None)
+      gear = ""
+    if pct is None:
+      return ""
+    return f" ({pct}%{gear})"
+
+  @staticmethod
   def _tp1_be_line(settings_dict: dict) -> str:
     """Render the TP1_MOVE_SL_TO_BREAKEVEN override line.
 
