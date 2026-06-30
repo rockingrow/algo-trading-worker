@@ -81,8 +81,7 @@ class Settings(BaseSettings):
   # sets each symbol's leverage to min(exchange_max, MAX_LEVERAGE_CAP). Empty
   # list (default) skips the init entirely. Comma-separated raw signal symbols
   # — they are resolved through the executor's symbol resolver, so the .env
-  # form mirrors how upstream signals address the symbol (e.g. "BTCUSDT.P,
-  # ETHUSDT.P" or "BTCUSD,ETHUSD").
+  # form mirrors how upstream signals address the symbol (e.g. "BTCUSD,ETHUSD").
   crypto_leverage_init_symbols: list[str] = []
   # Upper bound applied by LeverageInitJob. If the symbol's exchange-side max
   # leverage is below this, the lower value is used (sub-account caps are
