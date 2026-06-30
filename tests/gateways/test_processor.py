@@ -13,6 +13,7 @@ from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.schemas.system_schema import SystemActionEnum
 
 
 class FakePresenter:
@@ -94,6 +95,7 @@ class FakeProcessor(BaseSignalProcessor):
     self._market_type = "FAKE_MKT"
     self._connected = connected
     self.admin_calls = []
+    self.system_calls = []
     self.magic_calls = []
 
   # Hooks
@@ -135,6 +137,11 @@ class FakeProcessor(BaseSignalProcessor):
   # Override the (now concrete) shared FLAT handler to assert routing only.
   def _handle_admin_message(self, raw):
     self.admin_calls.append(raw)
+
+  # Record dispatched SYSTEM actions (base parses the envelope + ensures
+  # connection, then calls this hook).
+  def _handle_system_action(self, action, data):
+    self.system_calls.append((action, data))
 
 
 # ── Abstract enforcement ──────────────────────────────────────────────────── #
@@ -247,6 +254,40 @@ def test_admin_subject_routed_to_hook():
   proc._process_message(NatsSubjectEnum.ADMIN, '{"action":"FLAT"}')
   assert proc.admin_calls == ['{"action":"FLAT"}']
   assert proc.db.logged == []  # not treated as a signal
+
+
+def test_system_subject_parsed_and_dispatched_to_action_hook():
+  proc = FakeProcessor({"success": True})
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"symbols":["BTC","ETH"],"default_leverage":10}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert len(proc.system_calls) == 1
+  action, data = proc.system_calls[0]
+  assert action == SystemActionEnum.CRYPTO_LEVERAGE_INIT
+  assert data["symbols"] == ["BTC", "ETH"]
+  assert proc.db.logged == []  # not treated as a signal
+
+
+def test_system_malformed_json_dropped_without_dispatch():
+  proc = FakeProcessor({"success": True})
+  proc._process_message(NatsSubjectEnum.SYSTEM, "not json {{")
+  assert proc.system_calls == []
+
+
+def test_system_invalid_envelope_dropped_without_dispatch():
+  proc = FakeProcessor({"success": True})
+  # Unknown action fails SystemActionEnum validation → dropped before dispatch.
+  proc._process_message(NatsSubjectEnum.SYSTEM, '{"action":"NOPE","timestamp":"2026-06-30T00:00:00+00:00"}')
+  assert proc.system_calls == []
+
+
+def test_system_not_connected_short_circuits():
+  proc = FakeProcessor({"success": True}, connected=False)
+  raw = '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00"}'
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert proc.system_calls == []
 
 
 def test_invalid_signal_notifies_operator_and_skips_execution():

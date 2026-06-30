@@ -201,6 +201,10 @@ the failure mode this job exists to prevent. Any uncaught crash inside the
 job is logged and swallowed so the worker still starts; symbols are left at
 their current exchange-side leverage until the next restart.
 
+The same pass can be re-triggered at runtime — without restarting the worker —
+via a `SYSTEM` `CRYPTO_LEVERAGE_INIT` message (see the [SYSTEM Subject](#-system-subject)
+section), which may also override the symbol set and cap for that one run.
+
 ---
 
 ## 🧩 FOREX Gateway Module Flow (`worker/gateways/forex/`)
@@ -305,11 +309,11 @@ worker/
 │   ├── mt5_event_job.py          # MT5EventJob — terminal-close detection (FOREX)
 │   └── notification_job.py       # NotificationJob — outbox dispatcher (Telegram retries)
 ├── schemas/             # Pydantic / dataclass data schemas
-│   ├── admin_schema.py           # AdminActionEnum + AdminSignalSchema (NATS ADMIN subject)
+│   ├── admin_schema.py           # AdminActionEnum + AdminMessageSchema + Specific action Schema (NATS ADMIN subject)
 │   ├── job_schema.py             # LogAuthorEnum (broker / terminal / exchange)
 │   ├── trade_result.py           # TradeResult value object (ok()/fail() factories)
 │   ├── metatrader_schema.py      # Back-compat re-export of TradeResult
-│   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, TRADE)
+│   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, SYSTEM, TRADE)
 │   ├── notification_schema.py    # NotificationPlatformEnum / NotificationChannelEnum / NotificationModeEnum
 │   ├── position_schema.py        # PositionStatusEnum + PositionEvent / PositionEventType
 │   └── signal_schema.py          # Signal validation schemas
@@ -440,6 +444,40 @@ The broker/exchange is always the source of truth: live positions are closed **f
 - **Per-market match key, not symbol-only:** The admin FLAT correlates each live position with its DB row via `_flat_match_key` / `_flat_db_match_keys` — FOREX matches by ticket (checking both `ref_id` and `ref_source_id` so re-ticketed positions still match), CRYPTO by resolved exchange symbol. Two FOREX strategies running the same symbol are therefore handled independently.
 - **Graceful handling of already-closed positions:** If a position is tracked in SQLite but no longer live on the broker, it is marked `FLATTED` without sending a close order, so the DB stays consistent even after a connectivity gap.
 - **`PositionCDC` propagation:** After status updates, the CDC job picks up the `PENDING` rows and publishes `PositionEvent(event=UPDATED, status=FLATTED, …)` to the Broker via the NATS `TRADE` subject — no special handling required.
+
+---
+
+## 🚦 SYSTEM Subject
+
+The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches the action to the market-specific `_handle_system_action` hook. An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless. FOREX currently handles no `SYSTEM` actions.
+
+### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO)
+
+Re-runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass at runtime, without restarting the worker. Useful after editing a sub-account's leverage cap, onboarding new symbols, or recovering from a startup pass that ran before the exchange was reachable.
+
+| Field | Behaviour when present | Behaviour when omitted |
+| --- | --- | --- |
+| `symbols` | Initialise exactly this list of raw signal symbols | Falls back to `CRYPTO_LEVERAGE_INIT_SYMBOLS` |
+| `default_leverage` | Used as the cap — each symbol is set to `min(exchange_max, default_leverage)` | Falls back to `MAX_LEVERAGE_CAP` |
+
+#### CRYPTO_LEVERAGE_INIT Payload
+
+```json
+{
+  "action": "CRYPTO_LEVERAGE_INIT",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "symbols": ["BTC", "ETH"],
+  "default_leverage": 10
+}
+```
+
+Only `action` and `timestamp` are required; `symbols` and `default_leverage` are optional overrides.
+
+#### Execution flow (SYSTEM)
+
+1. Parse `SystemSchemaSchema`; drop silently on validation error.
+2. Ensure the broker/exchange connection; abort if unreachable.
+3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)` — the **same** `LeverageInitJob` used at startup. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are identical; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
 
 ---
 

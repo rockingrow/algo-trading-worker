@@ -1,8 +1,8 @@
 from enum import Enum
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from worker.schemas.nats_schema import NatsSubjectEnum
 
@@ -36,7 +36,7 @@ class ForexPlatformEnum(str, Enum):
   MT5 = "MT5"
 
 
-NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN}
+NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN, NatsSubjectEnum.SYSTEM}
 WATCHDOG_INTERVAL = 10  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 
@@ -82,11 +82,15 @@ class Settings(BaseSettings):
   # list (default) skips the init entirely. Comma-separated raw signal symbols
   # — they are resolved through the executor's symbol resolver, so the .env
   # form mirrors how upstream signals address the symbol (e.g. "BTCUSD,ETHUSD").
-  crypto_leverage_init_symbols: list[str] = []
+  # NoDecode: read the env var as a raw string and let parse_leverage_init_symbols
+  # split it — otherwise pydantic-settings JSON-decodes the dotenv value first and
+  # a plain "BTCUSD,ETHUSD" (not valid JSON) raises a SettingsError on startup.
+  crypto_leverage_init_symbols: Annotated[list[str], NoDecode] = []
   # Upper bound applied by LeverageInitJob. If the symbol's exchange-side max
   # leverage is below this, the lower value is used (sub-account caps are
   # honoured automatically); if it is at or above, this cap wins.
   max_leverage_cap: int = 10
+  use_custom_leverage: bool = False  # If true, force use custom leverage instead of broker crypto leverage initialization
 
   # Strategy configuration
   slippage_deviation: int = 100
@@ -110,7 +114,10 @@ class Settings(BaseSettings):
   telegram_enabled: bool
   telegram_bot_token: SecretStr
   telegram_chat_id: str  # management: NATS events, service start/stop, MT5 health
-  telegram_chat_channel_id: list[str] = []  # signals: order fills/failures, terminal closes
+  # NoDecode (see crypto_leverage_init_symbols): the documented unquoted
+  # comma-separated form (-100123,-100987) is not valid JSON, so let
+  # parse_channel_ids split the raw string instead of pydantic JSON-decoding it.
+  telegram_chat_channel_id: Annotated[list[str], NoDecode] = []  # signals: order fills/failures, terminal closes
 
   @field_validator("telegram_chat_channel_id", mode="before")
   @classmethod

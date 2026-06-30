@@ -134,16 +134,19 @@ class BaseExchangeGateway(ABC):
   # ── Leverage ──────────────────────────────────────────────────────────── #
 
   def get_max_leverage(self, symbol: str) -> Optional[int]:
-    """Return the maximum leverage this account may use for *symbol*, or ``None``
-    if the exchange does not expose a per-symbol cap. Sub-account / account-tier
-    restrictions are reflected here, so the value can be strictly below the
-    exchange-wide ceiling (e.g. 5x on a capped sub-account)."""
+    """Return the maximum leverage for *symbol*, or ``None`` if the exchange does
+    not expose a per-symbol cap. This is the symbol's market-wide ceiling;
+    account-level restrictions (sub-account / VIP tier) may not be reflected and
+    can only be discovered when :meth:`set_leverage` is rejected — implementations
+    should detect and honor that lower cap there."""
     return None
 
-  def set_leverage(self, symbol: str, leverage: int) -> bool:
-    """Set the working leverage for *symbol*. Returns ``True`` on success.
-    Default no-op for exchanges where leverage is not API-configurable."""
-    return False
+  def set_leverage(self, symbol: str, leverage: int) -> Optional[int]:
+    """Set the working leverage for *symbol*. Returns the leverage **actually
+    applied** on success — which may be below *leverage* if an account-level cap
+    forces it lower — or ``None`` on failure. Default no-op for exchanges where
+    leverage is not API-configurable."""
+    return None
 
   # ── Account ───────────────────────────────────────────────────────────── #
 

@@ -23,10 +23,11 @@ official SDK — see :mod:`worker.gateways.crypto.binance.user_data_stream`.
 
 from __future__ import annotations
 
+import re
 import time
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 import binance_common.utils as _bc_utils
 import requests
@@ -93,6 +94,23 @@ class _API_Endpoints(Enum):
   @property
   def path(self) -> str:
     return self.value[1]
+
+
+# Binance error code for an account-level leverage cap (sub-account / VIP tier
+# restriction). This ceiling is NOT exposed by /fapi/v1/leverageBracket — it
+# surfaces only when POSTing /fapi/v1/leverage, with the real limit embedded in
+# the message ("Subaccounts are restricted from using leverage greater than 5x.").
+_LEVERAGE_CAP_CODE = -4421
+_LEVERAGE_CAP_RE = re.compile(r"greater than (\d+)\s*x", re.IGNORECASE)
+
+
+# Shape of the POST /fapi/v1/leverage response. ``total=False`` because the
+# worker only relies on ``leverage`` (the value the exchange actually applied,
+# which may be clamped below the request) and tolerates the rest being absent.
+class LeverageResponse(TypedDict, total=False):
+  symbol: str
+  leverage: int
+  maxNotionalValue: str
 
 
 # Binance order side mapping for one-way mode.
@@ -403,9 +421,12 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
     ``/fapi/v1/leverageBracket`` returns notional brackets in ascending order;
     the first bracket (lowest notional) carries the highest ``initialLeverage``,
-    which is the per-symbol account ceiling. Sub-account / VIP caps are
-    reflected here automatically (a sub-account limited to 5x returns 5).
-    Returns ``None`` on error so the caller can skip rather than mis-size.
+    which is the symbol's *market-wide* ceiling. NOTE: account-level caps
+    (sub-account / VIP-tier restrictions) are **not** reflected here — a
+    sub-account limited to 5x still returns the market ceiling (e.g. 125). That
+    cap surfaces only when setting leverage (-4421), where :meth:`set_leverage`
+    detects and honors it. Returns ``None`` on error so the caller can skip
+    rather than mis-size.
     """
     try:
       data = self._send(_API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True)
@@ -423,16 +444,63 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     except (TypeError, ValueError):
       return None
 
-  def set_leverage(self, symbol: str, leverage: int) -> bool:
-    """Set per-symbol working leverage. Returns True on success."""
+  def set_leverage(self, symbol: str, leverage: int) -> Optional[int]:
+    """Set per-symbol working leverage.
+
+    Returns the leverage **actually applied** on success — which may be below
+    the requested value when an account-level cap forces it lower — or ``None``
+    on failure. Account caps (sub-account / VIP-tier) are not visible in
+    :meth:`get_max_leverage`; they only appear here as a -4421 rejection that
+    names the real ceiling, so we parse that ceiling and retry once at it rather
+    than leaving the symbol on its stale exchange setting.
+    """
+    leverage = int(leverage)
     try:
-      self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": int(leverage)}, signed=True)
-      return True
+      data = self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": leverage}, signed=True)
+      # Return what the exchange actually applied (response carries the live
+      # `leverage`), not the requested value — covers the case where Binance
+      # silently clamps to a lower account cap instead of rejecting.
+      return self._applied_leverage(data, leverage)
     except Exception as exc:
+      cap = self._leverage_cap_from_error(exc)
+      if cap is not None and cap < leverage:
+        logger.warning(
+          "[Binance] set_leverage(%s=%s) rejected by account cap (-4421); "
+          "retrying at %sx.", symbol, leverage, cap,
+        )
+        try:
+          data = self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": cap}, signed=True)
+          return self._applied_leverage(data, cap)
+        except Exception as exc2:
+          logger.warning(
+            "[Binance] set_leverage(%s=%s) retry failed: %s", symbol, cap, exc2
+          )
+          return None
       logger.warning(
         "[Binance] set_leverage(%s=%s) failed: %s", symbol, leverage, exc
       )
-      return False
+      return None
+
+  @staticmethod
+  def _applied_leverage(data: Optional[LeverageResponse], requested: int) -> int:
+    """Leverage the exchange reports as applied (POST /fapi/v1/leverage echoes the
+    live ``leverage``), falling back to *requested* if the field is absent/unparseable."""
+    try:
+      return int((data or {}).get("leverage"))
+    except (TypeError, ValueError, AttributeError):
+      return requested
+
+  @staticmethod
+  def _leverage_cap_from_error(exc: Exception) -> Optional[int]:
+    """Pull the account leverage ceiling out of a -4421 error, else ``None``."""
+    if getattr(exc, "status_code", None) != _LEVERAGE_CAP_CODE:
+      return None
+    msg = getattr(exc, "error_message", None) or str(exc)
+    match = _LEVERAGE_CAP_RE.search(msg)
+    if not match:
+      return None
+    cap = int(match.group(1))
+    return cap if cap > 0 else None
 
   # ── Account ───────────────────────────────────────────────────────────── #
 
