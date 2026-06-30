@@ -270,6 +270,30 @@ def test_system_subject_parsed_and_dispatched_to_action_hook():
   assert proc.db.logged == []  # not treated as a signal
 
 
+def test_system_matching_account_id_dispatched():
+  proc = FakeProcessor({"success": True})
+  # account_id is already "<market_type>-<id>" by the time Settings hands it
+  # over (see Settings._validate_market_requirements) — processor compares as-is.
+  proc.settings = {"account_id": "FAKE_MKT-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-acct-1","symbols":["BTC"]}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert len(proc.system_calls) == 1
+
+
+def test_system_wrong_account_id_silently_skips():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-other","symbols":["BTC"]}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert proc.system_calls == []
+
+
 def test_system_malformed_json_dropped_without_dispatch():
   proc = FakeProcessor({"success": True})
   proc._process_message(NatsSubjectEnum.SYSTEM, "not json {{")

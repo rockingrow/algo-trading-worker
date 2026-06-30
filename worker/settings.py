@@ -54,6 +54,12 @@ class Settings(BaseSettings):
 
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
 
+  # Identify — derived in _validate_market_requirements as
+  # "<market_type>-<MT5_LOGIN|BINANCE_ACCOUNT_ID>" once the per-market
+  # credentials are validated, so it is never read from .env and can't drift
+  # from the credential it identifies.
+  account_id: str = ""
+
   # MT5 Credentials — required only when MARKET_TYPE == FOREX. They are optional
   # at the field level so a pure CRYPTO deployment never has to set them (and the
   # MT5 / MetaTrader5 stack is never initialized). See the model validator below.
@@ -163,11 +169,16 @@ class Settings(BaseSettings):
 
   @model_validator(mode="after")
   def _validate_market_requirements(self):
-    """Require only the credentials the selected market actually needs.
+    """Require only the credentials the selected market actually needs, then
+    derive ``account_id`` from them.
 
     FOREX must not boot without MT5 credentials; CRYPTO must not boot without
     the selected exchange's API keys. This keeps each deployment from carrying
-    (or initializing) the other market's dependencies.
+    (or initializing) the other market's dependencies. Once the required
+    credential is confirmed present, ``account_id`` is set to
+    "<market_type>-<identifying credential>" — MT5_LOGIN for FOREX,
+    BINANCE_ACCOUNT_ID for CRYPTO — so it is always in sync and never
+    configured by hand.
     """
     if self.market_type == MarketTypeEnum.FOREX:
       missing = [
@@ -183,6 +194,7 @@ class Settings(BaseSettings):
         raise ValueError(
           f"MARKET_TYPE=FOREX requires: {', '.join(missing)}"
         )
+      self.account_id = f"{self.market_type.value}-{self.mt5_login}"
     elif self.market_type == MarketTypeEnum.CRYPTO:
       if self.crypto_exchange == CryptoExchangeEnum.BINANCE:
         missing = [
@@ -199,6 +211,7 @@ class Settings(BaseSettings):
           raise ValueError(
             f"MARKET_TYPE=CRYPTO (BINANCE) requires: {', '.join(missing)}"
           )
+        self.account_id = f"{self.market_type.value}-{self.binance_account_id}"
     return self
 
   model_config = SettingsConfigDict(

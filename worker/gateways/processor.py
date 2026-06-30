@@ -133,6 +133,7 @@ class BaseSignalProcessor(ABC):
       subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
       publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK], # purpose just only show on Notification
       token=nats_token,
+      account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
       enqueue_fn=self.ctx.nats_enqueue,
     )
@@ -142,6 +143,7 @@ class BaseSignalProcessor(ABC):
       url=self.settings["nats_url"],
       publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK],
       token=nats_token,
+      account_id=self.settings.get("account_id"),
     )
     self.publisher.connect()
 
@@ -482,7 +484,25 @@ class BaseSignalProcessor(ABC):
     if not self._ensure_connected():
       return
 
+    # Route by worker identity: a SYSTEM message targeting a specific
+    # account_id (NATS-name format "<market_type>-<account_id>") is executed
+    # only by the matching worker; an omitted account_id is a broadcast.
+    if system.account_id and system.account_id != self._system_account_id:
+      log.info(
+        "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
+        self.name, getattr(system.action, "value", system.action),
+        system.account_id, self._system_account_id,
+      )
+      return
+
     self._handle_system_action(system.action, data)
+
+  @property
+  def _system_account_id(self) -> Optional[str]:
+    """This worker's identity for SYSTEM routing, in NATS-name format
+    ``<market_type>-<account_id>`` (matches the NATS connection name; see
+    Settings._validate_market_requirements)."""
+    return self.settings.get("account_id") or None
 
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
     """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.

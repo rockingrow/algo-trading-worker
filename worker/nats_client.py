@@ -20,12 +20,14 @@ class NatsClient:
     self,
     url: str,
     token: Optional[str] = None,
+    name: Optional[str] = None,
     error_cb: Optional[Callable[..., Awaitable[None]]] = None,
     disconnected_cb: Optional[Callable[[], Awaitable[None]]] = None,
     reconnected_cb: Optional[Callable[[], Awaitable[None]]] = None,
   ):
     self.url = url
     self._token = token
+    self._name = name
     self._error_cb = error_cb
     self._disconnected_cb = disconnected_cb
     self._reconnected_cb = reconnected_cb
@@ -47,6 +49,10 @@ class NatsClient:
       opts["reconnected_cb"] = self._reconnected_cb
     if self._token:
       opts["token"] = self._token
+    # Connection name is surfaced to the NATS server (CONNECT protocol /
+    # /connz monitoring), so the Broker can see which account is connecting.
+    if self._name:
+      opts["name"] = self._name
     return await nats.connect(self.url, **opts)
 
   async def _run(self, body: Callable[..., Awaitable[None]]) -> None:

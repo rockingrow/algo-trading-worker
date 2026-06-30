@@ -12,6 +12,10 @@ class SystemActionEnum(str, Enum):
 class SystemSchemaSchema(BaseModel):
   action: SystemActionEnum
   timestamp: datetime
+  # Target worker identity in NATS-name format "<market_type>-<account_id>".
+  # When omitted the action applies to every worker; when set, only the worker
+  # whose identity matches executes it.
+  account_id: Optional[str] = None
 
 
 class SystemCryptoLeverageInitSchema(SystemSchemaSchema):

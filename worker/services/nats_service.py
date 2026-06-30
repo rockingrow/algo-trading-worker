@@ -17,6 +17,16 @@ def _subject_str(s: _Subject) -> str:
   return s if isinstance(s, str) else s.value
 
 
+def _connection_name(account_id: Optional[str]) -> Optional[str]:
+  """NATS connection name reported to the Broker server.
+
+  ``account_id`` already has the "<market_type>-<id>" form (see
+  Settings._validate_market_requirements), so the Broker can see which market
+  and account is connecting in its /connz monitoring. Returns None when no
+  account_id is configured, leaving the connection unnamed."""
+  return str(account_id) if account_id else None
+
+
 class NATSSubscriber:
   """NATS subscriber that listens on configured subjects and enqueues messages to an internal queue for synchronous consumption via listen()."""
 
@@ -26,6 +36,7 @@ class NATSSubscriber:
     subjects: list[_Subject],
     publish_subjects: list[NatsSubjectEnum] | None = None,
     token: Optional[str] = None,
+    account_id: Optional[str] = None,
     account_footer_fn: Optional[Callable[[], str]] = None,
     enqueue_fn: Optional[Callable[[str], None]] = None,
   ):
@@ -39,6 +50,7 @@ class NATSSubscriber:
     self._client = NatsClient(
       url=url,
       token=token,
+      name=_connection_name(account_id),
       error_cb=self._on_error,
       disconnected_cb=self._on_disconnect,
       reconnected_cb=self._on_reconnect,
@@ -141,6 +153,7 @@ class NATSPublisher:
     url: str,
     publish_subjects: list[NatsSubjectEnum],
     token: Optional[str] = None,
+    account_id: Optional[str] = None,
   ):
     self.url = url
     self.publish_subjects = publish_subjects
@@ -148,6 +161,7 @@ class NATSPublisher:
     self._client = NatsClient(
       url=url,
       token=token,
+      name=_connection_name(account_id),
       error_cb=self._on_error,
       disconnected_cb=self._on_disconnect,
       reconnected_cb=self._on_reconnect,
