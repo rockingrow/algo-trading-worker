@@ -24,6 +24,7 @@ from worker.gateways.crypto.binance.user_data_stream import (
 )
 from worker.gateways.crypto.executor import CryptoExecutor
 from worker.gateways.crypto.factory import ExchangeFactory
+from worker.gateways.crypto.leverage_init_job import LeverageInitJob
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
@@ -59,7 +60,27 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     )
 
   def _connect_broker(self) -> bool:
-    return self.gateway.connect()
+    if not self.gateway.connect():
+      return False
+    # Initialise per-symbol leverage once, here — after the gateway is verified
+    # but before any signal can be processed — so the first order on a sticky
+    # exchange-side leverage value never picks up a stale setting from a prior
+    # session. Failures inside the job are logged per symbol and never abort
+    # startup: a missed leverage init is recoverable on the next restart, but
+    # refusing to start over it would leave the worker permanently down.
+    try:
+      LeverageInitJob(
+        gateway=self.gateway,
+        symbols=self.settings.get("crypto_leverage_init_symbols") or [],
+        max_leverage_cap=self.settings.get("max_leverage_cap", 10),
+        resolve_symbol=self.executor.get_symbol,
+      ).run()
+    except Exception:
+      log.exception(
+        "[CRYPTO Process] LeverageInitJob crashed — continuing startup; "
+        "symbol leverages remain at their current exchange settings."
+      )
+    return True
 
   def _disconnect_broker(self) -> None:
     self.gateway.close()

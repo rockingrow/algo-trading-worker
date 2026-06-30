@@ -76,6 +76,18 @@ class Settings(BaseSettings):
   # merge positions at the exchange level.  Set to True only if you deliberately
   # run multiple strategies on the same symbol and understand the implications.
   crypto_allow_multi_strategy_per_symbol: bool = False
+  # Symbols whose leverage must be initialised at worker startup. The
+  # LeverageInitJob walks this list once after gateway.connect() succeeds and
+  # sets each symbol's leverage to min(exchange_max, MAX_LEVERAGE_CAP). Empty
+  # list (default) skips the init entirely. Comma-separated raw signal symbols
+  # — they are resolved through the executor's symbol resolver, so the .env
+  # form mirrors how upstream signals address the symbol (e.g. "BTCUSDT.P,
+  # ETHUSDT.P" or "BTCUSD,ETHUSD").
+  crypto_leverage_init_symbols: list[str] = []
+  # Upper bound applied by LeverageInitJob. If the symbol's exchange-side max
+  # leverage is below this, the lower value is used (sub-account caps are
+  # honoured automatically); if it is at or above, this cap wins.
+  max_leverage_cap: int = 10
 
   # Strategy configuration
   slippage_deviation: int = 100
@@ -110,6 +122,15 @@ class Settings(BaseSettings):
       return [i.strip() for i in v.split(",") if i.strip()]
     if isinstance(v, int):
       return [str(v)]
+    return v
+
+  @field_validator("crypto_leverage_init_symbols", mode="before")
+  @classmethod
+  def parse_leverage_init_symbols(cls, v):
+    if isinstance(v, list):
+      return [s for s in (str(i).strip() for i in v) if s]
+    if isinstance(v, str):
+      return [s for s in (i.strip() for i in v.split(",")) if s]
     return v
 
   # Database

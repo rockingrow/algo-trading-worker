@@ -168,6 +168,39 @@ Required env when `MARKET_TYPE=CRYPTO` (Binance): `BINANCE_API_KEY`,
 `BINANCE`; `BINANCE_TESTNET` is optional. MT5 credentials are **not** required.
 See `.env.example`.
 
+### Per-symbol leverage initialisation (CRYPTO)
+
+USDⓈ-M futures leverage is **sticky on the exchange**: whatever value was set
+the last time on a symbol (manually in the UI or by a previous worker run) is
+what the next order is sized against. Without an init pass, a sub-account
+capped at 5x can silently leave a symbol at its old 20x setting (or vice
+versa), and an order can fail with `-2019 Margin is insufficient` even when
+risk-sizing math is correct.
+
+`CryptoSignalProcessor` runs `LeverageInitJob` once on startup, right after
+`gateway.connect()` succeeds and before any signal can be processed. For each
+symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
+
+1. `gateway.get_max_leverage(symbol)` (Binance: `GET /fapi/v1/leverageBracket`)
+   returns the account-side ceiling. Sub-account / VIP caps are reflected here
+   automatically — a sub-account limited to 5x returns 5; an unrestricted
+   account returns the exchange-wide max (e.g. 125 for BTCUSDT).
+2. The target is `min(exchange_max, MAX_LEVERAGE_CAP)`.
+3. `gateway.set_leverage(symbol, target)` (Binance: `POST /fapi/v1/leverage`)
+   applies it.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `CRYPTO_LEVERAGE_INIT_SYMBOLS` | empty (skip) | Comma-separated raw signal symbols to initialise (`BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`). Resolved through the executor's symbol resolver, so the form mirrors how upstream signals address the symbol. |
+| `MAX_LEVERAGE_CAP` | `10` | Upper bound applied per symbol. A sub-account at 5x lands on 5; an unrestricted account lands on this cap. |
+
+Failure modes are isolated: a failed `get_max_leverage` (network blip, symbol
+typo) skips that symbol with a warning and **never falls back to the cap**
+blindly — picking the cap for an account that is actually limited to 5x is
+the failure mode this job exists to prevent. Any uncaught crash inside the
+job is logged and swallowed so the worker still starts; symbols are left at
+their current exchange-side leverage until the next restart.
+
 ---
 
 ## 🧩 FOREX Gateway Module Flow (`worker/gateways/forex/`)

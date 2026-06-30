@@ -86,6 +86,8 @@ class _API_Endpoints(str, Enum):
   ALGO_OPEN_ORDERS = "/fapi/v1/algoOpenOrders"
   ALL_OPEN_ORDERS = "/fapi/v1/allOpenOrders"
   ACCOUNT = "/fapi/v2/account"
+  LEVERAGE_BRACKET = "/fapi/v1/leverageBracket"
+  LEVERAGE = "/fapi/v1/leverage"
 
   def __str__(self) -> str:
     return self.value
@@ -392,6 +394,51 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       self._send("DELETE", _API_Endpoints.ALGO_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_algo_orders(%s) failed: %s", symbol, exc)
+
+  # ── Leverage ──────────────────────────────────────────────────────────── #
+
+  def get_max_leverage(self, symbol: str) -> Optional[int]:
+    """Max leverage Binance allows for *symbol* on this account.
+
+    ``/fapi/v1/leverageBracket`` returns notional brackets in ascending order;
+    the first bracket (lowest notional) carries the highest ``initialLeverage``,
+    which is the per-symbol account ceiling. Sub-account / VIP caps are
+    reflected here automatically (a sub-account limited to 5x returns 5).
+    Returns ``None`` on error so the caller can skip rather than mis-size.
+    """
+    try:
+      data = self._send(
+        "GET", _API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True
+      )
+    except Exception as exc:
+      logger.warning("[Binance] leverageBracket(%s) failed: %s", symbol, exc)
+      return None
+    # Response shape: list of {symbol, brackets:[...]} (one entry per symbol).
+    # Older API versions returned a single dict directly — handle both.
+    entry = data[0] if isinstance(data, list) and data else data
+    brackets = (entry or {}).get("brackets") or []
+    if not brackets:
+      return None
+    try:
+      return int(brackets[0].get("initialLeverage"))
+    except (TypeError, ValueError):
+      return None
+
+  def set_leverage(self, symbol: str, leverage: int) -> bool:
+    """Set per-symbol working leverage. Returns True on success."""
+    try:
+      self._send(
+        "POST",
+        _API_Endpoints.LEVERAGE,
+        {"symbol": symbol, "leverage": int(leverage)},
+        signed=True,
+      )
+      return True
+    except Exception as exc:
+      logger.warning(
+        "[Binance] set_leverage(%s=%s) failed: %s", symbol, leverage, exc
+      )
+      return False
 
   # ── Account ───────────────────────────────────────────────────────────── #
 

@@ -131,6 +131,20 @@ class BaseExchangeGateway(ABC):
   def cancel_all_orders(self, symbol: str) -> None:
     """Cancel all open (e.g. resting stop) orders for *symbol*."""
 
+  # ── Leverage ──────────────────────────────────────────────────────────── #
+
+  def get_max_leverage(self, symbol: str) -> Optional[int]:  # noqa: B027 - optional hook
+    """Return the maximum leverage this account may use for *symbol*, or ``None``
+    if the exchange does not expose a per-symbol cap. Sub-account / account-tier
+    restrictions are reflected here, so the value can be strictly below the
+    exchange-wide ceiling (e.g. 5x on a capped sub-account)."""
+    return None
+
+  def set_leverage(self, symbol: str, leverage: int) -> bool:  # noqa: B027 - optional hook
+    """Set the working leverage for *symbol*. Returns ``True`` on success.
+    Default no-op for exchanges where leverage is not API-configurable."""
+    return False
+
   # ── Account ───────────────────────────────────────────────────────────── #
 
   @abstractmethod
