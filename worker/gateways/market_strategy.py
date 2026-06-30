@@ -28,8 +28,8 @@ from typing import Any, List, Optional
 from worker.gateways.config import ExecutionConfig
 from worker.interfaces.executor_protocol import TradeExecutorProtocol
 from worker.logger import get_logger
-from worker.schemas.trade_result import TradeResult
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.trade_result import TradeResult
 from worker.settings import MarketTypeEnum
 
 logger = get_logger("worker.gateways.market_strategy")

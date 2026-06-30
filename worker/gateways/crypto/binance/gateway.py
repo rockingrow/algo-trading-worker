@@ -72,25 +72,27 @@ def _offset_timestamp() -> int:
 _bc_utils.get_timestamp = _offset_timestamp
 
 
-# ``str``-mixin Enum (not ``enum.StrEnum``, which is 3.11+) so the package keeps
-# working on the declared minimum Python 3.10. ``__str__`` returns the bare value
-# so ``str(endpoint)`` yields the path (matching StrEnum), which ``_send`` relies on.
-class _API_Endpoints(str, Enum):
-  TIME = "/fapi/v1/time"
-  BALANCE = "/fapi/v2/balance"
-  EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
-  PREMIUM_INDEX = "/fapi/v1/premiumIndex"
-  POSITION_RISK = "/fapi/v2/positionRisk"
-  ORDER = "/fapi/v1/order"
-  ALGO_ORDER = "/fapi/v1/algoOrder"
-  ALGO_OPEN_ORDERS = "/fapi/v1/algoOpenOrders"
-  ALL_OPEN_ORDERS = "/fapi/v1/allOpenOrders"
-  ACCOUNT = "/fapi/v2/account"
-  LEVERAGE_BRACKET = "/fapi/v1/leverageBracket"
-  LEVERAGE = "/fapi/v1/leverage"
+class _API_Endpoints(Enum):
+  TIME             = ("GET",    "/fapi/v1/time")
+  BALANCE          = ("GET",    "/fapi/v2/balance")
+  EXCHANGE_INFO    = ("GET",    "/fapi/v1/exchangeInfo")
+  PREMIUM_INDEX    = ("GET",    "/fapi/v1/premiumIndex")
+  POSITION_RISK    = ("GET",    "/fapi/v2/positionRisk")
+  ORDER            = ("POST",   "/fapi/v1/order")
+  ALGO_ORDER       = ("POST",   "/fapi/v1/algoOrder")
+  ALGO_OPEN_ORDERS = ("DELETE", "/fapi/v1/algoOpenOrders")
+  ALL_OPEN_ORDERS  = ("DELETE", "/fapi/v1/allOpenOrders")
+  ACCOUNT          = ("GET",    "/fapi/v2/account")
+  LEVERAGE_BRACKET = ("GET",    "/fapi/v1/leverageBracket")
+  LEVERAGE         = ("POST",   "/fapi/v1/leverage")
 
-  def __str__(self) -> str:
-    return self.value
+  @property
+  def method(self) -> str:
+    return self.value[0]
+
+  @property
+  def path(self) -> str:
+    return self.value[1]
 
 
 # Binance order side mapping for one-way mode.
@@ -132,8 +134,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def _send(
     self,
-    method: str,
-    path: str,
+    endpoint: _API_Endpoints,
     payload: Optional[dict] = None,
     *,
     signed: bool = False,
@@ -155,8 +156,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       return send_request(
         self._session,
         self._config,
-        method=method,
-        path=str(path),
+        method=endpoint.method,
+        path=endpoint.path,
         payload=params,
         is_signed=signed,
         response_model=None,
@@ -168,7 +169,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       if signed and getattr(exc, "status_code", None) == -1021:
         logger.warning(
           "[Binance] -1021 timestamp rejection on %s; re-syncing clock and retrying once.",
-          path,
+          endpoint.path,
         )
         self._sync_time()
         return _call()
@@ -179,7 +180,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   def connect(self) -> bool:
     try:
       self._sync_time()
-      self._send("GET", _API_Endpoints.BALANCE, signed=True)
+      self._send(_API_Endpoints.BALANCE, signed=True)
       logger.info("[Binance] Connected (testnet=%s).", self._testnet)
       return True
     except Exception as exc:
@@ -199,7 +200,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     global _TIME_OFFSET_MS
     try:
       t0 = time.time() * 1000
-      data = self._send("GET", _API_Endpoints.TIME)
+      data = self._send(_API_Endpoints.TIME)
       t1 = time.time() * 1000
       server_time = int(data["serverTime"])
       _TIME_OFFSET_MS = int(server_time - (t0 + t1) / 2)
@@ -232,7 +233,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     """
     out: Dict[str, SymbolFilter] = {}
     try:
-      data = self._send("GET", _API_Endpoints.EXCHANGE_INFO)
+      data = self._send(_API_Endpoints.EXCHANGE_INFO)
       for s in data.get("symbols", []):
         filters = {f["filterType"]: f for f in s.get("filters", [])}
         lot = filters.get("LOT_SIZE", {})
@@ -249,7 +250,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     return out
 
   def get_mark_price(self, symbol: str) -> float:
-    data = self._send("GET", _API_Endpoints.PREMIUM_INDEX, {"symbol": symbol})
+    data = self._send(_API_Endpoints.PREMIUM_INDEX, {"symbol": symbol})
     return float(data["markPrice"])
 
   def _round_to_tick(self, symbol: str, price: float) -> float:
@@ -272,7 +273,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def get_positions(self, symbol: Optional[str] = None) -> List[ExchangePosition]:
     payload = {"symbol": symbol} if symbol else None
-    rows = self._send("GET", _API_Endpoints.POSITION_RISK, payload, signed=True)
+    rows = self._send(_API_Endpoints.POSITION_RISK, payload, signed=True)
     positions: List[ExchangePosition] = []
     for row in rows or []:
       amt = float(row.get("positionAmt", 0) or 0)
@@ -324,7 +325,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     if client_order_id:
       payload["new_client_order_id"] = client_order_id
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ORDER, payload, signed=True))
+      return self._order_result(self._send(_API_Endpoints.ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] place_market_order failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -351,7 +352,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "close_position": "true",
     }
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ALGO_ORDER, payload, signed=True))
+      return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -376,7 +377,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "close_position": "true",
     }
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ALGO_ORDER, payload, signed=True))
+      return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] set_take_profit failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -387,11 +388,11 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     # conditionals placed via /fapi/v1/algoOrder. Both must be cancelled so an old
     # SL algo doesn't survive into the next stop-placement (double-stop scenario).
     try:
-      self._send("DELETE", _API_Endpoints.ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
+      self._send(_API_Endpoints.ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_all_orders(%s) failed: %s", symbol, exc)
     try:
-      self._send("DELETE", _API_Endpoints.ALGO_OPEN_ORDERS, {"symbol": symbol}, signed=True)
+      self._send(_API_Endpoints.ALGO_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_algo_orders(%s) failed: %s", symbol, exc)
 
@@ -407,9 +408,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     Returns ``None`` on error so the caller can skip rather than mis-size.
     """
     try:
-      data = self._send(
-        "GET", _API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True
-      )
+      data = self._send(_API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] leverageBracket(%s) failed: %s", symbol, exc)
       return None
@@ -427,12 +426,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   def set_leverage(self, symbol: str, leverage: int) -> bool:
     """Set per-symbol working leverage. Returns True on success."""
     try:
-      self._send(
-        "POST",
-        _API_Endpoints.LEVERAGE,
-        {"symbol": symbol, "leverage": int(leverage)},
-        signed=True,
-      )
+      self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": int(leverage)}, signed=True)
       return True
     except Exception as exc:
       logger.warning(
@@ -444,7 +438,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def get_account(self) -> Optional[Dict[str, Any]]:
     try:
-      data = self._send("GET", _API_Endpoints.ACCOUNT, signed=True)
+      data = self._send(_API_Endpoints.ACCOUNT, signed=True)
       return {
         "balance": float(data.get("totalWalletBalance", 0) or 0),
         "equity": float(data.get("totalMarginBalance", 0) or 0),

@@ -5,15 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- CRYPTO: `LeverageInitJob` — one-shot, sequential leverage initialisation run once at worker startup (inside `CryptoSignalProcessor._connect_broker`, right after `gateway.connect()` succeeds). For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS` the job calls `gateway.get_max_leverage` (Binance: `GET /fapi/v1/leverageBracket`) to read the account's exchange-side ceiling — which honours sub-account / VIP caps automatically — then calls `gateway.set_leverage` (Binance: `POST /fapi/v1/leverage`) to set the symbol to `min(exchange_max, MAX_LEVERAGE_CAP)`. A sub-account capped at 5x lands on 5; an unrestricted account lands on the configured cap. A failed lookup skips the symbol (never blindly applies the cap), and any crash inside the job is logged and swallowed so worker startup is never blocked.
-- `CRYPTO_LEVERAGE_INIT_SYMBOLS` (comma-separated, default empty) env var — raw signal symbols whose leverage the init job must walk (e.g. `BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`); resolved through the executor's symbol resolver so it mirrors how upstream signals address the symbol. An empty list skips the init entirely.
-- `MAX_LEVERAGE_CAP` (int, default `10`) env var — upper bound applied by `LeverageInitJob`. A non-positive cap skips the init with a warning.
-- `BaseExchangeGateway.get_max_leverage` / `set_leverage` hooks (default no-op) — added to the agnostic CEX contract so future exchanges plug in without touching the job.
-
 ## [1.1.6] - 2026-06-28
 
 ### Added
@@ -24,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TP1_MOVE_SL_TO_BREAKEVEN` is now optional (previously a required `bool`). When absent (the new default), the signal's own `move_sl_to_be` field governs whether the stop is moved to breakeven after TP1. When explicitly set in config, it overrides the signal.
 - Order fill notifications now show: the effective risk percent with a gear icon when the config overrides the signal; the TP1 close-percent appended to the volume/quantity line on TP1 fills; and an override-settings block listing VOLUME_DECISION_ENABLED, RISK_PERCENTAGE, USE_ACCOUNT_EQUITY, POSITION_TP1_PERCENT, and TP1_MOVE_SL_TO_BREAKEVEN states (ENABLED/DISABLED with value) so operators can see, on each trade notification, which modes are active for the connected worker.
 - Startup banner now renders all override settings as ENABLED/DISABLED (consistent with the order fill block) instead of raw boolean values.
+- CRYPTO: `LeverageInitJob` — one-shot, sequential leverage initialisation run once at worker startup (inside `CryptoSignalProcessor._connect_broker`, right after `gateway.connect()` succeeds). For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS` the job calls `gateway.get_max_leverage` (Binance: `GET /fapi/v1/leverageBracket`) to read the account's exchange-side ceiling — which honours sub-account / VIP caps automatically — then calls `gateway.set_leverage` (Binance: `POST /fapi/v1/leverage`) to set the symbol to `min(exchange_max, MAX_LEVERAGE_CAP)`. A sub-account capped at 5x lands on 5; an unrestricted account lands on the configured cap. A failed lookup skips the symbol (never blindly applies the cap), and any crash inside the job is logged and swallowed so worker startup is never blocked.
+- `CRYPTO_LEVERAGE_INIT_SYMBOLS` (comma-separated, default empty) env var — raw signal symbols whose leverage the init job must walk (e.g. `BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`); resolved through the executor's symbol resolver so it mirrors how upstream signals address the symbol. An empty list skips the init entirely.
+- `MAX_LEVERAGE_CAP` (int, default `10`) env var — upper bound applied by `LeverageInitJob`. A non-positive cap skips the init with a warning.
+- `BaseExchangeGateway.get_max_leverage` / `set_leverage` hooks (default no-op) — added to the agnostic CEX contract so future exchanges plug in without touching the job.
 
 ### Fixed
 
