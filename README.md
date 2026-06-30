@@ -168,6 +168,54 @@ Required env when `MARKET_TYPE=CRYPTO` (Binance): `BINANCE_API_KEY`,
 `BINANCE`; `BINANCE_TESTNET` is optional. MT5 credentials are **not** required.
 See `.env.example`.
 
+### Per-symbol leverage initialisation (CRYPTO)
+
+USDⓈ-M futures leverage is **sticky on the exchange**: whatever value was set
+the last time on a symbol (manually in the UI or by a previous worker run) is
+what the next order is sized against. Without an init pass, a sub-account
+capped at 5x can silently leave a symbol at its old 20x setting (or vice
+versa), and an order can fail with `-2019 Margin is insufficient` even when
+risk-sizing math is correct.
+
+`CryptoSignalProcessor` runs `LeverageInitJob` once on startup, right after
+`gateway.connect()` succeeds and before any signal can be processed. For each
+symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
+
+1. `gateway.get_max_leverage(symbol)` (Binance: `GET /fapi/v1/leverageBracket`)
+   returns the account-side ceiling. Sub-account / VIP caps are reflected here
+   automatically — a sub-account limited to 5x returns 5; an unrestricted
+   account returns the exchange-wide max (e.g. 125 for BTCUSDT).
+2. The target is `min(exchange_max, MAX_LEVERAGE_CAP)`.
+3. `gateway.set_leverage(symbol, target)` (Binance: `POST /fapi/v1/leverage`)
+   applies it.
+
+Some account-level caps (sub-account / VIP tier) are **not** exposed by
+`leverageBracket` and surface only when `set_leverage` is POSTed, as a `-4421`
+rejection whose message names the real ceiling (e.g. *"…greater than 5x"*). The
+gateway parses that ceiling and retries once at it, so the symbol still lands on
+its true limit instead of being abandoned. If Binance ever rewords the message
+so the parser misses it, `set_leverage` retries one last time at
+`min(MIN_LEVERAGE_CAP, target)` — a known-safe floor — rather than leaving the
+symbol at its dangerous default. If the account is restricted below that floor,
+the retry also fails and the symbol is logged for manual fixing.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `CRYPTO_LEVERAGE_INIT_SYMBOLS` | empty (skip) | Comma-separated raw signal symbols to initialise (`BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`). Resolved through the executor's symbol resolver, so the form mirrors how upstream signals address the symbol. |
+| `MAX_LEVERAGE_CAP` | `10` | Upper bound applied per symbol. A sub-account at 5x lands on 5; an unrestricted account lands on this cap. |
+| `MIN_LEVERAGE_CAP` | `5` | Last-resort floor used only when a `-4421` account cap cannot be parsed from the error message. Set to the lowest leverage your sub-accounts can take; if an account is restricted below it, the retry still fails and the symbol is left for manual fixing. |
+
+Failure modes are isolated: a failed `get_max_leverage` (network blip, symbol
+typo) skips that symbol with a warning and **never falls back to the cap**
+blindly — picking the cap for an account that is actually limited to 5x is
+the failure mode this job exists to prevent. Any uncaught crash inside the
+job is logged and swallowed so the worker still starts; symbols are left at
+their current exchange-side leverage until the next restart.
+
+The same pass can be re-triggered at runtime — without restarting the worker —
+via a `SYSTEM` `CRYPTO_LEVERAGE_INIT` message (see the [SYSTEM Subject](#-system-subject)
+section), which may also override the symbol set and cap for that one run.
+
 ---
 
 ## 🧩 FOREX Gateway Module Flow (`worker/gateways/forex/`)
@@ -272,11 +320,11 @@ worker/
 │   ├── mt5_event_job.py          # MT5EventJob — terminal-close detection (FOREX)
 │   └── notification_job.py       # NotificationJob — outbox dispatcher (Telegram retries)
 ├── schemas/             # Pydantic / dataclass data schemas
-│   ├── admin_schema.py           # AdminActionEnum + AdminSignalSchema (NATS ADMIN subject)
+│   ├── admin_schema.py           # AdminActionEnum + AdminMessageSchema + Specific action Schema (NATS ADMIN subject)
 │   ├── job_schema.py             # LogAuthorEnum (broker / terminal / exchange)
 │   ├── trade_result.py           # TradeResult value object (ok()/fail() factories)
 │   ├── metatrader_schema.py      # Back-compat re-export of TradeResult
-│   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, TRADE)
+│   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, SYSTEM, TRADE)
 │   ├── notification_schema.py    # NotificationPlatformEnum / NotificationChannelEnum / NotificationModeEnum
 │   ├── position_schema.py        # PositionStatusEnum + PositionEvent / PositionEventType
 │   └── signal_schema.py          # Signal validation schemas
@@ -407,6 +455,40 @@ The broker/exchange is always the source of truth: live positions are closed **f
 - **Per-market match key, not symbol-only:** The admin FLAT correlates each live position with its DB row via `_flat_match_key` / `_flat_db_match_keys` — FOREX matches by ticket (checking both `ref_id` and `ref_source_id` so re-ticketed positions still match), CRYPTO by resolved exchange symbol. Two FOREX strategies running the same symbol are therefore handled independently.
 - **Graceful handling of already-closed positions:** If a position is tracked in SQLite but no longer live on the broker, it is marked `FLATTED` without sending a close order, so the DB stays consistent even after a connectivity gap.
 - **`PositionCDC` propagation:** After status updates, the CDC job picks up the `PENDING` rows and publishes `PositionEvent(event=UPDATED, status=FLATTED, …)` to the Broker via the NATS `TRADE` subject — no special handling required.
+
+---
+
+## 🚦 SYSTEM Subject
+
+The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches the action to the market-specific `_handle_system_action` hook. An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless. FOREX currently handles no `SYSTEM` actions.
+
+### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO)
+
+Re-runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass at runtime, without restarting the worker. Useful after editing a sub-account's leverage cap, onboarding new symbols, or recovering from a startup pass that ran before the exchange was reachable.
+
+| Field | Behaviour when present | Behaviour when omitted |
+| --- | --- | --- |
+| `symbols` | Initialise exactly this list of raw signal symbols | Falls back to `CRYPTO_LEVERAGE_INIT_SYMBOLS` |
+| `default_leverage` | Used as the cap — each symbol is set to `min(exchange_max, default_leverage)` | Falls back to `MAX_LEVERAGE_CAP` |
+
+#### CRYPTO_LEVERAGE_INIT Payload
+
+```json
+{
+  "action": "CRYPTO_LEVERAGE_INIT",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "symbols": ["BTC", "ETH"],
+  "default_leverage": 10
+}
+```
+
+Only `action` and `timestamp` are required; `symbols` and `default_leverage` are optional overrides.
+
+#### Execution flow (SYSTEM)
+
+1. Parse `SystemSchemaSchema`; drop silently on validation error.
+2. Ensure the broker/exchange connection; abort if unreachable.
+3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)` — the **same** `LeverageInitJob` used at startup. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are identical; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
 
 ---
 

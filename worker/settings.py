@@ -1,8 +1,8 @@
 from enum import Enum
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from worker.schemas.nats_schema import NatsSubjectEnum
 
@@ -36,7 +36,7 @@ class ForexPlatformEnum(str, Enum):
   MT5 = "MT5"
 
 
-NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN}
+NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN, NatsSubjectEnum.SYSTEM}
 WATCHDOG_INTERVAL = 10  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 
@@ -53,6 +53,12 @@ class Settings(BaseSettings):
   nats_subjects: str
 
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
+
+  # Identify — derived in _validate_market_requirements as
+  # "<market_type>-<MT5_LOGIN|BINANCE_ACCOUNT_ID>" once the per-market
+  # credentials are validated, so it is never read from .env and can't drift
+  # from the credential it identifies.
+  account_id: str = ""
 
   # MT5 Credentials — required only when MARKET_TYPE == FOREX. They are optional
   # at the field level so a pure CRYPTO deployment never has to set them (and the
@@ -76,6 +82,29 @@ class Settings(BaseSettings):
   # merge positions at the exchange level.  Set to True only if you deliberately
   # run multiple strategies on the same symbol and understand the implications.
   crypto_allow_multi_strategy_per_symbol: bool = False
+  # Symbols whose leverage must be initialised at worker startup. The
+  # LeverageInitJob walks this list once after gateway.connect() succeeds and
+  # sets each symbol's leverage to min(exchange_max, MAX_LEVERAGE_CAP). Empty
+  # list (default) skips the init entirely. Comma-separated raw signal symbols
+  # — they are resolved through the executor's symbol resolver, so the .env
+  # form mirrors how upstream signals address the symbol (e.g. "BTCUSD,ETHUSD").
+  # NoDecode: read the env var as a raw string and let parse_leverage_init_symbols
+  # split it — otherwise pydantic-settings JSON-decodes the dotenv value first and
+  # a plain "BTCUSD,ETHUSD" (not valid JSON) raises a SettingsError on startup.
+  crypto_leverage_init_symbols: Annotated[list[str], NoDecode] = []
+  # Upper bound applied by LeverageInitJob. If the symbol's exchange-side max
+  # leverage is below this, the lower value is used (sub-account caps are
+  # honoured automatically); if it is at or above, this cap wins.
+  max_leverage_cap: int = 10
+  # Last-resort floor for LeverageInitJob: if a symbol is rejected with -4421
+  # (account-level cap) but the gateway cannot parse the real ceiling out of the
+  # error message — e.g. Binance reworded it and the regex no longer matches —
+  # it retries once at min(min_leverage_cap, target) instead of leaving the
+  # symbol at its dangerous default. Set to the lowest leverage you know your
+  # sub-accounts can take (5x on Binance); if an account is restricted below
+  # this, the retry still fails and the symbol is logged for manual fixing.
+  min_leverage_cap: int = 5
+  use_custom_leverage: bool = False  # If true, force use custom leverage instead of broker crypto leverage initialization
 
   # Strategy configuration
   slippage_deviation: int = 100
@@ -99,7 +128,10 @@ class Settings(BaseSettings):
   telegram_enabled: bool
   telegram_bot_token: SecretStr
   telegram_chat_id: str  # management: NATS events, service start/stop, MT5 health
-  telegram_chat_channel_id: list[str] = []  # signals: order fills/failures, terminal closes
+  # NoDecode (see crypto_leverage_init_symbols): the documented unquoted
+  # comma-separated form (-100123,-100987) is not valid JSON, so let
+  # parse_channel_ids split the raw string instead of pydantic JSON-decoding it.
+  telegram_chat_channel_id: Annotated[list[str], NoDecode] = []  # signals: order fills/failures, terminal closes
 
   @field_validator("telegram_chat_channel_id", mode="before")
   @classmethod
@@ -110,6 +142,15 @@ class Settings(BaseSettings):
       return [i.strip() for i in v.split(",") if i.strip()]
     if isinstance(v, int):
       return [str(v)]
+    return v
+
+  @field_validator("crypto_leverage_init_symbols", mode="before")
+  @classmethod
+  def parse_leverage_init_symbols(cls, v):
+    if isinstance(v, list):
+      return [s for s in (str(i).strip() for i in v) if s]
+    if isinstance(v, str):
+      return [s for s in (i.strip() for i in v.split(",")) if s]
     return v
 
   # Database
@@ -128,11 +169,16 @@ class Settings(BaseSettings):
 
   @model_validator(mode="after")
   def _validate_market_requirements(self):
-    """Require only the credentials the selected market actually needs.
+    """Require only the credentials the selected market actually needs, then
+    derive ``account_id`` from them.
 
     FOREX must not boot without MT5 credentials; CRYPTO must not boot without
     the selected exchange's API keys. This keeps each deployment from carrying
-    (or initializing) the other market's dependencies.
+    (or initializing) the other market's dependencies. Once the required
+    credential is confirmed present, ``account_id`` is set to
+    "<market_type>-<identifying credential>" — MT5_LOGIN for FOREX,
+    BINANCE_ACCOUNT_ID for CRYPTO — so it is always in sync and never
+    configured by hand.
     """
     if self.market_type == MarketTypeEnum.FOREX:
       missing = [
@@ -148,6 +194,7 @@ class Settings(BaseSettings):
         raise ValueError(
           f"MARKET_TYPE=FOREX requires: {', '.join(missing)}"
         )
+      self.account_id = f"{self.market_type.value}-{self.mt5_login}"
     elif self.market_type == MarketTypeEnum.CRYPTO:
       if self.crypto_exchange == CryptoExchangeEnum.BINANCE:
         missing = [
@@ -164,6 +211,7 @@ class Settings(BaseSettings):
           raise ValueError(
             f"MARKET_TYPE=CRYPTO (BINANCE) requires: {', '.join(missing)}"
           )
+        self.account_id = f"{self.market_type.value}-{self.binance_account_id}"
     return self
 
   model_config = SettingsConfigDict(

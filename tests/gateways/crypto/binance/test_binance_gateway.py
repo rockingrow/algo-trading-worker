@@ -137,6 +137,110 @@ def test_set_take_profit_snaps_trigger_price_to_tick(monkeypatch):
   assert calls[-1]["payload"]["trigger_price"] == 63764.7
 
 
+# ── Leverage / account-cap (-4421) handling ─────────────────────────────── #
+
+
+class FakeCapError(Exception):
+  """Mimics the binance_common exception: carries status_code / error_message."""
+
+  def __init__(self, status_code, error_message):
+    super().__init__(error_message)
+    self.status_code = status_code
+    self.error_message = error_message
+
+
+def _cap_err(message, code=gw_mod._LEVERAGE_CAP_CODE):
+  return FakeCapError(code, message)
+
+
+def test_leverage_cap_parsed_from_4421_message():
+  cap = gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+    _cap_err("Subaccounts are restricted from using leverage greater than 5x."),
+    upper_bound=10,
+  )
+  assert cap == 5
+
+
+def test_leverage_cap_ignored_for_non_4421_error():
+  assert gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+    _cap_err("greater than 5x", code=-1102), upper_bound=10
+  ) is None
+
+
+def test_leverage_cap_at_or_above_request_is_treated_as_anomaly():
+  # A -4421 is by definition a restriction below what we asked; a parsed value
+  # >= request means we grabbed the wrong number — discard it.
+  assert gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+    _cap_err("greater than 10x"), upper_bound=10
+  ) is None
+
+
+def test_leverage_cap_unparseable_returns_none():
+  # Reworded message the regex no longer matches.
+  assert gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+    _cap_err("Leverage is limited to 5 for this account."), upper_bound=10
+  ) is None
+
+
+def _leverage_gateway(monkeypatch, error_on_first):
+  """Gateway whose LEVERAGE POST raises *error_on_first* the first call, then
+  echoes back whatever leverage it is sent. Records each requested leverage."""
+  requested = []
+
+  def fake_send(session, config, *, method, path, payload, is_signed, response_model):
+    if str(path) == "/fapi/v1/leverage":
+      lev = payload["leverage"]
+      requested.append(lev)
+      if len(requested) == 1 and error_on_first is not None:
+        raise error_on_first
+      return FakeResp({"symbol": payload["symbol"], "leverage": lev})
+    return FakeResp({})
+
+  monkeypatch.setattr(gw_mod, "send_request", fake_send)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+  return gw, requested
+
+
+def test_set_leverage_retries_at_parsed_cap(monkeypatch):
+  gw, requested = _leverage_gateway(monkeypatch, _cap_err("greater than 5x"))
+  applied = gw.set_leverage("BTCUSDT", 10, min_leverage_cap=5)
+  assert applied == 5
+  assert requested == [10, 5]  # tried 10, retried at parsed 5
+
+
+def test_set_leverage_falls_back_to_floor_when_unparseable(monkeypatch):
+  # -4421 but the message can't be parsed → retry at min(min_leverage_cap, target).
+  gw, requested = _leverage_gateway(monkeypatch, _cap_err("Leverage limited to 5."))
+  applied = gw.set_leverage("BTCUSDT", 10, min_leverage_cap=5)
+  assert applied == 5
+  assert requested == [10, 5]
+
+
+def test_set_leverage_floor_never_raised_above_target(monkeypatch):
+  # Floor (5) is above target (3): clamping yields 3, which is the value that
+  # just failed — so no pointless retry fires and the symbol is left untouched
+  # (account is restricted below target → manual fix), never bumped up to 5.
+  gw, requested = _leverage_gateway(monkeypatch, _cap_err("reworded message"))
+  applied = gw.set_leverage("BTCUSDT", 3, min_leverage_cap=5)
+  assert applied is None
+  assert requested == [3]  # no retry above target
+
+
+def test_set_leverage_no_fallback_without_floor(monkeypatch):
+  # Unparseable -4421 and no floor configured → give up, leave symbol untouched.
+  gw, requested = _leverage_gateway(monkeypatch, _cap_err("reworded message"))
+  applied = gw.set_leverage("BTCUSDT", 10, min_leverage_cap=None)
+  assert applied is None
+  assert requested == [10]  # no retry
+
+
+def test_set_leverage_success_first_try(monkeypatch):
+  gw, requested = _leverage_gateway(monkeypatch, None)
+  applied = gw.set_leverage("BTCUSDT", 10, min_leverage_cap=5)
+  assert applied == 10
+  assert requested == [10]
+
+
 def test_get_positions_maps_and_filters_zero(monkeypatch):
   gw, _ = make_gateway(monkeypatch)
   positions = gw.get_positions("BTCUSDT")

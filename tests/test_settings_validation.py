@@ -34,6 +34,17 @@ def test_crypto_ok_with_keys_and_no_mt5(monkeypatch):
   assert s.mt5_server is None
 
 
+def test_crypto_account_id_derived_from_binance_account_id(monkeypatch):
+  monkeypatch.setenv("MARKET_TYPE", "CRYPTO")
+  monkeypatch.setenv("BINANCE_API_KEY", "key")
+  monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+  monkeypatch.setenv("BINANCE_ACCOUNT_ID", "acct-1")
+  # ACCOUNT_ID is never read from .env — set it anyway to prove it's ignored.
+  monkeypatch.setenv("ACCOUNT_ID", "should-be-overwritten")
+  s = Settings(_env_file=None)
+  assert s.account_id == "CRYPTO-acct-1"
+
+
 def test_forex_requires_mt5(monkeypatch):
   monkeypatch.setenv("MARKET_TYPE", "FOREX")
   monkeypatch.delenv("MT5_SERVER", raising=False)
@@ -41,3 +52,12 @@ def test_forex_requires_mt5(monkeypatch):
   monkeypatch.delenv("MT5_PASSWORD", raising=False)
   with pytest.raises(ValidationError):
     Settings(_env_file=None)
+
+
+def test_forex_account_id_derived_from_mt5_login(monkeypatch):
+  monkeypatch.setenv("MARKET_TYPE", "FOREX")
+  monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
+  monkeypatch.setenv("MT5_LOGIN", "413652379")
+  monkeypatch.setenv("MT5_PASSWORD", "pw")
+  s = Settings(_env_file=None)
+  assert s.account_id == "FOREX-413652379"

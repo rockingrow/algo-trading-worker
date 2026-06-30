@@ -23,19 +23,19 @@ os.environ.setdefault("BROKER_API_KEY", "key")
 from worker.gateways.crypto.base import (
   SIDE_LONG as CRYPTO_SIDE_LONG,
 )
-from worker.gateways.crypto.base import (  # noqa: E402
+from worker.gateways.crypto.base import (
   BaseExchangeGateway,
   ExchangePosition,
   SymbolFilter,
 )
-from worker.gateways.forex.base import (  # noqa: E402
+from worker.gateways.forex.base import (
   SIDE_LONG,
   PlatformPosition,
   SymbolSpec,
   Tick,
 )
-from worker.schemas.signal_schema import SignalActionEnum, SignalSchema  # noqa: E402
-from worker.schemas.trade_result import TradeResult  # noqa: E402
+from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
+from worker.schemas.trade_result import TradeResult
 
 
 def make_symbol_info(**overrides):

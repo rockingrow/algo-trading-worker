@@ -1,7 +1,7 @@
 from typing import Any, List, Optional, Protocol
 
-from worker.schemas.trade_result import TradeResult
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.trade_result import TradeResult
 
 
 class MT5ExecutorProtocol(Protocol):

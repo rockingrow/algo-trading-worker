@@ -35,11 +35,16 @@ from worker.gateways.market_strategy import MarketStrategyFactory
 from worker.gateways.signal_handler import SignalHandler
 from worker.interfaces.trade_presenter_protocol import TradePresenterProtocol
 from worker.logger import get_logger
-from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
+from worker.schemas.admin_schema import (
+  AdminActionEnum,
+  AdminFlatSchema,
+  AdminMessageSchema,
+)
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.system_schema import SystemActionEnum, SystemSchemaSchema
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
 
@@ -126,8 +131,9 @@ class BaseSignalProcessor(ABC):
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
       subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
-      publish_subjects=[NatsSubjectEnum.TRADE],
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK], # purpose just only show on Notification
       token=nats_token,
+      account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
       enqueue_fn=self.ctx.nats_enqueue,
     )
@@ -135,8 +141,9 @@ class BaseSignalProcessor(ABC):
 
     self.publisher = NATSPublisher(
       url=self.settings["nats_url"],
-      publish_subjects=[NatsSubjectEnum.TRADE],
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK],
       token=nats_token,
+      account_id=self.settings.get("account_id"),
     )
     self.publisher.connect()
 
@@ -189,6 +196,10 @@ class BaseSignalProcessor(ABC):
   def _process_message(self, subject, raw) -> None:
     if subject == NatsSubjectEnum.ADMIN:
       self._handle_admin_message(raw)
+      return
+
+    if subject == NatsSubjectEnum.SYSTEM:
+      self._handle_system_message(raw)
       return
 
     try:
@@ -339,28 +350,30 @@ class BaseSignalProcessor(ABC):
     still live), so the DB never claims a position is flat while it is not.
     """
     try:
-      admin = AdminSignalSchema(**json.loads(raw))
+      data = json.loads(raw)
+      admin = AdminMessageSchema(**data)
     except (json.JSONDecodeError, ValidationError) as err:
       log.error("[ADMIN] Parse error: %s", err)
-      return
-
-    if admin.action != AdminActionEnum.FLAT:
-      log.warning("[ADMIN] Unknown action: %s", admin.action)
-      return
-
-    if admin.account_id and admin.account_id != self._account_id:
-      log.info(
-        "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
-        admin.account_id, self._account_id,
-      )
       return
 
     if not self._ensure_connected():
       return
 
-    # Close live broker positions first (source of truth), then reconcile the DB.
-    closed, attempted = self._close_live_positions_for_flat(admin)
-    self._reconcile_flat_db(admin, closed, attempted, raw)
+    if admin.action == AdminActionEnum.FLAT:
+      admin_flat_schema = AdminFlatSchema(**data)
+      if admin_flat_schema.account_id and admin_flat_schema.account_id != self._account_id:
+        log.info(
+          "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
+          admin_flat_schema.account_id, self._account_id,
+        )
+        return
+      # Close live broker positions first (source of truth), then reconcile the DB.
+      closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
+      self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+      return
+
+    log.warning("[ADMIN] Unknown action: %s", admin.action)
+    return
 
   def _close_live_positions_for_flat(self, admin) -> tuple[Dict[Any, dict], set]:
     """Close every live broker position matching the FLAT filter.
@@ -447,6 +460,60 @@ class BaseSignalProcessor(ABC):
           "manual check required).",
           db_pos.get("symbol"), self.name,
         )
+
+  # ── Shared SYSTEM handling ────────────────────────────────────────────── #
+
+  def _handle_system_message(self, raw: str) -> None:
+    """Handle a NATS ``SYSTEM`` message: parse the envelope, then dispatch the
+    action to the market-specific :meth:`_handle_system_action` hook.
+
+    SYSTEM messages drive operational/maintenance actions (e.g. re-initialising
+    per-symbol leverage on a crypto exchange) that are not trade signals. The
+    base only validates the common envelope (action + timestamp); each market
+    decides which actions it understands — an unknown action is logged and
+    ignored rather than raising, so a SYSTEM action meant for another market type
+    is harmless here.
+    """
+    try:
+      data = json.loads(raw)
+      system = SystemSchemaSchema(**data)
+    except (json.JSONDecodeError, ValidationError) as err:
+      log.error("[SYSTEM] Parse error: %s", err)
+      return
+
+    if not self._ensure_connected():
+      return
+
+    # Route by worker identity: a SYSTEM message targeting a specific
+    # account_id (NATS-name format "<market_type>-<account_id>") is executed
+    # only by the matching worker; an omitted account_id is a broadcast.
+    if system.account_id and system.account_id != self._system_account_id:
+      log.info(
+        "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
+        self.name, getattr(system.action, "value", system.action),
+        system.account_id, self._system_account_id,
+      )
+      return
+
+    self._handle_system_action(system.action, data)
+
+  @property
+  def _system_account_id(self) -> Optional[str]:
+    """This worker's identity for SYSTEM routing, in NATS-name format
+    ``<market_type>-<account_id>`` (matches the NATS connection name; see
+    Settings._validate_market_requirements)."""
+    return self.settings.get("account_id") or None
+
+  def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
+    """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
+
+    Markets override this to handle the actions they support; the base ignores
+    every action so a market without SYSTEM actions (e.g. FOREX) needs no code.
+    """
+    log.info(
+      "[%s SYSTEM] No handler for action=%s — ignoring.",
+      self.name, getattr(action, "value", action),
+    )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #
 
