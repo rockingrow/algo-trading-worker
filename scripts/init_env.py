@@ -49,6 +49,7 @@ CRYPTO_KEYS = (
   "BINANCE_TESTNET",
   "CRYPTO_LEVERAGE_INIT_SYMBOLS",
   "MAX_LEVERAGE_CAP",
+  "MIN_LEVERAGE_CAP",
 )
 # Variables presented as a fixed-choice menu instead of free text.
 CHOICES = {
@@ -79,6 +80,7 @@ DESCRIPTIONS = {
   "BINANCE_TESTNET": "true -> use the Binance Futures testnet",
   "CRYPTO_LEVERAGE_INIT_SYMBOLS": "Comma-separated symbols to set leverage on at startup (empty = skip)",
   "MAX_LEVERAGE_CAP": "Upper bound applied by the leverage init job (e.g. 10)",
+  "MIN_LEVERAGE_CAP": "Fallback floor when a -4421 cap can't be parsed (e.g. 5)",
   "SLIPPAGE_DEVIATION": "Max slippage in points (100 = $1.00)",
   "STRATEGY_MAGIC_MAP": "JSON mapping each strategy/subject to its MT5 magic number",
   "POSITION_TP1_PERCENT": "Percent of the position closed at the first take-profit",

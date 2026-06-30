@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- CRYPTO: `MIN_LEVERAGE_CAP` (int, default `5`) env var — a last-resort floor for `LeverageInitJob`. When `set_leverage` hits a `-4421` account-level cap but the real ceiling **cannot be parsed** out of the error message (e.g. Binance reworded it and the regex no longer matches), the gateway retries once at `min(MIN_LEVERAGE_CAP, target)` instead of abandoning the symbol at its dangerous exchange default. Threaded through `BaseExchangeGateway.set_leverage(symbol, leverage, min_leverage_cap=None)` and `LeverageInitJob`. A non-positive value disables the fallback. If the account is restricted below the floor, the retry still fails and the symbol is logged for manual fixing.
+
+### Changed
+
+- CRYPTO: `BinanceFuturesGateway._leverage_cap_from_error` now (a) logs a warning when a `-4421` is received but its message does not match the cap parser — previously this silently dropped the retry path, hiding a Binance message reword — and (b) clamps the parsed ceiling to the requested leverage, discarding parse anomalies (a `-4421` is by definition a restriction *below* what was requested).
+
 ## [1.2.0] - 2026-06-30
 
 ### Added

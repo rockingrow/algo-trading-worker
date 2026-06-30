@@ -44,12 +44,16 @@ class LeverageInitJob:
     symbols: Iterable[str],
     max_leverage_cap: int,
     resolve_symbol: Optional[Callable[[str], str]] = None,
+    min_leverage_cap: Optional[int] = None,
   ) -> None:
     self._gateway = gateway
     # Deduplicate while preserving the .env declaration order, so the log lines
     # reflect what the operator wrote rather than a hash-set order.
     self._symbols: list[str] = list(dict.fromkeys(s for s in symbols if s))
     self._cap = int(max_leverage_cap)
+    # Last-resort floor used only when a -4421 cap cannot be parsed (see
+    # set_leverage). ``None``/non-positive disables the fallback.
+    self._min_cap = int(min_leverage_cap) if min_leverage_cap else None
     self._resolve = resolve_symbol or (lambda s: s)
 
   def run(self) -> None:
@@ -81,7 +85,7 @@ class LeverageInitJob:
       return
 
     target = min(max_lev, self._cap)
-    applied = self._gateway.set_leverage(resolved, target)
+    applied = self._gateway.set_leverage(resolved, target, min_leverage_cap=self._min_cap)
     if applied:
       # `applied` can be below `target` when an account-level cap (sub-account /
       # VIP tier) — invisible to get_max_leverage — forces the gateway lower.

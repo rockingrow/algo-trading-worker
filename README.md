@@ -189,10 +189,21 @@ symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
 3. `gateway.set_leverage(symbol, target)` (Binance: `POST /fapi/v1/leverage`)
    applies it.
 
+Some account-level caps (sub-account / VIP tier) are **not** exposed by
+`leverageBracket` and surface only when `set_leverage` is POSTed, as a `-4421`
+rejection whose message names the real ceiling (e.g. *"…greater than 5x"*). The
+gateway parses that ceiling and retries once at it, so the symbol still lands on
+its true limit instead of being abandoned. If Binance ever rewords the message
+so the parser misses it, `set_leverage` retries one last time at
+`min(MIN_LEVERAGE_CAP, target)` — a known-safe floor — rather than leaving the
+symbol at its dangerous default. If the account is restricted below that floor,
+the retry also fails and the symbol is logged for manual fixing.
+
 | Env var | Default | Purpose |
 | --- | --- | --- |
 | `CRYPTO_LEVERAGE_INIT_SYMBOLS` | empty (skip) | Comma-separated raw signal symbols to initialise (`BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`). Resolved through the executor's symbol resolver, so the form mirrors how upstream signals address the symbol. |
 | `MAX_LEVERAGE_CAP` | `10` | Upper bound applied per symbol. A sub-account at 5x lands on 5; an unrestricted account lands on this cap. |
+| `MIN_LEVERAGE_CAP` | `5` | Last-resort floor used only when a `-4421` account cap cannot be parsed from the error message. Set to the lowest leverage your sub-accounts can take; if an account is restricted below it, the retry still fails and the symbol is left for manual fixing. |
 
 Failure modes are isolated: a failed `get_max_leverage` (network blip, symbol
 typo) skips that symbol with a warning and **never falls back to the cap**

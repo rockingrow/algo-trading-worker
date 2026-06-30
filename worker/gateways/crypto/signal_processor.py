@@ -100,6 +100,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
         symbols=symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
         max_leverage_cap=max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
         resolve_symbol=self.executor.get_symbol,
+        min_leverage_cap=self.settings.get("min_leverage_cap", 5),
       ).run()
     except Exception:
       log.exception(

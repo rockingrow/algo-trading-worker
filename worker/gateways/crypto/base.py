@@ -141,11 +141,15 @@ class BaseExchangeGateway(ABC):
     should detect and honor that lower cap there."""
     return None
 
-  def set_leverage(self, symbol: str, leverage: int) -> Optional[int]:
+  def set_leverage(
+    self, symbol: str, leverage: int, min_leverage_cap: Optional[int] = None
+  ) -> Optional[int]:
     """Set the working leverage for *symbol*. Returns the leverage **actually
     applied** on success — which may be below *leverage* if an account-level cap
-    forces it lower — or ``None`` on failure. Default no-op for exchanges where
-    leverage is not API-configurable."""
+    forces it lower — or ``None`` on failure. ``min_leverage_cap`` is an optional
+    last-resort floor to retry at when an account-cap rejection cannot be parsed
+    for its real ceiling; implementations that cannot detect such caps ignore it.
+    Default no-op for exchanges where leverage is not API-configurable."""
     return None
 
   # ── Account ───────────────────────────────────────────────────────────── #

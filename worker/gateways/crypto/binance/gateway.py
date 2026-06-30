@@ -444,7 +444,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     except (TypeError, ValueError):
       return None
 
-  def set_leverage(self, symbol: str, leverage: int) -> Optional[int]:
+  def set_leverage(
+    self, symbol: str, leverage: int, min_leverage_cap: Optional[int] = None
+  ) -> Optional[int]:
     """Set per-symbol working leverage.
 
     Returns the leverage **actually applied** on success — which may be below
@@ -453,6 +455,15 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     :meth:`get_max_leverage`; they only appear here as a -4421 rejection that
     names the real ceiling, so we parse that ceiling and retry once at it rather
     than leaving the symbol on its stale exchange setting.
+
+    ``min_leverage_cap`` is a *last-resort* floor for the case where the -4421
+    message can no longer be parsed (e.g. Binance reworded it and the regex no
+    longer matches): rather than give up and leave the symbol at its dangerous
+    default, retry once at ``min(min_leverage_cap, leverage)``. It only fires on
+    a genuine -4421 that we could not parse — a known-safe value the operator
+    asserts no sub-account is restricted below. If the account is in fact capped
+    lower, this retry also fails and the symbol is left untouched (logged loudly
+    for manual fix).
     """
     leverage = int(leverage)
     try:
@@ -462,7 +473,15 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       # silently clamps to a lower account cap instead of rejecting.
       return self._applied_leverage(data, leverage)
     except Exception as exc:
-      cap = self._leverage_cap_from_error(exc)
+      cap = self._leverage_cap_from_error(exc, upper_bound=leverage)
+      if cap is None and min_leverage_cap and self._is_leverage_cap_error(exc):
+        # -4421 confirmed but the real ceiling could not be parsed — fall back
+        # to the operator-asserted floor instead of abandoning the symbol.
+        cap = min(int(min_leverage_cap), leverage)
+        logger.warning(
+          "[Binance] set_leverage(%s=%s) hit -4421 but cap was unparseable; "
+          "falling back to known floor %sx.", symbol, leverage, cap,
+        )
       if cap is not None and cap < leverage:
         logger.warning(
           "[Binance] set_leverage(%s=%s) rejected by account cap (-4421); "
@@ -491,16 +510,42 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       return requested
 
   @staticmethod
-  def _leverage_cap_from_error(exc: Exception) -> Optional[int]:
-    """Pull the account leverage ceiling out of a -4421 error, else ``None``."""
-    if getattr(exc, "status_code", None) != _LEVERAGE_CAP_CODE:
+  def _is_leverage_cap_error(exc: Exception) -> bool:
+    """True if *exc* is Binance's -4421 account-leverage-cap rejection."""
+    return getattr(exc, "status_code", None) == _LEVERAGE_CAP_CODE
+
+  @classmethod
+  def _leverage_cap_from_error(cls, exc: Exception, upper_bound: Optional[int] = None) -> Optional[int]:
+    """Pull the account leverage ceiling out of a -4421 error, else ``None``.
+
+    ``upper_bound`` (the leverage we requested, already ``min(exchange_max,
+    MAX_LEVERAGE_CAP)``) clamps the parsed value: a -4421 cap is by definition a
+    *restriction*, so anything at or above what we asked for is a parse anomaly,
+    not a real ceiling, and is discarded.
+    """
+    if not cls._is_leverage_cap_error(exc):
       return None
     msg = getattr(exc, "error_message", None) or str(exc)
     match = _LEVERAGE_CAP_RE.search(msg)
     if not match:
+      # The code says "account leverage cap" but the message no longer matches
+      # our pattern — most likely Binance reworded it. Surface it so the regex
+      # can be updated instead of silently losing the retry path.
+      logger.warning(
+        "[Binance] -4421 leverage cap but message did not match parser; "
+        "skipping cap-retry. message=%r", msg,
+      )
       return None
     cap = int(match.group(1))
-    return cap if cap > 0 else None
+    if cap <= 0:
+      return None
+    if upper_bound is not None and cap >= upper_bound:
+      logger.warning(
+        "[Binance] -4421 parsed cap %sx >= requested %sx — treating as parse "
+        "anomaly and ignoring. message=%r", cap, upper_bound, msg,
+      )
+      return None
+    return cap
 
   # ── Account ───────────────────────────────────────────────────────────── #
 

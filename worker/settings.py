@@ -90,6 +90,14 @@ class Settings(BaseSettings):
   # leverage is below this, the lower value is used (sub-account caps are
   # honoured automatically); if it is at or above, this cap wins.
   max_leverage_cap: int = 10
+  # Last-resort floor for LeverageInitJob: if a symbol is rejected with -4421
+  # (account-level cap) but the gateway cannot parse the real ceiling out of the
+  # error message — e.g. Binance reworded it and the regex no longer matches —
+  # it retries once at min(min_leverage_cap, target) instead of leaving the
+  # symbol at its dangerous default. Set to the lowest leverage you know your
+  # sub-accounts can take (5x on Binance); if an account is restricted below
+  # this, the retry still fails and the symbol is logged for manual fixing.
+  min_leverage_cap: int = 5
   use_custom_leverage: bool = False  # If true, force use custom leverage instead of broker crypto leverage initialization
 
   # Strategy configuration
