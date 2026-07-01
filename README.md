@@ -177,9 +177,11 @@ capped at 5x can silently leave a symbol at its old 20x setting (or vice
 versa), and an order can fail with `-2019 Margin is insufficient` even when
 risk-sizing math is correct.
 
-`CryptoSignalProcessor` runs `LeverageInitJob` once on startup, right after
-`gateway.connect()` succeeds and before any signal can be processed. For each
-symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
+`CryptoSignalProcessor` runs `LeverageInitJob` on demand, triggered by a `SYSTEM`
+`CRYPTO_LEVERAGE_INIT` message — normally pushed by the broker the moment it
+sees this worker's `WORKER_CONNECTED` handshake (see [SYSTEM Subject](#-system-subject)),
+so the pass still effectively happens right after connect without the worker
+needing to run it itself. For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
 
 1. `gateway.get_max_leverage(symbol)` (Binance: `GET /fapi/v1/leverageBracket`)
    returns the account-side ceiling. Sub-account / VIP caps are reflected here
@@ -209,12 +211,13 @@ Failure modes are isolated: a failed `get_max_leverage` (network blip, symbol
 typo) skips that symbol with a warning and **never falls back to the cap**
 blindly — picking the cap for an account that is actually limited to 5x is
 the failure mode this job exists to prevent. Any uncaught crash inside the
-job is logged and swallowed so the worker still starts; symbols are left at
-their current exchange-side leverage until the next restart.
+job is logged and swallowed so the worker keeps running; symbols are left at
+their current exchange-side leverage until the next `CRYPTO_LEVERAGE_INIT`
+trigger.
 
-The same pass can be re-triggered at runtime — without restarting the worker —
-via a `SYSTEM` `CRYPTO_LEVERAGE_INIT` message (see the [SYSTEM Subject](#-system-subject)
-section), which may also override the symbol set and cap for that one run.
+The pass can be re-triggered at any time — without restarting the worker — via
+another `SYSTEM` `CRYPTO_LEVERAGE_INIT` message, which may also override the
+symbol set and cap for that one run.
 
 ---
 
@@ -464,7 +467,7 @@ The `SYSTEM` NATS subject carries operational/maintenance commands that drive wo
 
 ### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO)
 
-Re-runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass at runtime, without restarting the worker. Useful after editing a sub-account's leverage cap, onboarding new symbols, or recovering from a startup pass that ran before the exchange was reachable.
+Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass — the only way it runs, since there is no longer a startup pass. Normally sent by the broker automatically right after this worker's `WORKER_CONNECTED` handshake; can also be re-sent manually after editing a sub-account's leverage cap or onboarding new symbols.
 
 | Field | Behaviour when present | Behaviour when omitted |
 | --- | --- | --- |
@@ -482,13 +485,13 @@ Re-runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisa
 }
 ```
 
-Only `action` and `timestamp` are required; `symbols` and `default_leverage` are optional overrides.
+`action`, `timestamp` and `account_id` are required; `symbols` and `default_leverage` are optional overrides.
 
 #### Execution flow (SYSTEM)
 
-1. Parse `SystemSchemaSchema`; drop silently on validation error.
+1. Parse `SystemSchema`; drop silently on validation error.
 2. Ensure the broker/exchange connection; abort if unreachable.
-3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)` — the **same** `LeverageInitJob` used at startup. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are identical; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
+3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)`. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are unchanged; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
 
 ---
 

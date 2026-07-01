@@ -44,7 +44,11 @@ from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.system_schema import SystemActionEnum, SystemSchemaSchema
+from worker.schemas.system_schema import (
+  SystemActionEnum,
+  SystemSchema,
+  SystemWorkerConnectedSchema,
+)
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
 
@@ -131,7 +135,7 @@ class BaseSignalProcessor(ABC):
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
       subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
-      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK], # purpose just only show on Notification
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM], # purpose just only show on Notification
       token=nats_token,
       account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
@@ -141,13 +145,20 @@ class BaseSignalProcessor(ABC):
 
     self.publisher = NATSPublisher(
       url=self.settings["nats_url"],
-      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK],
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM],
       token=nats_token,
       account_id=self.settings.get("account_id"),
+      # Re-announce on every reconnect so the broker re-pushes init config.
+      on_reconnect=self._announce_worker_connected,
     )
     self.publisher.connect()
 
     self._footer = self._account_footer()
+
+    # Handshake: tell the broker this worker is online so it can push any
+    # per-worker init (e.g. CRYPTO_LEVERAGE_INIT). The broker decides from
+    # market/gateway whether anything applies — every market announces.
+    self._announce_worker_connected()
     return True
 
   def shutdown(self) -> None:
@@ -469,24 +480,29 @@ class BaseSignalProcessor(ABC):
 
     SYSTEM messages drive operational/maintenance actions (e.g. re-initialising
     per-symbol leverage on a crypto exchange) that are not trade signals. The
-    base only validates the common envelope (action + timestamp); each market
+    base only validates the common envelope (action + timestamp + account_id); each market
     decides which actions it understands — an unknown action is logged and
     ignored rather than raising, so a SYSTEM action meant for another market type
     is harmless here.
     """
     try:
       data = json.loads(raw)
-      system = SystemSchemaSchema(**data)
+      system = SystemSchema(**data)
     except (json.JSONDecodeError, ValidationError) as err:
       log.error("[SYSTEM] Parse error: %s", err)
       return
 
+    log.info(
+      "[%s SYSTEM] Received action=%s account_id=%s",
+      self.name, getattr(system.action, "value", system.action), system.account_id,
+    )
+
     if not self._ensure_connected():
       return
 
-    # Route by worker identity: a SYSTEM message targeting a specific
-    # account_id (NATS-name format "<market_type>-<account_id>") is executed
-    # only by the matching worker; an omitted account_id is a broadcast.
+    # Route by worker identity: every SYSTEM message carries a required
+    # account_id (NATS-name format "<market>-<gateway>-<account_id>") and is
+    # executed only by the matching worker. A blank value would match nobody.
     if system.account_id and system.account_id != self._system_account_id:
       log.info(
         "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
@@ -500,9 +516,57 @@ class BaseSignalProcessor(ABC):
   @property
   def _system_account_id(self) -> Optional[str]:
     """This worker's identity for SYSTEM routing, in NATS-name format
-    ``<market_type>-<account_id>`` (matches the NATS connection name; see
+    ``<market>-<gateway>-<account_id>`` (matches the NATS connection name; see
     Settings._validate_market_requirements)."""
     return self.settings.get("account_id") or None
+
+  # Settings key holding this market's gateway enum (exchange / platform).
+  # Concrete processors set it so the WORKER_CONNECTED handshake can report the
+  # gateway name without the base knowing the per-market field.
+  _gateway_setting_key: str = ""
+
+  @property
+  def _gateway_value(self) -> str:
+    """Gateway name for this worker (e.g. ``BINANCE``, ``MT5``), read from the
+    market-specific setting named by ``_gateway_setting_key``."""
+    g = self.settings.get(self._gateway_setting_key)
+    return getattr(g, "value", None) or str(g or "")
+
+  def _worker_connected_payload(self) -> Optional[str]:
+    """Build the WORKER_CONNECTED handshake JSON, or None if this worker has no
+    identity yet (no account_id → nothing for the broker to target)."""
+    account_id = self._system_account_id
+    if not account_id:
+      return None
+    return SystemWorkerConnectedSchema(
+      account_id=account_id,
+      market=self._market_type,
+      gateway=self._gateway_value,
+    ).model_dump_json()
+
+  def _announce_worker_connected(self) -> None:
+    """Publish a SYSTEM ``WORKER_CONNECTED`` so the broker can push any initial
+    config targeted at this worker. Waits for the SYSTEM subscription to be live
+    first — NATS core does not replay, so a reply that arrives before we are
+    subscribed would be lost."""
+    payload = self._worker_connected_payload()
+    if payload is None:
+      log.warning(
+        "[%s Process] No account_id — skipping WORKER_CONNECTED handshake.", self.name
+      )
+      return
+    if self.publisher is None:
+      return
+    if self.subscriber is not None and not self.subscriber.wait_subscribed(timeout=10):
+      log.warning(
+        "[%s Process] SYSTEM subscription not confirmed within timeout — "
+        "announcing WORKER_CONNECTED anyway (reply may be missed).", self.name
+      )
+    self.publisher.publish(NatsSubjectEnum.SYSTEM, payload)
+    log.info(
+      "[%s Process] Announced WORKER_CONNECTED account_id=%s",
+      self.name, self._system_account_id,
+    )
 
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
     """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.

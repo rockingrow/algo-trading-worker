@@ -5,30 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- CRYPTO: `MIN_LEVERAGE_CAP` (int, default `5`) env var — a last-resort floor for `LeverageInitJob`. When `set_leverage` hits a `-4421` account-level cap but the real ceiling **cannot be parsed** out of the error message (e.g. Binance reworded it and the regex no longer matches), the gateway retries once at `min(MIN_LEVERAGE_CAP, target)` instead of abandoning the symbol at its dangerous exchange default. Threaded through `BaseExchangeGateway.set_leverage(symbol, leverage, min_leverage_cap=None)` and `LeverageInitJob`. A non-positive value disables the fallback. If the account is restricted below the floor, the retry still fails and the symbol is logged for manual fixing.
-
-### Changed
-
-- CRYPTO: `BinanceFuturesGateway._leverage_cap_from_error` now (a) logs a warning when a `-4421` is received but its message does not match the cap parser — previously this silently dropped the retry path, hiding a Binance message reword — and (b) clamps the parsed ceiling to the requested leverage, discarding parse anomalies (a `-4421` is by definition a restriction *below* what was requested).
-
-## [1.2.0] - 2026-06-30
-
-### Added
-
-- New `SYSTEM` NATS subject for operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order placed). Messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches to the market-specific `_handle_system_action` hook; an action a market does not understand is logged and ignored. `SYSTEM` is now one of `NATS_REQUIRED_LISTENING_SUBJECTS`, so every worker subscribes to it regardless of `NATS_SUBJECTS`.
-- `SystemActionEnum` / `SystemSchemaSchema` / `SystemCryptoLeverageInitSchema` (`worker/schemas/system_schema.py`) — the SYSTEM envelope and the `CRYPTO_LEVERAGE_INIT` payload (`symbols`, `default_leverage`).
-- CRYPTO: `SYSTEM` `CRYPTO_LEVERAGE_INIT` action — re-runs the per-symbol leverage initialisation pass at runtime, without restarting the worker. `CryptoSignalProcessor._handle_system_action` parses `SystemCryptoLeverageInitSchema` and invokes the **same** `LeverageInitJob` used at startup via the new shared `_run_leverage_init(symbols, max_leverage_cap)` helper. The message may override the symbol set (`symbols`, falls back to `CRYPTO_LEVERAGE_INIT_SYMBOLS`) and the cap (`default_leverage`, used as the cap so each symbol is set to `min(exchange_max, default_leverage)`, falls back to `MAX_LEVERAGE_CAP`). Per-symbol failure isolation and the "never blindly fall back to the cap" guarantee are unchanged; an uncaught crash is logged and swallowed so a message can never take the worker down.
-- Example payload `examples/signals/admin.crypto_leverage_init.json`.
-
-### Fixed
-
-- Worker crashed on startup with `SettingsError: error parsing value for field "crypto_leverage_init_symbols"` whenever `CRYPTO_LEVERAGE_INIT_SYMBOLS` was set to its documented comma form (e.g. `BTCUSDT,ETHUSDT`): pydantic-settings JSON-decodes `list[str]` fields from the dotenv source *before* the `mode="before"` split validator runs, and a bare comma string is not valid JSON. Both `crypto_leverage_init_symbols` and `telegram_chat_channel_id` are now annotated `Annotated[list[str], NoDecode]`, so the raw env string is handed straight to their split validators. `TELEGRAM_CHAT_CHANNEL_ID` previously only survived because its single quoted value happened to be valid JSON; the unquoted multi-channel form documented in `.env` would have hit the same crash.
-
-## [1.1.6] - 2026-06-28
+## [1.1.6] - Unreleased
 
 ### Added
 
@@ -38,16 +15,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TP1_MOVE_SL_TO_BREAKEVEN` is now optional (previously a required `bool`). When absent (the new default), the signal's own `move_sl_to_be` field governs whether the stop is moved to breakeven after TP1. When explicitly set in config, it overrides the signal.
 - Order fill notifications now show: the effective risk percent with a gear icon when the config overrides the signal; the TP1 close-percent appended to the volume/quantity line on TP1 fills; and an override-settings block listing VOLUME_DECISION_ENABLED, RISK_PERCENTAGE, USE_ACCOUNT_EQUITY, POSITION_TP1_PERCENT, and TP1_MOVE_SL_TO_BREAKEVEN states (ENABLED/DISABLED with value) so operators can see, on each trade notification, which modes are active for the connected worker.
 - Startup banner now renders all override settings as ENABLED/DISABLED (consistent with the order fill block) instead of raw boolean values.
-- CRYPTO: `LeverageInitJob` — one-shot, sequential leverage initialisation run once at worker startup (inside `CryptoSignalProcessor._connect_broker`, right after `gateway.connect()` succeeds). For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS` the job calls `gateway.get_max_leverage` (Binance: `GET /fapi/v1/leverageBracket`) to read the account's exchange-side ceiling — which honours sub-account / VIP caps automatically — then calls `gateway.set_leverage` (Binance: `POST /fapi/v1/leverage`) to set the symbol to `min(exchange_max, MAX_LEVERAGE_CAP)`. A sub-account capped at 5x lands on 5; an unrestricted account lands on the configured cap. A failed lookup skips the symbol (never blindly applies the cap), and any crash inside the job is logged and swallowed so worker startup is never blocked.
+- CRYPTO: `LeverageInitJob` — one-shot, sequential per-symbol leverage initialisation. For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS` the job calls `gateway.get_max_leverage` (Binance: `GET /fapi/v1/leverageBracket`) to read the account's exchange-side ceiling — which honours sub-account / VIP caps automatically — then calls `gateway.set_leverage` (Binance: `POST /fapi/v1/leverage`) to set the symbol to `min(exchange_max, MAX_LEVERAGE_CAP)`. A sub-account capped at 5x lands on 5; an unrestricted account lands on the configured cap. A failed lookup skips the symbol (never blindly applies the cap), and any crash inside the job is logged and swallowed. The job is not run at worker startup; it runs only on-demand via a `SYSTEM` `CRYPTO_LEVERAGE_INIT` message (see below), which the broker normally sends event-driven right after this worker announces `WORKER_CONNECTED`, and which may override the symbol set (`symbols`) and cap (`default_leverage`, applied as `min(exchange_max, default_leverage)`) for that one run.
 - `CRYPTO_LEVERAGE_INIT_SYMBOLS` (comma-separated, default empty) env var — raw signal symbols whose leverage the init job must walk (e.g. `BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`); resolved through the executor's symbol resolver so it mirrors how upstream signals address the symbol. An empty list skips the init entirely.
 - `MAX_LEVERAGE_CAP` (int, default `10`) env var — upper bound applied by `LeverageInitJob`. A non-positive cap skips the init with a warning.
 - `BaseExchangeGateway.get_max_leverage` / `set_leverage` hooks (default no-op) — added to the agnostic CEX contract so future exchanges plug in without touching the job.
+- New `SYSTEM` NATS subject for operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order placed). Messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope and dispatches to the market-specific `_handle_system_action` hook; an action a market does not understand is logged and ignored. `SYSTEM` is now one of `NATS_REQUIRED_LISTENING_SUBJECTS`, so every worker subscribes to it regardless of `NATS_SUBJECTS`.
+- `SystemActionEnum` / `SystemSchema` / `SystemCryptoLeverageInitSchema` (`worker/schemas/system_schema.py`) — the SYSTEM envelope (`action`, a required `account_id` addressing the message to one specific worker, `timestamp` defaulting to now) and the `CRYPTO_LEVERAGE_INIT` payload (`symbols`, `default_leverage`).
+- Example payload `examples/signals/admin.crypto_leverage_init.json`.
+- Worker → broker handshake on the `SYSTEM` subject: right after a worker connects to NATS it publishes a `WORKER_CONNECTED` message announcing its identity (`account_id`, `market`, `gateway`), so the broker can push any per-worker init config (e.g. `CRYPTO_LEVERAGE_INIT`) event-driven instead of polling `/connz`. The broker decides from `market`/`gateway` whether anything applies — every market announces. The announce waits for the SYSTEM subscription to be confirmed live first (`NATSSubscriber.wait_subscribed`) because NATS core does not replay: a reply published before we subscribe would be lost. It is re-sent on every NATS reconnect (`NATSPublisher(on_reconnect=…)`) so a broker/NATS restart re-triggers init. `SystemActionEnum.WORKER_CONNECTED` / `SystemWorkerConnectedSchema` added; workers now also publish on the `SYSTEM` subject.
+- Example payload `examples/signals/system.worker_connected.json`.
+- CRYPTO: `MIN_LEVERAGE_CAP` (int, default `5`) env var — a last-resort floor for `LeverageInitJob`. When `set_leverage` hits a `-4421` account-level cap but the real ceiling **cannot be parsed** out of the error message (e.g. Binance reworded it and the regex no longer matches), the gateway retries once at `min(MIN_LEVERAGE_CAP, target)` instead of abandoning the symbol at its dangerous exchange default. Threaded through `BaseExchangeGateway.set_leverage(symbol, leverage, min_leverage_cap=None)` and `LeverageInitJob`. A non-positive value disables the fallback. If the account is restricted below the floor, the retry still fails and the symbol is logged for manual fixing.
+
+### Changed
+
+- Worker identity `account_id` format is now `<market>-<gateway>-<account_id>` (was `<market>-<account_id>`) — e.g. `CRYPTO-BINANCE-7654321`, `FOREX-MT5-413652379`. The gateway segment lets the broker route/identify by exchange without a separate lookup. Derived in `Settings._validate_market_requirements`; surfaced as the NATS connection name and as the `SYSTEM` routing key.
+- CRYPTO: `BinanceFuturesGateway._leverage_cap_from_error` now (a) logs a warning when a `-4421` is received but its message does not match the cap parser — previously this silently dropped the retry path, hiding a Binance message reword — and (b) clamps the parsed ceiling to the requested leverage, discarding parse anomalies (a `-4421` is by definition a restriction *below* what was requested).
+- `BaseSignalProcessor._handle_system_message` now logs the parsed `action` and `account_id` before dispatching, so a received SYSTEM message (including a worker's own `WORKER_CONNECTED` echoed back on its own subscription) is always traceable in the logs even when there is no handler for it.
+
+### Removed
+
+- `NatsSubjectEnum.ACK` — unused NATS subject. `NATSSubscriber`/`NATSPublisher` `publish_subjects` are now `[TRADE, SYSTEM]` (was `[TRADE, ACK]` / `[TRADE, ACK, SYSTEM]`).
 
 ### Fixed
 
 - `PositionCDC` was calling `row.get("message")` to extract signal fields for TRADE events, but the DB column is `gateway_message`. As a result, `signal_id`, `sl`, `tp1`, `risk_percent`, and other fields published in the NATS TRADE event were always `null`. Now correctly reads `gateway_message` and forwards it as `message` in the PositionEvent payload.
 - TP1 fill notification could show a `(TP1 x%)` close-percent that did not match the volume actually closed: it ignored `VOLUME_DECISION_ENABLED` (appending a percent even when the close was sized from `signal.quantity`) and skipped the config fallback when the signal omitted `tp1_percent`. The suffix now mirrors `_resolve_tp1_params` exactly — dropped when volume-decision sizing is off, and falling back to `POSITION_TP1_PERCENT` when the signal carries no percent.
 - Override-settings lines (RISK_PERCENTAGE, POSITION_TP1_PERCENT) rendered a literal `None%` when an override was toggled on but its percent was never configured; they now read `n/a`.
+- Worker crashed on startup with `SettingsError: error parsing value for field "crypto_leverage_init_symbols"` whenever `CRYPTO_LEVERAGE_INIT_SYMBOLS` was set to its documented comma form (e.g. `BTCUSDT,ETHUSDT`): pydantic-settings JSON-decodes `list[str]` fields from the dotenv source *before* the `mode="before"` split validator runs, and a bare comma string is not valid JSON. Both `crypto_leverage_init_symbols` and `telegram_chat_channel_id` are now annotated `Annotated[list[str], NoDecode]`, so the raw env string is handed straight to their split validators. `TELEGRAM_CHAT_CHANNEL_ID` previously only survived because its single quoted value happened to be valid JSON; the unquoted multi-channel form documented in `.env` would have hit the same crash.
+- `NATSPublisher.__init__` stored the `on_reconnect` constructor argument on `self._on_reconnect`, shadowing the class's own `_on_reconnect` async callback method. Since `NatsClient(reconnected_cb=self._on_reconnect)` is built after that assignment, it picked up the shadowed value instead of the real handler, silently breaking the "re-announce `WORKER_CONNECTED` on NATS reconnect" behaviour. Renamed the stored argument to `self._on_reconnect_callback`.
 
 ## [1.1.5] - 2026-06-26
 

@@ -42,7 +42,7 @@ def test_crypto_account_id_derived_from_binance_account_id(monkeypatch):
   # ACCOUNT_ID is never read from .env — set it anyway to prove it's ignored.
   monkeypatch.setenv("ACCOUNT_ID", "should-be-overwritten")
   s = Settings(_env_file=None)
-  assert s.account_id == "CRYPTO-acct-1"
+  assert s.account_id == "CRYPTO-BINANCE-acct-1"
 
 
 def test_forex_requires_mt5(monkeypatch):
@@ -60,4 +60,4 @@ def test_forex_account_id_derived_from_mt5_login(monkeypatch):
   monkeypatch.setenv("MT5_LOGIN", "413652379")
   monkeypatch.setenv("MT5_PASSWORD", "pw")
   s = Settings(_env_file=None)
-  assert s.account_id == "FOREX-413652379"
+  assert s.account_id == "FOREX-MT5-413652379"

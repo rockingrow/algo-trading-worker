@@ -1,0 +1,7 @@
+{
+  "action": "WORKER_CONNECTED",
+  "account_id": "CRYPTO-BINANCE-7654321",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "market": "CRYPTO",
+  "gateway": "BINANCE"
+}
