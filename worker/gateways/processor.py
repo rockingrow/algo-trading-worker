@@ -135,7 +135,7 @@ class BaseSignalProcessor(ABC):
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
       subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
-      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK], # purpose just only show on Notification
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM], # purpose just only show on Notification
       token=nats_token,
       account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
@@ -145,7 +145,7 @@ class BaseSignalProcessor(ABC):
 
     self.publisher = NATSPublisher(
       url=self.settings["nats_url"],
-      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.ACK, NatsSubjectEnum.SYSTEM],
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM],
       token=nats_token,
       account_id=self.settings.get("account_id"),
       # Re-announce on every reconnect so the broker re-pushes init config.
@@ -491,6 +491,11 @@ class BaseSignalProcessor(ABC):
     except (json.JSONDecodeError, ValidationError) as err:
       log.error("[SYSTEM] Parse error: %s", err)
       return
+
+    log.info(
+      "[%s SYSTEM] Received action=%s account_id=%s",
+      self.name, getattr(system.action, "value", system.action), system.account_id,
+    )
 
     if not self._ensure_connected():
       return

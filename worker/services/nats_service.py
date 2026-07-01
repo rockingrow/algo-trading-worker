@@ -171,7 +171,7 @@ class NATSPublisher:
   ):
     self.url = url
     self.publish_subjects = publish_subjects
-    self._on_reconnect = on_reconnect
+    self._on_reconnect_callback = on_reconnect
     self._send_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
     self._client = NatsClient(
       url=url,
@@ -193,9 +193,9 @@ class NATSPublisher:
     # Re-announce presence so the broker re-pushes any per-worker init config
     # (e.g. CRYPTO_LEVERAGE_INIT) after a broker/NATS restart. The callback only
     # enqueues (thread-safe), so it is safe to call from this async callback.
-    if self._on_reconnect is not None:
+    if self._on_reconnect_callback is not None:
       try:
-        self._on_reconnect()
+        self._on_reconnect_callback()
       except Exception as exc:
         logger.exception("NATS publisher on_reconnect callback failed: %s", exc)
 

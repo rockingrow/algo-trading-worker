@@ -6,4 +6,3 @@ class NatsSubjectEnum(str, Enum):
   ADMIN = "ADMIN"
   SYSTEM = "SYSTEM"
   TRADE = "TRADE"
-  ACK = "ACK"
