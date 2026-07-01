@@ -9,10 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Worker → broker handshake on the `SYSTEM` subject: right after a worker connects to NATS it publishes a `WORKER_CONNECTED` message announcing its identity (`account_id`, `market`, `gateway`), so the broker can push any per-worker init config (e.g. `CRYPTO_LEVERAGE_INIT`) event-driven instead of polling `/connz`. The broker decides from `market`/`gateway` whether anything applies — every market announces. The announce waits for the SYSTEM subscription to be confirmed live first (`NATSSubscriber.wait_subscribed`) because NATS core does not replay: a reply published before we subscribe would be lost. It is re-sent on every NATS reconnect (`NATSPublisher(on_reconnect=…)`) so a broker/NATS restart re-triggers init. `SystemActionEnum.WORKER_CONNECTED` / `SystemWorkerConnectedSchema` added; workers now also publish on the `SYSTEM` subject.
+- Example payload `examples/signals/system.worker_connected.json`.
 - CRYPTO: `MIN_LEVERAGE_CAP` (int, default `5`) env var — a last-resort floor for `LeverageInitJob`. When `set_leverage` hits a `-4421` account-level cap but the real ceiling **cannot be parsed** out of the error message (e.g. Binance reworded it and the regex no longer matches), the gateway retries once at `min(MIN_LEVERAGE_CAP, target)` instead of abandoning the symbol at its dangerous exchange default. Threaded through `BaseExchangeGateway.set_leverage(symbol, leverage, min_leverage_cap=None)` and `LeverageInitJob`. A non-positive value disables the fallback. If the account is restricted below the floor, the retry still fails and the symbol is logged for manual fixing.
 
 ### Changed
 
+- Worker identity `account_id` format is now `<market>-<gateway>-<account_id>` (was `<market>-<account_id>`) — e.g. `CRYPTO-BINANCE-7654321`, `FOREX-MT5-413652379`. The gateway segment lets the broker route/identify by exchange without a separate lookup. Derived in `Settings._validate_market_requirements`; surfaced as the NATS connection name and as the `SYSTEM` routing key.
+- `SYSTEM` envelope: `SystemSchemaSchema` renamed to `SystemSchema`, `account_id` is now **required** (every SYSTEM message is addressed to a specific worker — the previous "omitted `account_id` = broadcast to all workers" behaviour is gone), and `timestamp` now defaults to the current time. `SystemCryptoLeverageInitSchema` and the new `SystemWorkerConnectedSchema` inherit this envelope.
 - CRYPTO: `BinanceFuturesGateway._leverage_cap_from_error` now (a) logs a warning when a `-4421` is received but its message does not match the cap parser — previously this silently dropped the retry path, hiding a Binance message reword — and (b) clamps the parsed ceiling to the requested leverage, discarding parse anomalies (a `-4421` is by definition a restriction *below* what was requested).
 
 ## [1.2.0] - 2026-06-30

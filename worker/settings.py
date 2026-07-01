@@ -55,7 +55,7 @@ class Settings(BaseSettings):
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
 
   # Identify — derived in _validate_market_requirements as
-  # "<market_type>-<MT5_LOGIN|BINANCE_ACCOUNT_ID>" once the per-market
+  # "<market_type>-<gateway>-<MT5_LOGIN|BINANCE_ACCOUNT_ID>" once the per-market
   # credentials are validated, so it is never read from .env and can't drift
   # from the credential it identifies.
   account_id: str = ""
@@ -176,9 +176,10 @@ class Settings(BaseSettings):
     the selected exchange's API keys. This keeps each deployment from carrying
     (or initializing) the other market's dependencies. Once the required
     credential is confirmed present, ``account_id`` is set to
-    "<market_type>-<identifying credential>" — MT5_LOGIN for FOREX,
-    BINANCE_ACCOUNT_ID for CRYPTO — so it is always in sync and never
-    configured by hand.
+    "<market_type>-<gateway>-<identifying credential>" — MT5_LOGIN behind the
+    forex platform for FOREX, BINANCE_ACCOUNT_ID behind the exchange for CRYPTO
+    — so it is always in sync and never configured by hand. The gateway segment
+    lets the broker route/identify by exchange without a separate lookup.
     """
     if self.market_type == MarketTypeEnum.FOREX:
       missing = [
@@ -194,7 +195,7 @@ class Settings(BaseSettings):
         raise ValueError(
           f"MARKET_TYPE=FOREX requires: {', '.join(missing)}"
         )
-      self.account_id = f"{self.market_type.value}-{self.mt5_login}"
+      self.account_id = f"{self.market_type.value}-{self.forex_platform.value}-{self.mt5_login}"
     elif self.market_type == MarketTypeEnum.CRYPTO:
       if self.crypto_exchange == CryptoExchangeEnum.BINANCE:
         missing = [
@@ -211,7 +212,7 @@ class Settings(BaseSettings):
           raise ValueError(
             f"MARKET_TYPE=CRYPTO (BINANCE) requires: {', '.join(missing)}"
           )
-        self.account_id = f"{self.market_type.value}-{self.binance_account_id}"
+        self.account_id = f"{self.market_type.value}-{self.crypto_exchange.value}-{self.binance_account_id}"
     return self
 
   model_config = SettingsConfigDict(

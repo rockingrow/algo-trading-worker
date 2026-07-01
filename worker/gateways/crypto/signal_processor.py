@@ -51,6 +51,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   name = "CRYPTO"
   presenter = CryptoMessagePresenter
+  _gateway_setting_key = "crypto_exchange"
 
   # ── Broker hooks ──────────────────────────────────────────────────────── #
 

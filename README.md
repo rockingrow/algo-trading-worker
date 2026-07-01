@@ -482,11 +482,11 @@ Re-runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisa
 }
 ```
 
-Only `action` and `timestamp` are required; `symbols` and `default_leverage` are optional overrides.
+`action`, `timestamp` and `account_id` are required; `symbols` and `default_leverage` are optional overrides.
 
 #### Execution flow (SYSTEM)
 
-1. Parse `SystemSchemaSchema`; drop silently on validation error.
+1. Parse `SystemSchema`; drop silently on validation error.
 2. Ensure the broker/exchange connection; abort if unreachable.
 3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)` — the **same** `LeverageInitJob` used at startup. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are identical; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
 

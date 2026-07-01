@@ -1,6 +1,6 @@
 {
   "action": "CRYPTO_LEVERAGE_INIT",
-  "account_id": "<market>-<account_id>",
+  "account_id": "CRYPTO-BINANCE-7654321",
   "timestamp": "2026-06-30T00:00:00+00:00",
   "symbols": [
     "BTC",

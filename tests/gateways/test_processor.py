@@ -258,9 +258,10 @@ def test_admin_subject_routed_to_hook():
 
 def test_system_subject_parsed_and_dispatched_to_action_hook():
   proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
   raw = (
     '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"symbols":["BTC","ETH"],"default_leverage":10}'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC","ETH"],"default_leverage":10}'
   )
   proc._process_message(NatsSubjectEnum.SYSTEM, raw)
   assert len(proc.system_calls) == 1
@@ -272,8 +273,8 @@ def test_system_subject_parsed_and_dispatched_to_action_hook():
 
 def test_system_matching_account_id_dispatched():
   proc = FakeProcessor({"success": True})
-  # account_id is already "<market_type>-<id>" by the time Settings hands it
-  # over (see Settings._validate_market_requirements) — processor compares as-is.
+  # account_id is already "<market>-<gateway>-<id>" by the time Settings hands
+  # it over (see Settings._validate_market_requirements) — processor compares as-is.
   proc.settings = {"account_id": "FAKE_MKT-acct-1"}
   raw = (
     '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
@@ -307,9 +308,33 @@ def test_system_invalid_envelope_dropped_without_dispatch():
   assert proc.system_calls == []
 
 
+def test_worker_connected_payload_includes_identity_market_and_gateway():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  import json as _json
+
+  payload = _json.loads(proc._worker_connected_payload())
+  assert payload["action"] == SystemActionEnum.WORKER_CONNECTED.value
+  assert payload["account_id"] == "FAKE_MKT-FAKE_GW-acct-1"
+  assert payload["market"] == "FAKE_MKT"  # FakeProcessor._market_type
+  assert payload["gateway"] == "FAKE_GW"
+  assert payload["timestamp"]  # auto-stamped
+
+
+def test_worker_connected_payload_none_without_account_id():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {}  # no account_id derived yet
+  assert proc._worker_connected_payload() is None
+
+
 def test_system_not_connected_short_circuits():
   proc = FakeProcessor({"success": True}, connected=False)
-  raw = '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00"}'
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
+  )
   proc._process_message(NatsSubjectEnum.SYSTEM, raw)
   assert proc.system_calls == []
 
