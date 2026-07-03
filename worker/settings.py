@@ -133,6 +133,16 @@ class Settings(BaseSettings):
   # parse_channel_ids split the raw string instead of pydantic JSON-decoding it.
   telegram_chat_channel_id: Annotated[list[str], NoDecode] = []  # signals: order fills/failures, terminal closes
 
+  # ── Telegram error-log hook ──────────────────────────────────────
+  # When enabled (and telegram_enabled is true), log records at ERROR level or
+  # above are forwarded to Telegram. The dedicated log bot/chat is kept separate
+  # from the main bot so an outage/ban on one never affects the other; both fall
+  # back to telegram_bot_token / telegram_chat_id when left empty.
+  telegram_log_errors_enabled: bool = False
+  telegram_log_dedup_window: int = 60  # seconds — suppress identical messages
+  telegram_log_chat_id: str = ""
+  telegram_log_bot_token: Optional[SecretStr] = None
+
   @field_validator("telegram_chat_channel_id", mode="before")
   @classmethod
   def parse_channel_ids(cls, v):
