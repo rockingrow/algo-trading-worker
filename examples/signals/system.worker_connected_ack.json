@@ -1,0 +1,5 @@
+{
+  "action": "WORKER_CONNECTED_ACK",
+  "account_id": "FOREX-MT5-1234567",
+  "timestamp": "2026-06-30T00:00:00+00:00"
+}

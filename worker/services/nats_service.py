@@ -191,13 +191,21 @@ class NATSPublisher:
   async def _on_reconnect(self) -> None:
     logger.info("NATS publisher reconnected to %s", self.url)
     # Re-announce presence so the broker re-pushes any per-worker init config
-    # (e.g. CRYPTO_LEVERAGE_INIT) after a broker/NATS restart. The callback only
-    # enqueues (thread-safe), so it is safe to call from this async callback.
+    # (e.g. CRYPTO_LEVERAGE_INIT) after a broker/NATS restart. The handshake is
+    # now a blocking request/reply with retries (see BaseSignalProcessor.
+    # _announce_worker_connected), so it must run off this event loop's thread —
+    # calling it here directly would deadlock the loop it needs to schedule its
+    # own nc.request() onto.
     if self._on_reconnect_callback is not None:
-      try:
-        self._on_reconnect_callback()
-      except Exception as exc:
-        logger.exception("NATS publisher on_reconnect callback failed: %s", exc)
+      threading.Thread(
+        target=self._run_reconnect_callback, daemon=True, name="nats-reconnect-announce"
+      ).start()
+
+  def _run_reconnect_callback(self) -> None:
+    try:
+      self._on_reconnect_callback()
+    except Exception as exc:
+      logger.exception("NATS publisher on_reconnect callback failed: %s", exc)
 
   def connect(self) -> None:
     subject_names = [s.value for s in self.publish_subjects]
@@ -225,6 +233,27 @@ class NATSPublisher:
   def publish(self, subject: NatsSubjectEnum, data: str) -> None:
     """Thread-safe: enqueue a message to be published asynchronously."""
     self._send_queue.put((subject.value, data.encode()))
+
+  def request(self, subject: NatsSubjectEnum, data: str, timeout: float = 5.0) -> str:
+    """Thread-safe: synchronously publish a request and block for the broker's
+    reply, bypassing the fire-and-forget queue (a reply has nowhere to go once
+    enqueued). Schedules ``nc.request`` onto the publisher's own event loop via
+    ``run_coroutine_threadsafe`` since this is called from other threads.
+
+    Raises ``ConnectionError`` if the publisher has no live connection yet, or
+    whatever ``nats.aio.client.Client.request`` raises (notably
+    ``nats.errors.TimeoutError`` when the broker doesn't reply in time) — the
+    caller decides whether/how to retry.
+    """
+    loop = self._client._loop
+    nc = self._client.nc
+    if loop is None or nc is None:
+      raise ConnectionError("NATS publisher is not connected")
+    future = asyncio.run_coroutine_threadsafe(
+      nc.request(subject.value, data.encode(), timeout=timeout), loop
+    )
+    msg = future.result(timeout=timeout + 5)
+    return msg.data.decode()
 
   def close(self) -> None:
     logger.info("NATS publisher stop requested. Closing...")
