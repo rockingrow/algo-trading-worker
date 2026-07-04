@@ -11,6 +11,13 @@ class SystemActionEnum(str, Enum):
   # Outbound (worker → broker): announced right after the worker connects to
   # NATS so the broker can push any initial config targeted at this worker.
   WORKER_CONNECTED = "WORKER_CONNECTED"
+  # Inbound (broker → worker): reply to WORKER_CONNECTED for a worker that
+  # needs no init config (e.g. non-crypto) — handshake is complete as-is.
+  WORKER_CONNECTED_ACK = "WORKER_CONNECTED_ACK"
+  # Inbound (broker → worker): reply to WORKER_CONNECTED when the broker
+  # received the handshake but could not process it (missing settings,
+  # invalid leverage, ...).
+  WORKER_CONNECTED_ERROR = "WORKER_CONNECTED_ERROR"
 
 
 class SystemSchema(BaseModel):
@@ -38,3 +45,18 @@ class SystemWorkerConnectedSchema(SystemSchema):
   action: SystemActionEnum = SystemActionEnum.WORKER_CONNECTED
   market: str
   gateway: str
+
+
+class SystemWorkerConnectedAckSchema(SystemSchema):
+  """Broker reply to WORKER_CONNECTED for a worker that needs no init config
+  (e.g. non-crypto) — the handshake is complete on receipt."""
+
+  action: SystemActionEnum = SystemActionEnum.WORKER_CONNECTED_ACK
+
+
+class SystemWorkerConnectedErrorSchema(SystemSchema):
+  """Broker reply to WORKER_CONNECTED when it received the handshake but could
+  not process it (e.g. missing settings, invalid leverage config)."""
+
+  action: SystemActionEnum = SystemActionEnum.WORKER_CONNECTED_ERROR
+  reason: Optional[str] = None

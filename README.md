@@ -178,10 +178,11 @@ versa), and an order can fail with `-2019 Margin is insufficient` even when
 risk-sizing math is correct.
 
 `CryptoSignalProcessor` runs `LeverageInitJob` on demand, triggered by a `SYSTEM`
-`CRYPTO_LEVERAGE_INIT` message — normally pushed by the broker the moment it
-sees this worker's `WORKER_CONNECTED` handshake (see [SYSTEM Subject](#-system-subject)),
-so the pass still effectively happens right after connect without the worker
-needing to run it itself. For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
+`CRYPTO_LEVERAGE_INIT` message — normally returned by the broker as the direct
+reply to this worker's `WORKER_CONNECTED` handshake (see
+[SYSTEM Subject](#-system-subject)), so the pass still effectively happens right
+after connect without the worker needing to run it itself. For each symbol in
+`CRYPTO_LEVERAGE_INIT_SYMBOLS`:
 
 1. `gateway.get_max_leverage(symbol)` (Binance: `GET /fapi/v1/leverageBracket`)
    returns the account-side ceiling. Sub-account / VIP caps are reflected here
@@ -463,11 +464,48 @@ The broker/exchange is always the source of truth: live positions are closed **f
 
 ## 🚦 SYSTEM Subject
 
-The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches the action to the market-specific `_handle_system_action` hook. An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless. FOREX currently handles no `SYSTEM` actions.
+The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Inbound messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches the action to the market-specific `_handle_system_action` hook. An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless. FOREX currently handles no inbound `SYSTEM` actions besides the `WORKER_CONNECTED` reply.
+
+### WORKER_CONNECTED handshake (request/reply)
+
+Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected` sends `WORKER_CONNECTED` on `SYSTEM` as a NATS **request** (`nc.request`, not a fire-and-forget publish) so the broker always replies on a private inbox rather than staying silent. The broker's reply is one of three actions:
+
+| Reply action | Meaning | Worker behaviour |
+| --- | --- | --- |
+| `CRYPTO_LEVERAGE_INIT` | Crypto worker, config attached | Routed through the normal `_handle_system_action` hook — applies `symbols` + `default_leverage` exactly as if received on the subscription (see below); handshake complete |
+| `WORKER_CONNECTED_ACK` | Non-crypto (or no init needed) | Handshake complete, nothing further to apply |
+| `WORKER_CONNECTED_ERROR` | Broker received it but couldn't process it (missing settings, invalid leverage config, …) | Logged with `reason` for operator attention; not retried — a config problem on the broker side isn't fixed by resending the same request |
+
+If the broker doesn't reply within the request timeout (5s), the worker retries with backoff (5s → 10s → 20s, capped) **indefinitely** — the handshake is idempotent on the broker side and gates trading (crypto specifically needs `default_leverage` before it's safe to size an order), so the worker blocks here rather than falling back to running without config. A random 0–500ms jitter is added before the very first attempt only, to desynchronise a reconnect storm (every connected worker reconnects and re-announces at roughly the same instant after a NATS/broker restart). From the 3rd consecutive timeout onward, the retry log escalates from `WARNING` to `ERROR` so it's forwarded to Telegram (`TelegramLogHandler`), alerting an operator that the broker looks unreachable rather than just transiently slow.
+
+The worker still keeps its normal `SYSTEM` subscription for `CRYPTO_LEVERAGE_INIT` regardless of the reply above: an older broker that hasn't been updated yet falls back to a plain `publish` (no reply), and a pre-request-reply worker still receives `CRYPTO_LEVERAGE_INIT` the old way — so broker and worker upgrades can roll out independently, in either order.
+
+#### WORKER_CONNECTED Payload (worker → broker, request)
+
+```json
+{
+  "action": "WORKER_CONNECTED",
+  "account_id": "CRYPTO-BINANCE-7654321",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "market": "CRYPTO",
+  "gateway": "BINANCE"
+}
+```
+
+#### WORKER_CONNECTED_ERROR Payload (broker → worker, reply)
+
+```json
+{
+  "action": "WORKER_CONNECTED_ERROR",
+  "account_id": "CRYPTO-BINANCE-7654321",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "reason": "missing leverage settings for account"
+}
+```
 
 ### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO)
 
-Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass — the only way it runs, since there is no longer a startup pass. Normally sent by the broker automatically right after this worker's `WORKER_CONNECTED` handshake; can also be re-sent manually after editing a sub-account's leverage cap or onboarding new symbols.
+Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass — the only way it runs, since there is no longer a startup pass. Normally returned by the broker as the reply to this worker's `WORKER_CONNECTED` handshake (see above); can also be sent standalone (subscription fallback) after editing a sub-account's leverage cap or onboarding new symbols.
 
 | Field | Behaviour when present | Behaviour when omitted |
 | --- | --- | --- |

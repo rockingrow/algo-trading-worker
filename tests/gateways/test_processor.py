@@ -4,11 +4,13 @@ Verifies the base enforces the broker hooks (abstract methods) and that the
 shared `_process_message` algorithm runs identically regardless of market.
 """
 
+import time
 from types import SimpleNamespace
 
 import pytest
 from helpers import make_signal
 
+from worker.gateways import processor as processor_module
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -326,6 +328,142 @@ def test_worker_connected_payload_none_without_account_id():
   proc = FakeProcessor({"success": True})
   proc.settings = {}  # no account_id derived yet
   assert proc._worker_connected_payload() is None
+
+
+# ── WORKER_CONNECTED handshake (request/reply) ─────────────────────────────── #
+
+
+class FakePublisher:
+  """Records each request() call; returns/raises the next queued response."""
+
+  def __init__(self, responses):
+    self.responses = list(responses)
+    self.requests = []
+
+  def request(self, subject, data, timeout=5.0):
+    self.requests.append((subject, data, timeout))
+    resp = self.responses.pop(0)
+    if isinstance(resp, Exception):
+      raise resp
+    return resp
+
+
+def _connected_proc():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  return proc
+
+
+@pytest.fixture(autouse=True)
+def _no_handshake_jitter(monkeypatch):
+  """Pin the pre-request jitter to 0 so handshake tests are deterministic and
+  don't pay a real 0-0.5s sleep."""
+  monkeypatch.setattr(processor_module.random, "uniform", lambda a, b: 0)
+
+
+def test_announce_worker_connected_ack_needs_no_dispatch():
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.publisher.requests) == 1
+  subject, payload, timeout = proc.publisher.requests[0]
+  assert subject == NatsSubjectEnum.SYSTEM
+  import json as _json
+
+  assert _json.loads(payload)["action"] == SystemActionEnum.WORKER_CONNECTED.value
+  assert timeout == 5
+  assert proc.system_calls == []
+
+
+def test_announce_worker_connected_routes_crypto_leverage_init_reply():
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC"],"default_leverage":10}'
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.system_calls) == 1
+  action, data = proc.system_calls[0]
+  assert action == SystemActionEnum.CRYPTO_LEVERAGE_INIT
+  assert data["symbols"] == ["BTC"]
+  assert data["default_leverage"] == 10
+
+
+def test_announce_worker_connected_error_reply_logged_without_retry():
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    '{"action":"WORKER_CONNECTED_ERROR","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","reason":"missing settings"}'
+  ])
+  proc._announce_worker_connected()
+
+  # The broker responded (not a timeout) — a config problem on its side isn't
+  # fixed by retrying, so the handshake attempt ends here, logged for an operator.
+  assert len(proc.publisher.requests) == 1
+  assert proc.system_calls == []
+
+
+def test_announce_worker_connected_retries_with_backoff_on_timeout(monkeypatch):
+  sleeps = []
+  monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.publisher.requests) == 3
+  assert sleeps == [0, 5, 10]  # leading 0 = jitter (pinned), then backoff schedule
+
+
+def test_announce_worker_connected_retries_indefinitely_until_success(monkeypatch):
+  sleeps = []
+  monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.publisher.requests) == 5
+  # Leading 0 = jitter (pinned); backoff caps at its last configured value
+  # rather than growing unbounded.
+  assert sleeps == [0, 5, 10, 20, 20]
+
+
+def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatch):
+  monkeypatch.setattr(time, "sleep", lambda s: None)
+  levels = []
+  monkeypatch.setattr(processor_module.log, "warning", lambda *a, **k: levels.append("WARNING"))
+  monkeypatch.setattr(processor_module.log, "error", lambda *a, **k: levels.append("ERROR"))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  # First two timeouts stay WARNING; from _HANDSHAKE_ALERT_THRESHOLD (3) onward
+  # they escalate to ERROR so TelegramLogHandler forwards an operator alert.
+  assert levels == ["WARNING", "WARNING", "ERROR"]
 
 
 def test_system_not_connected_short_circuits():
