@@ -45,11 +45,12 @@ class ForexMessagePresenter(BaseMessagePresenter):
   def startup(settings_dict: dict, footer: str) -> str:
     s = settings_dict
     volume_config = (
-      f"VOLUME_DECISION_ENABLED: <b>{s.get('volume_decision_enabled', False)}</b>\n"
+      f"{ForexMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
-      f"RISK_PERCENTAGE: <b>{s.get('risk_percentage')}%</b>\n"
-      f"USE_ACCOUNT_EQUITY: <b>{s.get('use_account_equity', False)}</b>\n"
-      f"POSITION_TP1_PERCENT: <b>{s.get('position_tp1_percent', 0)}%</b>\n"
+      f"{ForexMessagePresenter._risk_percentage_line(s)}"
+      f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
+      f"{ForexMessagePresenter._tp1_percent_line(s)}"
+      f"{ForexMessagePresenter._tp1_be_line(s)}"
     )
     return _box(
       f"{CONNECTED} <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
@@ -75,18 +76,23 @@ class ForexMessagePresenter(BaseMessagePresenter):
 
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str
+    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
+    risk_info=None, settings_dict: dict | None = None,
   ) -> str:
+    volume = format_volume(result.get("volume"), auto_calculated=True)
+    qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)
     return _box(
       f"{SUCCESS} <b>Order Filled</b>\n\n"
       f"Symbol: <b>{signal.symbol}</b>\n"
       f"Strategy: <b>{signal.strategy}</b>\n"
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
-      f"Volume: <b>{format_volume(result.get('volume'), auto_calculated=True)}</b>\n"
+      f"Volume: <b>{volume}{qty_suffix}</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
       f"Source Ticket: <b>{pos_ticket}</b>\n"
       f"{ForexMessagePresenter._scale_lines(signal)}"
+      f"{ForexMessagePresenter._risk_line(risk_info)}"
+      f"{ForexMessagePresenter._override_section(settings_dict)}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

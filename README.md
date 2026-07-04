@@ -168,6 +168,58 @@ Required env when `MARKET_TYPE=CRYPTO` (Binance): `BINANCE_API_KEY`,
 `BINANCE`; `BINANCE_TESTNET` is optional. MT5 credentials are **not** required.
 See `.env.example`.
 
+### Per-symbol leverage initialisation (CRYPTO)
+
+USDⓈ-M futures leverage is **sticky on the exchange**: whatever value was set
+the last time on a symbol (manually in the UI or by a previous worker run) is
+what the next order is sized against. Without an init pass, a sub-account
+capped at 5x can silently leave a symbol at its old 20x setting (or vice
+versa), and an order can fail with `-2019 Margin is insufficient` even when
+risk-sizing math is correct.
+
+`CryptoSignalProcessor` runs `LeverageInitJob` on demand, triggered by a `SYSTEM`
+`CRYPTO_LEVERAGE_INIT` message — normally returned by the broker as the direct
+reply to this worker's `WORKER_CONNECTED` handshake (see
+[SYSTEM Subject](#-system-subject)), so the pass still effectively happens right
+after connect without the worker needing to run it itself. For each symbol in
+`CRYPTO_LEVERAGE_INIT_SYMBOLS`:
+
+1. `gateway.get_max_leverage(symbol)` (Binance: `GET /fapi/v1/leverageBracket`)
+   returns the account-side ceiling. Sub-account / VIP caps are reflected here
+   automatically — a sub-account limited to 5x returns 5; an unrestricted
+   account returns the exchange-wide max (e.g. 125 for BTCUSDT).
+2. The target is `min(exchange_max, MAX_LEVERAGE_CAP)`.
+3. `gateway.set_leverage(symbol, target)` (Binance: `POST /fapi/v1/leverage`)
+   applies it.
+
+Some account-level caps (sub-account / VIP tier) are **not** exposed by
+`leverageBracket` and surface only when `set_leverage` is POSTed, as a `-4421`
+rejection whose message names the real ceiling (e.g. *"…greater than 5x"*). The
+gateway parses that ceiling and retries once at it, so the symbol still lands on
+its true limit instead of being abandoned. If Binance ever rewords the message
+so the parser misses it, `set_leverage` retries one last time at
+`min(MIN_LEVERAGE_CAP, target)` — a known-safe floor — rather than leaving the
+symbol at its dangerous default. If the account is restricted below that floor,
+the retry also fails and the symbol is logged for manual fixing.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `CRYPTO_LEVERAGE_INIT_SYMBOLS` | empty (skip) | Comma-separated raw signal symbols to initialise (`BTCUSDT.P,ETHUSDT.P` or `BTCUSD,ETHUSD`). Resolved through the executor's symbol resolver, so the form mirrors how upstream signals address the symbol. |
+| `MAX_LEVERAGE_CAP` | `10` | Upper bound applied per symbol. A sub-account at 5x lands on 5; an unrestricted account lands on this cap. |
+| `MIN_LEVERAGE_CAP` | `5` | Last-resort floor used only when a `-4421` account cap cannot be parsed from the error message. Set to the lowest leverage your sub-accounts can take; if an account is restricted below it, the retry still fails and the symbol is left for manual fixing. |
+
+Failure modes are isolated: a failed `get_max_leverage` (network blip, symbol
+typo) skips that symbol with a warning and **never falls back to the cap**
+blindly — picking the cap for an account that is actually limited to 5x is
+the failure mode this job exists to prevent. Any uncaught crash inside the
+job is logged and swallowed so the worker keeps running; symbols are left at
+their current exchange-side leverage until the next `CRYPTO_LEVERAGE_INIT`
+trigger.
+
+The pass can be re-triggered at any time — without restarting the worker — via
+another `SYSTEM` `CRYPTO_LEVERAGE_INIT` message, which may also override the
+symbol set and cap for that one run.
+
 ---
 
 ## 🧩 FOREX Gateway Module Flow (`worker/gateways/forex/`)
@@ -272,11 +324,11 @@ worker/
 │   ├── mt5_event_job.py          # MT5EventJob — terminal-close detection (FOREX)
 │   └── notification_job.py       # NotificationJob — outbox dispatcher (Telegram retries)
 ├── schemas/             # Pydantic / dataclass data schemas
-│   ├── admin_schema.py           # AdminActionEnum + AdminSignalSchema (NATS ADMIN subject)
+│   ├── admin_schema.py           # AdminActionEnum + AdminMessageSchema + Specific action Schema (NATS ADMIN subject)
 │   ├── job_schema.py             # LogAuthorEnum (broker / terminal / exchange)
 │   ├── trade_result.py           # TradeResult value object (ok()/fail() factories)
 │   ├── metatrader_schema.py      # Back-compat re-export of TradeResult
-│   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, TRADE)
+│   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, SYSTEM, TRADE)
 │   ├── notification_schema.py    # NotificationPlatformEnum / NotificationChannelEnum / NotificationModeEnum
 │   ├── position_schema.py        # PositionStatusEnum + PositionEvent / PositionEventType
 │   └── signal_schema.py          # Signal validation schemas
@@ -312,7 +364,7 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 | Group | Action(s) | Behaviour |
 | --- | --- | --- |
 | **1 — Entry** | `LONG` / `SHORT` | Force-close any stale position for the same strategy → open a fresh market order with a hard SL set on the broker/exchange server |
-| **2 — Partial Exit** | `TP1` | Partial close using `POSITION_TP1_PERCENT` % of live volume (or signal `quantity` if disabled) → move remaining SL to breakeven (`price_open`), unless `TP1_MOVE_SL_TO_BREAKEVEN=false` (then the original entry SL is kept) |
+| **2 — Partial Exit** | `TP1` | Partial close using the resolved TP1 percent of live volume (or signal `quantity` when `VOLUME_DECISION_ENABLED=false`) → optionally move remaining SL to breakeven (`price_open`). TP1 percent and breakeven flag are resolved from the signal (`tp1_percent`, `move_sl_to_be`) or overridden by config (`USE_CUSTOM_POSITION_TP1_PERCENT` / `TP1_MOVE_SL_TO_BREAKEVEN`). |
 | **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open volume using the **actual live `position.volume`** — signal `quantity` is intentionally ignored |
 | **4 — Flat** | `FLAT` | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED` |
 
@@ -410,6 +462,77 @@ The broker/exchange is always the source of truth: live positions are closed **f
 
 ---
 
+## 🚦 SYSTEM Subject
+
+The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Inbound messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches the action to the market-specific `_handle_system_action` hook. An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless. FOREX currently handles no inbound `SYSTEM` actions besides the `WORKER_CONNECTED` reply.
+
+### WORKER_CONNECTED handshake (request/reply)
+
+Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected` sends `WORKER_CONNECTED` on `SYSTEM` as a NATS **request** (`nc.request`, not a fire-and-forget publish) so the broker always replies on a private inbox rather than staying silent. The broker's reply is one of three actions:
+
+| Reply action | Meaning | Worker behaviour |
+| --- | --- | --- |
+| `CRYPTO_LEVERAGE_INIT` | Crypto worker, config attached | Routed through the normal `_handle_system_action` hook — applies `symbols` + `default_leverage` exactly as if received on the subscription (see below); handshake complete |
+| `WORKER_CONNECTED_ACK` | Non-crypto (or no init needed) | Handshake complete, nothing further to apply |
+| `WORKER_CONNECTED_ERROR` | Broker received it but couldn't process it (missing settings, invalid leverage config, …) | Logged with `reason` for operator attention; not retried — a config problem on the broker side isn't fixed by resending the same request |
+
+If the broker doesn't reply within the request timeout (5s), the worker retries with backoff (5s → 10s → 20s, capped) **indefinitely** — the handshake is idempotent on the broker side and gates trading (crypto specifically needs `default_leverage` before it's safe to size an order), so the worker blocks here rather than falling back to running without config. A random 0–500ms jitter is added before the very first attempt only, to desynchronise a reconnect storm (every connected worker reconnects and re-announces at roughly the same instant after a NATS/broker restart). From the 3rd consecutive timeout onward, the retry log escalates from `WARNING` to `ERROR` so it's forwarded to Telegram (`TelegramLogHandler`), alerting an operator that the broker looks unreachable rather than just transiently slow.
+
+The worker still keeps its normal `SYSTEM` subscription for `CRYPTO_LEVERAGE_INIT` regardless of the reply above: an older broker that hasn't been updated yet falls back to a plain `publish` (no reply), and a pre-request-reply worker still receives `CRYPTO_LEVERAGE_INIT` the old way — so broker and worker upgrades can roll out independently, in either order.
+
+#### WORKER_CONNECTED Payload (worker → broker, request)
+
+```json
+{
+  "action": "WORKER_CONNECTED",
+  "account_id": "CRYPTO-BINANCE-7654321",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "market": "CRYPTO",
+  "gateway": "BINANCE"
+}
+```
+
+#### WORKER_CONNECTED_ERROR Payload (broker → worker, reply)
+
+```json
+{
+  "action": "WORKER_CONNECTED_ERROR",
+  "account_id": "CRYPTO-BINANCE-7654321",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "reason": "missing leverage settings for account"
+}
+```
+
+### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO)
+
+Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass — the only way it runs, since there is no longer a startup pass. Normally returned by the broker as the reply to this worker's `WORKER_CONNECTED` handshake (see above); can also be sent standalone (subscription fallback) after editing a sub-account's leverage cap or onboarding new symbols.
+
+| Field | Behaviour when present | Behaviour when omitted |
+| --- | --- | --- |
+| `symbols` | Initialise exactly this list of raw signal symbols | Falls back to `CRYPTO_LEVERAGE_INIT_SYMBOLS` |
+| `default_leverage` | Used as the cap — each symbol is set to `min(exchange_max, default_leverage)` | Falls back to `MAX_LEVERAGE_CAP` |
+
+#### CRYPTO_LEVERAGE_INIT Payload
+
+```json
+{
+  "action": "CRYPTO_LEVERAGE_INIT",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "symbols": ["BTC", "ETH"],
+  "default_leverage": 10
+}
+```
+
+`action`, `timestamp` and `account_id` are required; `symbols` and `default_leverage` are optional overrides.
+
+#### Execution flow (SYSTEM)
+
+1. Parse `SystemSchema`; drop silently on validation error.
+2. Ensure the broker/exchange connection; abort if unreachable.
+3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)`. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are unchanged; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
+
+---
+
 ## 🧠 Signal Execution — Key Design Decisions
 
 - **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation differs per gateway:
@@ -427,11 +550,11 @@ The broker/exchange is always the source of truth: live positions are closed **f
 
 - **Ticket-linked partial close (TP1):** The partial close request always carries the original `position=ticket` so MT5 correctly treats it as a partial close rather than an opposing hedge order.
 
-- **TP1 volume — percent-based or signal quantity:** When `VOLUME_DECISION_ENABLED=true`, TP1 closes `POSITION_TP1_PERCENT` % of the current live position volume instead of using `signal.quantity`. The executor's `normalize_volume()` rounds the result to the broker/exchange's quantity step and clamps it to the `[min, max]` range before sending the order.
+- **TP1 volume — percent-based or signal quantity:** When `VOLUME_DECISION_ENABLED=true`, TP1 closes a percentage of the current live position volume instead of using `signal.quantity`. The percentage is resolved in priority order: if `USE_CUSTOM_POSITION_TP1_PERCENT=true`, always use `POSITION_TP1_PERCENT` from config; otherwise use `signal.tp1_percent` if present, falling back to `POSITION_TP1_PERCENT`. The executor's `normalize_volume()` rounds the result to the broker/exchange's quantity step and clamps it to the `[min, max]` range before sending the order.
 
 - **Actual volume on full close (TP2/SL/R_SL):** The signal `quantity` is **never used** for full exit calculations. The handler reads the live `position.volume` directly from the broker/exchange to avoid dust-lot rounding errors.
 
-- **Breakeven SL after TP1 (configurable):** When `TP1_MOVE_SL_TO_BREAKEVEN=true` (default), after the partial close succeeds the executor's `update_position_sl` moves the server-side SL to `price_open` (entry price), protecting the remaining runner against connectivity loss (a `TRADE_ACTION_SLTP` on MT5, a `STOP_MARKET` on a CEX). If the breakeven SL cannot be placed, the still-open runner is immediately emergency-closed rather than left to run unprotected. When `TP1_MOVE_SL_TO_BREAKEVEN=false`, TP1 is partial-close-only: the original entry SL stays in place and keeps protecting the runner, so no breakeven move (and no emergency-close fallback) is attempted.
+- **Breakeven SL after TP1 (configurable):** After the partial close succeeds, whether to move the server-side SL to `price_open` (entry price) is resolved in priority order: `TP1_MOVE_SL_TO_BREAKEVEN` in config (if set, overrides everything) → `signal.move_sl_to_be` (per-trade flag from the broker) → `false` (default when neither is set). When the resolved value is `true`, `update_position_sl` moves the SL to `price_open`, protecting the remaining runner against connectivity loss (a `TRADE_ACTION_SLTP` on MT5, a `STOP_MARKET` on a CEX); if the breakeven SL cannot be placed, the runner is immediately emergency-closed. When `false`, TP1 is partial-close-only: the original entry SL stays in place.
 
 - **Local Execution Forensics (`worker_data.sqlite`):** To aid in immediate execution debugging and lifecycle tracking natively on the VPS, every processed signal is persisted to the local `position_logs` SQLite table. This audit trail captures the full original NATS JSON message, the target order reference (`ref_id`), the originating reference (`ref_source_id`), and all execution context mapping directly back to the Broker's state.
 
@@ -446,6 +569,8 @@ The broker/exchange is always the source of truth: live positions are closed **f
 - **Hard SL vs. NATS SL — callback gap (mitigated by MT5EventJob):** When a LONG/SHORT is opened, the SL is registered directly on the MT5 server (`request["sl"]`), so MT5 will auto-close the position even if the NATS signal pipeline is delayed. If the hard SL fires before the NATS `SL` signal arrives, `_handle_full_close` finds no open position, returns `success=False`, and no event is published. `MT5EventJob` closes this gap by detecting the disappearance independently and updating the SQLite `positions` table, which then triggers `PositionCDC` to publish the `TRADE` event to the Broker.
 
 - **Notification outbox (store-and-forward):** In-process notification calls (`ctx.notifier` and `ctx.channel_notifier`) do **not** hit the Telegram API directly — they enqueue a row in the SQLite `notifications` table via `OutboxNotifier`. A separate `NotificationJob` daemon thread drains the table every 1 s and performs the actual HTTP send, retrying failed messages with exponential backoff (`5s → 30s → 2m → 10m`) up to `max_attempts` (default `5`). This decouples signal handling from Telegram's availability/latency and prevents Telegram outages from blocking the NATS event loop. **Startup/shutdown banners** are sent **directly** via `ctx.direct_notifier` (bypassing the outbox) so the user sees them immediately — even before the DB/notification dispatcher is ready or after they are torn down.
+
+- **Error-log forwarding (opt-in):** With `TELEGRAM_ENABLED` and `TELEGRAM_LOG_ERRORS_ENABLED` set, `get_logger` attaches a shared `TelegramLogHandler` that forwards every `ERROR`-level (or above) log record to Telegram. `emit` only formats the record and pushes it onto a bounded queue; a background **thread** performs the blocking `send_message`, so logging never stalls the NATS loop and works even inside the FOREX child process (which has no event loop). The handler is process-aware — a forked child (re)starts its own worker thread — and self-limits: a filter drops records from the send path itself (no feedback loop), identical messages are deduplicated within `TELEGRAM_LOG_DEDUP_WINDOW` seconds, and the queue drops records under saturation. `TELEGRAM_LOG_BOT_TOKEN` / `TELEGRAM_LOG_CHAT_ID` route these alerts through a dedicated bot/chat (falling back to `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`).
 
 ### MT5EventJob — Terminal-Close Polling (`worker/jobs/mt5_event_job.py`)
 

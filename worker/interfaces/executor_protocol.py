@@ -12,8 +12,8 @@ an alias for backward compatibility.
 
 from typing import Any, List, Optional, Protocol
 
-from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.trade_result import TradeResult
 
 
 class TradeExecutorProtocol(Protocol):

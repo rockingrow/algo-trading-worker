@@ -14,6 +14,7 @@ SUCCESS      = _e.emojize(":check_mark_button:")               # ✅
 FAILED       = _e.emojize(":cross_mark:")                      # ❌
 SHIELD       = _e.emojize(":shield:")                          # 🛡️
 ALARM        = _e.emojize(":rotating_light:")                  # 🚨
+ERROR_ALERT  = _e.emojize(":police_car_light:")                # 🚨 (forwarded ERROR logs)
 REJECTED     = _e.emojize(":prohibited:")                      # 🚫
 SYNC         = _e.emojize(":counterclockwise_arrows_button:")  # 🔄
 ADMIN        = _e.emojize(":high_voltage:")                    # ⚡

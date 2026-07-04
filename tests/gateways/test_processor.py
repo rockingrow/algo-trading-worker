@@ -4,14 +4,18 @@ Verifies the base enforces the broker hooks (abstract methods) and that the
 shared `_process_message` algorithm runs identically regardless of market.
 """
 
+import time
 from types import SimpleNamespace
 
 import pytest
 from helpers import make_signal
 
+from worker.gateways import processor as processor_module
+from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.schemas.system_schema import SystemActionEnum
 
 
 class FakePresenter:
@@ -28,7 +32,7 @@ class FakePresenter:
     return f"force_closed:{symbol}"
 
   @staticmethod
-  def order_filled(signal, result, pos_ticket, footer):
+  def order_filled(signal, result, pos_ticket, footer, risk_info=None, settings_dict=None):
     return f"filled:{signal.action.value}:{pos_ticket}"
 
   @staticmethod
@@ -83,9 +87,17 @@ class FakeProcessor(BaseSignalProcessor):
       direct_notifier=SimpleNamespace(send_message=lambda m: None),
     )
     self.handler = SimpleNamespace(handle=lambda sig: handle_result)
+    self.settings = {}
+    self.config = ExecutionConfig(
+      volume_decision_enabled=True,
+      capital=1000.0,
+      risk_percentage=2.0,
+      use_account_equity=False,
+    )
     self._market_type = "FAKE_MKT"
     self._connected = connected
     self.admin_calls = []
+    self.system_calls = []
     self.magic_calls = []
 
   # Hooks
@@ -127,6 +139,11 @@ class FakeProcessor(BaseSignalProcessor):
   # Override the (now concrete) shared FLAT handler to assert routing only.
   def _handle_admin_message(self, raw):
     self.admin_calls.append(raw)
+
+  # Record dispatched SYSTEM actions (base parses the envelope + ensures
+  # connection, then calls this hook).
+  def _handle_system_action(self, action, data):
+    self.system_calls.append((action, data))
 
 
 # ── Abstract enforcement ──────────────────────────────────────────────────── #
@@ -239,6 +256,225 @@ def test_admin_subject_routed_to_hook():
   proc._process_message(NatsSubjectEnum.ADMIN, '{"action":"FLAT"}')
   assert proc.admin_calls == ['{"action":"FLAT"}']
   assert proc.db.logged == []  # not treated as a signal
+
+
+def test_system_subject_parsed_and_dispatched_to_action_hook():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC","ETH"],"default_leverage":10}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert len(proc.system_calls) == 1
+  action, data = proc.system_calls[0]
+  assert action == SystemActionEnum.CRYPTO_LEVERAGE_INIT
+  assert data["symbols"] == ["BTC", "ETH"]
+  assert proc.db.logged == []  # not treated as a signal
+
+
+def test_system_matching_account_id_dispatched():
+  proc = FakeProcessor({"success": True})
+  # account_id is already "<market>-<gateway>-<id>" by the time Settings hands
+  # it over (see Settings._validate_market_requirements) — processor compares as-is.
+  proc.settings = {"account_id": "FAKE_MKT-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-acct-1","symbols":["BTC"]}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert len(proc.system_calls) == 1
+
+
+def test_system_wrong_account_id_silently_skips():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-other","symbols":["BTC"]}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert proc.system_calls == []
+
+
+def test_system_malformed_json_dropped_without_dispatch():
+  proc = FakeProcessor({"success": True})
+  proc._process_message(NatsSubjectEnum.SYSTEM, "not json {{")
+  assert proc.system_calls == []
+
+
+def test_system_invalid_envelope_dropped_without_dispatch():
+  proc = FakeProcessor({"success": True})
+  # Unknown action fails SystemActionEnum validation → dropped before dispatch.
+  proc._process_message(NatsSubjectEnum.SYSTEM, '{"action":"NOPE","timestamp":"2026-06-30T00:00:00+00:00"}')
+  assert proc.system_calls == []
+
+
+def test_worker_connected_payload_includes_identity_market_and_gateway():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  import json as _json
+
+  payload = _json.loads(proc._worker_connected_payload())
+  assert payload["action"] == SystemActionEnum.WORKER_CONNECTED.value
+  assert payload["account_id"] == "FAKE_MKT-FAKE_GW-acct-1"
+  assert payload["market"] == "FAKE_MKT"  # FakeProcessor._market_type
+  assert payload["gateway"] == "FAKE_GW"
+  assert payload["timestamp"]  # auto-stamped
+
+
+def test_worker_connected_payload_none_without_account_id():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {}  # no account_id derived yet
+  assert proc._worker_connected_payload() is None
+
+
+# ── WORKER_CONNECTED handshake (request/reply) ─────────────────────────────── #
+
+
+class FakePublisher:
+  """Records each request() call; returns/raises the next queued response."""
+
+  def __init__(self, responses):
+    self.responses = list(responses)
+    self.requests = []
+
+  def request(self, subject, data, timeout=5.0):
+    self.requests.append((subject, data, timeout))
+    resp = self.responses.pop(0)
+    if isinstance(resp, Exception):
+      raise resp
+    return resp
+
+
+def _connected_proc():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  return proc
+
+
+@pytest.fixture(autouse=True)
+def _no_handshake_jitter(monkeypatch):
+  """Pin the pre-request jitter to 0 so handshake tests are deterministic and
+  don't pay a real 0-0.5s sleep."""
+  monkeypatch.setattr(processor_module.random, "uniform", lambda a, b: 0)
+
+
+def test_announce_worker_connected_ack_needs_no_dispatch():
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.publisher.requests) == 1
+  subject, payload, timeout = proc.publisher.requests[0]
+  assert subject == NatsSubjectEnum.SYSTEM
+  import json as _json
+
+  assert _json.loads(payload)["action"] == SystemActionEnum.WORKER_CONNECTED.value
+  assert timeout == 5
+  assert proc.system_calls == []
+
+
+def test_announce_worker_connected_routes_crypto_leverage_init_reply():
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC"],"default_leverage":10}'
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.system_calls) == 1
+  action, data = proc.system_calls[0]
+  assert action == SystemActionEnum.CRYPTO_LEVERAGE_INIT
+  assert data["symbols"] == ["BTC"]
+  assert data["default_leverage"] == 10
+
+
+def test_announce_worker_connected_error_reply_logged_without_retry():
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    '{"action":"WORKER_CONNECTED_ERROR","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","reason":"missing settings"}'
+  ])
+  proc._announce_worker_connected()
+
+  # The broker responded (not a timeout) — a config problem on its side isn't
+  # fixed by retrying, so the handshake attempt ends here, logged for an operator.
+  assert len(proc.publisher.requests) == 1
+  assert proc.system_calls == []
+
+
+def test_announce_worker_connected_retries_with_backoff_on_timeout(monkeypatch):
+  sleeps = []
+  monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.publisher.requests) == 3
+  assert sleeps == [0, 5, 10]  # leading 0 = jitter (pinned), then backoff schedule
+
+
+def test_announce_worker_connected_retries_indefinitely_until_success(monkeypatch):
+  sleeps = []
+  monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  assert len(proc.publisher.requests) == 5
+  # Leading 0 = jitter (pinned); backoff caps at its last configured value
+  # rather than growing unbounded.
+  assert sleeps == [0, 5, 10, 20, 20]
+
+
+def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatch):
+  monkeypatch.setattr(time, "sleep", lambda s: None)
+  levels = []
+  monkeypatch.setattr(processor_module.log, "warning", lambda *a, **k: levels.append("WARNING"))
+  monkeypatch.setattr(processor_module.log, "error", lambda *a, **k: levels.append("ERROR"))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  # First two timeouts stay WARNING; from _HANDSHAKE_ALERT_THRESHOLD (3) onward
+  # they escalate to ERROR so TelegramLogHandler forwards an operator alert.
+  assert levels == ["WARNING", "WARNING", "ERROR"]
+
+
+def test_system_not_connected_short_circuits():
+  proc = FakeProcessor({"success": True}, connected=False)
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
+  raw = (
+    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  assert proc.system_calls == []
 
 
 def test_invalid_signal_notifies_operator_and_skips_execution():

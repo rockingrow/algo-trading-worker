@@ -12,6 +12,13 @@ log = get_logger("worker.app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+  # Start the background worker that forwards ERROR logs to Telegram. Cheap and
+  # idempotent when the feature is disabled (no records ever reach the handler).
+  if settings.telegram_enabled and settings.telegram_log_errors_enabled:
+    from worker.services.notification_service import telegram_log_handler
+
+    telegram_log_handler.start()
+
   db_service = DBService()
   db_service.initialize()
   log.info("Database initialized.")
@@ -25,6 +32,11 @@ async def lifespan(app: FastAPI):
   yield
 
   await processor.shutdown()
+
+  if settings.telegram_enabled and settings.telegram_log_errors_enabled:
+    from worker.services.notification_service import telegram_log_handler
+
+    telegram_log_handler.stop()
 
 
 def create_app() -> FastAPI:

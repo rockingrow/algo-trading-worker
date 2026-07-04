@@ -131,6 +131,27 @@ class BaseExchangeGateway(ABC):
   def cancel_all_orders(self, symbol: str) -> None:
     """Cancel all open (e.g. resting stop) orders for *symbol*."""
 
+  # ── Leverage ──────────────────────────────────────────────────────────── #
+
+  def get_max_leverage(self, symbol: str) -> Optional[int]:
+    """Return the maximum leverage for *symbol*, or ``None`` if the exchange does
+    not expose a per-symbol cap. This is the symbol's market-wide ceiling;
+    account-level restrictions (sub-account / VIP tier) may not be reflected and
+    can only be discovered when :meth:`set_leverage` is rejected — implementations
+    should detect and honor that lower cap there."""
+    return None
+
+  def set_leverage(
+    self, symbol: str, leverage: int, min_leverage_cap: Optional[int] = None
+  ) -> Optional[int]:
+    """Set the working leverage for *symbol*. Returns the leverage **actually
+    applied** on success — which may be below *leverage* if an account-level cap
+    forces it lower — or ``None`` on failure. ``min_leverage_cap`` is an optional
+    last-resort floor to retry at when an account-cap rejection cannot be parsed
+    for its real ceiling; implementations that cannot detect such caps ignore it.
+    Default no-op for exchanges where leverage is not API-configurable."""
+    return None
+
   # ── Account ───────────────────────────────────────────────────────────── #
 
   @abstractmethod

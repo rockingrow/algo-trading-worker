@@ -1,5 +1,6 @@
 import asyncio
 import queue
+import threading
 from typing import Callable, Generator, Optional
 
 from worker.icons import BROKER, DISCONNECTED, RETRYING
@@ -17,6 +18,16 @@ def _subject_str(s: _Subject) -> str:
   return s if isinstance(s, str) else s.value
 
 
+def _connection_name(account_id: Optional[str]) -> Optional[str]:
+  """NATS connection name reported to the Broker server.
+
+  ``account_id`` already has the "<market_type>-<id>" form (see
+  Settings._validate_market_requirements), so the Broker can see which market
+  and account is connecting in its /connz monitoring. Returns None when no
+  account_id is configured, leaving the connection unnamed."""
+  return str(account_id) if account_id else None
+
+
 class NATSSubscriber:
   """NATS subscriber that listens on configured subjects and enqueues messages to an internal queue for synchronous consumption via listen()."""
 
@@ -26,6 +37,7 @@ class NATSSubscriber:
     subjects: list[_Subject],
     publish_subjects: list[NatsSubjectEnum] | None = None,
     token: Optional[str] = None,
+    account_id: Optional[str] = None,
     account_footer_fn: Optional[Callable[[], str]] = None,
     enqueue_fn: Optional[Callable[[str], None]] = None,
   ):
@@ -34,11 +46,16 @@ class NATSSubscriber:
     self.publish_subjects = publish_subjects or []
     self._account_footer_fn = account_footer_fn
     self._enqueue_fn = enqueue_fn
+    # Set once the NATS subscriptions are live. A WORKER_CONNECTED handshake must
+    # wait on this before publishing: NATS core does not replay, so the broker's
+    # reply would be lost if we announced before the SYSTEM subscription existed.
+    self._subscribed = threading.Event()
     self._msg_queue: queue.Queue[tuple[_Subject, str]] = queue.Queue()
     self._footer = get_footer(account_footer_fn)
     self._client = NatsClient(
       url=url,
       token=token,
+      name=_connection_name(account_id),
       error_cb=self._on_error,
       disconnected_cb=self._on_disconnect,
       reconnected_cb=self._on_reconnect,
@@ -97,6 +114,8 @@ class NATSSubscriber:
         for subject in self.subjects
       ]
       logger.info("Subscribed to NATS subjects: [%s]", ", ".join(subject_names))
+      # Subscriptions are registered on the server now — safe to announce.
+      self._subscribed.set()
 
       while not stop_event.is_set():
         await asyncio.sleep(0.5)
@@ -106,6 +125,12 @@ class NATSSubscriber:
       logger.info("NATS subscriber connection closed.")
 
     self._client.start(body, thread_name="nats-subscriber-loop")
+
+  def wait_subscribed(self, timeout: Optional[float] = None) -> bool:
+    """Block until the subscriptions are live (see ``_subscribed``). Returns True
+    if subscribed within *timeout*, False on timeout. The flag is set once and
+    never cleared, so this returns immediately after the first subscription."""
+    return self._subscribed.wait(timeout)
 
   def close(self) -> None:
     logger.info("NATS subscriber stop requested. Closing...")
@@ -141,13 +166,17 @@ class NATSPublisher:
     url: str,
     publish_subjects: list[NatsSubjectEnum],
     token: Optional[str] = None,
+    account_id: Optional[str] = None,
+    on_reconnect: Optional[Callable[[], None]] = None,
   ):
     self.url = url
     self.publish_subjects = publish_subjects
+    self._on_reconnect_callback = on_reconnect
     self._send_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
     self._client = NatsClient(
       url=url,
       token=token,
+      name=_connection_name(account_id),
       error_cb=self._on_error,
       disconnected_cb=self._on_disconnect,
       reconnected_cb=self._on_reconnect,
@@ -161,6 +190,22 @@ class NATSPublisher:
 
   async def _on_reconnect(self) -> None:
     logger.info("NATS publisher reconnected to %s", self.url)
+    # Re-announce presence so the broker re-pushes any per-worker init config
+    # (e.g. CRYPTO_LEVERAGE_INIT) after a broker/NATS restart. The handshake is
+    # now a blocking request/reply with retries (see BaseSignalProcessor.
+    # _announce_worker_connected), so it must run off this event loop's thread —
+    # calling it here directly would deadlock the loop it needs to schedule its
+    # own nc.request() onto.
+    if self._on_reconnect_callback is not None:
+      threading.Thread(
+        target=self._run_reconnect_callback, daemon=True, name="nats-reconnect-announce"
+      ).start()
+
+  def _run_reconnect_callback(self) -> None:
+    try:
+      self._on_reconnect_callback()
+    except Exception as exc:
+      logger.exception("NATS publisher on_reconnect callback failed: %s", exc)
 
   def connect(self) -> None:
     subject_names = [s.value for s in self.publish_subjects]
@@ -188,6 +233,27 @@ class NATSPublisher:
   def publish(self, subject: NatsSubjectEnum, data: str) -> None:
     """Thread-safe: enqueue a message to be published asynchronously."""
     self._send_queue.put((subject.value, data.encode()))
+
+  def request(self, subject: NatsSubjectEnum, data: str, timeout: float = 5.0) -> str:
+    """Thread-safe: synchronously publish a request and block for the broker's
+    reply, bypassing the fire-and-forget queue (a reply has nowhere to go once
+    enqueued). Schedules ``nc.request`` onto the publisher's own event loop via
+    ``run_coroutine_threadsafe`` since this is called from other threads.
+
+    Raises ``ConnectionError`` if the publisher has no live connection yet, or
+    whatever ``nats.aio.client.Client.request`` raises (notably
+    ``nats.errors.TimeoutError`` when the broker doesn't reply in time) — the
+    caller decides whether/how to retry.
+    """
+    loop = self._client._loop
+    nc = self._client.nc
+    if loop is None or nc is None:
+      raise ConnectionError("NATS publisher is not connected")
+    future = asyncio.run_coroutine_threadsafe(
+      nc.request(subject.value, data.encode(), timeout=timeout), loop
+    )
+    msg = future.result(timeout=timeout + 5)
+    return msg.data.decode()
 
   def close(self) -> None:
     logger.info("NATS publisher stop requested. Closing...")

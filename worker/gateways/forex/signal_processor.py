@@ -134,6 +134,7 @@ class ForexSignalProcessor(BaseSignalProcessor):
 
   name = "FOREX"
   presenter = ForexMessagePresenter
+  _gateway_setting_key = "forex_platform"
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
     super().__init__(ctx, settings_dict)

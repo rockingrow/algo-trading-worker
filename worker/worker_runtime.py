@@ -19,6 +19,7 @@ from typing import Callable
 
 from worker.context import WorkerContext
 from worker.logger import get_logger
+from worker.settings import settings
 
 log = get_logger("worker.runtime")
 
@@ -41,6 +42,15 @@ def run_worker(
 
   ctx = WorkerContext(settings_dict)
   ctx.start_notification_job(stop_event)
+
+  # Forward this process's ERROR logs to Telegram. A market processor may run in
+  # a child process with no event loop, so the handler drains its queue on a
+  # background thread; it is flushed in the finally block below so the crash
+  # path's log.exception is delivered before the process exits.
+  if settings.telegram_enabled and settings.telegram_log_errors_enabled:
+    from worker.services.notification_service import telegram_log_handler
+
+    telegram_log_handler.start()
 
   # Everything after the notification job is started must run through the finally
   # block so a failure during construction, connect, or job startup never leaves a
@@ -75,4 +85,8 @@ def run_worker(
           processor.send_shutdown_notification()
         except Exception:
           log.exception("[%s Process] Error sending shutdown notification.", label)
+    if settings.telegram_enabled and settings.telegram_log_errors_enabled:
+      from worker.services.notification_service import telegram_log_handler
+
+      telegram_log_handler.stop()
     log.info("[%s Process] Exiting.", label)

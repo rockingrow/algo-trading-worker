@@ -24,11 +24,16 @@ from worker.gateways.crypto.binance.user_data_stream import (
 )
 from worker.gateways.crypto.executor import CryptoExecutor
 from worker.gateways.crypto.factory import ExchangeFactory
+from worker.gateways.crypto.leverage_init_job import LeverageInitJob
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
+from worker.schemas.system_schema import (
+  SystemActionEnum,
+  SystemCryptoLeverageInitSchema,
+)
 
 log = get_logger("worker.gateways.crypto.signal_processor")
 
@@ -46,6 +51,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   name = "CRYPTO"
   presenter = CryptoMessagePresenter
+  _gateway_setting_key = "crypto_exchange"
 
   # ── Broker hooks ──────────────────────────────────────────────────────── #
 
@@ -60,6 +66,68 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   def _connect_broker(self) -> bool:
     return self.gateway.connect()
+
+  def _run_leverage_init(
+    self,
+    symbols: Optional[list[str]] = None,
+    max_leverage_cap: Optional[int] = None,
+  ) -> None:
+    """Run :class:`LeverageInitJob` once, triggered by the SYSTEM
+    ``CRYPTO_LEVERAGE_INIT`` action (see :meth:`_handle_system_action`).
+
+    ``symbols`` / ``max_leverage_cap`` default to the configured values
+    (``CRYPTO_LEVERAGE_INIT_SYMBOLS`` / ``MAX_LEVERAGE_CAP``); a SYSTEM message
+    may override either to re-initialise an ad-hoc set of symbols or cap. Failures
+    inside the job are logged per symbol and never propagate — a missed leverage
+    init is recoverable on the next re-trigger, but aborting over it would drop
+    the message.
+    """
+    # When use_custom_leverage is on, the configured MAX_LEVERAGE_CAP always
+    # wins: any per-call override (e.g. a SYSTEM message's default_leverage) is
+    # ignored so the worker forces its own cap instead of the broker/ad-hoc one.
+    if self.settings.get("use_custom_leverage", False):
+      log.info(
+        "[CRYPTO Process] use_custom_leverage on — overriding requested cap=%s with MAX_LEVERAGE_CAP=%s",
+        max_leverage_cap, self.settings.get("max_leverage_cap", 10),
+      )
+      max_leverage_cap = self.settings.get("max_leverage_cap", 10)
+    log.info(
+      "[CRYPTO Process] Running leverage init | symbols=%s cap=%s",
+      symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
+      max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
+    )
+    try:
+      LeverageInitJob(
+        gateway=self.gateway,
+        symbols=symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
+        max_leverage_cap=max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
+        resolve_symbol=self.executor.get_symbol,
+        min_leverage_cap=self.settings.get("min_leverage_cap", 5),
+      ).run()
+    except Exception:
+      log.exception(
+        "[CRYPTO Process] LeverageInitJob crashed — continuing; symbol leverages "
+        "remain at their current exchange settings."
+      )
+
+  # ── SYSTEM actions (crypto handles CRYPTO_LEVERAGE_INIT) ──────────────── #
+
+  def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
+    if action == SystemActionEnum.CRYPTO_LEVERAGE_INIT:
+      msg = SystemCryptoLeverageInitSchema(**data)
+      log.info(
+        "[CRYPTO SYSTEM] CRYPTO_LEVERAGE_INIT | symbols=%s default_leverage=%s",
+        msg.symbols, msg.default_leverage,
+      )
+      # Either field omitted → fall back to the configured default for that field
+      # (CRYPTO_LEVERAGE_INIT_SYMBOLS / MAX_LEVERAGE_CAP). default_leverage acts as
+      # the cap: each symbol is set to min(exchange_max, default_leverage).
+      self._run_leverage_init(
+        symbols=msg.symbols,
+        max_leverage_cap=msg.default_leverage,
+      )
+      return
+    super()._handle_system_action(action, data)
 
   def _disconnect_broker(self) -> None:
     self.gateway.close()

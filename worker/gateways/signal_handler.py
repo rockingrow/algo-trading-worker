@@ -18,9 +18,9 @@ from typing import Any, Callable, Dict, Optional
 from worker.gateways.market_strategy import BaseMarketStrategy
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
-from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
+from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.gateways.signal_handler")
 

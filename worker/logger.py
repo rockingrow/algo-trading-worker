@@ -68,4 +68,25 @@ def get_logger(name: str) -> logging.Logger:
     # Prevent records from bubbling up to uvicorn's root handler
     logger.propagate = False
 
+  _maybe_attach_telegram_handler(logger)
+
   return logger
+
+
+def _maybe_attach_telegram_handler(logger: logging.Logger) -> None:
+  """Attach the shared Telegram error handler when enabled in settings.
+
+  Imported lazily to avoid a circular import (``notification_service`` imports
+  this module). Skipped while ``notification_service`` is still initializing —
+  its own logger is filtered from forwarding anyway."""
+  if not (settings.telegram_enabled and settings.telegram_log_errors_enabled):
+    return
+
+  from worker.services import notification_service
+
+  handler = getattr(notification_service, "telegram_log_handler", None)
+  if handler is None:
+    return
+
+  if handler not in logger.handlers:
+    logger.addHandler(handler)

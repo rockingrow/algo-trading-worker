@@ -23,10 +23,11 @@ official SDK — see :mod:`worker.gateways.crypto.binance.user_data_stream`.
 
 from __future__ import annotations
 
+import re
 import time
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 import binance_common.utils as _bc_utils
 import requests
@@ -72,23 +73,44 @@ def _offset_timestamp() -> int:
 _bc_utils.get_timestamp = _offset_timestamp
 
 
-# ``str``-mixin Enum (not ``enum.StrEnum``, which is 3.11+) so the package keeps
-# working on the declared minimum Python 3.10. ``__str__`` returns the bare value
-# so ``str(endpoint)`` yields the path (matching StrEnum), which ``_send`` relies on.
-class _API_Endpoints(str, Enum):
-  TIME = "/fapi/v1/time"
-  BALANCE = "/fapi/v2/balance"
-  EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
-  PREMIUM_INDEX = "/fapi/v1/premiumIndex"
-  POSITION_RISK = "/fapi/v2/positionRisk"
-  ORDER = "/fapi/v1/order"
-  ALGO_ORDER = "/fapi/v1/algoOrder"
-  ALGO_OPEN_ORDERS = "/fapi/v1/algoOpenOrders"
-  ALL_OPEN_ORDERS = "/fapi/v1/allOpenOrders"
-  ACCOUNT = "/fapi/v2/account"
+class _API_Endpoints(Enum):
+  TIME             = ("GET",    "/fapi/v1/time")
+  BALANCE          = ("GET",    "/fapi/v2/balance")
+  EXCHANGE_INFO    = ("GET",    "/fapi/v1/exchangeInfo")
+  PREMIUM_INDEX    = ("GET",    "/fapi/v1/premiumIndex")
+  POSITION_RISK    = ("GET",    "/fapi/v2/positionRisk")
+  ORDER            = ("POST",   "/fapi/v1/order")
+  ALGO_ORDER       = ("POST",   "/fapi/v1/algoOrder")
+  ALGO_OPEN_ORDERS = ("DELETE", "/fapi/v1/algoOpenOrders")
+  ALL_OPEN_ORDERS  = ("DELETE", "/fapi/v1/allOpenOrders")
+  ACCOUNT          = ("GET",    "/fapi/v2/account")
+  LEVERAGE_BRACKET = ("GET",    "/fapi/v1/leverageBracket")
+  LEVERAGE         = ("POST",   "/fapi/v1/leverage")
 
-  def __str__(self) -> str:
-    return self.value
+  @property
+  def method(self) -> str:
+    return self.value[0]
+
+  @property
+  def path(self) -> str:
+    return self.value[1]
+
+
+# Binance error code for an account-level leverage cap (sub-account / VIP tier
+# restriction). This ceiling is NOT exposed by /fapi/v1/leverageBracket — it
+# surfaces only when POSTing /fapi/v1/leverage, with the real limit embedded in
+# the message ("Subaccounts are restricted from using leverage greater than 5x.").
+_LEVERAGE_CAP_CODE = -4421
+_LEVERAGE_CAP_RE = re.compile(r"greater than (\d+)\s*x", re.IGNORECASE)
+
+
+# Shape of the POST /fapi/v1/leverage response. ``total=False`` because the
+# worker only relies on ``leverage`` (the value the exchange actually applied,
+# which may be clamped below the request) and tolerates the rest being absent.
+class LeverageResponse(TypedDict, total=False):
+  symbol: str
+  leverage: int
+  maxNotionalValue: str
 
 
 # Binance order side mapping for one-way mode.
@@ -130,8 +152,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def _send(
     self,
-    method: str,
-    path: str,
+    endpoint: _API_Endpoints,
     payload: Optional[dict] = None,
     *,
     signed: bool = False,
@@ -153,8 +174,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       return send_request(
         self._session,
         self._config,
-        method=method,
-        path=str(path),
+        method=endpoint.method,
+        path=endpoint.path,
         payload=params,
         is_signed=signed,
         response_model=None,
@@ -166,7 +187,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       if signed and getattr(exc, "status_code", None) == -1021:
         logger.warning(
           "[Binance] -1021 timestamp rejection on %s; re-syncing clock and retrying once.",
-          path,
+          endpoint.path,
         )
         self._sync_time()
         return _call()
@@ -177,7 +198,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
   def connect(self) -> bool:
     try:
       self._sync_time()
-      self._send("GET", _API_Endpoints.BALANCE, signed=True)
+      self._send(_API_Endpoints.BALANCE, signed=True)
       logger.info("[Binance] Connected (testnet=%s).", self._testnet)
       return True
     except Exception as exc:
@@ -197,7 +218,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     global _TIME_OFFSET_MS
     try:
       t0 = time.time() * 1000
-      data = self._send("GET", _API_Endpoints.TIME)
+      data = self._send(_API_Endpoints.TIME)
       t1 = time.time() * 1000
       server_time = int(data["serverTime"])
       _TIME_OFFSET_MS = int(server_time - (t0 + t1) / 2)
@@ -230,7 +251,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     """
     out: Dict[str, SymbolFilter] = {}
     try:
-      data = self._send("GET", _API_Endpoints.EXCHANGE_INFO)
+      data = self._send(_API_Endpoints.EXCHANGE_INFO)
       for s in data.get("symbols", []):
         filters = {f["filterType"]: f for f in s.get("filters", [])}
         lot = filters.get("LOT_SIZE", {})
@@ -247,7 +268,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     return out
 
   def get_mark_price(self, symbol: str) -> float:
-    data = self._send("GET", _API_Endpoints.PREMIUM_INDEX, {"symbol": symbol})
+    data = self._send(_API_Endpoints.PREMIUM_INDEX, {"symbol": symbol})
     return float(data["markPrice"])
 
   def _round_to_tick(self, symbol: str, price: float) -> float:
@@ -270,7 +291,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
 
   def get_positions(self, symbol: Optional[str] = None) -> List[ExchangePosition]:
     payload = {"symbol": symbol} if symbol else None
-    rows = self._send("GET", _API_Endpoints.POSITION_RISK, payload, signed=True)
+    rows = self._send(_API_Endpoints.POSITION_RISK, payload, signed=True)
     positions: List[ExchangePosition] = []
     for row in rows or []:
       amt = float(row.get("positionAmt", 0) or 0)
@@ -322,7 +343,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     if client_order_id:
       payload["new_client_order_id"] = client_order_id
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ORDER, payload, signed=True))
+      return self._order_result(self._send(_API_Endpoints.ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] place_market_order failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -349,7 +370,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "close_position": "true",
     }
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ALGO_ORDER, payload, signed=True))
+      return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -374,7 +395,7 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "close_position": "true",
     }
     try:
-      return self._order_result(self._send("POST", _API_Endpoints.ALGO_ORDER, payload, signed=True))
+      return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
       logger.exception("[Binance] set_take_profit failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -385,19 +406,152 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     # conditionals placed via /fapi/v1/algoOrder. Both must be cancelled so an old
     # SL algo doesn't survive into the next stop-placement (double-stop scenario).
     try:
-      self._send("DELETE", _API_Endpoints.ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
+      self._send(_API_Endpoints.ALL_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_all_orders(%s) failed: %s", symbol, exc)
     try:
-      self._send("DELETE", _API_Endpoints.ALGO_OPEN_ORDERS, {"symbol": symbol}, signed=True)
+      self._send(_API_Endpoints.ALGO_OPEN_ORDERS, {"symbol": symbol}, signed=True)
     except Exception as exc:
       logger.warning("[Binance] cancel_algo_orders(%s) failed: %s", symbol, exc)
+
+  # ── Leverage ──────────────────────────────────────────────────────────── #
+
+  def get_max_leverage(self, symbol: str) -> Optional[int]:
+    """Max leverage Binance allows for *symbol* on this account.
+
+    ``/fapi/v1/leverageBracket`` returns notional brackets in ascending order;
+    the first bracket (lowest notional) carries the highest ``initialLeverage``,
+    which is the symbol's *market-wide* ceiling. NOTE: account-level caps
+    (sub-account / VIP-tier restrictions) are **not** reflected here — a
+    sub-account limited to 5x still returns the market ceiling (e.g. 125). That
+    cap surfaces only when setting leverage (-4421), where :meth:`set_leverage`
+    detects and honors it. Returns ``None`` on error so the caller can skip
+    rather than mis-size.
+    """
+    try:
+      data = self._send(_API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True)
+    except Exception as exc:
+      logger.warning("[Binance] leverageBracket(%s) failed: %s", symbol, exc)
+      return None
+    # Response shape: list of {symbol, brackets:[...]} (one entry per symbol).
+    # Older API versions returned a single dict directly — handle both.
+    entry = data[0] if isinstance(data, list) and data else data
+    brackets = (entry or {}).get("brackets") or []
+    if not brackets:
+      return None
+    try:
+      return int(brackets[0].get("initialLeverage"))
+    except (TypeError, ValueError):
+      return None
+
+  def set_leverage(
+    self, symbol: str, leverage: int, min_leverage_cap: Optional[int] = None
+  ) -> Optional[int]:
+    """Set per-symbol working leverage.
+
+    Returns the leverage **actually applied** on success — which may be below
+    the requested value when an account-level cap forces it lower — or ``None``
+    on failure. Account caps (sub-account / VIP-tier) are not visible in
+    :meth:`get_max_leverage`; they only appear here as a -4421 rejection that
+    names the real ceiling, so we parse that ceiling and retry once at it rather
+    than leaving the symbol on its stale exchange setting.
+
+    ``min_leverage_cap`` is a *last-resort* floor for the case where the -4421
+    message can no longer be parsed (e.g. Binance reworded it and the regex no
+    longer matches): rather than give up and leave the symbol at its dangerous
+    default, retry once at ``min(min_leverage_cap, leverage)``. It only fires on
+    a genuine -4421 that we could not parse — a known-safe value the operator
+    asserts no sub-account is restricted below. If the account is in fact capped
+    lower, this retry also fails and the symbol is left untouched (logged loudly
+    for manual fix).
+    """
+    leverage = int(leverage)
+    try:
+      data = self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": leverage}, signed=True)
+      # Return what the exchange actually applied (response carries the live
+      # `leverage`), not the requested value — covers the case where Binance
+      # silently clamps to a lower account cap instead of rejecting.
+      return self._applied_leverage(data, leverage)
+    except Exception as exc:
+      cap = self._leverage_cap_from_error(exc, upper_bound=leverage)
+      if cap is None and min_leverage_cap and self._is_leverage_cap_error(exc):
+        # -4421 confirmed but the real ceiling could not be parsed — fall back
+        # to the operator-asserted floor instead of abandoning the symbol.
+        cap = min(int(min_leverage_cap), leverage)
+        logger.warning(
+          "[Binance] set_leverage(%s=%s) hit -4421 but cap was unparseable; "
+          "falling back to known floor %sx.", symbol, leverage, cap,
+        )
+      if cap is not None and cap < leverage:
+        logger.warning(
+          "[Binance] set_leverage(%s=%s) rejected by account cap (-4421); "
+          "retrying at %sx.", symbol, leverage, cap,
+        )
+        try:
+          data = self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": cap}, signed=True)
+          return self._applied_leverage(data, cap)
+        except Exception as exc2:
+          logger.warning(
+            "[Binance] set_leverage(%s=%s) retry failed: %s", symbol, cap, exc2
+          )
+          return None
+      logger.warning(
+        "[Binance] set_leverage(%s=%s) failed: %s", symbol, leverage, exc
+      )
+      return None
+
+  @staticmethod
+  def _applied_leverage(data: Optional[LeverageResponse], requested: int) -> int:
+    """Leverage the exchange reports as applied (POST /fapi/v1/leverage echoes the
+    live ``leverage``), falling back to *requested* if the field is absent/unparseable."""
+    try:
+      return int((data or {}).get("leverage"))
+    except (TypeError, ValueError, AttributeError):
+      return requested
+
+  @staticmethod
+  def _is_leverage_cap_error(exc: Exception) -> bool:
+    """True if *exc* is Binance's -4421 account-leverage-cap rejection."""
+    return getattr(exc, "status_code", None) == _LEVERAGE_CAP_CODE
+
+  @classmethod
+  def _leverage_cap_from_error(cls, exc: Exception, upper_bound: Optional[int] = None) -> Optional[int]:
+    """Pull the account leverage ceiling out of a -4421 error, else ``None``.
+
+    ``upper_bound`` (the leverage we requested, already ``min(exchange_max,
+    MAX_LEVERAGE_CAP)``) clamps the parsed value: a -4421 cap is by definition a
+    *restriction*, so anything at or above what we asked for is a parse anomaly,
+    not a real ceiling, and is discarded.
+    """
+    if not cls._is_leverage_cap_error(exc):
+      return None
+    msg = getattr(exc, "error_message", None) or str(exc)
+    match = _LEVERAGE_CAP_RE.search(msg)
+    if not match:
+      # The code says "account leverage cap" but the message no longer matches
+      # our pattern — most likely Binance reworded it. Surface it so the regex
+      # can be updated instead of silently losing the retry path.
+      logger.warning(
+        "[Binance] -4421 leverage cap but message did not match parser; "
+        "skipping cap-retry. message=%r", msg,
+      )
+      return None
+    cap = int(match.group(1))
+    if cap <= 0:
+      return None
+    if upper_bound is not None and cap >= upper_bound:
+      logger.warning(
+        "[Binance] -4421 parsed cap %sx >= requested %sx — treating as parse "
+        "anomaly and ignoring. message=%r", cap, upper_bound, msg,
+      )
+      return None
+    return cap
 
   # ── Account ───────────────────────────────────────────────────────────── #
 
   def get_account(self) -> Optional[Dict[str, Any]]:
     try:
-      data = self._send("GET", _API_Endpoints.ACCOUNT, signed=True)
+      data = self._send(_API_Endpoints.ACCOUNT, signed=True)
       return {
         "balance": float(data.get("totalWalletBalance", 0) or 0),
         "equity": float(data.get("totalMarginBalance", 0) or 0),

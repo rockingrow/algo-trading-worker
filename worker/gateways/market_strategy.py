@@ -28,8 +28,8 @@ from typing import Any, List, Optional
 from worker.gateways.config import ExecutionConfig
 from worker.interfaces.executor_protocol import TradeExecutorProtocol
 from worker.logger import get_logger
-from worker.schemas.metatrader_schema import TradeResult
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.trade_result import TradeResult
 from worker.settings import MarketTypeEnum
 
 logger = get_logger("worker.gateways.market_strategy")
@@ -123,16 +123,59 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 
   # ── TP1 ──────────────────────────────────────────────────────────────── #
 
-  def handle_tp1(self, signal: SignalSchema) -> TradeResult:
-    """
-    Partial close at TP1, then (optionally) move SL to entry (breakeven).
+  def _resolve_tp1_params(self, signal: SignalSchema) -> tuple[float, bool]:
+    """Return (tp1_percent, move_sl_to_be).
 
-    Steps delegated to executor:
-      1. Derive close volume (% of position or signal quantity).
-      2. partial_close_position
-      3. update_position_sl to breakeven (pos.price_open) — only when
-         ``config.tp1_move_sl_to_breakeven`` is True. When False, the original
-         entry SL is left untouched and keeps protecting the runner.
+    tp1_percent resolution:
+      use_custom=True  → always use config.position_tp1_percent
+      use_custom=False → signal.tp1_percent if present, else config.position_tp1_percent
+    move_sl_to_be: config if set, else signal if set, else False.
+    """
+    if self._config.use_custom_position_tp1_percent or signal.tp1_percent is None:
+      tp1_percent = self._config.position_tp1_percent
+    else:
+      tp1_percent = signal.tp1_percent
+    move_sl_to_be = (
+      self._config.tp1_move_sl_to_breakeven
+      if self._config.tp1_move_sl_to_breakeven is not None
+      else signal.move_sl_to_be if signal.move_sl_to_be is not None
+      else False
+    )
+    return tp1_percent, move_sl_to_be
+
+  def _resolve_tp1_volume(self, signal: SignalSchema, pos, tp1_percent: float) -> TradeResult | float:
+    """Derive close volume; returns TradeResult.fail on error, float on success."""
+    symbol = signal.symbol
+    if self._config.volume_decision_enabled:
+      if tp1_percent is None:
+        # Neither config.position_tp1_percent nor signal.tp1_percent supplied a
+        # percentage, so there is nothing to size the partial close from. Fail
+        # cleanly instead of crashing on ``None / 100``.
+        return TradeResult.fail(
+          "No TP1 percent available — set POSITION_TP1_PERCENT or include "
+          "tp1_percent in the signal."
+        )
+      calculated = pos.volume * (tp1_percent / 100)
+      close_volume = self._executor.normalize_volume(symbol, calculated)
+      logger.info(
+        "[handle_tp1] VOLUME_DECISION mode | position_volume=%s tp1_percent=%s%% "
+        "calculated=%s → close_volume=%s",
+        pos.volume, tp1_percent, calculated, close_volume,
+      )
+      return close_volume
+    if signal.quantity is None:
+      return TradeResult.fail("Missing quantity in TP1 signal")
+    close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
+    logger.info(
+      "[handle_tp1] Payload quantity mode | qty=%s → close_volume=%s",
+      signal.quantity, close_volume,
+    )
+    return close_volume
+
+  def handle_tp1(self, signal: SignalSchema) -> TradeResult:
+    """Partial close at TP1, then optionally move SL to entry (breakeven).
+
+    See _resolve_tp1_params for tp1_percent/move_sl_to_be resolution rules.
     """
     symbol = signal.symbol
     positions = self._executor.get_open_positions(symbol, strategy=signal.strategy)
@@ -141,22 +184,15 @@ class ExecutorBackedMarket(BaseMarketStrategy):
       return TradeResult.fail("No open position — likely SL already triggered.")
 
     pos = positions[0]
+    tp1_percent, move_sl_to_be = self._resolve_tp1_params(signal)
 
-    if self._config.volume_decision_enabled:
-      calculated_volume = pos.volume * (self._config.position_tp1_percent / 100)
-      close_volume = self._executor.normalize_volume(symbol, calculated_volume)
-      logger.info(
-        f"[handle_tp1] VOLUME_DECISION mode | "
-        f"position_volume={pos.volume} position_tp1_percent={self._config.position_tp1_percent}% "
-        f"calculated={calculated_volume} → close_volume={close_volume}"
-      )
-    else:
-      if signal.quantity is None:
-        return TradeResult.fail("Missing quantity in TP1 signal")
-      close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
-      logger.info(
-        f"[handle_tp1] Payload quantity mode | qty={signal.quantity} → close_volume={close_volume}"
-      )
+    volume_result = self._resolve_tp1_volume(signal, pos, tp1_percent)
+    if isinstance(volume_result, TradeResult):
+      # _resolve_tp1_volume returns a TradeResult (a dataclass, *not* a dict) on
+      # failure. ``isinstance(..., dict)`` would never match it, silently passing
+      # the failure object through as the close volume.
+      return volume_result
+    close_volume: float = volume_result
 
     close_result = self._executor.partial_close_position(
       symbol=symbol,
@@ -168,7 +204,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     if not close_result.get("success"):
       return close_result
 
-    if not self._config.tp1_move_sl_to_breakeven:
+    if not move_sl_to_be:
       # TP1 is partial-close-only: the original entry SL stays in place and keeps
       # protecting the runner, so there is no breakeven move to attempt.
       logger.info(

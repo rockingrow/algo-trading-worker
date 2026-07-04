@@ -23,6 +23,7 @@ safe to import on any market's path.
 from __future__ import annotations
 
 import json
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
@@ -35,11 +36,21 @@ from worker.gateways.market_strategy import MarketStrategyFactory
 from worker.gateways.signal_handler import SignalHandler
 from worker.interfaces.trade_presenter_protocol import TradePresenterProtocol
 from worker.logger import get_logger
-from worker.schemas.admin_schema import AdminActionEnum, AdminSignalSchema
+from worker.schemas.admin_schema import (
+  AdminActionEnum,
+  AdminFlatSchema,
+  AdminMessageSchema,
+)
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.system_schema import (
+  SystemActionEnum,
+  SystemSchema,
+  SystemWorkerConnectedErrorSchema,
+  SystemWorkerConnectedSchema,
+)
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
 
@@ -50,6 +61,23 @@ log = get_logger("worker.gateways.processor")
 # adds avoidable latency/rate-limit pressure, and a few-seconds-stale balance in a
 # notification is harmless.
 _FOOTER_TTL = 30  # seconds
+
+# How long to wait for the broker's WORKER_CONNECTED reply before retrying.
+_HANDSHAKE_TIMEOUT = 5  # seconds
+# Backoff between handshake retries (index by attempt, capped at the last value).
+# The handshake is idempotent on the broker side and gates trading (crypto needs
+# default_leverage before it's safe to trade), so it retries until it succeeds
+# rather than falling back to running without config.
+_HANDSHAKE_BACKOFF = (5, 10, 20)  # seconds
+# Random delay added before the very first request only, to desynchronise a
+# reconnect storm: a NATS/broker restart makes every connected worker reconnect
+# and re-announce at roughly the same instant, so without jitter the broker
+# receives N simultaneous WORKER_CONNECTED requests.
+_HANDSHAKE_JITTER_MAX = 0.5  # seconds
+# Consecutive timeouts after which a retry is escalated from WARNING to ERROR
+# (forwarded to Telegram via TelegramLogHandler) so an operator is alerted that
+# the broker looks unreachable rather than just transiently slow.
+_HANDSHAKE_ALERT_THRESHOLD = 3
 
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
@@ -126,8 +154,9 @@ class BaseSignalProcessor(ABC):
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
       subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
-      publish_subjects=[NatsSubjectEnum.TRADE],
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM], # purpose just only show on Notification
       token=nats_token,
+      account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
       enqueue_fn=self.ctx.nats_enqueue,
     )
@@ -135,12 +164,20 @@ class BaseSignalProcessor(ABC):
 
     self.publisher = NATSPublisher(
       url=self.settings["nats_url"],
-      publish_subjects=[NatsSubjectEnum.TRADE],
+      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM],
       token=nats_token,
+      account_id=self.settings.get("account_id"),
+      # Re-announce on every reconnect so the broker re-pushes init config.
+      on_reconnect=self._announce_worker_connected,
     )
     self.publisher.connect()
 
     self._footer = self._account_footer()
+
+    # Handshake: tell the broker this worker is online so it can push any
+    # per-worker init (e.g. CRYPTO_LEVERAGE_INIT). The broker decides from
+    # market/gateway whether anything applies — every market announces.
+    self._announce_worker_connected()
     return True
 
   def shutdown(self) -> None:
@@ -189,6 +226,10 @@ class BaseSignalProcessor(ABC):
   def _process_message(self, subject, raw) -> None:
     if subject == NatsSubjectEnum.ADMIN:
       self._handle_admin_message(raw)
+      return
+
+    if subject == NatsSubjectEnum.SYSTEM:
+      self._handle_system_message(raw)
       return
 
     try:
@@ -269,8 +310,10 @@ class BaseSignalProcessor(ABC):
         # of reporting a normal fill.
         msg = self.presenter.position_unprotected_closed(signal, result, footer)
       else:
+        risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
-          signal, result, result.get("source_ticket") or result.get("ticket"), footer
+          signal, result, result.get("source_ticket") or result.get("ticket"), footer,
+          risk_info=risk_info, settings_dict=self.settings,
         )
     else:
       msg = self.presenter.order_failed(signal, result, footer)
@@ -337,28 +380,30 @@ class BaseSignalProcessor(ABC):
     still live), so the DB never claims a position is flat while it is not.
     """
     try:
-      admin = AdminSignalSchema(**json.loads(raw))
+      data = json.loads(raw)
+      admin = AdminMessageSchema(**data)
     except (json.JSONDecodeError, ValidationError) as err:
       log.error("[ADMIN] Parse error: %s", err)
-      return
-
-    if admin.action != AdminActionEnum.FLAT:
-      log.warning("[ADMIN] Unknown action: %s", admin.action)
-      return
-
-    if admin.account_id and admin.account_id != self._account_id:
-      log.info(
-        "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
-        admin.account_id, self._account_id,
-      )
       return
 
     if not self._ensure_connected():
       return
 
-    # Close live broker positions first (source of truth), then reconcile the DB.
-    closed, attempted = self._close_live_positions_for_flat(admin)
-    self._reconcile_flat_db(admin, closed, attempted, raw)
+    if admin.action == AdminActionEnum.FLAT:
+      admin_flat_schema = AdminFlatSchema(**data)
+      if admin_flat_schema.account_id and admin_flat_schema.account_id != self._account_id:
+        log.info(
+          "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
+          admin_flat_schema.account_id, self._account_id,
+        )
+        return
+      # Close live broker positions first (source of truth), then reconcile the DB.
+      closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
+      self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+      return
+
+    log.warning("[ADMIN] Unknown action: %s", admin.action)
+    return
 
   def _close_live_positions_for_flat(self, admin) -> tuple[Dict[Any, dict], set]:
     """Close every live broker position matching the FLAT filter.
@@ -446,11 +491,189 @@ class BaseSignalProcessor(ABC):
           db_pos.get("symbol"), self.name,
         )
 
+  # ── Shared SYSTEM handling ────────────────────────────────────────────── #
+
+  def _handle_system_message(self, raw: str) -> None:
+    """Handle a NATS ``SYSTEM`` message: parse the envelope, then dispatch the
+    action to the market-specific :meth:`_handle_system_action` hook.
+
+    SYSTEM messages drive operational/maintenance actions (e.g. re-initialising
+    per-symbol leverage on a crypto exchange) that are not trade signals. The
+    base only validates the common envelope (action + timestamp + account_id); each market
+    decides which actions it understands — an unknown action is logged and
+    ignored rather than raising, so a SYSTEM action meant for another market type
+    is harmless here.
+    """
+    try:
+      data = json.loads(raw)
+      system = SystemSchema(**data)
+    except (json.JSONDecodeError, ValidationError) as err:
+      log.error("[SYSTEM] Parse error: %s", err)
+      return
+
+    log.info(
+      "[%s SYSTEM] Received action=%s account_id=%s",
+      self.name, getattr(system.action, "value", system.action), system.account_id,
+    )
+
+    if not self._ensure_connected():
+      return
+
+    # Route by worker identity: every SYSTEM message carries a required
+    # account_id (NATS-name format "<market>-<gateway>-<account_id>") and is
+    # executed only by the matching worker. A blank value would match nobody.
+    if system.account_id and system.account_id != self._system_account_id:
+      log.info(
+        "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
+        self.name, getattr(system.action, "value", system.action),
+        system.account_id, self._system_account_id,
+      )
+      return
+
+    self._handle_system_action(system.action, data)
+
+  @property
+  def _system_account_id(self) -> Optional[str]:
+    """This worker's identity for SYSTEM routing, in NATS-name format
+    ``<market>-<gateway>-<account_id>`` (matches the NATS connection name; see
+    Settings._validate_market_requirements)."""
+    return self.settings.get("account_id") or None
+
+  # Settings key holding this market's gateway enum (exchange / platform).
+  # Concrete processors set it so the WORKER_CONNECTED handshake can report the
+  # gateway name without the base knowing the per-market field.
+  _gateway_setting_key: str = ""
+
+  @property
+  def _gateway_value(self) -> str:
+    """Gateway name for this worker (e.g. ``BINANCE``, ``MT5``), read from the
+    market-specific setting named by ``_gateway_setting_key``."""
+    g = self.settings.get(self._gateway_setting_key)
+    return getattr(g, "value", None) or str(g or "")
+
+  def _worker_connected_payload(self) -> Optional[str]:
+    """Build the WORKER_CONNECTED handshake JSON, or None if this worker has no
+    identity yet (no account_id → nothing for the broker to target)."""
+    account_id = self._system_account_id
+    if not account_id:
+      return None
+    return SystemWorkerConnectedSchema(
+      account_id=account_id,
+      market=self._market_type,
+      gateway=self._gateway_value,
+    ).model_dump_json()
+
+  def _announce_worker_connected(self) -> None:
+    """Request/reply a SYSTEM ``WORKER_CONNECTED`` so the broker can push any
+    initial config targeted at this worker. Waits for the SYSTEM subscription to
+    be live first — NATS core does not replay, so a reply arriving before we are
+    subscribed would be lost.
+
+    The broker always replies now (``CRYPTO_LEVERAGE_INIT`` /
+    ``WORKER_CONNECTED_ACK`` / ``WORKER_CONNECTED_ERROR``), so a timeout means the
+    broker genuinely didn't get it. The handshake is idempotent and mandatory
+    before trading (crypto needs ``default_leverage``), so this blocks and
+    retries with backoff until it succeeds rather than giving up.
+    """
+    payload = self._worker_connected_payload()
+    if payload is None:
+      log.warning(
+        "[%s Process] No account_id — skipping WORKER_CONNECTED handshake.", self.name
+      )
+      return
+    if self.publisher is None:
+      return
+    if self.subscriber is not None and not self.subscriber.wait_subscribed(timeout=10):
+      log.warning(
+        "[%s Process] SYSTEM subscription not confirmed within timeout — "
+        "announcing WORKER_CONNECTED anyway (reply may be missed).", self.name
+      )
+
+    # Desynchronise a reconnect storm (see _HANDSHAKE_JITTER_MAX) before the
+    # very first attempt only — retries are already spaced out by the backoff.
+    time.sleep(random.uniform(0, _HANDSHAKE_JITTER_MAX))
+
+    attempt = 0
+    while True:
+      try:
+        raw_response = self.publisher.request(
+          NatsSubjectEnum.SYSTEM, payload, timeout=_HANDSHAKE_TIMEOUT
+        )
+      except Exception as exc:
+        delay = _HANDSHAKE_BACKOFF[min(attempt, len(_HANDSHAKE_BACKOFF) - 1)]
+        attempt += 1
+        log_fn = log.error if attempt >= _HANDSHAKE_ALERT_THRESHOLD else log.warning
+        log_fn(
+          "[%s Process] WORKER_CONNECTED handshake failed (%s) — attempt %d, retrying in %ds.",
+          self.name, exc, attempt, delay,
+        )
+        time.sleep(delay)
+        continue
+
+      log.info(
+        "[%s Process] Announced WORKER_CONNECTED account_id=%s",
+        self.name, self._system_account_id,
+      )
+      self._handle_worker_connected_response(raw_response)
+      return
+
+  def _handle_worker_connected_response(self, raw: str) -> None:
+    """Dispatch the broker's reply to WORKER_CONNECTED. ``CRYPTO_LEVERAGE_INIT``
+    is routed through the normal :meth:`_handle_system_action` hook (identical to
+    receiving it via the SYSTEM subscription); ``WORKER_CONNECTED_ACK`` needs no
+    further action; ``WORKER_CONNECTED_ERROR`` is logged for operator attention —
+    it signals a broker-side config problem (e.g. missing settings), which a
+    retry cannot fix."""
+    try:
+      data = json.loads(raw)
+      action = SystemActionEnum(data.get("action"))
+    except (json.JSONDecodeError, ValueError) as err:
+      log.error("[%s Process] WORKER_CONNECTED reply parse error: %s", self.name, err)
+      return
+
+    if action == SystemActionEnum.WORKER_CONNECTED_ERROR:
+      error = SystemWorkerConnectedErrorSchema(**data)
+      log.error(
+        "[%s Process] WORKER_CONNECTED_ERROR: %s", self.name, error.reason or "(no reason given)"
+      )
+      return
+
+    if action == SystemActionEnum.WORKER_CONNECTED_ACK:
+      log.info("[%s Process] WORKER_CONNECTED_ACK — handshake complete, no init config needed.", self.name)
+      return
+
+    self._handle_system_action(action, data)
+
+  def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
+    """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
+
+    Markets override this to handle the actions they support; the base ignores
+    every action so a market without SYSTEM actions (e.g. FOREX) needs no code.
+    """
+    log.info(
+      "[%s SYSTEM] No handler for action=%s — ignoring.",
+      self.name, getattr(action, "value", action),
+    )
+
   # ── Helpers ───────────────────────────────────────────────────────────── #
 
   @staticmethod
   def _market_type_value(mt) -> str:
     return mt.value if isinstance(mt, MarketTypeEnum) else str(mt or "")
+
+  def _resolve_risk_info(self, signal: SignalSchema):
+    """Return ``(risk_percent, is_custom)`` for entry signals when VDE is on, else None.
+
+    ``is_custom`` is True when USE_CUSTOM_RISK_PERCENTAGE overrides the signal's
+    own risk_percent (so the gear icon is shown in notifications).
+    """
+    if signal.action.value not in ("LONG", "SHORT") or not self.config.volume_decision_enabled:
+      return None
+    if self.config.use_custom_risk_percentage:
+      return (self.config.risk_percentage, True)
+    use_signal_risk = signal.risk_percent is not None and signal.risk_percent > 0
+    risk = signal.risk_percent if use_signal_risk else self.config.risk_percentage
+    return (risk, False)
 
   def _current_footer(self) -> str:
     """Account footer for notifications, cached for ``_FOOTER_TTL`` seconds so a

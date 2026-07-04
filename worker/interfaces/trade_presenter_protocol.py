@@ -27,7 +27,8 @@ class TradePresenterProtocol(Protocol):
   def force_closed(symbol: str, strategy: str, fc: dict, footer: str) -> str: ...
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str
+    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
+    risk_info=None, settings_dict: dict | None = None,
   ) -> str: ...
   @staticmethod
   def order_failed(signal: SignalSchema, result: dict, footer: str) -> str: ...
