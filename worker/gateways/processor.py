@@ -23,6 +23,7 @@ safe to import on any market's path.
 from __future__ import annotations
 
 import json
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
@@ -68,6 +69,15 @@ _HANDSHAKE_TIMEOUT = 5  # seconds
 # default_leverage before it's safe to trade), so it retries until it succeeds
 # rather than falling back to running without config.
 _HANDSHAKE_BACKOFF = (5, 10, 20)  # seconds
+# Random delay added before the very first request only, to desynchronise a
+# reconnect storm: a NATS/broker restart makes every connected worker reconnect
+# and re-announce at roughly the same instant, so without jitter the broker
+# receives N simultaneous WORKER_CONNECTED requests.
+_HANDSHAKE_JITTER_MAX = 0.5  # seconds
+# Consecutive timeouts after which a retry is escalated from WARNING to ERROR
+# (forwarded to Telegram via TelegramLogHandler) so an operator is alerted that
+# the broker looks unreachable rather than just transiently slow.
+_HANDSHAKE_ALERT_THRESHOLD = 3
 
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
@@ -579,6 +589,10 @@ class BaseSignalProcessor(ABC):
         "announcing WORKER_CONNECTED anyway (reply may be missed).", self.name
       )
 
+    # Desynchronise a reconnect storm (see _HANDSHAKE_JITTER_MAX) before the
+    # very first attempt only — retries are already spaced out by the backoff.
+    time.sleep(random.uniform(0, _HANDSHAKE_JITTER_MAX))
+
     attempt = 0
     while True:
       try:
@@ -587,11 +601,12 @@ class BaseSignalProcessor(ABC):
         )
       except Exception as exc:
         delay = _HANDSHAKE_BACKOFF[min(attempt, len(_HANDSHAKE_BACKOFF) - 1)]
-        log.warning(
-          "[%s Process] WORKER_CONNECTED handshake failed (%s) — retrying in %ds.",
-          self.name, exc, delay,
-        )
         attempt += 1
+        log_fn = log.error if attempt >= _HANDSHAKE_ALERT_THRESHOLD else log.warning
+        log_fn(
+          "[%s Process] WORKER_CONNECTED handshake failed (%s) — attempt %d, retrying in %ds.",
+          self.name, exc, attempt, delay,
+        )
         time.sleep(delay)
         continue
 

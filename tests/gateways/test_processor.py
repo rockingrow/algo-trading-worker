@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from helpers import make_signal
 
+from worker.gateways import processor as processor_module
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -355,6 +356,13 @@ def _connected_proc():
   return proc
 
 
+@pytest.fixture(autouse=True)
+def _no_handshake_jitter(monkeypatch):
+  """Pin the pre-request jitter to 0 so handshake tests are deterministic and
+  don't pay a real 0-0.5s sleep."""
+  monkeypatch.setattr(processor_module.random, "uniform", lambda a, b: 0)
+
+
 def test_announce_worker_connected_ack_needs_no_dispatch():
   proc = _connected_proc()
   proc.publisher = FakePublisher([
@@ -415,7 +423,7 @@ def test_announce_worker_connected_retries_with_backoff_on_timeout(monkeypatch):
   proc._announce_worker_connected()
 
   assert len(proc.publisher.requests) == 3
-  assert sleeps == [5, 10]  # backoff schedule, not yet capped
+  assert sleeps == [0, 5, 10]  # leading 0 = jitter (pinned), then backoff schedule
 
 
 def test_announce_worker_connected_retries_indefinitely_until_success(monkeypatch):
@@ -433,8 +441,29 @@ def test_announce_worker_connected_retries_indefinitely_until_success(monkeypatc
   proc._announce_worker_connected()
 
   assert len(proc.publisher.requests) == 5
-  # Backoff caps at its last configured value rather than growing unbounded.
-  assert sleeps == [5, 10, 20, 20]
+  # Leading 0 = jitter (pinned); backoff caps at its last configured value
+  # rather than growing unbounded.
+  assert sleeps == [0, 5, 10, 20, 20]
+
+
+def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatch):
+  monkeypatch.setattr(time, "sleep", lambda s: None)
+  levels = []
+  monkeypatch.setattr(processor_module.log, "warning", lambda *a, **k: levels.append("WARNING"))
+  monkeypatch.setattr(processor_module.log, "error", lambda *a, **k: levels.append("ERROR"))
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    TimeoutError("no reply"),
+    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+  ])
+  proc._announce_worker_connected()
+
+  # First two timeouts stay WARNING; from _HANDSHAKE_ALERT_THRESHOLD (3) onward
+  # they escalate to ERROR so TelegramLogHandler forwards an operator alert.
+  assert levels == ["WARNING", "WARNING", "ERROR"]
 
 
 def test_system_not_connected_short_circuits():
