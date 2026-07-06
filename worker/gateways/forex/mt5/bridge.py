@@ -42,7 +42,7 @@ class MT5:
         init_args["path"] = self.path
 
       if not mt5.initialize(**init_args):
-        logger.error(f"MT5 initialize() failed, error code: {mt5.last_error()}")
+        logger.warning(f"MT5 initialize() failed, error code: {mt5.last_error()}")
         return False
 
       # Log in to the account
@@ -137,7 +137,7 @@ class MT5:
       )
       time.sleep(delay_seconds)
 
-    logger.error("MT5 reconnection exhausted all attempts.")
+    logger.warning("MT5 reconnection exhausted all attempts.")
     return False
 
   def restart_terminal(self, startup_wait: float = 15.0) -> bool:
