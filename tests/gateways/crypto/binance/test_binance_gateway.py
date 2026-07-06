@@ -445,3 +445,49 @@ def test_order_result_falls_back_to_cumquote_when_avgprice_zero(monkeypatch):
   assert res["success"] is True
   assert res["volume"] == 0.0333
   assert abs(res["price"] - 2179.15 / 0.0333) < 0.01
+
+
+# ── Position mode ───────────────────────────────────────────────────────────── #
+
+
+def test_set_position_mode_hedge_posts_dual_true(monkeypatch):
+  gw, calls = make_gateway(monkeypatch)
+  assert gw.set_position_mode(True) is True
+  c = calls[-1]
+  assert c["method"] == "POST" and c["path"] == "/fapi/v1/positionSide/dual"
+  assert c["signed"] is True
+  assert c["payload"]["dual_side_position"] == "true"
+
+
+def test_set_position_mode_one_way_posts_dual_false(monkeypatch):
+  gw, calls = make_gateway(monkeypatch)
+  assert gw.set_position_mode(False) is True
+  assert calls[-1]["payload"]["dual_side_position"] == "false"
+
+
+def test_set_position_mode_treats_no_change_as_success(monkeypatch):
+  # Binance returns -4059 ("No need to change position side.") when the account is
+  # already in the requested mode — the desired end state, so it counts as success.
+  from binance_common.errors import BadRequestError
+
+  gw, _ = make_gateway(monkeypatch)
+
+  def already(session, config, *, method, path, payload, is_signed, response_model):
+    raise BadRequestError(error_message="No need to change position side.", status_code=-4059)
+
+  monkeypatch.setattr(gw_mod, "send_request", already)
+  assert gw.set_position_mode(True) is True
+
+
+def test_set_position_mode_returns_false_on_reject(monkeypatch):
+  # A genuine rejection (e.g. -4068 with open positions/orders) is best-effort:
+  # logged and reported as False so startup proceeds on the current mode.
+  from binance_common.errors import BadRequestError
+
+  gw, _ = make_gateway(monkeypatch)
+
+  def boom(session, config, *, method, path, payload, is_signed, response_model):
+    raise BadRequestError(error_message="Position side cannot be changed", status_code=-4068)
+
+  monkeypatch.setattr(gw_mod, "send_request", boom)
+  assert gw.set_position_mode(True) is False

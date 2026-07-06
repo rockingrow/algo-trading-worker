@@ -14,14 +14,14 @@ def _proc(settings: dict) -> CryptoSignalProcessor:
 
 
 def test_account_id_returns_configured_binance_account_id():
-  # _account_id is the explicit BINANCE_ACCOUNT_ID (required for crypto), used
+  # _account_id is the explicit CRYPTO_ACCOUNT_ID (required for crypto), used
   # for ADMIN FLAT routing and the account footer.
-  proc = _proc({"binance_account_id": "acct-123"})
+  proc = _proc({"crypto_account_id": "acct-123"})
   assert proc._account_id == "acct-123"
 
 
 def test_account_id_none_when_unset():
-  # Settings validation requires BINANCE_ACCOUNT_ID for crypto, so this is
+  # Settings validation requires CRYPTO_ACCOUNT_ID for crypto, so this is
   # unreachable in production; the property just surfaces what is configured.
   proc = _proc({})
   assert proc._account_id is None

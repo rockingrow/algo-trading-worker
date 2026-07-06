@@ -86,6 +86,7 @@ class _API_Endpoints(Enum):
   ACCOUNT          = ("GET",    "/fapi/v2/account")
   LEVERAGE_BRACKET = ("GET",    "/fapi/v1/leverageBracket")
   LEVERAGE         = ("POST",   "/fapi/v1/leverage")
+  POSITION_MODE    = ("POST",   "/fapi/v1/positionSide/dual")
 
   @property
   def method(self) -> str:
@@ -102,6 +103,11 @@ class _API_Endpoints(Enum):
 # the message ("Subaccounts are restricted from using leverage greater than 5x.").
 _LEVERAGE_CAP_CODE = -4421
 _LEVERAGE_CAP_RE = re.compile(r"greater than (\d+)\s*x", re.IGNORECASE)
+
+# Binance returns -4059 ("No need to change position side.") when the account is
+# already in the requested position mode. That is the desired end state, so we
+# treat it as success rather than a failure.
+_POSITION_MODE_NO_CHANGE_CODE = -4059
 
 
 # Shape of the POST /fapi/v1/leverage response. ``total=False`` because the
@@ -245,6 +251,36 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       self._session.close()
     except Exception:  # pragma: no cover - best effort
       pass
+
+  def set_position_mode(self, hedge_mode: bool) -> bool:
+    """Switch the account into Hedge (dualSidePosition=true) or One-way mode.
+
+    Best-effort: Binance returns -4059 ("No need to change position side.") when
+    the account is already in the requested mode — that is the desired end state,
+    so it counts as success. A genuine failure (e.g. -4068 when open positions or
+    orders block the switch) is logged and returns False so the worker keeps
+    running on the account's current mode; the mismatch then surfaces as -4061 on
+    the first order, exactly as before this reconciliation existed.
+    """
+    target = "Hedge" if hedge_mode else "One-way"
+    try:
+      self._send(
+        _API_Endpoints.POSITION_MODE,
+        {"dual_side_position": "true" if hedge_mode else "false"},
+        signed=True,
+      )
+      logger.info("[Binance] Position mode set to %s.", target)
+      return True
+    except Exception as exc:
+      if getattr(exc, "status_code", None) == _POSITION_MODE_NO_CHANGE_CODE:
+        logger.info("[Binance] Position mode already %s; no change needed.", target)
+        return True
+      logger.warning(
+        "[Binance] set_position_mode(%s) failed (%s); leaving the account on its "
+        "current mode — a mismatch will surface as -4061 on the first order.",
+        target, exc,
+      )
+      return False
 
   # ── Market data / rules ───────────────────────────────────────────────── #
 

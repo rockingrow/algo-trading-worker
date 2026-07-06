@@ -70,7 +70,21 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     )
 
   def _connect_broker(self) -> bool:
-    return self.gateway.connect()
+    if not self.gateway.connect():
+      return False
+    # Reconcile the exchange account's position mode to CRYPTO_HEDGE_MODE so the
+    # account setting always matches the payload convention the gateway sends
+    # (Hedge → explicit positionSide; One-way → reduceOnly). Generic across
+    # exchanges: gateways without a switchable mode no-op. A failure here is not
+    # fatal — it is logged inside the gateway and the worker proceeds on the
+    # account's current mode (a mismatch then surfaces as -4061 on the first order).
+    hedge_mode = bool(self.settings.get("crypto_hedge_mode", True))
+    ok = self.gateway.set_position_mode(hedge_mode)
+    log.info(
+      "[CRYPTO Process] set_position_mode(%s) -> %s",
+      "HEDGE" if hedge_mode else "ONE-WAY", "ok" if ok else "failed, keeping account's current mode",
+    )
+    return True
 
   def _run_leverage_init(
     self,
@@ -142,7 +156,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   @property
   def _account_id(self) -> str:
-    return self.settings.get("binance_account_id")
+    return self.settings.get("crypto_account_id")
 
   def _magic_for(self, strategy: str) -> Optional[int]:
     return None  # crypto exchanges have no magic-number equivalent
@@ -150,7 +164,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   def _position_cdc_kwargs(self) -> Dict[str, Any]:
     return {
       "account_info_fn": self._account_snapshot,
-      "account_name": self.settings.get("binance_account_id"),
+      "account_name": self.settings.get("crypto_account_id"),
       "strategy_magic_map": self.settings.get("strategy_magic_map") or {},
     }
 

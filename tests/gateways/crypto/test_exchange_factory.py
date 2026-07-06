@@ -14,9 +14,9 @@ def test_factory_builds_binance_gateway():
   gw = ExchangeFactory.create(
     {
       "crypto_exchange": CryptoExchangeEnum.BINANCE,
-      "binance_api_key": SecretStr("k"),
-      "binance_api_secret": SecretStr("s"),
-      "binance_testnet": True,
+      "crypto_api_key": SecretStr("k"),
+      "crypto_api_secret": SecretStr("s"),
+      "crypto_testnet": True,
     }
   )
   assert isinstance(gw, BaseExchangeGateway)
@@ -27,8 +27,8 @@ def test_factory_accepts_string_exchange():
   gw = ExchangeFactory.create(
     {
       "crypto_exchange": "BINANCE",
-      "binance_api_key": SecretStr("k"),
-      "binance_api_secret": SecretStr("s"),
+      "crypto_api_key": SecretStr("k"),
+      "crypto_api_secret": SecretStr("s"),
     }
   )
   assert gw.name == "BINANCE"
