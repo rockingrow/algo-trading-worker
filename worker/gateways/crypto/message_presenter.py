@@ -45,6 +45,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
     cfg = (
       f"EXCHANGE: <b>{exchange_display}</b>\n"
       f"TESTNET: <b>{s.get('binance_testnet', False)}</b>\n"
+      f"HEDGE_MODE: <b>{'Hedge' if s.get('binance_hedge_mode', True) else 'One-way'}</b>\n"
       f"{CryptoMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"{CryptoMessagePresenter._risk_percentage_line(s)}"
@@ -149,6 +150,22 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Strategy: <b>{db_pos.get('strategy')}</b>\n"
       f"Approx Close: <b>{close_price}</b>\n"
       f"Source: <b>{db_pos.get('ref_source_id')}</b>\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def position_imported_manual(pos: Any, ref_source_id: Any, footer: str) -> str:
+    """The periodic reconciler found a position open on the exchange that the DB
+    was not tracking (opened directly via the exchange UI / app / a third party)
+    and imported it so the worker now manages it like any other position."""
+    return _box(
+      f"{MANUAL} <b>Manual Position Imported</b>\n\n"
+      f"A position opened <b>directly on the exchange</b> was detected and is now tracked.\n"
+      f"Symbol: <b>{pos.symbol}</b>\n"
+      f"Side: <b>{pos.side}</b>\n"
+      f"Quantity: <b>{pos.volume}</b>\n"
+      f"Entry: <b>{pos.price_open}</b>\n"
+      f"Source: <b>{ref_source_id}</b>\n"
       f"{_DIVIDER}\n{footer}"
     )
 

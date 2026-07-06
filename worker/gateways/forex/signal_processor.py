@@ -62,7 +62,7 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
           log.info("[%s Health] %s reconnected successfully.", name, name)
           notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer_fn()}"))
         else:
-          log.error(
+          log.warning(
             "[%s Health] %s reconnect failed after 15 attempts — killing and restarting terminal...",
             name, name,
           )

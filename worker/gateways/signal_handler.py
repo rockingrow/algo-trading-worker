@@ -303,7 +303,7 @@ class SignalHandler:
         f"closed_vol={result.get('volume')} price={result.get('price')}"
       )
     else:
-      logger.error(f"[SignalHandler._handle_tp1] TP1 FAILED: {result.get('comment')}")
+      logger.warning(f"[SignalHandler._handle_tp1] TP1 FAILED: {result.get('comment')}")
     return result
 
   # ------------------------------------------------------------------ #
@@ -324,7 +324,7 @@ class SignalHandler:
         f"vol={result.get('volume')} price={result.get('price')}"
       )
     else:
-      logger.error(
+      logger.warning(
         f"[SignalHandler._handle_full_close] Full close FAILED | "
         f"action={signal.action.value} retcode={result.get('retcode')} comment={result.get('comment')}"
       )
