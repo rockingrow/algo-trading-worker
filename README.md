@@ -165,8 +165,32 @@ executor/strategy/processor, so it never leaks upward.
 Required env when `MARKET_TYPE=CRYPTO` (Binance): `BINANCE_API_KEY`,
 `BINANCE_API_SECRET`, `BINANCE_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
 `USDT`) — enforced by the settings validator. `CRYPTO_EXCHANGE` defaults to
-`BINANCE`; `BINANCE_TESTNET` is optional. MT5 credentials are **not** required.
-See `.env.example`.
+`BINANCE`; `BINANCE_TESTNET` is optional, and `BINANCE_HEDGE_MODE` (default
+`true`) must match the account's actual Position Mode (see below). MT5
+credentials are **not** required. See `.env.example`.
+
+### Position Mode — Hedge vs One-way (CRYPTO / Binance)
+
+Binance Futures accounts run in one of two **Position Modes**, configured on
+the exchange itself (Binance app/web → Futures → Preferences → Position
+Mode) — the worker cannot detect or change it, so `BINANCE_HEDGE_MODE` only
+tells the gateway which mode the account is *already* set to:
+
+| `BINANCE_HEDGE_MODE` | Exchange mode | Order payload |
+| --- | --- | --- |
+| `true` (default) | Hedge | Every order (market open/close, stop-loss, take-profit) carries an explicit `positionSide` (`LONG`/`SHORT`); `reduceOnly` is omitted entirely — Binance rejects it in Hedge Mode. |
+| `false` | One-way | No `positionSide` sent; `reduceOnly` marks closing orders instead. Binance infers direction from `side` alone. |
+
+A mismatch between this flag and the account's actual Position Mode is what
+produces Binance error `-4061` ("*Order's position side does not match user's
+setting.*"). Flip `BINANCE_HEDGE_MODE` to match whatever the account is
+genuinely set to — not the other way around.
+
+The worker still only ever tracks **one net position per symbol** regardless
+of this setting: it does not open or manage simultaneous LONG and SHORT
+positions on the same symbol even when the account is in Hedge Mode. Strategy
+isolation on a shared symbol remains logical-only, as described in [Signal
+Execution — Key Design Decisions](#-signal-execution--key-design-decisions).
 
 ### Per-symbol leverage initialisation (CRYPTO)
 

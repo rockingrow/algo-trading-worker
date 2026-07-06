@@ -78,10 +78,10 @@ class Settings(BaseSettings):
   binance_account_id: Optional[str] = None
   binance_testnet: bool = False
   # Must match the account's actual Binance position mode (Futures >
-  # Preferences > Position Mode). False = One-way (default): the account nets
-  # BUY/SELL into a single position per symbol and Binance infers direction
-  # from `side` alone. True = Hedge: every order must carry an explicit
-  # positionSide (LONG/SHORT). Setting this incorrectly is what produces
+  # Preferences > Position Mode). True = Hedge (default): every order must
+  # carry an explicit positionSide (LONG/SHORT). False = One-way: the account
+  # nets BUY/SELL into a single position per symbol and Binance infers
+  # direction from `side` alone. Setting this incorrectly is what produces
   # Binance error -4061 ("Order's position side does not match user's
   # setting.") — flip this to match whatever the account is actually set to.
   binance_hedge_mode: bool = True
