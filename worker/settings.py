@@ -84,7 +84,7 @@ class Settings(BaseSettings):
   # positionSide (LONG/SHORT). Setting this incorrectly is what produces
   # Binance error -4061 ("Order's position side does not match user's
   # setting.") — flip this to match whatever the account is actually set to.
-  binance_hedge_mode: bool = False
+  binance_hedge_mode: bool = True
   # Binance USDⓈ-M futures use netting mode: all strategies on the same symbol
   # share one net position, so a second strategy opening on that symbol will
   # merge positions at the exchange level.  Set to True only if you deliberately
