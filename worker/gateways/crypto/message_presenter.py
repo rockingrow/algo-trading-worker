@@ -44,8 +44,8 @@ class CryptoMessagePresenter(BaseMessagePresenter):
     exchange_display = getattr(exchange, "value", exchange)
     cfg = (
       f"EXCHANGE: <b>{exchange_display}</b>\n"
-      f"TESTNET: <b>{s.get('binance_testnet', False)}</b>\n"
-      f"HEDGE_MODE: <b>{'Hedge' if s.get('binance_hedge_mode', True) else 'One-way'}</b>\n"
+      f"TESTNET: <b>{s.get('crypto_testnet', False)}</b>\n"
+      f"POSITION MODE: <b>{'HEDGE' if s.get('crypto_hedge_mode', True) else 'ONE-WAY'}</b>\n"
       f"{CryptoMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"{CryptoMessagePresenter._risk_percentage_line(s)}"

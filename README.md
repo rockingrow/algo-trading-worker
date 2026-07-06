@@ -162,29 +162,34 @@ Data Stream uses the SDK websocket (auto-reconnect). All of this lives only insi
 `worker/gateways/crypto/binance/` — the gateway abstraction keeps it out of the
 executor/strategy/processor, so it never leaks upward.
 
-Required env when `MARKET_TYPE=CRYPTO` (Binance): `BINANCE_API_KEY`,
-`BINANCE_API_SECRET`, `BINANCE_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
+Required env when `MARKET_TYPE=CRYPTO` (Binance): `CRYPTO_API_KEY`,
+`CRYPTO_API_SECRET`, `CRYPTO_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
 `USDT`) — enforced by the settings validator. `CRYPTO_EXCHANGE` defaults to
-`BINANCE`; `BINANCE_TESTNET` is optional, and `BINANCE_HEDGE_MODE` (default
-`true`) must match the account's actual Position Mode (see below). MT5
-credentials are **not** required. See `.env.example`.
+`BINANCE`; `CRYPTO_TESTNET` is optional, and `CRYPTO_HEDGE_MODE` (default
+`true`) is the Position Mode the worker enforces on the account at startup (see
+below). MT5 credentials are **not** required. See `.env.example`.
 
 ### Position Mode — Hedge vs One-way (CRYPTO / Binance)
 
-Binance Futures accounts run in one of two **Position Modes**, configured on
-the exchange itself (Binance app/web → Futures → Preferences → Position
-Mode) — the worker cannot detect or change it, so `BINANCE_HEDGE_MODE` only
-tells the gateway which mode the account is *already* set to:
+Binance Futures accounts run in one of two **Position Modes**. Rather than
+relying on the operator to set it on the exchange (Binance app/web → Futures →
+Preferences → Position Mode), the worker **reconciles** the account into
+`CRYPTO_HEDGE_MODE` right after connecting — the generic
+`BaseExchangeGateway.set_position_mode()` hook, implemented by the Binance
+gateway via `POST /fapi/v1/positionSide/dual`. So `CRYPTO_HEDGE_MODE` is the
+mode the worker *drives the account into*, and it selects the order payload:
 
-| `BINANCE_HEDGE_MODE` | Exchange mode | Order payload |
+| `CRYPTO_HEDGE_MODE` | Exchange mode | Order payload |
 | --- | --- | --- |
 | `true` (default) | Hedge | Every order (market open/close, stop-loss, take-profit) carries an explicit `positionSide` (`LONG`/`SHORT`); `reduceOnly` is omitted entirely — Binance rejects it in Hedge Mode. |
 | `false` | One-way | No `positionSide` sent; `reduceOnly` marks closing orders instead. Binance infers direction from `side` alone. |
 
-A mismatch between this flag and the account's actual Position Mode is what
-produces Binance error `-4061` ("*Order's position side does not match user's
-setting.*"). Flip `BINANCE_HEDGE_MODE` to match whatever the account is
-genuinely set to — not the other way around.
+The switch is best-effort: Binance returns `-4059` ("*No need to change
+position side.*") when the account is already in the requested mode (treated as
+success), and can reject the switch (e.g. `-4068`) when open positions or orders
+exist — that is logged and the worker proceeds on the account's current mode, in
+which case a mismatch still surfaces as Binance error `-4061` ("*Order's
+position side does not match user's setting.*") on the first order.
 
 The worker still only ever tracks **one net position per symbol** regardless
 of this setting: it does not open or manage simultaneous LONG and SHORT
@@ -446,7 +451,7 @@ Closes open positions across one or more strategies/symbols in a single command.
 
 | Filter | Behaviour when present |
 | --- | --- |
-| `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `BINANCE_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
+| `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
 | `strategy` | Restricts close to positions whose `strategy` column equals this value |
 | `symbol` | Restricts close to positions for this symbol |
 
@@ -682,8 +687,8 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 | Field | Source |
 | --- | --- |
 | `event` | `CREATED` (first sync) or `UPDATED` (subsequent syncs) |
-| `account_id` | Worker account id — `MT5_LOGIN` (FOREX) or `BINANCE_ACCOUNT_ID` (CRYPTO) |
-| `account_name` | `MT5_NAME` (FOREX) or `BINANCE_ACCOUNT_ID` (CRYPTO) |
+| `account_id` | Worker account id — `MT5_LOGIN` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
+| `account_name` | `MT5_NAME` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
 | `market_type` | `MARKET_TYPE` from settings (e.g. `forex`, `crypto`) |
 | `account_balance` / `account_leverage` | Snapshot from the gateway's account (`account_info_fn`) at poll time (CRYPTO reports balance only; leverage is `null`) |
 | `signal_id`, `sl`, `tp1`, `tp2`, `risk_percent`, `magic` | Extracted from the original signal JSON stored in `positions.gateway_message` |

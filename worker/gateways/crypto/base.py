@@ -86,6 +86,23 @@ class BaseExchangeGateway(ABC):
   def close(self) -> None:  # noqa: B027 - optional hook, not all gateways need it
     """Release any held resources (HTTP sessions, sockets)."""
 
+  def set_position_mode(self, hedge_mode: bool) -> bool:
+    """Reconcile the account's position mode to *hedge_mode* on the exchange.
+
+    ``True`` → Hedge (orders carry an explicit ``positionSide``); ``False`` →
+    One-way (netting, direction inferred from ``side``). Called once after
+    :meth:`connect` so the exchange-side setting always matches the payload
+    convention this gateway sends, instead of relying on the operator to have
+    flipped it by hand (a mismatch is what produces Binance -4061).
+
+    Returns ``True`` when the account is in the requested mode after the call
+    (including when it was already there). Default no-op returning ``True`` for
+    exchanges without a switchable position mode. Implementations must treat this
+    as best-effort — never raise — so a failed switch degrades to the account's
+    current mode rather than aborting startup.
+    """
+    return True
+
   # ── Market data / rules ───────────────────────────────────────────────── #
 
   @abstractmethod
