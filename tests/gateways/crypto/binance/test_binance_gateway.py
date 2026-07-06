@@ -6,7 +6,7 @@ responses into TradeResult / ExchangePosition — without any network.
 """
 
 import worker.gateways.crypto.binance.gateway as gw_mod
-from worker.gateways.crypto.base import SIDE_LONG
+from worker.gateways.crypto.base import SIDE_LONG, SIDE_SHORT
 
 
 class FakeResp:
@@ -31,7 +31,7 @@ def _exchange_info():
   }
 
 
-def make_gateway(monkeypatch):
+def make_gateway(monkeypatch, hedge_mode=False):
   calls = []
 
   def fake_send(session, config, *, method, path, payload, is_signed, response_model):
@@ -58,7 +58,7 @@ def make_gateway(monkeypatch):
     return FakeResp({})
 
   monkeypatch.setattr(gw_mod, "send_request", fake_send)
-  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True, hedge_mode=hedge_mode)
   return gw, calls
 
 
@@ -126,6 +126,52 @@ def test_set_take_profit_is_conditional_algo_order_close_position(monkeypatch):
   assert c["payload"]["type"] == "TAKE_PROFIT_MARKET"
   assert c["payload"]["side"] == "SELL"        # close a LONG
   assert c["payload"]["trigger_price"] == 31000.0
+
+
+def test_place_market_order_hedge_mode_sends_position_side_not_reduce_only(monkeypatch):
+  # Hedge Mode accounts require every order to carry positionSide and reject
+  # reduceOnly outright (-1106) — this is the -4061 fix for Hedge accounts.
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, reduce_only=False)
+  c = calls[-1]
+  assert c["payload"]["side"] == "BUY"
+  assert c["payload"]["position_side"] == "LONG"
+  assert "reduce_only" not in c["payload"]
+
+
+def test_place_market_order_hedge_mode_close_keeps_position_side_of_the_position(monkeypatch):
+  # Closing a LONG in Hedge Mode still sells, but positionSide stays LONG (the
+  # position being reduced) — it must not flip to SHORT.
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, reduce_only=True)
+  c = calls[-1]
+  assert c["payload"]["side"] == "SELL"
+  assert c["payload"]["position_side"] == "LONG"
+  assert "reduce_only" not in c["payload"]
+
+
+def test_place_market_order_hedge_mode_short(monkeypatch):
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.place_market_order("BTCUSDT", SIDE_SHORT, 0.02, reduce_only=False)
+  c = calls[-1]
+  assert c["payload"]["side"] == "SELL"
+  assert c["payload"]["position_side"] == "SHORT"
+
+
+def test_set_stop_loss_hedge_mode_sends_position_side(monkeypatch):
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.set_stop_loss("BTCUSDT", SIDE_LONG, stop_price=29000.0, quantity=0.02)
+  c = calls[-1]
+  assert c["payload"]["position_side"] == "LONG"
+  assert c["payload"]["side"] == "SELL"
+
+
+def test_set_take_profit_hedge_mode_sends_position_side(monkeypatch):
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.set_take_profit("BTCUSDT", SIDE_SHORT, tp_price=28000.0, quantity=0.02)
+  c = calls[-1]
+  assert c["payload"]["position_side"] == "SHORT"
+  assert c["payload"]["side"] == "BUY"         # close a SHORT
   assert c["payload"]["close_position"] == "true"
   assert "quantity" not in c["payload"]        # closePosition forbids quantity
 

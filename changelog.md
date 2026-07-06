@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- CRYPTO: `BINANCE_HEDGE_MODE` (bool, default `true`) env var — tells the Binance gateway whether the account's Position Mode (Binance app/web → Futures → Preferences → Position Mode) is Hedge or One-way; the worker cannot detect this itself, so it must be set to match. When `true`, every order (market open/close, stop-loss, take-profit) carries an explicit `positionSide` (`LONG`/`SHORT`) and omits `reduceOnly` entirely, since Binance rejects `reduceOnly` in Hedge Mode. When `false`, orders omit `positionSide` and closing orders use `reduceOnly` instead, as before. A mismatch between this flag and the account's real Position Mode is what produces Binance error `-4061` ("Order's position side does not match user's setting."). Threaded through `BinanceFuturesGateway.__init__(hedge_mode=…)` and `ExchangeFactory`. The worker still only ever tracks one net position per symbol regardless of this setting — it does not manage simultaneous LONG and SHORT positions on the same symbol even in Hedge Mode.
+
 ## [1.1.6] - 2026-07-05
 
 ### Added
@@ -98,6 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
+[Unreleased]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.6...dev
 [1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.5...dev
 [1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.3...dev
