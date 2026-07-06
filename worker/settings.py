@@ -77,10 +77,21 @@ class Settings(BaseSettings):
   binance_api_secret: Optional[SecretStr] = None
   binance_account_id: Optional[str] = None
   binance_testnet: bool = False
+  # Must match the account's actual Binance position mode (Futures >
+  # Preferences > Position Mode). False = One-way (default): the account nets
+  # BUY/SELL into a single position per symbol and Binance infers direction
+  # from `side` alone. True = Hedge: every order must carry an explicit
+  # positionSide (LONG/SHORT). Setting this incorrectly is what produces
+  # Binance error -4061 ("Order's position side does not match user's
+  # setting.") — flip this to match whatever the account is actually set to.
+  binance_hedge_mode: bool = False
   # Binance USDⓈ-M futures use netting mode: all strategies on the same symbol
   # share one net position, so a second strategy opening on that symbol will
   # merge positions at the exchange level.  Set to True only if you deliberately
   # run multiple strategies on the same symbol and understand the implications.
+  # NOTE: this worker only ever tracks one net position per symbol regardless of
+  # binance_hedge_mode — it does not manage simultaneous LONG and SHORT
+  # positions on the same symbol even when the account is in Hedge mode.
   crypto_allow_multi_strategy_per_symbol: bool = False
   # Symbols whose leverage must be initialised at worker startup. The
   # LeverageInitJob walks this list once after gateway.connect() succeeds and

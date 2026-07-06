@@ -113,7 +113,8 @@ class LeverageResponse(TypedDict, total=False):
   maxNotionalValue: str
 
 
-# Binance order side mapping for one-way mode.
+# Binance order side mapping. Valid in both One-way and Hedge position modes —
+# Hedge mode additionally requires positionSide, added by the callers below.
 _OPEN_SIDE = {SIDE_LONG: "BUY", SIDE_SHORT: "SELL"}
 # To reduce/close a LONG you SELL; to reduce/close a SHORT you BUY.
 _CLOSE_SIDE = {SIDE_LONG: "SELL", SIDE_SHORT: "BUY"}
@@ -130,12 +131,21 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     api_secret: str,
     testnet: bool = False,
     recv_window: int = 5000,
+    hedge_mode: bool = False,
     session: Optional[requests.Session] = None,
   ) -> None:
     self._api_key = api_key
     self._api_secret = api_secret
     self._testnet = testnet
     self._recv_window = recv_window
+    # Must match the account's actual Binance position mode (Preferences >
+    # Position Mode). One-way accounts default positionSide to BOTH and infer
+    # direction from `side` alone; Hedge accounts require every order to carry
+    # an explicit positionSide (LONG/SHORT) and reject `reduceOnly` outright
+    # (-1106) since positionSide + side already disambiguate open vs close.
+    # Mismatching this flag against the account setting is exactly what
+    # produces -4061 ("Order's position side does not match user's setting").
+    self._hedge_mode = hedge_mode
     self._config = ConfigurationRestAPI(
       api_key=api_key,
       api_secret=api_secret,
@@ -338,7 +348,11 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       # are persisted as 0 — corrupting the DB row and every downstream event.
       "new_order_resp_type": "RESULT",
     }
-    if reduce_only:
+    if self._hedge_mode:
+      # side param is already the position's LONG/SHORT (not the wire BUY/SELL),
+      # so it's exactly the positionSide Binance wants for both opens and closes.
+      payload["position_side"] = side
+    elif reduce_only:
       payload["reduce_only"] = "true"
     if client_order_id:
       payload["new_client_order_id"] = client_order_id
@@ -369,6 +383,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "trigger_price": self._round_to_tick(symbol, stop_price),
       "close_position": "true",
     }
+    if self._hedge_mode:
+      payload["position_side"] = position_side
     try:
       return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
@@ -394,6 +410,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "trigger_price": self._round_to_tick(symbol, tp_price),
       "close_position": "true",
     }
+    if self._hedge_mode:
+      payload["position_side"] = position_side
     try:
       return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
