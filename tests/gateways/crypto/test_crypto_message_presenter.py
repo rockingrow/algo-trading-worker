@@ -1,8 +1,41 @@
+from types import SimpleNamespace
+
 from helpers import make_signal
 
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
 from worker.icons import SUCCESS
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.settings import CryptoExchangeEnum
+
+
+def test_startup_message_shows_hedge_mode():
+  cfg = {
+    "crypto_exchange": CryptoExchangeEnum.BINANCE,
+    "binance_testnet": False,
+    "binance_hedge_mode": True,
+    "capital": 1000,
+  }
+  msg = CryptoMessagePresenter.startup(cfg, "FOOTER")
+  assert "HEDGE_MODE: <b>Hedge</b>" in msg
+
+
+def test_startup_message_shows_one_way_mode():
+  cfg = {
+    "crypto_exchange": CryptoExchangeEnum.BINANCE,
+    "binance_hedge_mode": False,
+    "capital": 1000,
+  }
+  msg = CryptoMessagePresenter.startup(cfg, "FOOTER")
+  assert "HEDGE_MODE: <b>One-way</b>" in msg
+
+
+def test_position_imported_manual_message():
+  pos = SimpleNamespace(symbol="BTCUSDT", side="LONG", volume=0.02, price_open=64000.0)
+  msg = CryptoMessagePresenter.position_imported_manual(pos, "MANUAL-BTCUSDT-abcd1234", "FOOTER")
+  assert "Manual Position Imported" in msg
+  assert "BTCUSDT" in msg and "LONG" in msg
+  assert "0.02" in msg and "64000.0" in msg
+  assert "MANUAL-BTCUSDT-abcd1234" in msg
 
 
 def test_order_filled_shows_sl_set():
