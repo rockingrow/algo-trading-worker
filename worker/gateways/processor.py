@@ -204,6 +204,9 @@ class BaseSignalProcessor(ABC):
       publisher=self.publisher,
       db_service=self.ctx.db_service,
       market_type=self.settings.get("market_type"),
+      # Ship the gateway (platform/exchange) too so the broker can persist the
+      # full worker identity "<market>-<gateway>-<account_id>" from a TRADE event.
+      gateway=self._gateway_value,
       **self._position_cdc_kwargs(),
     ).start(stop_event=stop_event)
 

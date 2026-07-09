@@ -38,6 +38,11 @@ class PositionEvent(BaseModel):
   account_id: str
   account_name: Optional[str] = None
   market_type: MarketTypeEnum
+  # Gateway (platform/exchange) this account trades through, e.g. "MT5" /
+  # "BINANCE". Sent alongside market_type and account_id so the broker can store
+  # and reconstruct the full worker identity "<market>-<gateway>-<account_id>"
+  # without parsing it out of any single field.
+  gateway: Optional[str] = None
 
   id: int
   ref_source_id: str
