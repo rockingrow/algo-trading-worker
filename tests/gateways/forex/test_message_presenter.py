@@ -4,12 +4,33 @@ from worker.gateways.forex.message_presenter import (
   ForexMessagePresenter,
   format_volume,
 )
-from worker.icons import GEAR
+from worker.icons import GEAR, REJECTED
 from worker.schemas.signal_schema import SignalActionEnum
 
 
 def test_format_volume_plain():
   assert format_volume(0.5) == "0.5 lot"
+
+
+def test_order_rejected_contains_reason_and_fields():
+  signal = make_signal(SignalActionEnum.LONG)
+  msg = ForexMessagePresenter.order_rejected(
+    signal, "Max open orders reached (5/5); entry not placed (MAX_OPEN_ORDERS).", "FOOTER"
+  )
+  assert "Order Rejected" in msg and REJECTED in msg
+  assert "XAUUSD" in msg and "strat-1" in msg and "LONG" in msg
+  assert "Max open orders reached (5/5)" in msg
+  assert "FOOTER" in msg
+
+
+def test_startup_banner_shows_max_open_orders():
+  msg = ForexMessagePresenter.startup({"capital": 1000, "max_open_orders": 7}, "FOOTER")
+  assert "MAX_OPEN_ORDERS: <b>7</b>" in msg
+
+
+def test_startup_banner_omits_max_open_orders_when_disabled():
+  msg = ForexMessagePresenter.startup({"capital": 1000, "max_open_orders": 0}, "FOOTER")
+  assert "MAX_OPEN_ORDERS" not in msg
 
 
 def test_format_volume_auto_calculated_has_icon():

@@ -44,7 +44,7 @@ from worker.schemas.admin_schema import (
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
-from worker.schemas.signal_schema import SignalSchema
+from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 from worker.schemas.system_schema import (
   SystemActionEnum,
   SystemSchema,
@@ -78,6 +78,10 @@ _HANDSHAKE_JITTER_MAX = 0.5  # seconds
 # (forwarded to Telegram via TelegramLogHandler) so an operator is alerted that
 # the broker looks unreachable rather than just transiently slow.
 _HANDSHAKE_ALERT_THRESHOLD = 3
+
+# Entry actions that open a fresh position — the only ones the MAX_OPEN_ORDERS
+# cap applies to (exits must always be allowed so positions can be closed).
+_ENTRY_ACTIONS = (SignalActionEnum.LONG, SignalActionEnum.SHORT)
 
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
@@ -255,6 +259,13 @@ class BaseSignalProcessor(ABC):
     if not self._ensure_connected():
       return
 
+    self._process_signal(signal)
+
+  def _process_signal(self, signal: SignalSchema) -> None:
+    """Execute one validated, connection-checked signal end-to-end: apply the
+    MAX_OPEN_ORDERS exposure guard, run it through the handler, then persist and
+    notify the outcome. Split out of :meth:`_process_message` so each NATS subject
+    (ADMIN / SYSTEM / signal) has its own handler."""
     # Scale-in (averaging): the broker has already scaled SL/TP1/TP2/quantity in
     # the payload, so every downstream step (SL/TP placement, persistence,
     # notifications) consumes them verbatim. The only re-derivation happens inside
@@ -272,6 +283,16 @@ class BaseSignalProcessor(ABC):
       "[%s Process] Processing Signal: %s | %s | TV Time: %s",
       self.name, signal.symbol, signal.action.value, signal.timestamp,
     )
+
+    # Exposure guard: a new entry that would exceed MAX_OPEN_ORDERS is never sent
+    # to the broker. It is still recorded (status REJECT), forwarded to the broker
+    # via CDC on the TRADE subject, and notified. Exits are never gated here so a
+    # position can always be closed even at the cap.
+    if signal.action in _ENTRY_ACTIONS:
+      reject_reason = self._max_open_orders_rejection(signal)
+      if reject_reason is not None:
+        self._reject_signal(signal, reject_reason)
+        return
 
     result = self.handler.handle(signal)
     # Some exchanges (notably Binance testnet) return a 0 fill price on a filled
@@ -364,6 +385,92 @@ class BaseSignalProcessor(ABC):
           comment=result.get("comment", ""),
           message=signal_json,
         )
+
+  # ── Shared MAX_OPEN_ORDERS exposure guard ─────────────────────────────── #
+
+  def _max_open_orders_rejection(self, signal: SignalSchema) -> Optional[str]:
+    """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
+    because the worker is already at its MAX_OPEN_ORDERS cap, else ``None``.
+
+    The cap counts active (OPENED/TP1) positions across every strategy/symbol. A
+    re-entry or scale-in on a symbol this strategy already holds replaces the
+    existing position rather than opening a new slot, so it is never counted
+    against the cap. A value of 0 (or unset) disables the limit.
+    """
+    max_orders = self.settings.get("max_open_orders")
+    if not max_orders or max_orders <= 0:
+      return None
+
+    open_positions = self.ctx.db_service.get_open_positions_for_flat()
+    already_held = any(
+      p.get("strategy") == signal.strategy and p.get("symbol") == signal.symbol
+      for p in open_positions
+    )
+    if already_held:
+      return None
+
+    open_count = len(open_positions)
+    if open_count < max_orders:
+      return None
+    return (
+      f"Max open orders reached ({open_count}/{max_orders}); "
+      f"entry not placed (MAX_OPEN_ORDERS)."
+    )
+
+  def _reject_signal(self, signal: SignalSchema, reason: str) -> None:
+    """Handle a policy-rejected entry end-to-end without touching the broker.
+
+    Records the rejection in the append-only log and as a REJECT position row (so
+    :class:`PositionCDC` forwards it to the broker on the TRADE subject with status
+    REJECT), then notifies the community channel. No order is placed.
+    """
+    log.warning(
+      "[%s Process] Entry REJECTED | %s %s | %s",
+      self.name, signal.symbol, signal.action.value, reason,
+    )
+    footer = self._current_footer()
+    signal_json = signal.model_dump_json()
+    # No broker order exists, so there's no ticket to key on — echo the broker's
+    # signal_id (falling back to a deterministic tag) so the rejection is still
+    # correlatable end-to-end.
+    ref = signal.signal_id or f"REJECT-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
+    volume = signal.quantity or 0.0
+    price = signal.price or 0.0
+
+    self.ctx.db_service.log_position(
+      strategy=signal.strategy,
+      ref_id=ref,
+      ref_source_id=ref,
+      symbol=signal.symbol,
+      action=signal.action.value,
+      volume=volume,
+      price=price,
+      sl=getattr(signal, "sl", None),
+      tp1=getattr(signal, "tp1", None),
+      gateway_return_code=-1,
+      comment=reason,
+      message=signal_json,
+      author=LogAuthorEnum.BROKER.value,
+      market_type=self._market_type,
+    )
+
+    self.ctx.db_service.insert_rejected_position(
+      ref_id=ref,
+      strategy=signal.strategy,
+      symbol=signal.symbol,
+      action=signal.action.value.lower(),
+      volume=volume,
+      opened_price=price,
+      gateway_return_code=-1,
+      comment=reason,
+      message=signal_json,
+      strategy_code=self._magic_for(signal.strategy),
+      market_type=self._market_type,
+    )
+
+    self.ctx.channel_notifier.send_message(
+      self.presenter.order_rejected(signal, reason, footer)
+    )
 
   # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
 

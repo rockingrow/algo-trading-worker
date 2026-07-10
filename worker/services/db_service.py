@@ -45,6 +45,9 @@ class DBService:
   def insert_position(self, *args, **kwargs):
     return self.positions.insert_position(*args, **kwargs)
 
+  def insert_rejected_position(self, *args, **kwargs):
+    return self.positions.insert_rejected_position(*args, **kwargs)
+
   def update_position_status(
     self,
     ref_source_id: str,

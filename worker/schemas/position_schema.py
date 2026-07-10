@@ -19,6 +19,10 @@ class PositionStatusEnum(str, Enum):
   TERMINAL_CLOSED = "TERMINAL_CLOSED"
   FORCED_CLOSED = "FORCED_CLOSED"
   FLATTED = "FLATTED"
+  # Entry that was never sent to the broker because a worker-side policy blocked
+  # it (e.g. MAX_OPEN_ORDERS reached). Recorded for audit and forwarded to the
+  # broker via the TRADE subject so the rejected signal is visible end-to-end.
+  REJECT = "REJECT"
 
 
 class PositionEventType(str, Enum):

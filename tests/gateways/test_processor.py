@@ -40,6 +40,10 @@ class FakePresenter:
     return f"failed:{signal.action.value}"
 
   @staticmethod
+  def order_rejected(signal, reason, footer):
+    return f"order_rejected:{signal.action.value}:{reason}"
+
+  @staticmethod
   def signal_rejected(reason, footer):
     return f"rejected:{reason}"
 
@@ -53,6 +57,8 @@ class FakeDb:
     self.logged = []
     self.inserted = []
     self.updated = []
+    self.rejected = []
+    self.open_positions = []
 
   def log_position(self, **kw):
     self.logged.append(kw)
@@ -60,8 +66,14 @@ class FakeDb:
   def insert_position(self, **kw):
     self.inserted.append(kw)
 
+  def insert_rejected_position(self, **kw):
+    self.rejected.append(kw)
+
   def update_position_status(self, **kw):
     self.updated.append(kw)
+
+  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+    return list(self.open_positions)
 
 
 class FakeProcessor(BaseSignalProcessor):
@@ -249,6 +261,114 @@ def test_failed_result_sends_failure_notification():
   proc._process_message(NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json())
   assert proc.db.inserted == []
   assert proc.notifications == ["failed:LONG"]
+
+
+# ── MAX_OPEN_ORDERS exposure guard ─────────────────────────────────────────── #
+
+
+def _open_row(strategy, symbol):
+  return {
+    "strategy": strategy, "symbol": symbol, "status": "OPENED",
+    "ref_source_id": f"{strategy}:{symbol}",
+  }
+
+
+def _capturing_handler(proc, result):
+  """Replace the handler with one that records the signals it was asked to
+  execute, so a test can assert the broker path was (not) reached."""
+  seen = []
+  proc.handler = SimpleNamespace(handle=lambda sig: seen.append(sig) or result)
+  return seen
+
+
+def test_entry_rejected_when_at_max_open_orders():
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 2}
+  proc.db.open_positions = [_open_row("s1", "AAA"), _open_row("s2", "BBB")]
+  seen = _capturing_handler(proc, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, symbol="CCC").model_dump_json(),
+  )
+
+  # Broker execution never runs for a rejected entry.
+  assert seen == []
+  # Not tracked as an OPENED position...
+  assert proc.db.inserted == []
+  # ...but recorded as a REJECT row so PositionCDC forwards it to the broker.
+  assert len(proc.db.rejected) == 1
+  rej = proc.db.rejected[0]
+  assert rej["symbol"] == "CCC"
+  assert rej["action"] == "long"
+  assert "Max open orders reached (2/2)" in rej["comment"]
+  # Audit-logged and reported on the community channel.
+  assert len(proc.db.logged) == 1
+  assert proc.notifications == ["order_rejected:LONG:" + rej["comment"]]
+
+
+def test_entry_allowed_when_below_max_open_orders():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {"max_open_orders": 5}
+  proc.db.open_positions = [_open_row("s1", "AAA")]
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, symbol="CCC").model_dump_json(),
+  )
+
+  # Normal entry path: inserted as OPENED, no REJECT row, filled notification.
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_reentry_on_held_symbol_not_rejected_at_cap():
+  # A re-entry/scale-in on a symbol this strategy already holds replaces the
+  # existing position rather than opening a new slot, so it is allowed at the cap.
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {"max_open_orders": 2}
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD"), _open_row("s2", "BBB")]
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, symbol="XAUUSD").model_dump_json(),
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+
+
+def test_exit_signal_not_gated_by_max_open_orders():
+  # An exit (SL) must still be processed when the worker is at its cap so a
+  # position can always be closed.
+  proc = FakeProcessor(
+    {"success": True, "ticket": 9, "source_ticket": 5, "price": 1990.0, "volume": 0.1}
+  )
+  proc.settings = {"max_open_orders": 1}
+  proc.db.open_positions = [_open_row("s1", "AAA"), _open_row("s2", "BBB")]
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.SL).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.updated) == 1
+  assert proc.notifications == ["filled:SL:5"]
+
+
+def test_max_open_orders_zero_disables_cap():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {"max_open_orders": 0}
+  proc.db.open_positions = [_open_row("s1", "AAA"), _open_row("s2", "BBB")]
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, symbol="CCC").model_dump_json(),
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
 
 
 def test_admin_subject_routed_to_hook():

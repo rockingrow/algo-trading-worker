@@ -96,6 +96,43 @@ def test_prices_persisted_without_lossy_rounding(repo):
   assert rows[0]["price"] == close
 
 
+def test_insert_rejected_position_writes_reject_row_pending_sync(repo):
+  """A policy-rejected entry is stored with status REJECT and sync_status PENDING
+  so PositionCDC forwards it to the broker on the TRADE subject."""
+  repo.insert_rejected_position(
+    ref_id="sig-1", strategy="strat-a", symbol="XAUUSD", action="long",
+    volume=0.5, opened_price=4500.0, gateway_return_code=-1,
+    comment="Max open orders reached (5/5); entry not placed (MAX_OPEN_ORDERS).",
+    message='{"signal_id":"sig-1"}', strategy_code=777, market_type="FOREX",
+  )
+  pos = repo.get_position("sig-1")
+  assert pos["status"] == "REJECT"
+  assert pos["ref_id"] == "sig-1" and pos["ref_source_id"] == "sig-1"
+  assert pos["sync_status"] == "PENDING"
+  assert "Max open orders reached" in pos["comment"]
+  # The REJECT row is not OPENED/TP1, so it never occupies the one-active-position
+  # slot — a real position can still open on the same (strategy, symbol).
+  repo.insert_position(
+    ref_id="100", strategy="strat-a", symbol="XAUUSD", action="long",
+    volume=0.5, opened_price=4500.0,
+  )
+  assert repo.get_position("100")["status"] == "OPENED"
+
+
+def test_insert_rejected_position_swallows_errors(repo, monkeypatch):
+  """Unlike insert_position, a failure recording a rejection must not raise —
+  the rejection is advisory and must not abort signal processing."""
+  def boom(*a, **k):
+    raise sqlite3.OperationalError("disk full")
+
+  monkeypatch.setattr(repo, "_insert_position_row", boom)
+  # Must not propagate.
+  repo.insert_rejected_position(
+    ref_id="x", strategy="s", symbol="Y", action="long",
+    volume=1.0, opened_price=1.0,
+  )
+
+
 def test_log_position_persists_generic_columns(repo):
   repo.log_position(
     strategy="strat-a", ref_id="5", ref_source_id="5", symbol="XAUUSD",
