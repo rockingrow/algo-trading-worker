@@ -160,6 +160,16 @@ class Settings(BaseSettings):
   # Strategy configuration
   slippage_deviation: int = 100
   strategy_magic_map: dict[str, int] = {}
+  # FOREX manual-order adoption. When enabled, ManualOrderSyncJob scans the
+  # terminal for positions opened by hand (a magic NOT in strategy_magic_map,
+  # e.g. magic 0 from the desktop/mobile/web terminal) and inserts them into the
+  # positions table under the reserved manual_order_strategy so the normal exit
+  # signals (TP1/TP2/SL/R_SL/FLAT) — which upstream must address with that same
+  # strategy — can complete the position cycle. Off by default (no behaviour
+  # change); the reserved strategy name must be disjoint from strategy_magic_map.
+  manual_order_sync_enabled: bool = False
+  manual_order_strategy: str = "MANUAL"
+  manual_order_sync_interval: int = 5  # seconds between terminal scans
   use_custom_position_tp1_percent: bool = False  # If true, use custom TP1 percentage instead of signal's tp1_percent
   position_tp1_percent: Optional[float] = 50  # Only defined if you want custom TP1 percentage, otherwise default is tp1_percent in signal
   # When True, TP1 partial-closes and then moves the stop to breakeven (entry).

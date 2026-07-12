@@ -126,6 +126,14 @@ class BasePlatformGateway(ABC):
   def resolve_symbol(self, base_symbol: str) -> str:
     """Resolve a base symbol (e.g. ``XAUUSD``) to the tradeable platform name."""
 
+  def base_symbol(self, resolved_symbol: str) -> str:
+    """Best-effort inverse of :meth:`resolve_symbol`. Default: identity.
+
+    Only platforms that append a suffix to the base symbol (MT5) need to
+    override this; everywhere else the tradeable name already is the base name.
+    """
+    return resolved_symbol
+
   @abstractmethod
   def get_symbol_spec(self, symbol: str) -> Optional[SymbolSpec]:
     """Return the trading rules for *symbol* (already resolved)."""

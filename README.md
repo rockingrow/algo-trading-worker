@@ -48,7 +48,7 @@ make start
 
 The Worker initialises the `worker_data.sqlite` database, starts the market worker, and subscribes to the configured NATS subjects. The worker runs differently per market:
 
-- **FOREX** — in an isolated child **process** (GIL isolation for the MetaTrader5 C extension), supervised by a watchdog. Daemon threads inside it: MT5 health-check, `MT5EventJob` (terminal-close detection), `PositionCDC`, and `NotificationJob`.
+- **FOREX** — in an isolated child **process** (GIL isolation for the MetaTrader5 C extension), supervised by a watchdog. Daemon threads inside it: MT5 health-check, `MT5EventJob` (terminal-close detection), `ManualOrderSyncJob` (manual-order adoption, when enabled), `PositionCDC`, and `NotificationJob`.
 - **CRYPTO** — in a background **thread** (the pure-Python gateway needs no process isolation). Daemon threads: the exchange user-data event stream (Binance websocket), `CryptoReconcileJob` (missed-fill safety net), `PositionCDC`, and `NotificationJob`.
 
 You can monitor the logs printed directly to the screen. Both markets start the same way (`make start`); `MARKET_TYPE` decides which gateway is loaded.
@@ -567,6 +567,7 @@ Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisatio
 - **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation differs per gateway:
 
   - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number via `STRATEGY_MAGIC_MAP`. `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
+    - **Manual orders (opt-in exception):** a hand-opened position carries a magic the worker never assigned (typically `0`), so it falls outside every mapped magic. With `MANUAL_ORDER_SYNC_ENABLED`, the reserved `MANUAL_ORDER_STRATEGY` stands in for "positions whose magic this worker does not own": `get_open_positions`/`get_all_open_positions` route that strategy to the unowned bucket instead of resolving a magic, and `ManualOrderSyncJob` files adopted rows under it. See the [ManualOrderSyncJob](#manualordersyncjob--manual-order-adoption-workerjobsmanual_order_sync_jobpy) section.
   - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol)` DB invariant and the `strategy` column.
 
 - **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries the broker/exchange for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. It then reconciles **every** active (`OPENED`/`TP1`) DB row for that `(strategy, symbol)` to `FORCED_CLOSED`, independently of whether the broker still reported a live position: a prior position may have been closed externally (exchange SL/liquidation, a manual close, or a missed close event), leaving an orphaned `OPENED` row the broker no longer reports. Clearing it is required — otherwise the fresh entry below would collide with the one-active-per-`(strategy, symbol)` unique index on insert and leave the new trade live but untracked. Only then is the new position opened.
@@ -642,6 +643,23 @@ When `positions_get()` returns `None` (terminal offline), the scan is skipped an
 Over the **weekend-closed window** (Fri 22:00 → Sun 22:00 UTC) the connection is deliberately closed by the health thread, so `MT5EventJob` skips polling entirely rather than logging a "terminal offline" warning every 5 s — see [FOREX weekend market-closed handling](#forex-weekend-market-closed-handling).
 
 The job shares the process-level `stop_event` (`multiprocessing.Event`) with the health-check thread and the NATS loop, so it shuts down cleanly as part of the normal worker lifecycle — no independent restart mechanism is needed.
+
+### ManualOrderSyncJob — Manual-Order Adoption (`worker/jobs/manual_order_sync_job.py`)
+
+**Opt-in (`MANUAL_ORDER_SYNC_ENABLED=true`); off by default.** FOREX strategy isolation is magic-based: `open_position` stamps every worker order with the strategy's magic, and the whole exit pipeline (`get_open_positions`, `MT5EventJob`, ADMIN FLAT) only ever looks at magics in `STRATEGY_MAGIC_MAP`. A position opened **by hand** on the terminal (desktop / mobile / web) therefore carries a magic the worker never assigned — usually `0` — so it is invisible: no DB row is inserted for it, and any `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` signal bails at the "no tracked position in DB" guard, leaving the position impossible to close by signal.
+
+`ManualOrderSyncJob` closes that gap. It runs as a daemon thread in the FOREX child process (default every `MANUAL_ORDER_SYNC_INTERVAL` = 5 s). Each scan:
+
+1. Asks `ForexExecutor.get_manual_open_positions()` for live positions whose magic is **not** in `owned_magics()` (the hand-opened ones).
+2. For each ticket not already in the `positions` table, inserts a row as `OPENED` under the reserved `MANUAL_ORDER_STRATEGY` (default `MANUAL`), stored under the **base** symbol (`base_symbol()` inverts the broker suffix, e.g. `XAUUSDc` → `XAUUSD`) so exit signals match it, writes a `position_logs` row with `author='manual'`, and sends an operator notification.
+
+Once adopted, the position is tracked like any other: `PositionCDC` publishes it, and exit signals **addressed to `MANUAL_ORDER_STRATEGY`** resolve it through the executor's reserved-strategy path — `get_open_positions(symbol, strategy=MANUAL_ORDER_STRATEGY)` returns the unowned bucket instead of resolving a magic — and close it. Every exit path (partial TP1 + breakeven SL move, full close, FLAT) works unchanged.
+
+**Contract & limits:**
+
+- Upstream **must** send the manual trade's exit signals with `strategy = MANUAL_ORDER_STRATEGY`; that name must be **disjoint** from `STRATEGY_MAGIC_MAP`.
+- The reserved strategy is one logical slot, so it obeys the one-active-per-`(strategy, symbol)` invariant — at most one adopted manual position per symbol at a time; a second live manual position on the same symbol is left untracked and logged.
+- `base_symbol()` is best-effort via the resolver cache; on a suffixed broker a symbol never otherwise resolved this session falls back to the tradeable name (brokers without a suffix are always correct).
 
 ### CryptoReconcileJob — Missed-Fill & Manual-Position Reconciliation (`worker/gateways/crypto/reconcile_job.py`)
 
@@ -874,6 +892,7 @@ Daemon threads running alongside the NATS message loop:
 | --- | --- | --- | --- |
 | `forex-health` | FOREX | 15 s (`MT5_HEALTH_INTERVAL`); 15 min while market closed | Checks MT5 connection; sends Telegram alert on disconnect/reconnect, and relaunches/restarts the terminal when needed. Parks the connection over the weekend-closed window (see below) |
 | `MT5EventJob` | FOREX | 5 s; paused while market closed | Detects terminal-side position closes (SL/TP/Stop-Out) |
+| `ManualOrderSyncJob` | FOREX | 5 s (`MANUAL_ORDER_SYNC_INTERVAL`) | **Off unless `MANUAL_ORDER_SYNC_ENABLED`.** Adopts hand-opened positions (unowned magic) into DB tracking so their exit cycle runs |
 | `binance-user-stream` | CRYPTO | push | Websocket user-data stream → exchange-side fills / SL / TP / liquidation |
 | `crypto-reconcile` | CRYPTO | 45 s | `CryptoReconcileJob` — polls live positions; reconciles DB-open rows that are exchange-flat on two consecutive scans (missed-fill safety net) and imports exchange-open positions untracked in the DB (manual opens) on two consecutive scans |
 | `PositionCDC` | both | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |

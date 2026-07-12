@@ -71,10 +71,39 @@ class ForexExecutor:
     terminal-close detection)."""
     return set(self._strategy_magic_map.values())
 
+  def _is_manual_strategy(self, strategy: Optional[str]) -> bool:
+    """True when *strategy* is the reserved name that owns hand-opened positions.
+
+    Manual orders carry a magic this worker never assigned (typically 0 from the
+    desktop/mobile/web terminal), so they cannot be resolved through
+    ``strategy_magic_map``. When manual-order adoption is enabled the reserved
+    strategy stands in for "every position whose magic this worker does not own",
+    letting the normal exit flow (TP1/TP2/SL/R_SL/FLAT) close them by strategy.
+    """
+    manual = self._config.manual_order_strategy
+    return manual is not None and strategy == manual
+
+  def get_manual_open_positions(
+    self, symbol: Optional[str] = None
+  ) -> List[PlatformPosition]:
+    """Live positions whose magic this worker does NOT own — i.e. opened by hand
+    on the terminal. Used by :class:`ManualOrderSyncJob` to adopt them and by the
+    reserved-strategy path in :meth:`get_open_positions`."""
+    resolved = self.get_symbol(symbol) if symbol is not None else None
+    positions = self._gateway.get_positions(resolved)
+    owned = self.owned_magics()
+    return [p for p in positions if p.magic not in owned]
+
   # ── Symbol / volume helpers (delegated to the agnostic math) ──────────── #
 
   def get_symbol(self, base_symbol: str) -> str:
     return self._gateway.resolve_symbol(base_symbol)
+
+  def base_symbol(self, resolved_symbol: str) -> str:
+    """Best-effort inverse of :meth:`get_symbol` (delegated to the gateway), so
+    an adopted manual position is stored under the base symbol that exit signals
+    address it by."""
+    return self._gateway.base_symbol(resolved_symbol)
 
   def _spec(self, base_symbol: str) -> Optional[SymbolSpec]:
     return self._gateway.get_symbol_spec(self._gateway.resolve_symbol(base_symbol))
@@ -104,6 +133,8 @@ class ForexExecutor:
     With *strategy* given, keep only that strategy's positions (native magic
     isolation); otherwise every position this worker owns for the symbol.
     """
+    if self._is_manual_strategy(strategy):
+      return self.get_manual_open_positions(symbol)
     resolved = self.get_symbol(symbol)
     positions = self._gateway.get_positions(resolved)
     if strategy is None:
@@ -117,6 +148,8 @@ class ForexExecutor:
   ) -> List[PlatformPosition]:
     """All open positions across symbols owned by this worker (optionally one
     strategy)."""
+    if self._is_manual_strategy(strategy):
+      return self.get_manual_open_positions()
     positions = self._gateway.get_positions()
     if strategy is None:
       owned = self.owned_magics()

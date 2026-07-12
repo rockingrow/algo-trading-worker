@@ -47,3 +47,17 @@ class SymbolResolver:
         return sym.name
 
     return base_symbol
+
+  def base_for(self, resolved_symbol: str) -> str:
+    """Best-effort inverse of :meth:`get_symbol`: map a tradeable broker symbol
+    (e.g. ``XAUUSDc``) back to the base symbol upstream signals use (``XAUUSD``).
+
+    Uses the resolve cache, so it only knows symbols this worker has already
+    resolved. When the mapping is unknown (a symbol never traded/queried) it
+    returns *resolved_symbol* unchanged — for brokers without a suffix that is
+    already the base symbol, so the common case is always correct.
+    """
+    for base, resolved in self._cache.items():
+      if resolved == resolved_symbol:
+        return base
+    return resolved_symbol

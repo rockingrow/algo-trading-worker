@@ -97,6 +97,9 @@ class MT5Gateway(BasePlatformGateway):
   def resolve_symbol(self, base_symbol: str) -> str:
     return self._resolver.get_symbol(base_symbol)
 
+  def base_symbol(self, resolved_symbol: str) -> str:
+    return self._resolver.base_for(resolved_symbol)
+
   def get_symbol_spec(self, symbol: str) -> Optional[SymbolSpec]:
     si = self._mt5.symbol_info(symbol)
     if not si:

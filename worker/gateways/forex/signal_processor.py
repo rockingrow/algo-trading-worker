@@ -240,6 +240,19 @@ class ForexSignalProcessor(BaseSignalProcessor):
     if job is not None:
       job.start(stop_event=stop_event)
 
+    # Adopt hand-opened terminal positions into DB tracking so their exit cycle
+    # (TP1/TP2/SL/R_SL/FLAT) runs like a worker-opened trade. Off unless enabled.
+    if self.settings.get("manual_order_sync_enabled"):
+      from worker.jobs.manual_order_sync_job import ManualOrderSyncJob
+
+      ManualOrderSyncJob(
+        executor=self.executor,
+        db_service=self.ctx.db_service,
+        notifier=self.ctx.channel_notifier,
+        manual_strategy=self.settings.get("manual_order_strategy") or "MANUAL",
+        poll_interval=self.settings.get("manual_order_sync_interval", 5),
+      ).start(stop_event=stop_event)
+
   # ── ADMIN FLAT match keys (forex reconciles against live tickets) ──────── #
 
   def _flat_match_key(self, pos: Any) -> Any:

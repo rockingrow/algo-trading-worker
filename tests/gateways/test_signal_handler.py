@@ -74,6 +74,22 @@ def test_dispatch_routes_every_action(action, expected):
   assert strat.calls[-1] == expected
 
 
+def test_manual_strategy_full_close_executes_and_injects_ticket():
+  """An adopted manual position (DB row + live position under the reserved
+  strategy) completes a full-close exit (SL): the handler passes the DB gate and
+  the live-position guard, calls the close, and stamps the tracked source_ticket.
+  """
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=555)])
+  store = FakeStore(
+    positions=[{"ref_source_id": "555", "ref_id": "555", "status": "OPENED"}]
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.SL, strategy="MANUAL"))
+  assert res["success"] is True
+  assert res["source_ticket"] == "555"
+  assert strat.calls[-1] == "full_close"
+
+
 def test_flat_routes_through_handler():
   """Regression: FLAT must go through the handler, not a special pre-branch."""
   strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)])

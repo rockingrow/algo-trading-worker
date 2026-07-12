@@ -40,6 +40,12 @@ class ExecutionConfig:
   # When True, always use risk_percentage from settings regardless of signal.
   # When False (default): use signal.risk_percent if present, else risk_percentage.
   use_custom_risk_percentage: bool = False
+  # FOREX only: the reserved strategy name that owns hand-opened positions
+  # adopted by ManualOrderSyncJob. When set, ForexExecutor treats positions whose
+  # magic is NOT in strategy_magic_map (manual orders) as belonging to this
+  # strategy, so exit signals addressed to it can close them. None (the default,
+  # i.e. manual_order_sync_enabled is off) disables the special-casing entirely.
+  manual_order_strategy: Optional[str] = None
 
   @classmethod
   def from_dict(cls, settings_dict: dict) -> "ExecutionConfig":
@@ -55,4 +61,11 @@ class ExecutionConfig:
       tp1_move_sl_to_breakeven=settings_dict.get("tp1_move_sl_to_breakeven"),
       allow_multi_strategy_per_symbol=settings_dict.get("crypto_allow_multi_strategy_per_symbol", False),
       use_custom_risk_percentage=settings_dict.get("use_custom_risk_percentage", False),
+      # Only expose the reserved strategy when adoption is enabled, so the
+      # executor's manual-position matching stays completely inert by default.
+      manual_order_strategy=(
+        settings_dict.get("manual_order_strategy")
+        if settings_dict.get("manual_order_sync_enabled")
+        else None
+      ),
     )

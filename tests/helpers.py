@@ -234,6 +234,9 @@ class FakePlatformGateway:
   def resolve_symbol(self, base_symbol):
     return base_symbol
 
+  def base_symbol(self, resolved_symbol):
+    return resolved_symbol
+
   def get_symbol_spec(self, symbol):
     return self._spec
 
