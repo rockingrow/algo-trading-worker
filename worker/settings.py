@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Optional
 
@@ -39,6 +40,29 @@ class ForexPlatformEnum(str, Enum):
 NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN, NatsSubjectEnum.SYSTEM}
 WATCHDOG_INTERVAL = 10  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
+# The FOREX market is closed over the weekend (roughly Fri 22:00 → Sun 22:00
+# UTC), when the broker's trade server is offline for its weekly maintenance. A
+# disconnect during this window is expected — not a crash — so hammering the
+# server with the weekday relaunch/reconnect storm only floods the logs and
+# Telegram. On weekends the health loop backs off to this slower cadence.
+MT5_HEALTH_INTERVAL_WEEKEND = 15 * 60  # seconds between health checks on weekends
+# Timezone offset (hours from UTC) used to decide whether "now" falls on a
+# weekend. Defaults to UTC+7 (Asia/Ho_Chi_Minh) to match the deployment. Sat/Sun
+# in UTC+7 sits entirely inside the FOREX weekend-closed window, so it is a safe
+# proxy for "market closed" without needing exact session boundaries.
+MARKET_TZ_OFFSET_HOURS = 7
+
+
+def is_market_weekend(now: Optional[datetime] = None) -> bool:
+  """True if `now` is Saturday or Sunday in MARKET_TZ_OFFSET_HOURS local time.
+
+  The FOREX market is closed on weekends and the broker runs its weekly
+  maintenance then, so MT5 legitimately reports "disconnected". Callers use this
+  to back off reconnect attempts instead of hammering an offline trade server.
+  """
+  tz = timezone(timedelta(hours=MARKET_TZ_OFFSET_HOURS))
+  moment = now.astimezone(tz) if now is not None else datetime.now(tz)
+  return moment.weekday() >= 5  # 5 = Saturday, 6 = Sunday
 
 
 class Settings(BaseSettings):
