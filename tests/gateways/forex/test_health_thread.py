@@ -1,10 +1,12 @@
 """
 tests/gateways/forex/test_health_thread.py
 ──────────────────────────────────────────
-The FOREX health thread must treat a weekend disconnect (broker trade server
-offline for weekly maintenance) differently from a weekday crash: back off to a
-slower cadence, skip the kill/relaunch storm, and notify only once — so it stops
-flooding the logs and Telegram while the market is closed.
+The FOREX health thread must treat a weekend (broker trade server offline for
+weekly maintenance) differently from a weekday crash: **close** the MT5
+connection once and stay idle at the slow weekend cadence until the market
+reopens, then reconnect on the first weekday check — so it stops flooding the
+logs and Telegram while the market is closed. A weekday disconnect still gets
+the full aggressive relaunch/reconnect path.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -39,11 +41,13 @@ class _FakeStopEvent:
 
 
 class _FakeGateway:
-  def __init__(self, connected: bool = False) -> None:
+  def __init__(self, connected: bool = False, reconnect_result: bool = False) -> None:
     self.name = "MT5"
     self._connected = connected
+    self._reconnect_result = reconnect_result
     self.reconnect_calls: list[dict] = []
     self.restart_calls = 0
+    self.close_calls = 0
 
   def is_connected(self) -> bool:
     return self._connected
@@ -52,11 +56,21 @@ class _FakeGateway:
     self.reconnect_calls.append(
       {"max_attempts": max_attempts, "delay_seconds": delay_seconds}
     )
-    return self._connected
+    return self._reconnect_result
 
   def restart_terminal(self, startup_wait: float = 15.0) -> bool:
     self.restart_calls += 1
     return False
+
+  def close(self) -> None:
+    self.close_calls += 1
+    self._connected = False
+
+
+def _weekend_sequence(monkeypatch, values):
+  """Patch is_market_weekend to yield each value in `values`, one per loop pass."""
+  it = iter(values)
+  monkeypatch.setattr(sp, "is_market_weekend", lambda: next(it))
 
 
 class _FakeNotifier:
@@ -93,12 +107,12 @@ def test_naive_datetime_is_treated_as_market_local():
   assert is_market_weekend(moment.replace(tzinfo=_TZ)) is True
 
 
-# ── _health_thread: weekend backoff ──────────────────────────────────────── #
+# ── _health_thread: weekend closes the connection ────────────────────────── #
 
 
-def test_weekend_disconnect_backs_off_and_skips_terminal_restart(monkeypatch):
-  monkeypatch.setattr(sp, "is_market_weekend", lambda: True)
-  gateway = _FakeGateway(connected=False)
+def test_weekend_closes_connection_and_does_not_reconnect(monkeypatch):
+  _weekend_sequence(monkeypatch, [True])
+  gateway = _FakeGateway(connected=True)  # still connected when the weekend hits
   notifier = _FakeNotifier()
   stop = _FakeStopEvent(iterations=1)
 
@@ -106,24 +120,44 @@ def test_weekend_disconnect_backs_off_and_skips_terminal_restart(monkeypatch):
 
   # Backs off to the slow weekend cadence.
   assert stop.wait_intervals == [MT5_HEALTH_INTERVAL_WEEKEND]
-  # A single lightweight reconnect attempt — never the 15-attempt storm.
-  assert gateway.reconnect_calls == [{"max_attempts": 1, "delay_seconds": 0}]
-  # Never kills/relaunches the terminal while the server is down for maintenance.
+  # Closes the connection exactly once and never retries while the market is shut.
+  assert gateway.close_calls == 1
+  assert gateway.reconnect_calls == []
   assert gateway.restart_calls == 0
+  # One "Market Closed" notice.
+  assert len(notifier.messages) == 1
+  assert "Market Closed" in notifier.messages[0]
 
 
-def test_weekend_notice_sent_only_once(monkeypatch):
-  monkeypatch.setattr(sp, "is_market_weekend", lambda: True)
-  gateway = _FakeGateway(connected=False)
+def test_weekend_closes_only_once_across_iterations(monkeypatch):
+  _weekend_sequence(monkeypatch, [True, True, True])
+  gateway = _FakeGateway(connected=True)
   notifier = _FakeNotifier()
   stop = _FakeStopEvent(iterations=3)
 
   sp._health_thread(gateway, notifier, lambda: "", stop, sp.log)
 
-  # Three disconnected passes, but only one "Market Closed" Telegram message.
+  # Three weekend passes, but the connection is closed (and announced) only once.
+  assert gateway.close_calls == 1
   assert len(notifier.messages) == 1
-  assert "Market Closed" in notifier.messages[0]
-  assert len(gateway.reconnect_calls) == 3
+  assert stop.wait_intervals == [MT5_HEALTH_INTERVAL_WEEKEND] * 3
+
+
+def test_reopen_after_weekend_reconnects(monkeypatch):
+  # Pass 1: weekend → close. Pass 2: weekday → market reopened → reconnect.
+  _weekend_sequence(monkeypatch, [True, False])
+  gateway = _FakeGateway(connected=True, reconnect_result=True)
+  notifier = _FakeNotifier()
+  stop = _FakeStopEvent(iterations=2)
+
+  sp._health_thread(gateway, notifier, lambda: "", stop, sp.log)
+
+  # Closed for the weekend, then reconnected through the normal path on reopen.
+  assert gateway.close_calls == 1
+  assert gateway.reconnect_calls and gateway.reconnect_calls[0]["max_attempts"] == 15
+  assert gateway.restart_calls == 0  # reconnect succeeded, no terminal relaunch
+  # Cadence: slow on the weekend pass, fast on the weekday reopen pass.
+  assert stop.wait_intervals == [MT5_HEALTH_INTERVAL_WEEKEND, MT5_HEALTH_INTERVAL]
 
 
 # ── _health_thread: weekday path unchanged ───────────────────────────────── #

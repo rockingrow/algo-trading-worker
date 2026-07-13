@@ -48,13 +48,13 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
   terminal without waiting for a signal to arrive.
 
   On weekends the FOREX trade server is offline for the broker's weekly
-  maintenance, so a disconnect is expected. The loop then backs off to
-  ``MT5_HEALTH_INTERVAL_WEEKEND`` and skips the weekday relaunch/reconnect storm
-  — it just checks quietly (and sends a single notice) instead of flooding the
-  logs and Telegram with attempts that cannot succeed until the market reopens.
+  maintenance, so a connection is impossible and reconnecting only floods the
+  logs. The loop then **closes** the MT5 connection once, backs off to
+  ``MT5_HEALTH_INTERVAL_WEEKEND``, and stays idle until the market reopens — at
+  which point (the first weekday check) it reconnects through the normal path.
   """
   name = gateway.name
-  weekend_notice_sent = False
+  closed_for_weekend = False
   while not stop_event.is_set():
     weekend = is_market_weekend()
     interval = MT5_HEALTH_INTERVAL_WEEKEND if weekend else MT5_HEALTH_INTERVAL
@@ -62,32 +62,38 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
     if stop_event.wait(interval):
       break
     try:
-      if gateway.is_connected():
-        weekend_notice_sent = False
-        continue
-
       if weekend:
-        # Market closed for the weekend — the trade server is down for
-        # maintenance. Reconnecting cannot succeed until it reopens, so stay
-        # quiet: log once at INFO and notify only on the first detection.
-        log.info(
-          "[%s Health] %s disconnected during weekend market close — "
-          "backing off, next check in %ds.",
-          name, name, interval,
-        )
-        if not weekend_notice_sent:
+        # Market closed for the weekend. The broker trade server is offline for
+        # maintenance, so keeping (or retrying) a connection is pointless. Close
+        # it once and stay idle at the slow weekend cadence until the market
+        # reopens; the paired MT5EventJob likewise pauses its polling.
+        if not closed_for_weekend:
+          log.info(
+            "[%s Health] Weekend market close — closing %s connection until the market reopens.",
+            name, name,
+          )
           notifier.send_message(
             _box(
-              f"{WARNING} <b>[Market Closed] {name} disconnected (weekend)</b>\n\n"
-              f"Broker trade server is offline for weekend maintenance. "
-              f"Reconnect attempts are paused until the market reopens."
+              f"{DISCONNECTED} <b>[Market Closed] {name}</b>\n\n"
+              f"Broker trade server is offline for the weekend. Connection closed — "
+              f"{name} will reconnect automatically when the market reopens."
               f"{footer_fn()}"
             )
           )
-          weekend_notice_sent = True
-        # A single lightweight attempt re-establishes the session promptly once
-        # the server returns, without the weekday retry storm.
-        gateway.reconnect(max_attempts=1, delay_seconds=0)
+          try:
+            gateway.close()
+          except Exception:
+            log.exception("[%s Health] Error closing %s for the weekend.", name, name)
+          closed_for_weekend = True
+        continue
+
+      # Weekday. If the connection was closed for the weekend, the market has now
+      # reopened — fall through to the normal reconnect path to bring it back up.
+      if closed_for_weekend:
+        closed_for_weekend = False
+        log.info("[%s Health] Market reopened — reconnecting %s...", name, name)
+
+      if gateway.is_connected():
         continue
 
       log.warning(
