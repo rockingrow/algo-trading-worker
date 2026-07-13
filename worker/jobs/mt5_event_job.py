@@ -25,7 +25,7 @@ from worker.logger import get_logger
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.notification_service import _box
-from worker.settings import MT5_HEALTH_INTERVAL_WEEKEND, is_market_weekend
+from worker.settings import MT5_HEALTH_INTERVAL_WEEKEND, is_market_closed
 
 log = get_logger("worker.jobs.mt5_event_job")
 
@@ -94,11 +94,11 @@ class MT5EventJob:
 
   def _run(self) -> None:
     while not self._stop_event.is_set():
-      # Over the weekend the health thread closes the MT5 connection until the
-      # market reopens, so positions_get() would return None and every scan
-      # would log a "terminal offline" warning. Skip polling entirely and idle
-      # at the slow weekend cadence instead of flooding the logs.
-      if is_market_weekend():
+      # Over the weekend-closed window the health thread closes the MT5
+      # connection until the market reopens, so positions_get() would return None
+      # and every scan would log a "terminal offline" warning. Skip polling
+      # entirely and idle at the slow weekend cadence instead of flooding the logs.
+      if is_market_closed():
         self._stop_event.wait(MT5_HEALTH_INTERVAL_WEEKEND)
         continue
       try:

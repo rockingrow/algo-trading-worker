@@ -32,7 +32,7 @@ from worker.services.notification_service import _box
 from worker.settings import (
   MT5_HEALTH_INTERVAL,
   MT5_HEALTH_INTERVAL_WEEKEND,
-  is_market_weekend,
+  is_market_closed,
 )
 
 log = get_logger("worker.gateways.forex.signal_processor")
@@ -47,22 +47,23 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
   Proactively detects a platform disconnect and relaunches/reconnects the
   terminal without waiting for a signal to arrive.
 
-  On weekends the FOREX trade server is offline for the broker's weekly
-  maintenance, so a connection is impossible and reconnecting only floods the
-  logs. The loop then **closes** the MT5 connection once, backs off to
-  ``MT5_HEALTH_INTERVAL_WEEKEND``, and stays idle until the market reopens — at
-  which point (the first weekday check) it reconnects through the normal path.
+  Over the weekend-closed window (Fri 22:00 → Sun 22:00 UTC) the FOREX trade
+  server is offline for the broker's weekly maintenance, so a connection is
+  impossible and reconnecting only floods the logs. The loop then **closes** the
+  MT5 connection once, backs off to ``MT5_HEALTH_INTERVAL_WEEKEND``, and stays
+  idle until the market reopens — at which point (the first check after the
+  window) it reconnects through the normal path.
   """
   name = gateway.name
   closed_for_weekend = False
   while not stop_event.is_set():
-    weekend = is_market_weekend()
-    interval = MT5_HEALTH_INTERVAL_WEEKEND if weekend else MT5_HEALTH_INTERVAL
+    market_closed = is_market_closed()
+    interval = MT5_HEALTH_INTERVAL_WEEKEND if market_closed else MT5_HEALTH_INTERVAL
     # Interruptible wait so shutdown isn't delayed by the (long) weekend interval.
     if stop_event.wait(interval):
       break
     try:
-      if weekend:
+      if market_closed:
         # Market closed for the weekend. The broker trade server is offline for
         # maintenance, so keeping (or retrying) a connection is pointless. Close
         # it once and stay idle at the slow weekend cadence until the market
@@ -87,8 +88,9 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
           closed_for_weekend = True
         continue
 
-      # Weekday. If the connection was closed for the weekend, the market has now
-      # reopened — fall through to the normal reconnect path to bring it back up.
+      # Market is open. If the connection was closed for the weekend, the market
+      # has now reopened — fall through to the normal reconnect path to bring it
+      # back up.
       if closed_for_weekend:
         closed_for_weekend = False
         log.info("[%s Health] Market reopened — reconnecting %s...", name, name)

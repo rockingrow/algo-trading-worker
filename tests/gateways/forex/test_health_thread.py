@@ -9,17 +9,14 @@ logs and Telegram while the market is closed. A weekday disconnect still gets
 the full aggressive relaunch/reconnect path.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import worker.gateways.forex.signal_processor as sp
 from worker.settings import (
-  MARKET_TZ_OFFSET_HOURS,
   MT5_HEALTH_INTERVAL,
   MT5_HEALTH_INTERVAL_WEEKEND,
-  is_market_weekend,
+  is_market_closed,
 )
-
-_TZ = timezone(timedelta(hours=MARKET_TZ_OFFSET_HOURS))
 
 
 class _FakeStopEvent:
@@ -68,9 +65,9 @@ class _FakeGateway:
 
 
 def _weekend_sequence(monkeypatch, values):
-  """Patch is_market_weekend to yield each value in `values`, one per loop pass."""
+  """Patch is_market_closed to yield each value in `values`, one per loop pass."""
   it = iter(values)
-  monkeypatch.setattr(sp, "is_market_weekend", lambda: next(it))
+  monkeypatch.setattr(sp, "is_market_closed", lambda: next(it))
 
 
 class _FakeNotifier:
@@ -81,30 +78,46 @@ class _FakeNotifier:
     self.messages.append(msg)
 
 
-# ── is_market_weekend ─────────────────────────────────────────────────────── #
+# ── is_market_closed (window: Fri 22:00 UTC → Sun 22:00 UTC) ─────────────── #
+# July 2026: 10th=Fri, 11th=Sat, 12th=Sun, 13th=Mon.
 
 
-def test_sunday_noon_utc7_is_weekend():
-  # Sun 2026-07-12 12:00 UTC+7 == 05:00 UTC — the reported disconnect window.
-  moment = datetime(2026, 7, 12, 5, 0, tzinfo=timezone.utc)
-  assert is_market_weekend(moment) is True
+def test_friday_before_close_is_open():
+  # Fri 21:00 UTC — market still open (closes at 22:00 UTC).
+  assert is_market_closed(datetime(2026, 7, 10, 21, 0, tzinfo=timezone.utc)) is False
 
 
-def test_wednesday_is_not_weekend():
-  moment = datetime(2026, 7, 8, 5, 0, tzinfo=timezone.utc)
-  assert is_market_weekend(moment) is False
+def test_friday_at_close_hour_is_closed():
+  # Fri 22:00 UTC — the close boundary is inclusive.
+  assert is_market_closed(datetime(2026, 7, 10, 22, 0, tzinfo=timezone.utc)) is True
 
 
-def test_friday_evening_utc7_still_weekday():
-  # Fri 23:00 UTC+7 == Fri 16:00 UTC — still a weekday in market-local time.
-  moment = datetime(2026, 7, 10, 16, 0, tzinfo=timezone.utc)
-  assert is_market_weekend(moment) is False
+def test_saturday_is_closed_all_day():
+  assert is_market_closed(datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)) is True
 
 
-def test_naive_datetime_is_treated_as_market_local():
-  # A naive Saturday noon must be read in market-local time, not assumed UTC.
-  moment = datetime(2026, 7, 11, 12, 0)
-  assert is_market_weekend(moment.replace(tzinfo=_TZ)) is True
+def test_sunday_noon_utc7_is_closed():
+  # Sun 12:00 UTC+7 == 05:00 UTC — the reported disconnect window.
+  assert is_market_closed(datetime(2026, 7, 12, 5, 0, tzinfo=timezone.utc)) is True
+
+
+def test_sunday_just_before_open_is_closed():
+  # Sun 21:00 UTC — still closed until the 22:00 UTC reopen.
+  assert is_market_closed(datetime(2026, 7, 12, 21, 0, tzinfo=timezone.utc)) is True
+
+
+def test_sunday_at_open_hour_is_open():
+  # Sun 22:00 UTC — market reopens; the open boundary is exclusive of "closed".
+  assert is_market_closed(datetime(2026, 7, 12, 22, 0, tzinfo=timezone.utc)) is False
+
+
+def test_wednesday_is_open():
+  assert is_market_closed(datetime(2026, 7, 8, 5, 0, tzinfo=timezone.utc)) is False
+
+
+def test_naive_datetime_is_treated_as_utc():
+  # A naive Saturday must be read as UTC, not local system time.
+  assert is_market_closed(datetime(2026, 7, 11, 12, 0)) is True
 
 
 # ── _health_thread: weekend closes the connection ────────────────────────── #
@@ -164,7 +177,7 @@ def test_reopen_after_weekend_reconnects(monkeypatch):
 
 
 def test_weekday_disconnect_uses_aggressive_path(monkeypatch):
-  monkeypatch.setattr(sp, "is_market_weekend", lambda: False)
+  monkeypatch.setattr(sp, "is_market_closed", lambda: False)
   gateway = _FakeGateway(connected=False)  # reconnect keeps failing
   notifier = _FakeNotifier()
   stop = _FakeStopEvent(iterations=1)
@@ -179,7 +192,7 @@ def test_weekday_disconnect_uses_aggressive_path(monkeypatch):
 
 
 def test_connected_gateway_does_nothing(monkeypatch):
-  monkeypatch.setattr(sp, "is_market_weekend", lambda: False)
+  monkeypatch.setattr(sp, "is_market_closed", lambda: False)
   gateway = _FakeGateway(connected=True)
   notifier = _FakeNotifier()
   stop = _FakeStopEvent(iterations=1)
