@@ -6,7 +6,7 @@ responses into TradeResult / ExchangePosition — without any network.
 """
 
 import worker.gateways.crypto.binance.gateway as gw_mod
-from worker.gateways.crypto.base import SIDE_LONG
+from worker.gateways.crypto.base import SIDE_LONG, SIDE_SHORT
 
 
 class FakeResp:
@@ -31,7 +31,7 @@ def _exchange_info():
   }
 
 
-def make_gateway(monkeypatch):
+def make_gateway(monkeypatch, hedge_mode=False):
   calls = []
 
   def fake_send(session, config, *, method, path, payload, is_signed, response_model):
@@ -58,7 +58,7 @@ def make_gateway(monkeypatch):
     return FakeResp({})
 
   monkeypatch.setattr(gw_mod, "send_request", fake_send)
-  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True, hedge_mode=hedge_mode)
   return gw, calls
 
 
@@ -126,6 +126,52 @@ def test_set_take_profit_is_conditional_algo_order_close_position(monkeypatch):
   assert c["payload"]["type"] == "TAKE_PROFIT_MARKET"
   assert c["payload"]["side"] == "SELL"        # close a LONG
   assert c["payload"]["trigger_price"] == 31000.0
+
+
+def test_place_market_order_hedge_mode_sends_position_side_not_reduce_only(monkeypatch):
+  # Hedge Mode accounts require every order to carry positionSide and reject
+  # reduceOnly outright (-1106) — this is the -4061 fix for Hedge accounts.
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, reduce_only=False)
+  c = calls[-1]
+  assert c["payload"]["side"] == "BUY"
+  assert c["payload"]["position_side"] == "LONG"
+  assert "reduce_only" not in c["payload"]
+
+
+def test_place_market_order_hedge_mode_close_keeps_position_side_of_the_position(monkeypatch):
+  # Closing a LONG in Hedge Mode still sells, but positionSide stays LONG (the
+  # position being reduced) — it must not flip to SHORT.
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, reduce_only=True)
+  c = calls[-1]
+  assert c["payload"]["side"] == "SELL"
+  assert c["payload"]["position_side"] == "LONG"
+  assert "reduce_only" not in c["payload"]
+
+
+def test_place_market_order_hedge_mode_short(monkeypatch):
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.place_market_order("BTCUSDT", SIDE_SHORT, 0.02, reduce_only=False)
+  c = calls[-1]
+  assert c["payload"]["side"] == "SELL"
+  assert c["payload"]["position_side"] == "SHORT"
+
+
+def test_set_stop_loss_hedge_mode_sends_position_side(monkeypatch):
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.set_stop_loss("BTCUSDT", SIDE_LONG, stop_price=29000.0, quantity=0.02)
+  c = calls[-1]
+  assert c["payload"]["position_side"] == "LONG"
+  assert c["payload"]["side"] == "SELL"
+
+
+def test_set_take_profit_hedge_mode_sends_position_side(monkeypatch):
+  gw, calls = make_gateway(monkeypatch, hedge_mode=True)
+  gw.set_take_profit("BTCUSDT", SIDE_SHORT, tp_price=28000.0, quantity=0.02)
+  c = calls[-1]
+  assert c["payload"]["position_side"] == "SHORT"
+  assert c["payload"]["side"] == "BUY"         # close a SHORT
   assert c["payload"]["close_position"] == "true"
   assert "quantity" not in c["payload"]        # closePosition forbids quantity
 
@@ -399,3 +445,49 @@ def test_order_result_falls_back_to_cumquote_when_avgprice_zero(monkeypatch):
   assert res["success"] is True
   assert res["volume"] == 0.0333
   assert abs(res["price"] - 2179.15 / 0.0333) < 0.01
+
+
+# ── Position mode ───────────────────────────────────────────────────────────── #
+
+
+def test_set_position_mode_hedge_posts_dual_true(monkeypatch):
+  gw, calls = make_gateway(monkeypatch)
+  assert gw.set_position_mode(True) is True
+  c = calls[-1]
+  assert c["method"] == "POST" and c["path"] == "/fapi/v1/positionSide/dual"
+  assert c["signed"] is True
+  assert c["payload"]["dual_side_position"] == "true"
+
+
+def test_set_position_mode_one_way_posts_dual_false(monkeypatch):
+  gw, calls = make_gateway(monkeypatch)
+  assert gw.set_position_mode(False) is True
+  assert calls[-1]["payload"]["dual_side_position"] == "false"
+
+
+def test_set_position_mode_treats_no_change_as_success(monkeypatch):
+  # Binance returns -4059 ("No need to change position side.") when the account is
+  # already in the requested mode — the desired end state, so it counts as success.
+  from binance_common.errors import BadRequestError
+
+  gw, _ = make_gateway(monkeypatch)
+
+  def already(session, config, *, method, path, payload, is_signed, response_model):
+    raise BadRequestError(error_message="No need to change position side.", status_code=-4059)
+
+  monkeypatch.setattr(gw_mod, "send_request", already)
+  assert gw.set_position_mode(True) is True
+
+
+def test_set_position_mode_returns_false_on_reject(monkeypatch):
+  # A genuine rejection (e.g. -4068 with open positions/orders) is best-effort:
+  # logged and reported as False so startup proceeds on the current mode.
+  from binance_common.errors import BadRequestError
+
+  gw, _ = make_gateway(monkeypatch)
+
+  def boom(session, config, *, method, path, payload, is_signed, response_model):
+    raise BadRequestError(error_message="Position side cannot be changed", status_code=-4068)
+
+  monkeypatch.setattr(gw_mod, "send_request", boom)
+  assert gw.set_position_mode(True) is False

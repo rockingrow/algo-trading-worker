@@ -25,9 +25,10 @@ def _build_binance(settings_dict: dict) -> BaseExchangeGateway:
   from worker.gateways.crypto.binance.gateway import BinanceFuturesGateway
 
   return BinanceFuturesGateway(
-    api_key=settings_dict["binance_api_key"].get_secret_value(),
-    api_secret=settings_dict["binance_api_secret"].get_secret_value(),
-    testnet=bool(settings_dict.get("binance_testnet", False)),
+    api_key=settings_dict["crypto_api_key"].get_secret_value(),
+    api_secret=settings_dict["crypto_api_secret"].get_secret_value(),
+    testnet=bool(settings_dict.get("crypto_testnet", False)),
+    hedge_mode=bool(settings_dict.get("crypto_hedge_mode", False)),
   )
 
 

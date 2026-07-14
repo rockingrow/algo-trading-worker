@@ -150,7 +150,7 @@ imports MetaTrader5 or any `worker.gateways.forex.mt5.*` module:
 | `worker/gateways/crypto/binance/user_data_stream.py` | `BinanceUserDataStream` | Official-SDK websocket User Data Stream ingesting fills / SL / TP / liquidation / external manual closes (+ pure parser) |
 | `worker/gateways/crypto/executor.py` | `CryptoExecutor` | Implements the generic executor protocol over a gateway |
 | `worker/gateways/crypto/signal_processor.py` | `CryptoSignalProcessor` | NATS loop + executor/handler + crypto jobs |
-| `worker/gateways/crypto/reconcile_job.py` | `CryptoReconcileJob` | Periodic missed-fill reconciler — diffs DB-open rows against live exchange positions; two-scan confirmation before marking closed |
+| `worker/gateways/crypto/reconcile_job.py` | `CryptoReconcileJob` | Periodic reconciler — diffs DB-open rows against live exchange positions in both directions: marks missed closes, and imports untracked live positions as `MANUAL`-strategy DB rows; two-scan confirmation either way |
 
 Adding a new exchange = implement `BaseExchangeGateway` + register it in
 `ExchangeFactory`. No business-logic change.
@@ -162,11 +162,40 @@ Data Stream uses the SDK websocket (auto-reconnect). All of this lives only insi
 `worker/gateways/crypto/binance/` — the gateway abstraction keeps it out of the
 executor/strategy/processor, so it never leaks upward.
 
-Required env when `MARKET_TYPE=CRYPTO` (Binance): `BINANCE_API_KEY`,
-`BINANCE_API_SECRET`, `BINANCE_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
+Required env when `MARKET_TYPE=CRYPTO` (Binance): `CRYPTO_API_KEY`,
+`CRYPTO_API_SECRET`, `CRYPTO_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
 `USDT`) — enforced by the settings validator. `CRYPTO_EXCHANGE` defaults to
-`BINANCE`; `BINANCE_TESTNET` is optional. MT5 credentials are **not** required.
-See `.env.example`.
+`BINANCE`; `CRYPTO_TESTNET` is optional, and `CRYPTO_HEDGE_MODE` (default
+`true`) is the Position Mode the worker enforces on the account at startup (see
+below). MT5 credentials are **not** required. See `.env.example`.
+
+### Position Mode — Hedge vs One-way (CRYPTO / Binance)
+
+Binance Futures accounts run in one of two **Position Modes**. Rather than
+relying on the operator to set it on the exchange (Binance app/web → Futures →
+Preferences → Position Mode), the worker **reconciles** the account into
+`CRYPTO_HEDGE_MODE` right after connecting — the generic
+`BaseExchangeGateway.set_position_mode()` hook, implemented by the Binance
+gateway via `POST /fapi/v1/positionSide/dual`. So `CRYPTO_HEDGE_MODE` is the
+mode the worker *drives the account into*, and it selects the order payload:
+
+| `CRYPTO_HEDGE_MODE` | Exchange mode | Order payload |
+| --- | --- | --- |
+| `true` (default) | Hedge | Every order (market open/close, stop-loss, take-profit) carries an explicit `positionSide` (`LONG`/`SHORT`); `reduceOnly` is omitted entirely — Binance rejects it in Hedge Mode. |
+| `false` | One-way | No `positionSide` sent; `reduceOnly` marks closing orders instead. Binance infers direction from `side` alone. |
+
+The switch is best-effort: Binance returns `-4059` ("*No need to change
+position side.*") when the account is already in the requested mode (treated as
+success), and can reject the switch (e.g. `-4068`) when open positions or orders
+exist — that is logged and the worker proceeds on the account's current mode, in
+which case a mismatch still surfaces as Binance error `-4061` ("*Order's
+position side does not match user's setting.*") on the first order.
+
+The worker still only ever tracks **one net position per symbol** regardless
+of this setting: it does not open or manage simultaneous LONG and SHORT
+positions on the same symbol even when the account is in Hedge Mode. Strategy
+isolation on a shared symbol remains logical-only, as described in [Signal
+Execution — Key Design Decisions](#-signal-execution--key-design-decisions).
 
 ### Per-symbol leverage initialisation (CRYPTO)
 
@@ -306,7 +335,7 @@ worker/
 │       ├── executor.py               # CryptoExecutor (TradeExecutorProtocol)
 │       ├── factory.py                # ExchangeFactory — selects the CEX
 │       ├── message_presenter.py      # CryptoMessagePresenter
-│       ├── reconcile_job.py          # CryptoReconcileJob — missed-fill safety-net (two-scan confirmation)
+│       ├── reconcile_job.py          # CryptoReconcileJob — missed-fill safety-net + manual-position import (two-scan confirmation)
 │       ├── signal_processor.py       # CryptoSignalProcessor — crypto hooks over the base
 │       └── binance/                  # First concrete exchange
 │           ├── gateway.py            # BinanceFuturesGateway (official binance_common transport)
@@ -422,7 +451,7 @@ Closes open positions across one or more strategies/symbols in a single command.
 
 | Filter | Behaviour when present |
 | --- | --- |
-| `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `BINANCE_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
+| `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
 | `strategy` | Restricts close to positions whose `strategy` column equals this value |
 | `symbol` | Restricts close to positions for this symbol |
 
@@ -610,7 +639,46 @@ On each event the job then:
 
 When `positions_get()` returns `None` (terminal offline), the scan is skipped and `seen_tickets` is left untouched. This prevents false-positive "position closed" events and ensures that once MT5 comes back online, any positions that were closed during the outage are detected on the next scan.
 
+Over the **weekend-closed window** (Fri 22:00 → Sun 22:00 UTC) the connection is deliberately closed by the health thread, so `MT5EventJob` skips polling entirely rather than logging a "terminal offline" warning every 5 s — see [FOREX weekend market-closed handling](#forex-weekend-market-closed-handling).
+
 The job shares the process-level `stop_event` (`multiprocessing.Event`) with the health-check thread and the NATS loop, so it shuts down cleanly as part of the normal worker lifecycle — no independent restart mechanism is needed.
+
+### CryptoReconcileJob — Missed-Fill & Manual-Position Reconciliation (`worker/gateways/crypto/reconcile_job.py`)
+
+`CryptoReconcileJob` runs as a daemon thread (`crypto-reconcile`, 45 s poll) alongside the Binance user-data websocket stream, `PositionCDC`, and `NotificationJob`. It is the CRYPTO durability backstop, playing the same role `MT5EventJob` plays for FOREX, but the exchange only exposes positions via a single point-in-time snapshot (no `history_deals_get` equivalent), so instead of classifying a close reason it diffs one `get_all_open_positions()` call (Binance `positionRisk`) against the DB's open rows in **both directions**:
+
+1. **Missed closes** — a DB-open row (`OPENED`/`TP1`) whose resolved symbol is no longer live on the exchange. Backstops the user-data stream for a fill it missed (reconnect gap, handler exception, worker downtime during an SL/TP/liquidation).
+2. **Manual opens** — a live exchange position whose resolved symbol matches no DB-open row, i.e. opened directly on the exchange (UI / app / a third party) and never routed through a worker signal. This is the opposite drift from (1), and is what lets **manually-opened positions get imported and managed by the worker** even though they never came from a NATS `SIGNAL`.
+
+#### Two-scan confirmation
+
+Both directions require the same symbol to be flagged on **two consecutive scans** before acting, mirroring `MT5EventJob`'s use of `seen_tickets` across polls:
+
+| Case | Suspect set (kept across scans) | Confirmed action |
+| --- | --- | --- |
+| Missed close | `_suspected`, keyed by `ref_source_id` | DB-open + exchange-flat this scan **and** the previous one → `handler(row)` |
+| Manual open | `_suspected_manual`, keyed by resolved exchange symbol | Exchange-open + DB-untracked this scan **and** the previous one → `manual_handler(pos)` |
+
+This absorbs the brief lag between a fill and its appearance in (or disappearance from) `positionRisk`: a freshly opened worker position is never mistaken for a missed close, and a worker-opened position still mid-persist (DB insert not yet committed) is never mistaken for a manual one. If the live-position fetch itself raises, the entire scan is skipped and **both** suspect sets are left untouched — a transient API error can never be read as "everything is flat" or "everything is manual".
+
+#### Missed-close handling (`CryptoSignalProcessor._on_missed_close`)
+
+The exact close reason/price is unknown (the live user-data event is what normally carries those), so the row is marked `TERMINAL_CLOSED` with a best-effort mark price (`gateway.get_mark_price`) and a comment flagging it as reconciled. `PositionCDC` then publishes the status downstream as usual, and a `Position Reconciled — Closed on Exchange` Telegram notification is sent.
+
+#### Manual-position import (`CryptoSignalProcessor._on_manual_position`)
+
+A confirmed manual position is persisted as a brand-new `OPENED` row so the worker manages it exactly like a signal-opened position from this point on — `PositionCDC` publishes it as a `CREATED` TRADE event, and the existing close backstops (user-data stream, missed-close reconciliation above) later flatten it by resolved symbol, same as any other position:
+
+| Field | Value |
+| --- | --- |
+| `strategy` | Synthetic `MANUAL` strategy — never a real signal strategy, so it can never collide with the one-active-per-`(strategy, symbol)` invariant |
+| `ref_id` / `ref_source_id` | `MANUAL-<symbol>-<uuid8>` — the uuid suffix means a symbol that is manually opened, closed, then re-opened gets a fresh id each time instead of upserting onto the prior, already-closed trade |
+| `action` / `volume` / `opened_price` | Read straight off the live `ExchangePosition` (`side`, `volume`, `price_open`) |
+| `sl` / `tp1` / `gateway_message` | `None` — there is no originating signal to record |
+
+Idempotency doesn't depend on the generated id: the reconciler only ever imports a symbol the DB isn't already tracking, so the same live position can't be imported twice even though each import mints a fresh id. A `Manual Position Imported` Telegram notification (`CryptoMessagePresenter.position_imported_manual`) is sent per import, with the symbol, side, quantity, entry price, and generated `ref_source_id`.
+
+`manual_handler` is an optional constructor argument on `CryptoReconcileJob` — leaving it unset keeps the job close-only (its original behaviour before manual-position import existed); `CryptoSignalProcessor` wires `_on_manual_position` in when it starts the job.
 
 ### PositionCDC — NATS Trade Publisher (`worker/jobs/cdc_job.py`)
 
@@ -621,8 +689,8 @@ The job shares the process-level `stop_event` (`multiprocessing.Event`) with the
 | Field | Source |
 | --- | --- |
 | `event` | `CREATED` (first sync) or `UPDATED` (subsequent syncs) |
-| `account_id` | Worker account id — `MT5_LOGIN` (FOREX) or `BINANCE_ACCOUNT_ID` (CRYPTO) |
-| `account_name` | `MT5_NAME` (FOREX) or `BINANCE_ACCOUNT_ID` (CRYPTO) |
+| `account_id` | Worker account id — `MT5_LOGIN` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
+| `account_name` | `MT5_NAME` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
 | `market_type` | `MARKET_TYPE` from settings (e.g. `forex`, `crypto`) |
 | `account_balance` / `account_leverage` | Snapshot from the gateway's account (`account_info_fn`) at poll time (CRYPTO reports balance only; leverage is `null`) |
 | `signal_id`, `sl`, `tp1`, `tp2`, `risk_percent`, `magic` | Extracted from the original signal JSON stored in `positions.gateway_message` |
@@ -737,7 +805,7 @@ OPENED ──► TP1 ──► TP2
 
 | Status | Set by | Meaning |
 | --- | --- | --- |
-| `OPENED` | Entry signal | Position is live |
+| `OPENED` | Entry signal (or `CryptoReconcileJob` manual-position import, `strategy=MANUAL`) | Position is live |
 | `TP1` | TP1 signal | Partially closed; runner is still active |
 | `TP2` | TP2 signal | Fully closed at take-profit 2 |
 | `SL` | SL signal | Fully closed at stop-loss (NATS-triggered) |
@@ -804,11 +872,34 @@ Daemon threads running alongside the NATS message loop:
 
 | Thread | Markets | Interval | Purpose |
 | --- | --- | --- | --- |
-| `forex-health` | FOREX | 15 s (`MT5_HEALTH_INTERVAL`) | Checks MT5 connection; sends Telegram alert on disconnect/reconnect, and relaunches/restarts the terminal when needed |
-| `MT5EventJob` | FOREX | 5 s | Detects terminal-side position closes (SL/TP/Stop-Out) |
+| `forex-health` | FOREX | 15 s (`MT5_HEALTH_INTERVAL`); 15 min while market closed | Checks MT5 connection; sends Telegram alert on disconnect/reconnect, and relaunches/restarts the terminal when needed. Parks the connection over the weekend-closed window (see below) |
+| `MT5EventJob` | FOREX | 5 s; paused while market closed | Detects terminal-side position closes (SL/TP/Stop-Out) |
 | `binance-user-stream` | CRYPTO | push | Websocket user-data stream → exchange-side fills / SL / TP / liquidation |
-| `crypto-reconcile` | CRYPTO | 45 s | `CryptoReconcileJob` — polls live positions; reconciles DB-open rows that are exchange-flat on two consecutive scans (missed-fill safety net) |
+| `crypto-reconcile` | CRYPTO | 45 s | `CryptoReconcileJob` — polls live positions; reconciles DB-open rows that are exchange-flat on two consecutive scans (missed-fill safety net) and imports exchange-open positions untracked in the DB (manual opens) on two consecutive scans |
 | `PositionCDC` | both | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
 | `NotificationJob` | both | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
 
 All threads share the same `stop_event` — a `multiprocessing.Event` for FOREX, a `threading.Event` for CRYPTO — and exit cleanly when it is set.
+
+### FOREX weekend market-closed handling
+
+The FOREX market is closed from **Friday 22:00 UTC to Sunday 22:00 UTC**, when the broker's trade server is offline for its weekly maintenance. During this window MT5 legitimately reports "disconnected" — it is **not** a crash, and reconnecting cannot succeed until the market reopens. Left unchecked, the `forex-health` thread would treat it like a weekday outage and hammer the server every 15 s (up to 15 reconnect attempts, then `taskkill terminal64.exe` + relaunch + 15 more), flooding the logs and Telegram all weekend.
+
+Instead, both FOREX threads become market-hours-aware via `is_market_closed()` (`worker/settings.py`), which returns `True` inside the Fri 22:00 → Sun 22:00 UTC window:
+
+| Thread | While the market is closed |
+| --- | --- |
+| `forex-health` | Closes the MT5 connection **once** (`gateway.close()`), sends a single **"Market Closed"** Telegram notice, then idles at `MT5_HEALTH_INTERVAL_WEEKEND` (default 15 min) — no reconnect attempts, no terminal relaunch — until the market reopens. |
+| `MT5EventJob` | Pauses its 5 s polling (also at the 15-min cadence). A closed connection makes `positions_get()` return `None`, so without this it would log a "terminal offline" warning on every scan. |
+
+On **reopen** (Sunday 22:00 UTC = Monday 05:00 UTC+7) the first health check reconnects through the normal path and emits the usual *reconnecting → connected* Telegram pair; `MT5EventJob` resumes polling and catches up on any SL/TP that fired at the open. Open-market behaviour is otherwise unchanged — a genuine disconnect still triggers the full aggressive relaunch/reconnect path immediately.
+
+The window and cadence are module constants in `worker/settings.py`:
+
+| Constant | Default | Meaning |
+| --- | --- | --- |
+| `MARKET_CLOSE_HOUR_UTC` | `22` | Friday: market is closed at/after this UTC hour |
+| `MARKET_OPEN_HOUR_UTC` | `22` | Sunday: market reopens at/after this UTC hour |
+| `MT5_HEALTH_INTERVAL_WEEKEND` | `900` (15 min) | Health-check / poll cadence while the market is closed |
+
+> **DST note:** `22:00 UTC` matches the New-York close (17:00 ET) in winter. During northern-hemisphere summer the market opens/closes an hour earlier — set both hour constants to `21` if your broker follows it.

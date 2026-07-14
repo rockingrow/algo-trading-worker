@@ -16,6 +16,7 @@ CRYPTO path never initializes any Forex dependency.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict, Optional
 
 from worker.gateways.crypto.binance.user_data_stream import (
@@ -53,6 +54,10 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   presenter = CryptoMessagePresenter
   _gateway_setting_key = "crypto_exchange"
 
+  # Synthetic strategy tag for positions opened directly on the exchange (no
+  # originating worker signal) and imported by the reconciler.
+  _MANUAL_STRATEGY = "MANUAL"
+
   # ── Broker hooks ──────────────────────────────────────────────────────── #
 
   def _build_executor(self) -> CryptoExecutor:
@@ -65,7 +70,21 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     )
 
   def _connect_broker(self) -> bool:
-    return self.gateway.connect()
+    if not self.gateway.connect():
+      return False
+    # Reconcile the exchange account's position mode to CRYPTO_HEDGE_MODE so the
+    # account setting always matches the payload convention the gateway sends
+    # (Hedge → explicit positionSide; One-way → reduceOnly). Generic across
+    # exchanges: gateways without a switchable mode no-op. A failure here is not
+    # fatal — it is logged inside the gateway and the worker proceeds on the
+    # account's current mode (a mismatch then surfaces as -4061 on the first order).
+    hedge_mode = bool(self.settings.get("crypto_hedge_mode", True))
+    ok = self.gateway.set_position_mode(hedge_mode)
+    log.info(
+      "[CRYPTO Process] set_position_mode(%s) -> %s",
+      "HEDGE" if hedge_mode else "ONE-WAY", "ok" if ok else "failed, keeping account's current mode",
+    )
+    return True
 
   def _run_leverage_init(
     self,
@@ -137,7 +156,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   @property
   def _account_id(self) -> str:
-    return self.settings.get("binance_account_id")
+    return self.settings.get("crypto_account_id")
 
   def _magic_for(self, strategy: str) -> Optional[int]:
     return None  # crypto exchanges have no magic-number equivalent
@@ -145,7 +164,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   def _position_cdc_kwargs(self) -> Dict[str, Any]:
     return {
       "account_info_fn": self._account_snapshot,
-      "account_name": self.settings.get("binance_account_id"),
+      "account_name": self.settings.get("crypto_account_id"),
       "strategy_magic_map": self.settings.get("strategy_magic_map") or {},
     }
 
@@ -173,6 +192,7 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       db_service=self.ctx.db_service,
       executor=self.executor,
       handler=self._on_missed_close,
+      manual_handler=self._on_manual_position,
     ).start(stop_event=stop_event)
 
   # ── Exchange-triggered close handler (from the user data stream) ──────── #
@@ -278,6 +298,61 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     self.ctx.channel_notifier.send_message(
       CryptoMessagePresenter.position_reconciled_closed(
         row, close_price, self.gateway.get_account_footer()
+      )
+    )
+
+  # ── Manual-position import (from CryptoReconcileJob) ──────────────────── #
+
+  def _on_manual_position(self, pos: Any) -> None:
+    """Import a position opened directly on the exchange into the DB.
+
+    The reconciler confirmed (two scans) that *pos* is live on the exchange but
+    tracked by no DB row — a manual open via the exchange UI / app / a third
+    party. It is persisted as an ``OPENED`` row under the synthetic ``MANUAL``
+    strategy so the worker manages it like any other position: the CDC job
+    publishes it as a CREATED TRADE event, and the close backstops (user-data
+    stream / missed-close reconciler) later flatten it by resolved symbol.
+
+    ``ref_source_id`` carries a uuid suffix so a symbol that is manually opened,
+    closed, then re-opened yields a fresh id each time (never upserting the
+    broker onto the prior, already-closed trade). Idempotency within the loop
+    does not rely on that id — the reconciler only imports a symbol the DB is not
+    already tracking — so a fresh id per import is safe.
+    """
+    ref_source_id = f"MANUAL-{pos.symbol}-{uuid.uuid4().hex[:8]}"
+    comment = "Imported: opened manually on exchange"
+
+    self.ctx.db_service.log_position(
+      strategy=self._MANUAL_STRATEGY,
+      ref_id=ref_source_id,
+      ref_source_id=ref_source_id,
+      symbol=pos.symbol,
+      action=pos.side,  # LONG / SHORT
+      volume=pos.volume,
+      price=pos.price_open,
+      sl=None,
+      tp1=None,
+      gateway_return_code=0,
+      comment=comment,
+      author=LogAuthorEnum.EXCHANGE.value,
+      market_type=self._market_type,
+    )
+    self.ctx.db_service.insert_position(
+      ref_id=ref_source_id,
+      strategy=self._MANUAL_STRATEGY,
+      symbol=pos.symbol,
+      action=pos.side.lower(),  # long / short, mirroring the signal-entry flow
+      volume=pos.volume,
+      opened_price=pos.price_open,
+      gateway_return_code=0,
+      comment=comment,
+      message=None,  # no originating signal JSON
+      strategy_code=None,
+      market_type=self._market_type,
+    )
+    self.ctx.channel_notifier.send_message(
+      CryptoMessagePresenter.position_imported_manual(
+        pos, ref_source_id, self.gateway.get_account_footer()
       )
     )
 

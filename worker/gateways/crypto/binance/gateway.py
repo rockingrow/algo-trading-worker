@@ -86,6 +86,7 @@ class _API_Endpoints(Enum):
   ACCOUNT          = ("GET",    "/fapi/v2/account")
   LEVERAGE_BRACKET = ("GET",    "/fapi/v1/leverageBracket")
   LEVERAGE         = ("POST",   "/fapi/v1/leverage")
+  POSITION_MODE    = ("POST",   "/fapi/v1/positionSide/dual")
 
   @property
   def method(self) -> str:
@@ -103,6 +104,11 @@ class _API_Endpoints(Enum):
 _LEVERAGE_CAP_CODE = -4421
 _LEVERAGE_CAP_RE = re.compile(r"greater than (\d+)\s*x", re.IGNORECASE)
 
+# Binance returns -4059 ("No need to change position side.") when the account is
+# already in the requested position mode. That is the desired end state, so we
+# treat it as success rather than a failure.
+_POSITION_MODE_NO_CHANGE_CODE = -4059
+
 
 # Shape of the POST /fapi/v1/leverage response. ``total=False`` because the
 # worker only relies on ``leverage`` (the value the exchange actually applied,
@@ -113,7 +119,8 @@ class LeverageResponse(TypedDict, total=False):
   maxNotionalValue: str
 
 
-# Binance order side mapping for one-way mode.
+# Binance order side mapping. Valid in both One-way and Hedge position modes —
+# Hedge mode additionally requires positionSide, added by the callers below.
 _OPEN_SIDE = {SIDE_LONG: "BUY", SIDE_SHORT: "SELL"}
 # To reduce/close a LONG you SELL; to reduce/close a SHORT you BUY.
 _CLOSE_SIDE = {SIDE_LONG: "SELL", SIDE_SHORT: "BUY"}
@@ -130,12 +137,21 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     api_secret: str,
     testnet: bool = False,
     recv_window: int = 5000,
+    hedge_mode: bool = False,
     session: Optional[requests.Session] = None,
   ) -> None:
     self._api_key = api_key
     self._api_secret = api_secret
     self._testnet = testnet
     self._recv_window = recv_window
+    # Must match the account's actual Binance position mode (Preferences >
+    # Position Mode). One-way accounts default positionSide to BOTH and infer
+    # direction from `side` alone; Hedge accounts require every order to carry
+    # an explicit positionSide (LONG/SHORT) and reject `reduceOnly` outright
+    # (-1106) since positionSide + side already disambiguate open vs close.
+    # Mismatching this flag against the account setting is exactly what
+    # produces -4061 ("Order's position side does not match user's setting").
+    self._hedge_mode = hedge_mode
     self._config = ConfigurationRestAPI(
       api_key=api_key,
       api_secret=api_secret,
@@ -235,6 +251,36 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       self._session.close()
     except Exception:  # pragma: no cover - best effort
       pass
+
+  def set_position_mode(self, hedge_mode: bool) -> bool:
+    """Switch the account into Hedge (dualSidePosition=true) or One-way mode.
+
+    Best-effort: Binance returns -4059 ("No need to change position side.") when
+    the account is already in the requested mode — that is the desired end state,
+    so it counts as success. A genuine failure (e.g. -4068 when open positions or
+    orders block the switch) is logged and returns False so the worker keeps
+    running on the account's current mode; the mismatch then surfaces as -4061 on
+    the first order, exactly as before this reconciliation existed.
+    """
+    target = "Hedge" if hedge_mode else "One-way"
+    try:
+      self._send(
+        _API_Endpoints.POSITION_MODE,
+        {"dual_side_position": "true" if hedge_mode else "false"},
+        signed=True,
+      )
+      logger.info("[Binance] Position mode set to %s.", target)
+      return True
+    except Exception as exc:
+      if getattr(exc, "status_code", None) == _POSITION_MODE_NO_CHANGE_CODE:
+        logger.info("[Binance] Position mode already %s; no change needed.", target)
+        return True
+      logger.warning(
+        "[Binance] set_position_mode(%s) failed (%s); leaving the account on its "
+        "current mode — a mismatch will surface as -4061 on the first order.",
+        target, exc,
+      )
+      return False
 
   # ── Market data / rules ───────────────────────────────────────────────── #
 
@@ -338,7 +384,11 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       # are persisted as 0 — corrupting the DB row and every downstream event.
       "new_order_resp_type": "RESULT",
     }
-    if reduce_only:
+    if self._hedge_mode:
+      # side param is already the position's LONG/SHORT (not the wire BUY/SELL),
+      # so it's exactly the positionSide Binance wants for both opens and closes.
+      payload["position_side"] = side
+    elif reduce_only:
       payload["reduce_only"] = "true"
     if client_order_id:
       payload["new_client_order_id"] = client_order_id
@@ -369,6 +419,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "trigger_price": self._round_to_tick(symbol, stop_price),
       "close_position": "true",
     }
+    if self._hedge_mode:
+      payload["position_side"] = position_side
     try:
       return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:
@@ -394,6 +446,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       "trigger_price": self._round_to_tick(symbol, tp_price),
       "close_position": "true",
     }
+    if self._hedge_mode:
+      payload["position_side"] = position_side
     try:
       return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
     except Exception as exc:

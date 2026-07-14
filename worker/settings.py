@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Optional
 
@@ -39,6 +40,43 @@ class ForexPlatformEnum(str, Enum):
 NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN, NatsSubjectEnum.SYSTEM}
 WATCHDOG_INTERVAL = 10  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
+# The FOREX market is closed from Friday 22:00 UTC to Sunday 22:00 UTC, when the
+# broker's trade server is offline for its weekly maintenance. A disconnect
+# during this window is expected — not a crash — so hammering the server with the
+# weekday relaunch/reconnect storm only floods the logs and Telegram. While the
+# market is closed the health loop backs off to this slower cadence.
+MT5_HEALTH_INTERVAL_WEEKEND = 15 * 60  # seconds between health checks while closed
+# Boundaries of the weekend-closed window, in UTC. These are the New-York-close
+# times (17:00 ET) in winter; during northern-hemisphere summer (DST) the market
+# opens/closes an hour earlier, so set both to 21 if your broker follows it.
+MARKET_CLOSE_HOUR_UTC = 22  # Friday: market closed at/after this UTC hour
+MARKET_OPEN_HOUR_UTC = 22   # Sunday: market open at/after this UTC hour
+
+
+def is_market_closed(now: Optional[datetime] = None) -> bool:
+  """True if `now` falls in the FOREX weekend-closed window (UTC).
+
+  The window runs Friday ``MARKET_CLOSE_HOUR_UTC``:00 → Sunday
+  ``MARKET_OPEN_HOUR_UTC``:00 UTC — the broker's weekly maintenance, when the
+  trade server is offline and MT5 legitimately reports "disconnected". Callers
+  use it to close/park the MT5 connection instead of hammering an unreachable
+  server. A naive ``now`` is treated as UTC.
+  """
+  if now is None:
+    moment = datetime.now(timezone.utc)
+  elif now.tzinfo is None:
+    moment = now.replace(tzinfo=timezone.utc)
+  else:
+    moment = now.astimezone(timezone.utc)
+
+  weekday = moment.weekday()  # Mon=0 … Fri=4, Sat=5, Sun=6
+  if weekday == 4:  # Friday — closed once the close hour passes
+    return moment.hour >= MARKET_CLOSE_HOUR_UTC
+  if weekday == 5:  # Saturday — closed all day
+    return True
+  if weekday == 6:  # Sunday — closed until the open hour
+    return moment.hour < MARKET_OPEN_HOUR_UTC
+  return False
 
 
 class Settings(BaseSettings):
@@ -55,7 +93,7 @@ class Settings(BaseSettings):
   market_type: MarketTypeEnum = MarketTypeEnum.FOREX
 
   # Identify — derived in _validate_market_requirements as
-  # "<market_type>-<gateway>-<MT5_LOGIN|BINANCE_ACCOUNT_ID>" once the per-market
+  # "<market_type>-<gateway>-<MT5_LOGIN|CRYPTO_ACCOUNT_ID>" once the per-market
   # credentials are validated, so it is never read from .env and can't drift
   # from the credential it identifies.
   account_id: str = ""
@@ -73,14 +111,27 @@ class Settings(BaseSettings):
   # Crypto CEX — required only when MARKET_TYPE == CRYPTO.
   crypto_exchange: CryptoExchangeEnum = CryptoExchangeEnum.BINANCE
   crypto_quote_asset: str = "USDT"  # quote currency appended to bare symbols
-  binance_api_key: Optional[SecretStr] = None
-  binance_api_secret: Optional[SecretStr] = None
-  binance_account_id: Optional[str] = None
-  binance_testnet: bool = False
+  crypto_api_key: Optional[SecretStr] = None
+  crypto_api_secret: Optional[SecretStr] = None
+  crypto_account_id: Optional[str] = None
+  crypto_testnet: bool = False
+  # Desired exchange position mode, enforced at startup: the gateway calls the
+  # exchange after connect() to switch the account into this mode (True = Hedge,
+  # False = One-way), so the account setting always matches the worker's payload
+  # convention. True = Hedge (default): every order must carry an explicit
+  # positionSide (LONG/SHORT). False = One-way: the account nets BUY/SELL into a
+  # single position per symbol and the exchange infers direction from `side`
+  # alone. A stale account setting is what produces Binance error -4061 ("Order's
+  # position side does not match user's setting.") — this flag makes the worker
+  # reconcile it rather than the operator flipping it by hand.
+  crypto_hedge_mode: bool = True
   # Binance USDⓈ-M futures use netting mode: all strategies on the same symbol
   # share one net position, so a second strategy opening on that symbol will
   # merge positions at the exchange level.  Set to True only if you deliberately
   # run multiple strategies on the same symbol and understand the implications.
+  # NOTE: this worker only ever tracks one net position per symbol regardless of
+  # crypto_hedge_mode — it does not manage simultaneous LONG and SHORT
+  # positions on the same symbol even when the account is in Hedge mode.
   crypto_allow_multi_strategy_per_symbol: bool = False
   # Symbols whose leverage must be initialised at worker startup. The
   # LeverageInitJob walks this list once after gateway.connect() succeeds and
@@ -187,7 +238,7 @@ class Settings(BaseSettings):
     (or initializing) the other market's dependencies. Once the required
     credential is confirmed present, ``account_id`` is set to
     "<market_type>-<gateway>-<identifying credential>" — MT5_LOGIN behind the
-    forex platform for FOREX, BINANCE_ACCOUNT_ID behind the exchange for CRYPTO
+    forex platform for FOREX, CRYPTO_ACCOUNT_ID behind the exchange for CRYPTO
     — so it is always in sync and never configured by hand. The gateway segment
     lets the broker route/identify by exchange without a separate lookup.
     """
@@ -212,9 +263,9 @@ class Settings(BaseSettings):
           name
           for name, value in (
             ("CRYPTO_QUOTE_ASSET", self.crypto_quote_asset),
-            ("BINANCE_API_KEY", self.binance_api_key),
-            ("BINANCE_API_SECRET", self.binance_api_secret),
-            ("BINANCE_ACCOUNT_ID", self.binance_account_id),
+            ("CRYPTO_API_KEY", self.crypto_api_key),
+            ("CRYPTO_API_SECRET", self.crypto_api_secret),
+            ("CRYPTO_ACCOUNT_ID", self.crypto_account_id),
           )
           if not value
         ]
@@ -222,7 +273,7 @@ class Settings(BaseSettings):
           raise ValueError(
             f"MARKET_TYPE=CRYPTO (BINANCE) requires: {', '.join(missing)}"
           )
-        self.account_id = f"{self.market_type.value}-{self.crypto_exchange.value}-{self.binance_account_id}"
+        self.account_id = f"{self.market_type.value}-{self.crypto_exchange.value}-{self.crypto_account_id}"
     return self
 
   model_config = SettingsConfigDict(

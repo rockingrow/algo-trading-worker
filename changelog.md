@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.7] - 2026-07-15
+
+### Changed
+
+- FOREX: the MT5 health loop is now **market-hours-aware**, so a routine weekend disconnect no longer floods the logs and Telegram. The FOREX market is closed from **Friday 22:00 UTC to Sunday 22:00 UTC** while the broker's trade server is offline for its weekly maintenance — a disconnect in that window is expected, not a crash, and reconnecting cannot succeed until the market reopens. During the closed window the health thread now **closes the MT5 connection once**, backs off from the 15s cadence to `MT5_HEALTH_INTERVAL_WEEKEND` (default 15 min), and stays idle — no reconnect attempts and no `taskkill terminal64.exe` relaunch storm — until the first check after the window, when it reconnects through the normal path. A single "Market Closed" notice is sent when the connection is closed for the weekend (and the usual "reconnecting"/"connected" pair when the market reopens), replacing the previous per-disconnect storm of Telegram messages. `MT5EventJob` (the terminal-close detector) likewise pauses its 5s polling while the market is closed, so it no longer logs a "terminal offline" warning on every scan. Open-market behaviour is unchanged — a genuine disconnect still triggers the full aggressive relaunch/reconnect path immediately. The health-loop wait is now interruptible (`stop_event.wait`) so shutdown isn't delayed by the long weekend interval. New module constants `MT5_HEALTH_INTERVAL_WEEKEND`, `MARKET_CLOSE_HOUR_UTC` and `MARKET_OPEN_HOUR_UTC` (both default `22`; drop to `21` if your broker follows northern-hemisphere DST), plus the `is_market_closed()` helper, in `worker.settings`.
+
+### Added
+
+- CRYPTO: `CRYPTO_HEDGE_MODE` (bool, default `true`) env var — the exchange Position Mode the worker **enforces** on the account at startup. Rather than requiring the operator to set it by hand (Binance app/web → Futures → Preferences → Position Mode), the gateway reconciles the account into this mode right after `connect()` via the new generic `BaseExchangeGateway.set_position_mode(hedge_mode)` hook (Binance: `POST /fapi/v1/positionSide/dual`). When `true` (Hedge), every order (market open/close, stop-loss, take-profit) carries an explicit `positionSide` (`LONG`/`SHORT`) and omits `reduceOnly` entirely, since Binance rejects `reduceOnly` in Hedge Mode. When `false` (One-way), orders omit `positionSide` and closing orders use `reduceOnly` instead. The switch is best-effort: Binance `-4059` ("No need to change position side.") means the account is already in the requested mode (treated as success), and a reject (e.g. `-4068` with open positions/orders) is logged and the worker proceeds on the current mode — where a mismatch then surfaces as `-4061` ("Order's position side does not match user's setting.") on the first order. `set_position_mode` is defined on the agnostic CEX contract (default no-op returning `True`), so it is reusable across exchanges and is driven generically from `CryptoSignalProcessor._connect_broker`. Threaded through `BinanceFuturesGateway.__init__(hedge_mode=…)` and `ExchangeFactory`. The worker still only ever tracks one net position per symbol regardless of this setting — it does not manage simultaneous LONG and SHORT positions on the same symbol even in Hedge Mode.
+- CRYPTO: the crypto worker's `[Connected]` startup banner now includes a `POSITION MODE` line (`Hedge` / `One-way`, from `CRYPTO_HEDGE_MODE`), so operators can confirm at a glance which Position Mode the connected worker is configured for alongside `EXCHANGE` and `TESTNET`.
+- CRYPTO: the periodic reconciler (`CryptoReconcileJob`) now also imports **manually-opened positions** — a position live on the exchange that no DB row tracks (opened directly via the Binance UI / app / a third party, never through a worker signal). The same live-vs-DB scan that self-heals missed closes now, in the other direction, detects an untracked live position and — once confirmed on two consecutive scans (so a worker-opened position still mid-persist is never misread as manual) — persists it as an `OPENED` row under the synthetic `MANUAL` strategy with a unique `ref_source_id`. The CDC job then publishes it as a `CREATED` TRADE event and the existing close backstops (user-data stream / missed-close reconciler) manage it like any other position. Wired via a new optional `manual_handler` on `CryptoReconcileJob` and `CryptoSignalProcessor._on_manual_position`; an operator notification (`Manual Position Imported`) is sent per import.
+
 ## [1.1.6] - 2026-07-05
 
 ### Added
@@ -31,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CRYPTO: the exchange credential/config env vars are renamed from `BINANCE_*` to generic `CRYPTO_*` so they read as gateway-agnostic settings on the crypto contract rather than Binance-specific ones: `BINANCE_API_KEY` → `CRYPTO_API_KEY`, `BINANCE_API_SECRET` → `CRYPTO_API_SECRET`, `BINANCE_ACCOUNT_ID` → `CRYPTO_ACCOUNT_ID`, `BINANCE_TESTNET` → `CRYPTO_TESTNET`, `BINANCE_HEDGE_MODE` → `CRYPTO_HEDGE_MODE`. **Breaking:** update `.env` — the old `BINANCE_*` names are no longer read (the settings validator raises if the crypto keys are missing). `CRYPTO_EXCHANGE` / `CRYPTO_QUOTE_ASSET` are unchanged.
 - Worker identity `account_id` format is now `<market>-<gateway>-<account_id>` (was `<market>-<account_id>`) — e.g. `CRYPTO-BINANCE-7654321`, `FOREX-MT5-413652379`. The gateway segment lets the broker route/identify by exchange without a separate lookup. Derived in `Settings._validate_market_requirements`; surfaced as the NATS connection name and as the `SYSTEM` routing key.
 - CRYPTO: `BinanceFuturesGateway._leverage_cap_from_error` now (a) logs a warning when a `-4421` is received but its message does not match the cap parser — previously this silently dropped the retry path, hiding a Binance message reword — and (b) clamps the parsed ceiling to the requested leverage, discarding parse anomalies (a `-4421` is by definition a restriction *below* what was requested).
 - `BaseSignalProcessor._handle_system_message` now logs the parsed `action` and `account_id` before dispatching, so a received SYSTEM message (including a worker's own `WORKER_CONNECTED` echoed back on its own subscription) is always traceable in the logs even when there is no handler for it.
@@ -98,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
-[1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.5...dev
+[1.1.7]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.7...dev
+[1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.6...dev
 [1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.3...dev
 [1.1.3]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.2...v1.1.3

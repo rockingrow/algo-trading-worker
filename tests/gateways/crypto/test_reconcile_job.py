@@ -24,7 +24,12 @@ class _FakeExecutor:
   def get_all_open_positions(self, strategy=None):
     if self._raise:
       raise RuntimeError("positionRisk fetch failed")
-    return [SimpleNamespace(symbol=s) for s in self._live]
+    # Mirror ExchangePosition's shape (symbol + side/volume/price_open aliases) so
+    # the manual-import path has the fields it persists.
+    return [
+      SimpleNamespace(symbol=s, side="LONG", volume=0.01, price_open=100.0)
+      for s in self._live
+    ]
 
   @staticmethod
   def get_symbol(symbol):
@@ -59,6 +64,22 @@ def _job(db, executor):
     db.close(row["ref_source_id"])  # mimic the real handler closing the row
 
   return CryptoReconcileJob(db, executor, handler), handled
+
+
+def _manual_job(db, executor):
+  """A job wired with a manual_handler that imports untracked live positions."""
+  handled, imported = [], []
+
+  def handler(row):
+    handled.append(row)
+    db.close(row["ref_source_id"])
+
+  def manual_handler(pos):
+    imported.append(pos)
+    # Mimic the real handler: the imported position is now DB-tracked.
+    db._rows.append(_row(f"MANUAL-{pos.symbol}", symbol=pos.symbol, strategy="MANUAL"))
+
+  return CryptoReconcileJob(db, executor, handler, manual_handler=manual_handler), imported
 
 
 def test_missed_close_confirmed_after_two_scans():
@@ -117,3 +138,78 @@ def test_only_stale_rows_reconciled_in_mixed_book():
   job._scan()
   job._scan()
   assert [r["ref_source_id"] for r in handled] == ["200"]
+
+
+# ── manual-position import ──────────────────────────────────────────────────── #
+
+
+def test_manual_position_imported_after_two_scans():
+  # A live position the DB does not track (opened manually on the exchange).
+  db = _FakeDb([])
+  job, imported = _manual_job(db, _FakeExecutor(live_symbols={"BTCUSDT"}))
+
+  job._scan()
+  assert imported == []  # first scan only suspects
+
+  job._scan()
+  assert len(imported) == 1 and imported[0].symbol == "BTCUSDT"
+
+
+def test_manual_position_not_imported_on_single_scan():
+  db = _FakeDb([])
+  job, imported = _manual_job(db, _FakeExecutor(live_symbols={"BTCUSDT"}))
+  job._scan()
+  assert imported == []
+
+
+def test_manual_position_imported_only_once():
+  # After import the position becomes DB-tracked, so it is not imported again.
+  db = _FakeDb([])
+  job, imported = _manual_job(db, _FakeExecutor(live_symbols={"BTCUSDT"}))
+  job._scan()
+  job._scan()
+  job._scan()
+  job._scan()
+  assert len(imported) == 1
+
+
+def test_tracked_position_never_imported():
+  # BTCUSD is already tracked in the DB (its resolved symbol is BTCUSDT) → the
+  # matching live position is the worker's own, not a manual open.
+  db = _FakeDb([_row("100", symbol="BTCUSD")])
+  job, imported = _manual_job(db, _FakeExecutor(live_symbols={"BTCUSDT"}))
+  job._scan()
+  job._scan()
+  assert imported == []
+
+
+def test_entry_lag_does_not_import_worker_position():
+  # Scan 1: the just-opened position is live on the exchange but its DB row has
+  # not been persisted yet (looks untracked) → suspected.
+  db = _FakeDb([])
+  exec_live = _FakeExecutor(live_symbols={"BTCUSDT"})
+  job, imported = _manual_job(db, exec_live)
+  job._scan()  # suspects BTCUSDT
+
+  # Scan 2: the worker's DB row now exists → suspicion cleared, no import.
+  db._rows.append(_row("100", symbol="BTCUSD"))
+  job._scan()
+  assert imported == []
+
+
+def test_manual_import_skipped_when_no_manual_handler():
+  # The default close-only job never imports, even with an untracked live position.
+  db = _FakeDb([])
+  job, _ = _job(db, _FakeExecutor(live_symbols={"BTCUSDT"}))
+  job._scan()
+  job._scan()
+  assert job._suspected_manual == set()  # manual path never populated
+
+
+def test_fetch_failure_leaves_manual_suspects_untouched():
+  db = _FakeDb([])
+  job, imported = _manual_job(db, _FakeExecutor(live_symbols={"BTCUSDT"}, raise_on_fetch=True))
+  with pytest.raises(RuntimeError):
+    job._scan()
+  assert imported == []
+  assert job._suspected_manual == set()  # never populated from a failed fetch
