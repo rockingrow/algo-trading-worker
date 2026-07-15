@@ -95,7 +95,7 @@ class PositionRepository:
     """Insert a single positions row at ``status``. ref_source_id is seeded from
     ref_id (they diverge later only when a partial close re-tickets the order).
     Shared by :meth:`insert_position` (OPENED) and :meth:`insert_rejected_position`
-    (REJECT); each owns its own error handling."""
+    (REJECTED); each owns its own error handling."""
     conn = None
     try:
       conn = _get_conn()
@@ -158,8 +158,8 @@ class PositionRepository:
     market_type: Optional[str] = None,
   ):
     """Record an entry that a worker-side policy rejected (e.g. MAX_OPEN_ORDERS)
-    as a REJECT row, so it is auditable and picked up by :class:`PositionCDC` and
-    forwarded to the broker on the TRADE subject with status REJECT.
+    as a REJECTED row, so it is auditable and picked up by :class:`PositionCDC` and
+    forwarded to the broker on the TRADE subject with status REJECTED.
 
     Unlike :meth:`insert_position`, a failure here is logged but NOT re-raised: no
     live order exists to reconcile, and the rejection must not abort signal
@@ -168,7 +168,7 @@ class PositionRepository:
       self._insert_position_row(
         ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
         volume=volume, opened_price=opened_price,
-        status=PositionStatusEnum.REJECT.value,
+        status=PositionStatusEnum.REJECTED.value,
         gateway_return_code=gateway_return_code, comment=comment, message=message,
         strategy_code=strategy_code, market_type=market_type,
       )

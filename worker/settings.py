@@ -176,8 +176,8 @@ class Settings(BaseSettings):
   use_account_equity: bool = False  # If true, use account equity instead of initial capital for entry volume calculation
   # Maximum number of concurrently open orders (OPENED/TP1 positions) this worker
   # may hold. A new entry (LONG/SHORT) that would exceed the cap is not sent to the
-  # broker: it is recorded with status REJECT, reported to the broker on the TRADE
-  # subject (also REJECT) and notified — but no order is placed. A re-entry/scale-in
+  # broker: it is recorded with status REJECTED, reported to the broker on the TRADE
+  # subject (also REJECTED) and notified — but no order is placed. A re-entry/scale-in
   # on a symbol the strategy already holds replaces that position rather than opening
   # a new slot, so it never counts against the cap. Set to 0 to disable the limit.
   max_open_orders: int = 5

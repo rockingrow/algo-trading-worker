@@ -22,7 +22,7 @@ class PositionStatusEnum(str, Enum):
   # Entry that was never sent to the broker because a worker-side policy blocked
   # it (e.g. MAX_OPEN_ORDERS reached). Recorded for audit and forwarded to the
   # broker via the TRADE subject so the rejected signal is visible end-to-end.
-  REJECT = "REJECT"
+  REJECTED = "REJECTED"
 
 
 class PositionEventType(str, Enum):

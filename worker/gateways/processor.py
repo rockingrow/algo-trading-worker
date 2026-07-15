@@ -285,7 +285,7 @@ class BaseSignalProcessor(ABC):
     )
 
     # Exposure guard: a new entry that would exceed MAX_OPEN_ORDERS is never sent
-    # to the broker. It is still recorded (status REJECT), forwarded to the broker
+    # to the broker. It is still recorded (status REJECTED), forwarded to the broker
     # via CDC on the TRADE subject, and notified. Exits are never gated here so a
     # position can always be closed even at the cap.
     if signal.action in _ENTRY_ACTIONS:
@@ -420,9 +420,9 @@ class BaseSignalProcessor(ABC):
   def _reject_signal(self, signal: SignalSchema, reason: str) -> None:
     """Handle a policy-rejected entry end-to-end without touching the broker.
 
-    Records the rejection in the append-only log and as a REJECT position row (so
+    Records the rejection in the append-only log and as a REJECTED position row (so
     :class:`PositionCDC` forwards it to the broker on the TRADE subject with status
-    REJECT), then notifies the community channel. No order is placed.
+    REJECTED), then notifies the community channel. No order is placed.
     """
     log.warning(
       "[%s Process] Entry REJECTED | %s %s | %s",
@@ -433,7 +433,7 @@ class BaseSignalProcessor(ABC):
     # No broker order exists, so there's no ticket to key on — echo the broker's
     # signal_id (falling back to a deterministic tag) so the rejection is still
     # correlatable end-to-end.
-    ref = signal.signal_id or f"REJECT-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
+    ref = signal.signal_id or f"REJECTED-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
     volume = signal.quantity or 0.0
     price = signal.price or 0.0
 

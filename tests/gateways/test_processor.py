@@ -296,7 +296,7 @@ def test_entry_rejected_when_at_max_open_orders():
   assert seen == []
   # Not tracked as an OPENED position...
   assert proc.db.inserted == []
-  # ...but recorded as a REJECT row so PositionCDC forwards it to the broker.
+  # ...but recorded as a REJECTED row so PositionCDC forwards it to the broker.
   assert len(proc.db.rejected) == 1
   rej = proc.db.rejected[0]
   assert rej["symbol"] == "CCC"
@@ -317,7 +317,7 @@ def test_entry_allowed_when_below_max_open_orders():
     make_signal(SignalActionEnum.LONG, symbol="CCC").model_dump_json(),
   )
 
-  # Normal entry path: inserted as OPENED, no REJECT row, filled notification.
+  # Normal entry path: inserted as OPENED, no REJECTED row, filled notification.
   assert proc.db.rejected == []
   assert len(proc.db.inserted) == 1
   assert proc.notifications == ["filled:LONG:1"]

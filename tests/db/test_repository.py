@@ -96,8 +96,8 @@ def test_prices_persisted_without_lossy_rounding(repo):
   assert rows[0]["price"] == close
 
 
-def test_insert_rejected_position_writes_reject_row_pending_sync(repo):
-  """A policy-rejected entry is stored with status REJECT and sync_status PENDING
+def test_insert_rejected_position_writes_rejected_row_pending_sync(repo):
+  """A policy-rejected entry is stored with status REJECTED and sync_status PENDING
   so PositionCDC forwards it to the broker on the TRADE subject."""
   repo.insert_rejected_position(
     ref_id="sig-1", strategy="strat-a", symbol="XAUUSD", action="long",
@@ -106,11 +106,11 @@ def test_insert_rejected_position_writes_reject_row_pending_sync(repo):
     message='{"signal_id":"sig-1"}', strategy_code=777, market_type="FOREX",
   )
   pos = repo.get_position("sig-1")
-  assert pos["status"] == "REJECT"
+  assert pos["status"] == "REJECTED"
   assert pos["ref_id"] == "sig-1" and pos["ref_source_id"] == "sig-1"
   assert pos["sync_status"] == "PENDING"
   assert "Max open orders reached" in pos["comment"]
-  # The REJECT row is not OPENED/TP1, so it never occupies the one-active-position
+  # The REJECTED row is not OPENED/TP1, so it never occupies the one-active-position
   # slot — a real position can still open on the same (strategy, symbol).
   repo.insert_position(
     ref_id="100", strategy="strat-a", symbol="XAUUSD", action="long",
