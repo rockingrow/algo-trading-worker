@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.8] - Unreleased
+
+### Added
+
+- `MAX_OPEN_ORDERS` (int, default `5`; `0` in `.env.example` disables) env var — a worker-side exposure cap on how many positions may be concurrently open. When a new entry (`LONG`/`SHORT`) would push the count of active (`OPENED`/`TP1`) positions **across every strategy and symbol** past the cap, the entry is **not** sent to the broker: it is recorded in SQLite as a `REJECTED` position row, forwarded to the broker via `PositionCDC` on the `TRADE` subject with status `REJECTED` (so the rejected signal is visible end-to-end), audit-logged in `position_logs`, and an `Order Rejected` operator notification is sent — but no order is placed. A re-entry or scale-in on a symbol the strategy already holds **replaces** the existing position rather than opening a new slot, so it never counts against the cap. Exits (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`) are never gated, so a position can always be closed even at the cap. Set to `0` to disable the limit entirely. The guard is market-agnostic — the shared `BaseSignalProcessor._max_open_orders_rejection` check and `_reject_signal` handler run identically for FOREX and CRYPTO, backed by `PositionRepository.insert_rejected_position` and the `BaseMessagePresenter.order_rejected` message.
+- `PositionStatusEnum.REJECTED` — a new terminal lifecycle status for a position row that a worker-side policy (currently `MAX_OPEN_ORDERS`) blocked before it reached the broker. The row is auditable and, being neither `OPENED` nor `TP1`, never occupies the one-active-position slot, so a real position can still open later on the same `(strategy, symbol)`.
+
 ## [1.1.7] - 2026-07-15
 
 ### Changed
@@ -111,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
+[1.1.8]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.8...dev
 [1.1.7]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.7...dev
 [1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.6...dev
 [1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...v1.1.5

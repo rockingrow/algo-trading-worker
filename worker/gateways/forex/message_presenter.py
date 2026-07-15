@@ -51,6 +51,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
       f"{ForexMessagePresenter._tp1_percent_line(s)}"
       f"{ForexMessagePresenter._tp1_be_line(s)}"
+      f"{ForexMessagePresenter._max_open_orders_line(s)}"
     )
     return _box(
       f"{CONNECTED} <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"

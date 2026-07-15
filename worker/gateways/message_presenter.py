@@ -179,10 +179,36 @@ class BaseMessagePresenter:
     )
 
   @staticmethod
+  def _max_open_orders_line(settings_dict: dict) -> str:
+    """Render the MAX_OPEN_ORDERS limit line, or '' when the limit is disabled.
+
+    A falsy/zero value means no cap, so the line is omitted rather than printing
+    a misleading ``0``.
+    """
+    limit = settings_dict.get("max_open_orders")
+    if not limit or limit <= 0:
+      return ""
+    return f"MAX_OPEN_ORDERS: <b>{limit}</b>\n"
+
+  @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
       f"{REJECTED} <b>Signal Rejected</b>\n\n"
       f"A signal failed validation and was <b>NOT executed</b>.\n"
+      f"Reason: <b>{html.escape(reason)}</b>\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def order_rejected(signal: SignalSchema, reason: str, footer: str) -> str:
+    """An entry that was blocked by a worker-side policy (e.g. MAX_OPEN_ORDERS)
+    and therefore never sent to the broker. Market-agnostic (symbol/strategy/
+    action are common to both markets), so both presenters inherit this."""
+    return _box(
+      f"{REJECTED} <b>Order Rejected</b>\n\n"
+      f"Symbol: <b>{signal.symbol}</b>\n"
+      f"Strategy: <b>{signal.strategy}</b>\n"
+      f"Action: <b>{signal.action.value}</b>\n"
       f"Reason: <b>{html.escape(reason)}</b>\n"
       f"{_DIVIDER}\n{footer}"
     )

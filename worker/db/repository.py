@@ -76,6 +76,43 @@ class PositionRepository:
       if conn:
         conn.close()
 
+  def _insert_position_row(
+    self,
+    *,
+    ref_id: str,
+    strategy: str,
+    symbol: str,
+    action: str,
+    volume: float,
+    opened_price: float,
+    status: str,
+    gateway_return_code: Optional[int],
+    comment: Optional[str],
+    message: Optional[str],
+    strategy_code: Optional[int],
+    market_type: Optional[str],
+  ) -> None:
+    """Insert a single positions row at ``status``. ref_source_id is seeded from
+    ref_id (they diverge later only when a partial close re-tickets the order).
+    Shared by :meth:`insert_position` (OPENED) and :meth:`insert_rejected_position`
+    (REJECTED); each owns its own error handling."""
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+        # Broker-native price, no rounding — see log_position for the rationale.
+        (ref_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, message, strategy_code, market_type),
+      )
+      conn.commit()
+    finally:
+      if conn:
+        conn.close()
+
   def insert_position(
     self,
     ref_id: str,
@@ -90,19 +127,13 @@ class PositionRepository:
     strategy_code: Optional[int] = None,
     market_type: Optional[str] = None,
   ):
-    conn = None
     try:
-      conn = _get_conn()
-      cursor = conn.cursor()
-      cursor.execute(
-        """
-              INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          """,
-        # Broker-native price, no rounding — see log_position for the rationale.
-        (ref_id, ref_id, strategy, symbol, action, volume, opened_price, "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
+      self._insert_position_row(
+        ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
+        volume=volume, opened_price=opened_price, status="OPENED",
+        gateway_return_code=gateway_return_code, comment=comment, message=message,
+        strategy_code=strategy_code, market_type=market_type,
       )
-      conn.commit()
       logger.debug(f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}")
     except Exception as exc:
       logger.critical(
@@ -111,9 +142,42 @@ class PositionRepository:
         ref_id, strategy, symbol, exc,
       )
       raise
-    finally:
-      if conn:
-        conn.close()
+
+  def insert_rejected_position(
+    self,
+    ref_id: str,
+    strategy: str,
+    symbol: str,
+    action: str,
+    volume: float,
+    opened_price: float,
+    gateway_return_code: Optional[int] = None,
+    comment: Optional[str] = None,
+    message: Optional[str] = None,
+    strategy_code: Optional[int] = None,
+    market_type: Optional[str] = None,
+  ):
+    """Record an entry that a worker-side policy rejected (e.g. MAX_OPEN_ORDERS)
+    as a REJECTED row, so it is auditable and picked up by :class:`PositionCDC` and
+    forwarded to the broker on the TRADE subject with status REJECTED.
+
+    Unlike :meth:`insert_position`, a failure here is logged but NOT re-raised: no
+    live order exists to reconcile, and the rejection must not abort signal
+    processing (the operator notification still needs to fire)."""
+    try:
+      self._insert_position_row(
+        ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
+        volume=volume, opened_price=opened_price,
+        status=PositionStatusEnum.REJECTED.value,
+        gateway_return_code=gateway_return_code, comment=comment, message=message,
+        strategy_code=strategy_code, market_type=market_type,
+      )
+      logger.debug(f"Rejected entry recorded: ref_source_id={ref_id}, symbol={symbol}, action={action}")
+    except Exception as exc:
+      logger.error(
+        "insert_rejected_position failed (ref_id=%s strategy=%s symbol=%s): %s",
+        ref_id, strategy, symbol, exc,
+      )
 
   def update_position_status(
     self,

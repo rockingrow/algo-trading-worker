@@ -52,6 +52,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
       f"{CryptoMessagePresenter._tp1_percent_line(s)}"
       f"{CryptoMessagePresenter._tp1_be_line(s)}"
+      f"{CryptoMessagePresenter._max_open_orders_line(s)}"
     )
     return _box(f"{CONNECTED} <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")
 
