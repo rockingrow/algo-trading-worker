@@ -34,6 +34,7 @@ _POSITIONS_TABLE = """
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ref_source_id TEXT NOT NULL,
         ref_id TEXT NOT NULL,
+        signal_id TEXT,
         strategy TEXT NOT NULL,
         symbol TEXT NOT NULL,
         action TEXT NOT NULL,
@@ -59,6 +60,7 @@ _POSITION_LOGS_TABLE = """
         strategy TEXT NOT NULL,
         ref_id TEXT,
         ref_source_id TEXT,
+        signal_id TEXT,
         symbol TEXT NOT NULL,
         action TEXT NOT NULL,
         volume REAL,
@@ -105,6 +107,18 @@ _ONE_ACTIVE_INDEX = """
         WHERE status = 'OPENED' OR status = 'TP1'
 """
 
+# Fast dedup lookup for RETRY_SIGNALS: the base processor's replay handler
+# checks each incoming signal_id against position_logs (every processed signal
+# is logged there, whether it succeeded or was rejected) and skips ones already
+# seen. The audit log is the single source of truth here — positions may or may
+# not exist for a given signal_id (rejections have no OPENED row), while
+# position_logs always does.
+_POSITION_LOGS_SIGNAL_ID_INDEX = """
+    CREATE INDEX IF NOT EXISTS idx_position_logs_signal_id
+        ON position_logs (signal_id)
+        WHERE signal_id IS NOT NULL
+"""
+
 
 def _create_tables(conn) -> None:
   conn.execute(_POSITIONS_TABLE)
@@ -112,6 +126,7 @@ def _create_tables(conn) -> None:
   conn.execute(_NOTIFICATIONS_TABLE)
   conn.execute(_NOTIFICATIONS_INDEX)
   conn.execute(_ONE_ACTIVE_INDEX)
+  conn.execute(_POSITION_LOGS_SIGNAL_ID_INDEX)
 
 
 def db_init():

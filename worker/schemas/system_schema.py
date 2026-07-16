@@ -4,6 +4,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from worker.schemas.signal_schema import SignalSchema
+
 
 class SystemActionEnum(str, Enum):
   # Inbound (broker → worker): re-initialise per-symbol leverage on a CEX.
@@ -18,6 +20,11 @@ class SystemActionEnum(str, Enum):
   # received the handshake but could not process it (missing settings,
   # invalid leverage, ...).
   WORKER_CONNECTED_ERROR = "WORKER_CONNECTED_ERROR"
+  # Inbound (broker → worker): replay a batch of recent signals for the
+  # strategies this worker is subscribed to. Each signal is deduped by
+  # signal_id and only executed when still within MAX_RETRY_TIMEOUT of its
+  # own timestamp — a stale replay is dropped rather than fired late.
+  RETRY_SIGNALS = "RETRY_SIGNALS"
 
 
 class SystemSchema(BaseModel):
@@ -40,11 +47,17 @@ class SystemWorkerConnectedSchema(SystemSchema):
   to NATS. ``account_id`` is the worker identity in "<market>-<gateway>-<id>"
   form; ``market`` and ``gateway`` are also sent so the broker can decide,
   without parsing the identity string, whether to reply with an init action
-  (e.g. CRYPTO_LEVERAGE_INIT) for this worker."""
+  (e.g. CRYPTO_LEVERAGE_INIT) for this worker.
+
+  ``strategies`` is the list of strategy names this worker is subscribed to
+  (derived from ``NATS_SUBJECTS`` minus the always-listened control subjects
+  ADMIN/SYSTEM). The broker uses it to decide which recent signals to replay
+  in a RETRY_SIGNALS response after the handshake."""
 
   action: SystemActionEnum = SystemActionEnum.WORKER_CONNECTED
   market: str
   gateway: str
+  strategies: list[str] = Field(default_factory=list)
 
 
 class SystemWorkerConnectedAckSchema(SystemSchema):
@@ -60,3 +73,17 @@ class SystemWorkerConnectedErrorSchema(SystemSchema):
 
   action: SystemActionEnum = SystemActionEnum.WORKER_CONNECTED_ERROR
   reason: Optional[str] = None
+
+
+class SystemRetrySignalsSchema(SystemSchema):
+  """Broker → worker replay of recent signals for the strategies this worker
+  subscribes to. Sent either as a WORKER_CONNECTED reply (fill any gap the
+  worker missed while offline) or on-demand on the SYSTEM subject.
+
+  Each entry in ``signals`` is a full :class:`SignalSchema`. The worker dedupes
+  by ``signal_id`` against its local DB and only executes signals still within
+  ``MAX_RETRY_TIMEOUT`` of their own ``timestamp`` — an older replay is dropped
+  rather than fired late."""
+
+  action: SystemActionEnum = SystemActionEnum.RETRY_SIGNALS
+  signals: list[SignalSchema] = Field(default_factory=list)

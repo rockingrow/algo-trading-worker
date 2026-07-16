@@ -145,3 +145,42 @@ def test_log_position_persists_generic_columns(repo):
   assert rows[0]["ref_source_id"] == "5"
   assert rows[0]["gateway_message"] == '{"a":1}'
   assert rows[0]["market_type"] == "FOREX"
+
+
+# ── signal_id dedup (used by RETRY_SIGNALS) ──────────────────────────────── #
+
+
+def test_signal_exists_returns_true_only_after_signal_logged(repo):
+  # A signal_id we've never seen is not present.
+  assert repo.signal_exists("sig-abc") is False
+
+  # Once a position for that signal_id is logged, the RETRY_SIGNALS handler
+  # can find it and dedup incoming replays.
+  repo.log_position(
+    strategy="strat-a", ref_id="5", ref_source_id="5", symbol="XAUUSD",
+    action="LONG", volume=0.5, price=4400.0, sl=None, tp1=None,
+    gateway_return_code=0, comment="", signal_id="sig-abc",
+  )
+  assert repo.signal_exists("sig-abc") is True
+  # Other ids must remain not-seen (no false positives from partial matches).
+  assert repo.signal_exists("sig-abcd") is False
+
+
+def test_signal_exists_treats_missing_id_as_not_seen(repo):
+  # Signals without an id are never dedup'd — the caller decides what to do
+  # (currently: pass through).
+  assert repo.signal_exists("") is False
+  assert repo.signal_exists(None) is False
+
+
+def test_insert_position_persists_signal_id(repo):
+  repo.insert_position(
+    ref_id="200", strategy="strat-a", symbol="BTCUSD", action="long",
+    volume=1.0, opened_price=30000.0, signal_id="sig-open",
+  )
+  rows = _raw(settings.db_file, "SELECT signal_id FROM positions WHERE ref_id='200'")
+  assert rows[0]["signal_id"] == "sig-open"
+  # And signal_exists (which reads position_logs) is still driven by log_position,
+  # not by the positions insert — a signal that only produced a positions row
+  # without a matching log row is not visible to the dedup gate.
+  assert repo.signal_exists("sig-open") is False

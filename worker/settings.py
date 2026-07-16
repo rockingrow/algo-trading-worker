@@ -39,6 +39,11 @@ class ForexPlatformEnum(str, Enum):
 
 NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN, NatsSubjectEnum.SYSTEM}
 WATCHDOG_INTERVAL = 10  # seconds
+# Maximum age (seconds, against the signal's own timestamp) a replayed signal
+# from a SYSTEM RETRY_SIGNALS may still be executed at. Older replays are
+# dropped so the worker never fires a stale entry/exit fill hours after the
+# market moved. See BaseSignalProcessor._handle_retry_signals.
+MAX_RETRY_TIMEOUT = 60  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 # The FOREX market is closed from Friday 22:00 UTC to Sunday 22:00 UTC, when the
 # broker's trade server is offline for its weekly maintenance. A disconnect
