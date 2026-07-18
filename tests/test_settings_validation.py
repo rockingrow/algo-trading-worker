@@ -61,3 +61,21 @@ def test_forex_account_id_derived_from_mt5_login(monkeypatch):
   monkeypatch.setenv("MT5_PASSWORD", "pw")
   s = Settings(_env_file=None)
   assert s.account_id == "FOREX-MT5-413652379"
+
+
+def test_max_open_orders_defaults_to_five(monkeypatch):
+  monkeypatch.setenv("MARKET_TYPE", "FOREX")
+  monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
+  monkeypatch.setenv("MT5_LOGIN", "413652379")
+  monkeypatch.setenv("MT5_PASSWORD", "pw")
+  monkeypatch.delenv("MAX_OPEN_ORDERS", raising=False)
+  assert Settings(_env_file=None).max_open_orders == 5
+
+
+def test_max_open_orders_overridable(monkeypatch):
+  monkeypatch.setenv("MARKET_TYPE", "FOREX")
+  monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
+  monkeypatch.setenv("MT5_LOGIN", "413652379")
+  monkeypatch.setenv("MT5_PASSWORD", "pw")
+  monkeypatch.setenv("MAX_OPEN_ORDERS", "10")
+  assert Settings(_env_file=None).max_open_orders == 10

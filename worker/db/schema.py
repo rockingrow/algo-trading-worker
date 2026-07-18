@@ -19,8 +19,10 @@ every gateway (FOREX/MT5 and CRYPTO/CEX), so the columns are deliberately
                              across re-ticketing after a partial close).
   * ``market_type``          TEXT    — FOREX / CRYPTO tag.
 
-No runtime migrations: PROD has no data yet, so the database is simply created
-from scratch (drop the sqlite file to recreate).
+Table creation uses CREATE TABLE IF NOT EXISTS, so a brand-new column added to
+an existing table (e.g. ``signal_id``) won't retrofit onto a DB created before
+that change. Those columns get a small ``ALTER TABLE ... ADD COLUMN`` guarded
+by a ``PRAGMA table_info`` check in ``_create_tables`` below.
 """
 
 from worker.db.connection import _get_conn
@@ -34,6 +36,7 @@ _POSITIONS_TABLE = """
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ref_source_id TEXT NOT NULL,
         ref_id TEXT NOT NULL,
+        signal_id TEXT,
         strategy TEXT NOT NULL,
         symbol TEXT NOT NULL,
         action TEXT NOT NULL,
@@ -59,6 +62,7 @@ _POSITION_LOGS_TABLE = """
         strategy TEXT NOT NULL,
         ref_id TEXT,
         ref_source_id TEXT,
+        signal_id TEXT,
         symbol TEXT NOT NULL,
         action TEXT NOT NULL,
         volume REAL,
@@ -105,13 +109,54 @@ _ONE_ACTIVE_INDEX = """
         WHERE status = 'OPENED' OR status = 'TP1'
 """
 
+# Fast dedup lookup for RETRY_SIGNALS: the base processor's replay handler
+# checks each incoming signal_id against position_logs (every processed signal
+# is logged there, whether it succeeded or was rejected) and skips ones already
+# seen. The audit log is the single source of truth here — positions may or may
+# not exist for a given signal_id (rejections have no OPENED row), while
+# position_logs always does.
+_POSITION_LOGS_SIGNAL_ID_INDEX = """
+    CREATE INDEX IF NOT EXISTS idx_position_logs_signal_id
+        ON position_logs (signal_id)
+        WHERE signal_id IS NOT NULL
+"""
+
+# positions.signal_id / position_logs.signal_id were added after these tables
+# first shipped, so a database created before that change has the tables but
+# not the columns. CREATE TABLE IF NOT EXISTS won't retrofit it, and the index
+# above requires position_logs.signal_id to exist — add both first, ignoring
+# the "already exists" case for DBs created from scratch with the columns
+# already in _POSITIONS_TABLE / _POSITION_LOGS_TABLE.
+_POSITIONS_ADD_SIGNAL_ID_COLUMN = """
+    ALTER TABLE positions ADD COLUMN signal_id TEXT
+"""
+
+_POSITION_LOGS_ADD_SIGNAL_ID_COLUMN = """
+    ALTER TABLE position_logs ADD COLUMN signal_id TEXT
+"""
+
+
+def _ensure_positions_signal_id_column(conn) -> None:
+  columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+  if "signal_id" not in columns:
+    conn.execute(_POSITIONS_ADD_SIGNAL_ID_COLUMN)
+
+
+def _ensure_position_logs_signal_id_column(conn) -> None:
+  columns = {row[1] for row in conn.execute("PRAGMA table_info(position_logs)")}
+  if "signal_id" not in columns:
+    conn.execute(_POSITION_LOGS_ADD_SIGNAL_ID_COLUMN)
+
 
 def _create_tables(conn) -> None:
   conn.execute(_POSITIONS_TABLE)
   conn.execute(_POSITION_LOGS_TABLE)
   conn.execute(_NOTIFICATIONS_TABLE)
   conn.execute(_NOTIFICATIONS_INDEX)
+  _ensure_positions_signal_id_column(conn)
   conn.execute(_ONE_ACTIVE_INDEX)
+  _ensure_position_logs_signal_id_column(conn)
+  conn.execute(_POSITION_LOGS_SIGNAL_ID_INDEX)
 
 
 def db_init():

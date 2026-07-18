@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-18
+
+### Added
+
+- `MAX_OPEN_ORDERS` (int, default `5`; `0` in `.env.example` disables) env var — a worker-side exposure cap on how many positions may be concurrently open. When a new entry (`LONG`/`SHORT`) would push the count of active (`OPENED`/`TP1`) positions **across every strategy and symbol** past the cap, the entry is **not** sent to the broker: it is recorded in SQLite as a `REJECTED` position row, forwarded to the broker via `PositionCDC` on the `TRADE` subject with status `REJECTED` (so the rejected signal is visible end-to-end), audit-logged in `position_logs`, and an `Order Rejected` operator notification is sent — but no order is placed. A re-entry or scale-in on a symbol the strategy already holds **replaces** the existing position rather than opening a new slot, so it never counts against the cap. Exits (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`) are never gated, so a position can always be closed even at the cap. Set to `0` to disable the limit entirely. The guard is market-agnostic — the shared `BaseSignalProcessor._max_open_orders_rejection` check and `_reject_signal` handler run identically for FOREX and CRYPTO, backed by `PositionRepository.insert_rejected_position` and the `BaseMessagePresenter.order_rejected` message.
+- `PositionStatusEnum.REJECTED` — a new terminal lifecycle status for a position row that a worker-side policy (currently `MAX_OPEN_ORDERS`) blocked before it reached the broker. The row is auditable and, being neither `OPENED` nor `TP1`, never occupies the one-active-position slot, so a real position can still open later on the same `(strategy, symbol)`.
+- `WORKER_CONNECTED` handshake now ships the worker's **subscribed strategies** (`strategies: list[str]`) alongside `market` and `gateway` — the strategy-name subjects in `NATS_SUBJECTS` minus the control subjects (`ADMIN`/`SYSTEM`). Extracted via the new `worker.gateways.processor.parse_strategy_subjects` helper and populated on `SystemWorkerConnectedSchema`. The broker uses this list to decide which strategies' recent signals to include in a `RETRY_SIGNALS` replay for this worker, so a worker that reconnects after a brief outage can be caught up without the broker having to guess its subscription set.
+- `SystemActionEnum.RETRY_SIGNALS` + `SystemRetrySignalsSchema` — new inbound SYSTEM action (either as a `WORKER_CONNECTED` reply or a live SYSTEM push) carrying a list of `SignalSchema` payloads for the strategies this worker subscribes to. Handled generically by `BaseSignalProcessor._handle_retry_signals` (both FOREX and CRYPTO get identical replay semantics): each signal is (1) deduped against `position_logs.signal_id` — a signal we've already processed (successfully or as a REJECT) is skipped — and (2) age-gated against `MAX_RETRY_TIMEOUT` (default `60`s in `worker.settings`) using the signal's own `timestamp`; older replays are dropped so the worker never fires a stale entry/exit fill hours after the market moved. Eligible signals go through the normal `_process_signal` pipeline — order placement, DB persistence, notifications — so a replayed entry is indistinguishable from a live one. A malformed envelope or a single bad signal in a batch never aborts the rest.
+- `position_logs.signal_id` / `positions.signal_id` (TEXT, nullable) — new columns populated by `log_position` / `insert_position` / `insert_rejected_position` with the originating `SignalSchema.signal_id`. The RETRY_SIGNALS handler's dedup gate reads `position_logs.signal_id` via the new `PositionRepository.signal_exists(signal_id)` method (backed by an index on the column so the lookup stays O(log n) as the log grows); a DB error is fail-safe (treats the id as seen so a replay never double-executes).
+
 ## [1.1.7] - 2026-07-15
 
 ### Changed
@@ -111,6 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
+[1.2.0]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.0...dev
 [1.1.7]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.7...dev
 [1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.6...dev
 [1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...v1.1.5

@@ -52,6 +52,7 @@ class PositionRepository:
     message: Optional[str] = None,
     author: str = "broker",
     market_type: Optional[str] = None,
+    signal_id: Optional[str] = None,
   ):
     conn = None
     try:
@@ -59,19 +60,57 @@ class PositionRepository:
       cursor = conn.cursor()
       cursor.execute(
         """
-              INSERT INTO position_logs (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              INSERT INTO position_logs (strategy, ref_id, ref_source_id, signal_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
         # Store the broker-native price as-is. Rounding to 2 decimals (a forex-era
         # assumption) corrupts low-priced crypto (e.g. SHIB → 0.00) and is
         # inconsistent with sl/tp1, which are already stored unrounded. The caller
         # supplies a price already quantized to the instrument's tick.
-        (strategy, ref_id, ref_source_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, message, author, market_type),
+        (strategy, ref_id, ref_source_id, signal_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, message, author, market_type),
       )
       conn.commit()
       logger.debug(f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}")
     except Exception as exc:
       logger.error("log_position failed (strategy=%s symbol=%s action=%s): %s", strategy, symbol, action, exc)
+    finally:
+      if conn:
+        conn.close()
+
+  def _insert_position_row(
+    self,
+    *,
+    ref_id: str,
+    strategy: str,
+    symbol: str,
+    action: str,
+    volume: float,
+    opened_price: float,
+    status: str,
+    gateway_return_code: Optional[int],
+    comment: Optional[str],
+    message: Optional[str],
+    strategy_code: Optional[int],
+    market_type: Optional[str],
+    signal_id: Optional[str] = None,
+  ) -> None:
+    """Insert a single positions row at ``status``. ref_source_id is seeded from
+    ref_id (they diverge later only when a partial close re-tickets the order).
+    Shared by :meth:`insert_position` (OPENED) and :meth:`insert_rejected_position`
+    (REJECTED); each owns its own error handling."""
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+              INSERT INTO positions (ref_source_id, ref_id, signal_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+        # Broker-native price, no rounding — see log_position for the rationale.
+        (ref_id, ref_id, signal_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, message, strategy_code, market_type),
+      )
+      conn.commit()
     finally:
       if conn:
         conn.close()
@@ -89,20 +128,15 @@ class PositionRepository:
     message: Optional[str] = None,
     strategy_code: Optional[int] = None,
     market_type: Optional[str] = None,
+    signal_id: Optional[str] = None,
   ):
-    conn = None
     try:
-      conn = _get_conn()
-      cursor = conn.cursor()
-      cursor.execute(
-        """
-              INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          """,
-        # Broker-native price, no rounding — see log_position for the rationale.
-        (ref_id, ref_id, strategy, symbol, action, volume, opened_price, "OPENED", gateway_return_code, comment, message, strategy_code, market_type),
+      self._insert_position_row(
+        ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
+        volume=volume, opened_price=opened_price, status="OPENED",
+        gateway_return_code=gateway_return_code, comment=comment, message=message,
+        strategy_code=strategy_code, market_type=market_type, signal_id=signal_id,
       )
-      conn.commit()
       logger.debug(f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}")
     except Exception as exc:
       logger.critical(
@@ -111,9 +145,43 @@ class PositionRepository:
         ref_id, strategy, symbol, exc,
       )
       raise
-    finally:
-      if conn:
-        conn.close()
+
+  def insert_rejected_position(
+    self,
+    ref_id: str,
+    strategy: str,
+    symbol: str,
+    action: str,
+    volume: float,
+    opened_price: float,
+    gateway_return_code: Optional[int] = None,
+    comment: Optional[str] = None,
+    message: Optional[str] = None,
+    strategy_code: Optional[int] = None,
+    market_type: Optional[str] = None,
+    signal_id: Optional[str] = None,
+  ):
+    """Record an entry that a worker-side policy rejected (e.g. MAX_OPEN_ORDERS)
+    as a REJECTED row, so it is auditable and picked up by :class:`PositionCDC` and
+    forwarded to the broker on the TRADE subject with status REJECTED.
+
+    Unlike :meth:`insert_position`, a failure here is logged but NOT re-raised: no
+    live order exists to reconcile, and the rejection must not abort signal
+    processing (the operator notification still needs to fire)."""
+    try:
+      self._insert_position_row(
+        ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
+        volume=volume, opened_price=opened_price,
+        status=PositionStatusEnum.REJECTED.value,
+        gateway_return_code=gateway_return_code, comment=comment, message=message,
+        strategy_code=strategy_code, market_type=market_type, signal_id=signal_id,
+      )
+      logger.debug(f"Rejected entry recorded: ref_source_id={ref_id}, symbol={symbol}, action={action}")
+    except Exception as exc:
+      logger.error(
+        "insert_rejected_position failed (ref_id=%s strategy=%s symbol=%s): %s",
+        ref_id, strategy, symbol, exc,
+      )
 
   def update_position_status(
     self,
@@ -229,6 +297,34 @@ class PositionRepository:
     except Exception as e:
       logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
       return []
+    finally:
+      if conn:
+        conn.close()
+
+  def signal_exists(self, signal_id: str) -> bool:
+    """True if any position_logs row already carries this ``signal_id``.
+
+    Called by the RETRY_SIGNALS handler in
+    :class:`~worker.gateways.processor.BaseSignalProcessor` to skip a replay for
+    a signal the worker has already processed (successfully or as a REJECT).
+    An empty/None ``signal_id`` is treated as "not seen" — the caller decides
+    what to do with a replay carrying no id (currently: pass it through)."""
+    if not signal_id:
+      return False
+    conn = None
+    try:
+      conn = _get_conn()
+      cursor = conn.cursor()
+      cursor.execute(
+        "SELECT 1 FROM position_logs WHERE signal_id = ? LIMIT 1",
+        (signal_id,),
+      )
+      return cursor.fetchone() is not None
+    except Exception as exc:
+      logger.exception("signal_exists failed (signal_id=%s): %s", signal_id, exc)
+      # Fail-safe: treat as "seen" so a DB error does NOT let a replay
+      # double-execute the signal.
+      return True
     finally:
       if conn:
         conn.close()

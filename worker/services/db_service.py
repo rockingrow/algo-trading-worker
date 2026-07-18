@@ -45,6 +45,9 @@ class DBService:
   def insert_position(self, *args, **kwargs):
     return self.positions.insert_position(*args, **kwargs)
 
+  def insert_rejected_position(self, *args, **kwargs):
+    return self.positions.insert_rejected_position(*args, **kwargs)
+
   def update_position_status(
     self,
     ref_source_id: str,
@@ -77,6 +80,9 @@ class DBService:
     symbol: Optional[str] = None,
   ) -> list:
     return self.positions.get_open_positions_for_flat(strategy=strategy, symbol=symbol)
+
+  def signal_exists(self, signal_id: str) -> bool:
+    return self.positions.signal_exists(signal_id)
 
   # ── Notification outbox delegation ───────────────────────────────────── #
 
