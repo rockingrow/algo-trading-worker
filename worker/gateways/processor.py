@@ -26,6 +26,7 @@ import json
 import random
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from pydantic import ValidationError
@@ -47,12 +48,17 @@ from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 from worker.schemas.system_schema import (
   SystemActionEnum,
+  SystemRetrySignalsSchema,
   SystemSchema,
   SystemWorkerConnectedErrorSchema,
   SystemWorkerConnectedSchema,
 )
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
-from worker.settings import NATS_REQUIRED_LISTENING_SUBJECTS, MarketTypeEnum
+from worker.settings import (
+  MAX_RETRY_TIMEOUT,
+  NATS_REQUIRED_LISTENING_SUBJECTS,
+  MarketTypeEnum,
+)
 
 log = get_logger("worker.gateways.processor")
 
@@ -93,6 +99,17 @@ _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
 }
 
 
+def _seconds_since(ts: Optional[datetime], now: datetime) -> Optional[float]:
+  """Seconds between *ts* and *now*, treating a naive *ts* as UTC. Returns
+  None when *ts* is missing so the RETRY_SIGNALS handler can drop a payload
+  with no timestamp instead of guessing an age."""
+  if ts is None:
+    return None
+  if ts.tzinfo is None:
+    ts = ts.replace(tzinfo=timezone.utc)
+  return (now - ts).total_seconds()
+
+
 def parse_nats_subjects(raw: str) -> list[str | NatsSubjectEnum]:
   """Parse a comma-separated subject string, always including the required ones."""
   parsed: set[str | NatsSubjectEnum] = set()
@@ -105,6 +122,29 @@ def parse_nats_subjects(raw: str) -> list[str | NatsSubjectEnum]:
     except ValueError:
       parsed.add(s)
   return list(NATS_REQUIRED_LISTENING_SUBJECTS | parsed)
+
+
+def parse_strategy_subjects(raw: str) -> list[str]:
+  """Return only the strategy-name subjects from ``NATS_SUBJECTS``.
+
+  Every entry in ``NATS_SUBJECTS`` that is not one of the control subjects
+  (see :class:`NatsSubjectEnum`) is a strategy name (e.g. ``MT5_GOLD``). The
+  WORKER_CONNECTED handshake ships this list to the broker so it knows which
+  strategies' recent signals to include in a RETRY_SIGNALS replay for this
+  worker."""
+  strategies: list[str] = []
+  seen: set[str] = set()
+  for s in raw.split(","):
+    s = s.strip()
+    if not s or s in seen:
+      continue
+    try:
+      NatsSubjectEnum(s)
+      continue  # control subject, not a strategy
+    except ValueError:
+      strategies.append(s)
+      seen.add(s)
+  return strategies
 
 
 class BaseSignalProcessor(ABC):
@@ -321,6 +361,7 @@ class BaseSignalProcessor(ABC):
       message=signal.model_dump_json(),
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
+      signal_id=signal.signal_id,
     )
 
     if result.get("success"):
@@ -363,6 +404,7 @@ class BaseSignalProcessor(ABC):
         message=signal_json,
         strategy_code=self._magic_for(signal.strategy),
         market_type=self._market_type,
+        signal_id=signal.signal_id,
       )
     else:
       status = _CLOSE_STATUS_MAP.get(action_val)
@@ -452,6 +494,7 @@ class BaseSignalProcessor(ABC):
       message=signal_json,
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
+      signal_id=signal.signal_id,
     )
 
     self.ctx.db_service.insert_rejected_position(
@@ -466,6 +509,7 @@ class BaseSignalProcessor(ABC):
       message=signal_json,
       strategy_code=self._magic_for(signal.strategy),
       market_type=self._market_type,
+      signal_id=signal.signal_id,
     )
 
     self.ctx.channel_notifier.send_message(
@@ -658,6 +702,12 @@ class BaseSignalProcessor(ABC):
     g = self.settings.get(self._gateway_setting_key)
     return getattr(g, "value", None) or str(g or "")
 
+  def _subscribed_strategies(self) -> list[str]:
+    """Strategy names this worker subscribes to (from ``NATS_SUBJECTS`` minus
+    the control subjects). Shipped in WORKER_CONNECTED so the broker knows
+    which strategies' recent signals belong in a RETRY_SIGNALS replay."""
+    return parse_strategy_subjects(self.settings.get("nats_subjects", "") or "")
+
   def _worker_connected_payload(self) -> Optional[str]:
     """Build the WORKER_CONNECTED handshake JSON, or None if this worker has no
     identity yet (no account_id → nothing for the broker to target)."""
@@ -668,6 +718,7 @@ class BaseSignalProcessor(ABC):
       account_id=account_id,
       market=self._market_type,
       gateway=self._gateway_value,
+      strategies=self._subscribed_strategies(),
     ).model_dump_json()
 
   def _announce_worker_connected(self) -> None:
@@ -754,12 +805,78 @@ class BaseSignalProcessor(ABC):
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
     """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
 
-    Markets override this to handle the actions they support; the base ignores
-    every action so a market without SYSTEM actions (e.g. FOREX) needs no code.
+    ``RETRY_SIGNALS`` is handled here for every market — the base owns the
+    dedup+timeout gate so both FOREX and CRYPTO get identical replay semantics.
+    Markets that add their own SYSTEM actions override this hook and delegate
+    to ``super()`` so the shared actions still fire.
     """
+    if action == SystemActionEnum.RETRY_SIGNALS:
+      self._handle_retry_signals(data)
+      return
     log.info(
       "[%s SYSTEM] No handler for action=%s — ignoring.",
       self.name, getattr(action, "value", action),
+    )
+
+  def _handle_retry_signals(self, data: dict) -> None:
+    """Execute a RETRY_SIGNALS replay: for each signal, drop it if already
+    processed (dedup by ``signal_id`` against ``position_logs``) or older than
+    :data:`~worker.settings.MAX_RETRY_TIMEOUT` (against the signal's own
+    ``timestamp``); otherwise run it through the normal signal pipeline.
+
+    A bad envelope is dropped (never crashes the SYSTEM listener) and a single
+    bad signal in an otherwise valid batch does not abort the rest — the goal
+    of a replay is to fill gaps, so each entry stands on its own.
+    """
+    try:
+      envelope = SystemRetrySignalsSchema(**data)
+    except ValidationError as err:
+      log.error("[%s SYSTEM] RETRY_SIGNALS envelope invalid: %s", self.name, err)
+      return
+
+    signals = envelope.signals
+    if not signals:
+      log.info("[%s SYSTEM] RETRY_SIGNALS: empty batch — nothing to do.", self.name)
+      return
+
+    now = datetime.now(timezone.utc)
+    executed = skipped_dedup = skipped_stale = failed = 0
+
+    for signal in signals:
+      # Dedup first (cheap DB lookup) so a replay of a signal we already
+      # processed never re-hits the broker even if it's still within the window.
+      if signal.signal_id and self.ctx.db_service.signal_exists(signal.signal_id):
+        skipped_dedup += 1
+        log.info(
+          "[%s SYSTEM] RETRY_SIGNALS: skip signal_id=%s (already processed).",
+          self.name, signal.signal_id,
+        )
+        continue
+
+      age = _seconds_since(signal.timestamp, now)
+      if age is None or age > MAX_RETRY_TIMEOUT:
+        skipped_stale += 1
+        log.info(
+          "[%s SYSTEM] RETRY_SIGNALS: skip signal_id=%s symbol=%s action=%s — "
+          "age=%.1fs > MAX_RETRY_TIMEOUT=%ds.",
+          self.name, signal.signal_id, signal.symbol, signal.action.value,
+          age if age is not None else float("nan"), MAX_RETRY_TIMEOUT,
+        )
+        continue
+
+      try:
+        self._process_signal(signal)
+        executed += 1
+      except Exception:
+        failed += 1
+        log.exception(
+          "[%s SYSTEM] RETRY_SIGNALS: signal_id=%s failed — continuing batch.",
+          self.name, signal.signal_id,
+        )
+
+    log.info(
+      "[%s SYSTEM] RETRY_SIGNALS done | executed=%d dedup=%d stale=%d failed=%d total=%d",
+      self.name, executed, skipped_dedup, skipped_stale, failed, len(signals),
     )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #

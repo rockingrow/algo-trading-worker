@@ -5,6 +5,7 @@ shared `_process_message` algorithm runs identically regardless of market.
 """
 
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -12,10 +13,11 @@ from helpers import make_signal
 
 from worker.gateways import processor as processor_module
 from worker.gateways.config import ExecutionConfig
-from worker.gateways.processor import BaseSignalProcessor
+from worker.gateways.processor import BaseSignalProcessor, parse_strategy_subjects
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
 from worker.schemas.system_schema import SystemActionEnum
+from worker.settings import MAX_RETRY_TIMEOUT
 
 
 class FakePresenter:
@@ -59,6 +61,7 @@ class FakeDb:
     self.updated = []
     self.rejected = []
     self.open_positions = []
+    self.known_signal_ids = set()
 
   def log_position(self, **kw):
     self.logged.append(kw)
@@ -74,6 +77,9 @@ class FakeDb:
 
   def get_open_positions_for_flat(self, strategy=None, symbol=None):
     return list(self.open_positions)
+
+  def signal_exists(self, signal_id):
+    return signal_id in self.known_signal_ids
 
 
 class FakeProcessor(BaseSignalProcessor):
@@ -690,3 +696,244 @@ def test_non_scale_position_signal_is_untouched():
 
   assert seen[0].tp1 == 65000.0  # scaling ignored without is_scale_position=True
   assert seen[0].scale_quantity_factor() == 1.0
+
+
+# ── Strategy subject parsing / WORKER_CONNECTED strategies ─────────────────── #
+
+
+def test_parse_strategy_subjects_keeps_only_strategy_names():
+  # Control subjects (ADMIN/SYSTEM/SIGNAL/TRADE) are filtered out; blank and
+  # duplicate entries are dropped; order of first occurrence is preserved.
+  assert parse_strategy_subjects("MT5_GOLD,ADMIN,MT5_FX, ,MT5_GOLD,SYSTEM,CRYPTO_ETH") == [
+    "MT5_GOLD", "MT5_FX", "CRYPTO_ETH",
+  ]
+
+
+def test_parse_strategy_subjects_empty_string_returns_empty_list():
+  assert parse_strategy_subjects("") == []
+  assert parse_strategy_subjects("  ,  , ") == []
+
+
+def test_worker_connected_payload_includes_strategies_from_settings():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "gw_key": "FAKE_GW",
+    "nats_subjects": "MT5_GOLD,MT5_FX,ADMIN,SYSTEM",
+  }
+  proc._gateway_setting_key = "gw_key"
+
+  import json as _json
+
+  payload = _json.loads(proc._worker_connected_payload())
+  # The subscribed strategies (nats_subjects minus control subjects) are shipped
+  # so the broker knows which strategies' recent signals to include in a
+  # RETRY_SIGNALS reply for this worker.
+  assert payload["strategies"] == ["MT5_GOLD", "MT5_FX"]
+
+
+def test_worker_connected_payload_strategies_defaults_to_empty_when_unset():
+  proc = FakeProcessor({"success": True})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+
+  import json as _json
+
+  payload = _json.loads(proc._worker_connected_payload())
+  assert payload["strategies"] == []
+
+
+# ── RETRY_SIGNALS SYSTEM action ────────────────────────────────────────────── #
+
+
+def _retry_signals_payload(signals, account_id="FAKE_MKT-FAKE_GW-acct-1"):
+  """Serialise a RETRY_SIGNALS envelope with the given signal payloads."""
+  import json as _json
+
+  return _json.dumps({
+    "action": SystemActionEnum.RETRY_SIGNALS.value,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "account_id": account_id,
+    "signals": [s.model_dump(mode="json") for s in signals],
+  })
+
+
+def _fresh_signal(action=SignalActionEnum.LONG, **overrides):
+  """A signal whose ``timestamp`` is well within MAX_RETRY_TIMEOUT so it is
+  eligible for replay unless the test overrides ``timestamp`` explicitly."""
+  overrides.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+  return make_signal(action, **overrides)
+
+
+def _retry_proc():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
+  # Route RETRY_SIGNALS through the real base handler instead of the FakeProcessor
+  # test-only capture, so the dedup + timeout + _process_signal path is exercised.
+  proc._handle_system_action = lambda action, data: BaseSignalProcessor._handle_system_action(
+    proc, action, data
+  )
+  return proc
+
+
+def test_retry_signals_executes_fresh_signal_via_process_signal():
+  proc = _retry_proc()
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-fresh", symbol="AAA")
+  raw = _retry_signals_payload([sig])
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  # The eligible signal went through the normal pipeline: it was persisted as
+  # an OPENED position and a fill notification was sent to the channel.
+  assert len(proc.db.inserted) == 1
+  assert proc.db.inserted[0]["symbol"] == "AAA"
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_retry_signals_skips_signal_already_processed():
+  proc = _retry_proc()
+  proc.db.known_signal_ids.add("dup-1")
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="dup-1", symbol="AAA")
+  raw = _retry_signals_payload([sig])
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  # A signal we've already processed must not be re-executed — no DB writes,
+  # no channel notification.
+  assert proc.db.inserted == []
+  assert proc.db.logged == []
+  assert proc.notifications == []
+
+
+def test_retry_signals_skips_signal_older_than_max_retry_timeout():
+  proc = _retry_proc()
+  # Stamp the signal well past MAX_RETRY_TIMEOUT so the age-gate drops it.
+  stale_ts = datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 30)
+  sig = _fresh_signal(
+    SignalActionEnum.LONG,
+    signal_id="stale-1",
+    symbol="AAA",
+    timestamp=stale_ts.isoformat(),
+  )
+  raw = _retry_signals_payload([sig])
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert proc.db.inserted == []
+  assert proc.notifications == []
+
+
+def test_retry_signals_mixed_batch_only_executes_eligible():
+  proc = _retry_proc()
+  proc.db.known_signal_ids.add("dup")
+  fresh = _fresh_signal(SignalActionEnum.LONG, signal_id="fresh", symbol="AAA")
+  duplicate = _fresh_signal(SignalActionEnum.LONG, signal_id="dup", symbol="BBB")
+  stale = _fresh_signal(
+    SignalActionEnum.LONG,
+    signal_id="stale",
+    symbol="CCC",
+    timestamp=(datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 5)).isoformat(),
+  )
+  raw = _retry_signals_payload([fresh, duplicate, stale])
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  # Only the fresh (non-dup, in-window) signal reaches the broker path.
+  assert [row["symbol"] for row in proc.db.inserted] == ["AAA"]
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_retry_signals_empty_batch_is_a_no_op():
+  proc = _retry_proc()
+  raw = _retry_signals_payload([])
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert proc.db.inserted == []
+  assert proc.notifications == []
+
+
+def test_retry_signals_marks_executed_signal_id_in_db():
+  """The processed signal_id is stored in position_logs + positions so a
+  subsequent RETRY_SIGNALS carrying the same id dedups against it."""
+  proc = _retry_proc()
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-persist", symbol="AAA")
+  raw = _retry_signals_payload([sig])
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert proc.db.logged[0]["signal_id"] == "sig-persist"
+  assert proc.db.inserted[0]["signal_id"] == "sig-persist"
+
+
+def test_retry_signals_handles_batch_of_ten_mixed_signals():
+  """A realistic-size replay batch (10 signals) mixes executable, duplicate,
+  stale, and broker-failure entries. The whole batch must be drained in one
+  pass — no early abort, no cross-signal interference — with each signal
+  landing in the correct bucket."""
+  proc = _retry_proc()
+  proc.db.known_signal_ids.update({"dup-1", "dup-2"})
+
+  fresh = [
+    _fresh_signal(SignalActionEnum.LONG, signal_id=f"fresh-{i}", symbol=f"SYM{i}")
+    for i in range(5)
+  ]
+  duplicates = [
+    _fresh_signal(SignalActionEnum.LONG, signal_id="dup-1", symbol="DUPA"),
+    _fresh_signal(SignalActionEnum.LONG, signal_id="dup-2", symbol="DUPB"),
+  ]
+  stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 30)).isoformat()
+  stale = [
+    _fresh_signal(SignalActionEnum.LONG, signal_id="stale-1", symbol="STA", timestamp=stale_ts),
+    _fresh_signal(SignalActionEnum.LONG, signal_id="stale-2", symbol="STB", timestamp=stale_ts),
+  ]
+  failing = _fresh_signal(SignalActionEnum.LONG, signal_id="boom", symbol="BOOM")
+
+  signals = fresh + duplicates + stale + [failing]
+  assert len(signals) == 10
+
+  # Every signal shares the same fake handler; make only "boom" raise so the
+  # rest of the batch proves it isn't affected by one broker-side failure.
+  def handle(sig):
+    if sig.signal_id == "boom":
+      raise RuntimeError("broker unreachable")
+    return {"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1}
+
+  proc.handler = SimpleNamespace(handle=handle)
+
+  raw = _retry_signals_payload(signals)
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  # The 5 fresh, eligible entries all executed and were persisted + notified.
+  assert sorted(row["symbol"] for row in proc.db.inserted) == [f"SYM{i}" for i in range(5)]
+  assert len(proc.notifications) == 5
+  # Duplicates, stale entries, and the failing signal never reach persistence.
+  assert not any(
+    row["symbol"] in ("DUPA", "DUPB", "STA", "STB", "BOOM") for row in proc.db.inserted
+  )
+
+
+def test_retry_signals_dispatched_via_worker_connected_reply():
+  """RETRY_SIGNALS is also a valid WORKER_CONNECTED reply — the broker can
+  replay in-flight signals right after the handshake instead of on a separate
+  SYSTEM push. The reply router must dispatch through the same handler."""
+  proc = _connected_proc()
+  # Wire the real base action-dispatch so RETRY_SIGNALS hits _handle_retry_signals.
+  proc._handle_system_action = lambda action, data: BaseSignalProcessor._handle_system_action(
+    proc, action, data
+  )
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="wc-retry", symbol="ZZZ")
+  import json as _json
+
+  reply = _json.dumps({
+    "action": SystemActionEnum.RETRY_SIGNALS.value,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "signals": [sig.model_dump(mode="json")],
+  })
+  proc.publisher = FakePublisher([reply])
+
+  proc._announce_worker_connected()
+
+  assert len(proc.db.inserted) == 1
+  assert proc.db.inserted[0]["symbol"] == "ZZZ"

@@ -81,6 +81,9 @@ class DBService:
   ) -> list:
     return self.positions.get_open_positions_for_flat(strategy=strategy, symbol=symbol)
 
+  def signal_exists(self, signal_id: str) -> bool:
+    return self.positions.signal_exists(signal_id)
+
   # ── Notification outbox delegation ───────────────────────────────────── #
 
   def enqueue_notification(
