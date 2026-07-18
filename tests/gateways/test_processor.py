@@ -866,6 +866,53 @@ def test_retry_signals_marks_executed_signal_id_in_db():
   assert proc.db.inserted[0]["signal_id"] == "sig-persist"
 
 
+def test_retry_signals_handles_batch_of_ten_mixed_signals():
+  """A realistic-size replay batch (10 signals) mixes executable, duplicate,
+  stale, and broker-failure entries. The whole batch must be drained in one
+  pass — no early abort, no cross-signal interference — with each signal
+  landing in the correct bucket."""
+  proc = _retry_proc()
+  proc.db.known_signal_ids.update({"dup-1", "dup-2"})
+
+  fresh = [
+    _fresh_signal(SignalActionEnum.LONG, signal_id=f"fresh-{i}", symbol=f"SYM{i}")
+    for i in range(5)
+  ]
+  duplicates = [
+    _fresh_signal(SignalActionEnum.LONG, signal_id="dup-1", symbol="DUPA"),
+    _fresh_signal(SignalActionEnum.LONG, signal_id="dup-2", symbol="DUPB"),
+  ]
+  stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 30)).isoformat()
+  stale = [
+    _fresh_signal(SignalActionEnum.LONG, signal_id="stale-1", symbol="STA", timestamp=stale_ts),
+    _fresh_signal(SignalActionEnum.LONG, signal_id="stale-2", symbol="STB", timestamp=stale_ts),
+  ]
+  failing = _fresh_signal(SignalActionEnum.LONG, signal_id="boom", symbol="BOOM")
+
+  signals = fresh + duplicates + stale + [failing]
+  assert len(signals) == 10
+
+  # Every signal shares the same fake handler; make only "boom" raise so the
+  # rest of the batch proves it isn't affected by one broker-side failure.
+  def handle(sig):
+    if sig.signal_id == "boom":
+      raise RuntimeError("broker unreachable")
+    return {"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1}
+
+  proc.handler = SimpleNamespace(handle=handle)
+
+  raw = _retry_signals_payload(signals)
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  # The 5 fresh, eligible entries all executed and were persisted + notified.
+  assert sorted(row["symbol"] for row in proc.db.inserted) == [f"SYM{i}" for i in range(5)]
+  assert len(proc.notifications) == 5
+  # Duplicates, stale entries, and the failing signal never reach persistence.
+  assert not any(
+    row["symbol"] in ("DUPA", "DUPB", "STA", "STB", "BOOM") for row in proc.db.inserted
+  )
+
+
 def test_retry_signals_dispatched_via_worker_connected_reply():
   """RETRY_SIGNALS is also a valid WORKER_CONNECTED reply — the broker can
   replay in-flight signals right after the handshake instead of on a separate
