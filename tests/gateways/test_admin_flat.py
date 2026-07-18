@@ -80,12 +80,15 @@ class FakeProc:
   """Minimal stand-in providing exactly the hooks the base FLAT handler touches."""
 
   def __init__(
-    self, *, account_id="100", db_positions=None, positions=None,
+    self, *, account_id="100", market_type="FOREX", gateway_value="MT5",
+    db_positions=None, positions=None,
     close_result=None, results_by_key=None, match_style="ticket", connected=True,
   ):
     self.name = "TEST"
     self.presenter = FakePresenter
     self._account_id = account_id
+    self._market_type = market_type
+    self._gateway_value = gateway_value
     self._connected = connected
     self._match_style = match_style
     self.executor = FakeExecutor(
@@ -116,6 +119,7 @@ class FakeProc:
     return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}
 
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
+  _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
 
@@ -146,6 +150,58 @@ def test_absent_account_id_closes_all():
   proc = FakeProc(db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)])
   proc._handle_admin_message(_payload())
   assert len(proc.executor.closed) == 1
+
+
+# ── composite (market, gateway, account_id) routing ─────────────────────────
+# account_id alone is not a unique worker identity — it can collide across
+# markets/gateways (e.g. an email account_id also matching a CRYPTO gateway
+# name), so the broker now sends market/gateway alongside account_id and a
+# FLAT must match all three before this worker acts on it.
+
+
+def test_matching_account_id_wrong_market_skips():
+  proc = FakeProc(account_id="100", market_type="FOREX", db_positions=[_db_pos()])
+  proc._handle_admin_message(_payload(account_id="100", market="CRYPTO"))
+  assert proc.db.flat_calls == []
+  assert proc.executor.closed == []
+
+
+def test_matching_account_id_wrong_gateway_skips():
+  proc = FakeProc(account_id="100", gateway_value="MT5", db_positions=[_db_pos()])
+  proc._handle_admin_message(_payload(account_id="100", gateway="BINANCE"))
+  assert proc.db.flat_calls == []
+  assert proc.executor.closed == []
+
+
+def test_matching_composite_key_proceeds():
+  proc = FakeProc(
+    account_id="100", market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+  )
+  proc._handle_admin_message(
+    _payload(account_id="100", market="FOREX", gateway="MT5")
+  )
+  assert len(proc.executor.closed) == 1
+
+
+def test_colliding_account_id_across_gateways_only_matches_owner():
+  # Same raw account_id ("shared@example.com") used on two different gateways —
+  # only the worker whose (market, gateway) also matches should act.
+  mt5_proc = FakeProc(
+    account_id="shared@example.com", market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+  )
+  binance_proc = FakeProc(
+    account_id="shared@example.com", market_type="CRYPTO", gateway_value="BINANCE",
+    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+  )
+  payload = _payload(
+    account_id="shared@example.com", market="CRYPTO", gateway="BINANCE",
+  )
+  mt5_proc._handle_admin_message(payload)
+  binance_proc._handle_admin_message(payload)
+  assert mt5_proc.executor.closed == []
+  assert len(binance_proc.executor.closed) == 1
 
 
 # ── DB filter forwarding ─────────────────────────────────────────────────────

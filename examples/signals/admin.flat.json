@@ -3,5 +3,7 @@
   "timestamp": "2026-06-02T08:00:00+00:00",
   "strategy": "my_strategy",
   "symbol": "XAUUSD",
-  "account_id": "123456"
+  "account_id": "123456",
+  "market": "FOREX",
+  "gateway": "MT5"
 }

@@ -92,6 +92,7 @@ class _FakeProc:
   _flat_db_match_keys = ForexSignalProcessor._flat_db_match_keys
   # Real broker-agnostic skeleton.
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
+  _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
 
@@ -101,6 +102,8 @@ class _FakeProc:
       admin_flat_closed=lambda db_pos, result, footer: f"Admin FLAT {db_pos['symbol']}"
     )
     self._account_id = "100"
+    self._market_type = "FOREX"
+    self._gateway_value = "MT5"
     self.executor = _FakeExecutor(positions, close_result)
     self.db = _FakeDb(db_positions)
     self.notifications = []

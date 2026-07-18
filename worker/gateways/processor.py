@@ -248,6 +248,7 @@ class BaseSignalProcessor(ABC):
       publisher=self.publisher,
       db_service=self.ctx.db_service,
       market_type=self.settings.get("market_type"),
+      gateway=self._gateway_value,
       **self._position_cdc_kwargs(),
     ).start(stop_event=stop_event)
 
@@ -542,10 +543,12 @@ class BaseSignalProcessor(ABC):
 
     if admin.action == AdminActionEnum.FLAT:
       admin_flat_schema = AdminFlatSchema(**data)
-      if admin_flat_schema.account_id and admin_flat_schema.account_id != self._account_id:
+      if not self._flat_targets_this_worker(admin_flat_schema):
         log.info(
-          "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
-          admin_flat_schema.account_id, self._account_id,
+          "[ADMIN FLAT] Skipping: market=%s gateway=%s account_id=%s != worker "
+          "market=%s gateway=%s account=%s",
+          admin_flat_schema.market, admin_flat_schema.gateway, admin_flat_schema.account_id,
+          self._market_type, self._gateway_value, self._account_id,
         )
         return
       # Close live broker positions first (source of truth), then reconcile the DB.
@@ -555,6 +558,21 @@ class BaseSignalProcessor(ABC):
 
     log.warning("[ADMIN] Unknown action: %s", admin.action)
     return
+
+  def _flat_targets_this_worker(self, admin: AdminFlatSchema) -> bool:
+    """Whether this worker should act on an ADMIN FLAT, matched by the composite
+    key (market, gateway, account_id) rather than ``account_id`` alone —
+    ``account_id`` is not unique across markets/gateways (see
+    :class:`AdminFlatSchema`). Each field is an optional filter: unset matches
+    every worker on that dimension; a broadcast FLAT (all three unset) targets
+    everyone."""
+    if admin.account_id and admin.account_id != self._account_id:
+      return False
+    if admin.market and admin.market != self._market_type:
+      return False
+    if admin.gateway and admin.gateway != self._gateway_value:
+      return False
+    return True
 
   def _close_live_positions_for_flat(self, admin) -> tuple[Dict[Any, dict], set]:
     """Close every live broker position matching the FLAT filter.

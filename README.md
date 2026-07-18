@@ -447,13 +447,17 @@ The `ADMIN` NATS subject carries out-of-band administrative commands that operat
 
 ### Action: `FLAT`
 
-Closes open positions across one or more strategies/symbols in a single command. Accepts three **optional** filter attributes — any combination can be specified; omitting all three closes every tracked open position on the account.
+Closes open positions across one or more strategies/symbols in a single command. Accepts five **optional** filter attributes — any combination can be specified; omitting all of `account_id`/`market`/`gateway`/`strategy`/`symbol` closes every tracked open position on the account.
 
 | Filter | Behaviour when present |
 | --- | --- |
 | `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
+| `market` | Silently ignored if it does not match the worker's `MARKET_TYPE`; processed normally if it matches or is absent |
+| `gateway` | Silently ignored if it does not match the worker's gateway/platform setting (`MT5_PLATFORM` for FOREX, `CRYPTO_EXCHANGE` for CRYPTO); processed normally if it matches or is absent |
 | `strategy` | Restricts close to positions whose `strategy` column equals this value |
 | `symbol` | Restricts close to positions for this symbol |
+
+`account_id` alone is **not** a unique worker identity — the same raw id can collide across markets/gateways (e.g. an email used as `account_id` also matching a CRYPTO gateway name). A worker only acts on a FLAT when `account_id`, `market`, and `gateway` **all** match (each is skipped as a filter when absent from the payload).
 
 #### ADMIN FLAT Payload
 
@@ -463,7 +467,9 @@ Closes open positions across one or more strategies/symbols in a single command.
   "timestamp": "2026-06-02T08:00:00+00:00",
   "strategy": "my_strategy",
   "symbol": "XAUUSD",
-  "account_id": "123456"
+  "account_id": "123456",
+  "market": "FOREX",
+  "gateway": "MT5"
 }
 ```
 
@@ -474,7 +480,7 @@ All fields except `action` and `timestamp` are optional.
 The broker/exchange is always the source of truth: live positions are closed **first**, then the DB is reconciled against what actually closed.
 
 1. Parse `AdminSignalSchema`; drop silently on validation error, and ignore any non-`FLAT` action.
-2. If `account_id` is present and does not match the worker's account id → skip (no log noise).
+2. If any of `account_id` / `market` / `gateway` is present and does not match the worker's identity → skip (no log noise).
 3. Ensure the broker/exchange connection; abort if unreachable.
 4. **Close live positions** (`_close_live_positions_for_flat`): fetch live positions — for a given `symbol` via `get_open_positions(symbol, strategy=…)`, otherwise account-wide via `get_all_open_positions(strategy=…)` — and call `close_single_position(pos, reason="FLAT")` on each. Track every key *attempted* and the subset that *closed successfully*.
 5. **Reconcile the DB** (`_reconcile_flat_db`) against the open rows matching the filter. For each DB row:
@@ -694,10 +700,11 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 | `account_id` | Worker account id — `MT5_LOGIN` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
 | `account_name` | `MT5_NAME` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
 | `market_type` | `MARKET_TYPE` from settings (e.g. `forex`, `crypto`) |
+| `gateway` | Gateway/platform name (e.g. `MT5`, `BINANCE`) — sent alongside `account_id` because the raw account id is not unique on its own (it can collide across markets/gateways) |
 | `account_balance` / `account_leverage` | Snapshot from the gateway's account (`account_info_fn`) at poll time (CRYPTO reports balance only; leverage is `null`) |
 | `signal_id`, `sl`, `tp1`, `tp2`, `risk_percent`, `magic` | Extracted from the original signal JSON stored in `positions.gateway_message` |
 
-The Broker handler is expected to be idempotent (upsert by `account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
+The Broker handler is expected to be idempotent (upsert by `market_type + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
 
 ### NotificationJob — Telegram Outbox Dispatcher (`worker/jobs/notification_job.py`)
 
