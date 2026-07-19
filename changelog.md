@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - Unreleased
+
+### Changed
+
+- **Breaking (broker payload):** `account_id` alone is not a unique worker identity — the same raw id can collide across markets/gateways (e.g. an email used as `account_id` also matching a CRYPTO gateway name). The broker now sends `market` and `gateway` alongside `account_id` on the `ADMIN` `FLAT` command, and every place that previously routed by `account_id` alone now matches the full composite key `(market, gateway, account_id)`.
+  - `AdminFlatSchema` gains optional `market` / `gateway` fields (mirrors `SystemWorkerConnectedSchema`). `BaseSignalProcessor._handle_admin_message` now calls a new `_flat_targets_this_worker` helper: each of `account_id` / `market` / `gateway` is an independent optional filter — present in the payload it must match this worker's identity (`self._account_id` / `self._market_type` / `self._gateway_value`), absent it does not filter that dimension. A broadcast FLAT (all three unset) still targets every worker.
+  - `PositionEvent` (the `TRADE` subject payload) gains a `gateway` field, populated from `BaseSignalProcessor._gateway_value` and threaded through `PositionCDC(gateway=...)`. Its market field is renamed `market_type` → `market` to match the Broker's field name; the broker can now upsert a Trade row by the full `(market, gateway, account_id, ticket)` key instead of `account_id + ticket`.
+  - `examples/signals/admin.flat.json` updated with `market` / `gateway`.
+
 ## [1.2.0] - 2026-07-18
 
 ### Added
@@ -121,7 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
-[1.2.0]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.0...dev
+[1.2.1]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.1...dev
+[1.2.0]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.0...v1.2.1
 [1.1.7]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.7...dev
 [1.1.6]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.6...dev
 [1.1.5]: https://github.com/rockingrow/algo-trading-worker/compare/v1.1.4...v1.1.5
