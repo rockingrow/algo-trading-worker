@@ -135,7 +135,7 @@ class PositionCDC:
         event=event_type,
         account_id=self._account_id,
         account_name=self._account_name,
-        market_type=self._market_type,
+        market=self._market_type,
         gateway=self._gateway,
         **payload,
       )
@@ -149,7 +149,7 @@ class PositionCDC:
       )
       self._publisher.publish(NatsSubjectEnum.TRADE, event_json)
       # Publish-then-mark gives at-least-once delivery; the broker handler is
-      # idempotent (upsert by market_type + gateway + account_id + ticket).
+      # idempotent (upsert by market + gateway + account_id + ticket).
       marked = self._db.mark_position_synced(row["id"], row["updated_at"])
       if not marked:
         log.debug(

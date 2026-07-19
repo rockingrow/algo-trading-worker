@@ -699,12 +699,12 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 | `event` | `CREATED` (first sync) or `UPDATED` (subsequent syncs) |
 | `account_id` | Worker account id — `MT5_LOGIN` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
 | `account_name` | `MT5_NAME` (FOREX) or `CRYPTO_ACCOUNT_ID` (CRYPTO) |
-| `market_type` | `MARKET_TYPE` from settings (e.g. `forex`, `crypto`) |
+| `market` | `MARKET_TYPE` from settings (e.g. `forex`, `crypto`) |
 | `gateway` | Gateway/platform name (e.g. `MT5`, `BINANCE`) — sent alongside `account_id` because the raw account id is not unique on its own (it can collide across markets/gateways) |
 | `account_balance` / `account_leverage` | Snapshot from the gateway's account (`account_info_fn`) at poll time (CRYPTO reports balance only; leverage is `null`) |
 | `signal_id`, `sl`, `tp1`, `tp2`, `risk_percent`, `magic` | Extracted from the original signal JSON stored in `positions.gateway_message` |
 
-The Broker handler is expected to be idempotent (upsert by `market_type + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
+The Broker handler is expected to be idempotent (upsert by `market + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
 
 ### NotificationJob — Telegram Outbox Dispatcher (`worker/jobs/notification_job.py`)
 

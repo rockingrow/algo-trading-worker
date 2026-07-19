@@ -2,7 +2,7 @@
   "event": "CREATED",
   "account_id": "413652379",
   "account_name": "MT5-Live-01",
-  "market_type": "FOREX",
+  "market": "FOREX",
   "gateway": "MT5",
   "id": 101,
   "ref_source_id": "4587420656",
