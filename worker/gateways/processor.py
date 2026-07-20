@@ -6,7 +6,8 @@ Market-agnostic signal-processor skeleton (Template Method pattern).
 Both the FOREX (MT5) and CRYPTO (CEX) gateways run the *same* algorithm:
 
     connect → subscribe to NATS → for each message:
-        ADMIN  → validate + reconcile a FLAT
+        ADMIN  → validate + reconcile a FLAT (public fanout ``ADMIN``, or the
+                 worker's private ``ADMIN.<market>.<gateway>.<account_id>``)
         SIGNAL → handle, persist the position, notify
 
 Only a handful of steps actually differ per broker (how to connect, how to read
@@ -41,6 +42,7 @@ from worker.schemas.admin_schema import (
   AdminActionEnum,
   AdminFlatSchema,
   AdminMessageSchema,
+  PrivateAdminFlatSchema,
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -195,9 +197,17 @@ class BaseSignalProcessor(ABC):
     _tok = self.settings.get("nats_token")
     nats_token = _tok.get_secret_value() if _tok is not None else None
 
+    # Listen on the shared subjects plus this worker's own private ADMIN subject
+    # (ADMIN.<market>.<gateway>.<account_id>) so the broker can address a FLAT to
+    # exactly this account without fanning it out to every worker.
+    subjects = parse_nats_subjects(self.settings.get("nats_subjects", ""))
+    private_admin = self._private_admin_subject
+    if private_admin is not None and private_admin not in subjects:
+      subjects.append(private_admin)
+
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
-      subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
+      subjects=subjects,
       publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM], # purpose just only show on Notification
       token=nats_token,
       account_id=self.settings.get("account_id"),
@@ -270,7 +280,11 @@ class BaseSignalProcessor(ABC):
 
   def _process_message(self, subject, raw) -> None:
     if subject == NatsSubjectEnum.ADMIN:
-      self._handle_admin_message(raw)
+      self._handle_admin_message(raw, private=False)
+      return
+
+    if subject == self._private_admin_subject:
+      self._handle_admin_message(raw, private=True)
       return
 
     if subject == NatsSubjectEnum.SYSTEM:
@@ -519,17 +533,29 @@ class BaseSignalProcessor(ABC):
 
   # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
 
-  def _handle_admin_message(self, raw: str) -> None:
-    """Handle a NATS ADMIN ``FLAT``: parse, route by account, close live broker
-    positions, then reconcile the DB.
+  def _handle_admin_message(self, raw: str, *, private: bool = False) -> None:
+    """Handle a NATS ADMIN ``FLAT``: parse, route to this worker, close live
+    broker positions, then reconcile the DB.
 
-    The algorithm is identical for every market; only *how a live close maps to a
-    DB row* differs (MT5 matches by ticket, a CEX by resolved symbol). That single
-    variation point is the :meth:`_flat_match_key` / :meth:`_flat_db_match_keys`
-    pair, so the broker is always the source of truth: a row is marked ``FLATTED``
-    only when its close actually succeeded *or* the position was never live on the
-    broker. A row whose close was **attempted but failed** is left OPEN (it is
-    still live), so the DB never claims a position is flat while it is not.
+    A FLAT arrives on one of two subjects:
+
+    * the **public** ``ADMIN`` subject — the broker fans it out to every worker
+      with optional ``market``/``gateway`` filters and **no** ``account_id``
+      (the public subject is not account-scoped); or
+    * this worker's **private** ``ADMIN.<market>.<gateway>.<account_id>`` subject
+      — ``market``/``gateway``/``account_id`` are required and must match this
+      worker exactly.
+
+    ``private`` selects which of the two payload schemas / routing rules applies.
+
+    The close-and-reconcile algorithm below is identical for every market and
+    both subjects; only *how a live close maps to a DB row* differs (MT5 matches
+    by ticket, a CEX by resolved symbol). That single variation point is the
+    :meth:`_flat_match_key` / :meth:`_flat_db_match_keys` pair, so the broker is
+    always the source of truth: a row is marked ``FLATTED`` only when its close
+    actually succeeded *or* the position was never live on the broker. A row
+    whose close was **attempted but failed** is left OPEN (it is still live), so
+    the DB never claims a position is flat while it is not.
     """
     try:
       data = json.loads(raw)
@@ -542,12 +568,22 @@ class BaseSignalProcessor(ABC):
       return
 
     if admin.action == AdminActionEnum.FLAT:
-      admin_flat_schema = AdminFlatSchema(**data)
-      if not self._flat_targets_this_worker(admin_flat_schema):
+      schema_cls = PrivateAdminFlatSchema if private else AdminFlatSchema
+      try:
+        admin_flat_schema = schema_cls(**data)
+      except ValidationError as err:
+        log.error(
+          "[ADMIN FLAT] Invalid %s payload: %s",
+          "private" if private else "public", err,
+        )
+        return
+      if not self._flat_targets_this_worker(admin_flat_schema, private=private):
         log.info(
-          "[ADMIN FLAT] Skipping: market=%s gateway=%s account_id=%s != worker "
-          "market=%s gateway=%s account=%s",
-          admin_flat_schema.market, admin_flat_schema.gateway, admin_flat_schema.account_id,
+          "[ADMIN FLAT] Skipping (%s): market=%s gateway=%s account_id=%s != "
+          "worker market=%s gateway=%s account=%s",
+          "private" if private else "public",
+          admin_flat_schema.market, admin_flat_schema.gateway,
+          getattr(admin_flat_schema, "account_id", None),
           self._market_type, self._gateway_value, self._account_id,
         )
         return
@@ -559,15 +595,24 @@ class BaseSignalProcessor(ABC):
     log.warning("[ADMIN] Unknown action: %s", admin.action)
     return
 
-  def _flat_targets_this_worker(self, admin: AdminFlatSchema) -> bool:
-    """Whether this worker should act on an ADMIN FLAT, matched by the composite
-    key (market, gateway, account_id) rather than ``account_id`` alone —
-    ``account_id`` is not unique across markets/gateways (see
-    :class:`AdminFlatSchema`). Each field is an optional filter: unset matches
-    every worker on that dimension; a broadcast FLAT (all three unset) targets
-    everyone."""
-    if admin.account_id and admin.account_id != self._account_id:
-      return False
+  def _flat_targets_this_worker(self, admin, *, private: bool = False) -> bool:
+    """Whether this worker should act on an ADMIN FLAT.
+
+    Private subject (``private=True``): ``market``/``gateway``/``account_id`` are
+    all required and must match this worker's identity exactly — the private
+    subject already addresses one worker, so this re-check is defence-in-depth
+    against a misrouted publish.
+
+    Public subject (``private=False``): ``market``/``gateway`` are optional
+    filters (unset matches every worker on that dimension; both unset broadcasts
+    to everyone matching strategy/symbol). The public FLAT carries no
+    ``account_id`` — account-scoped FLATs use the private subject instead."""
+    if private:
+      return (
+        admin.market == self._market_type
+        and admin.gateway == self._gateway_value
+        and admin.account_id == self._account_id
+      )
     if admin.market and admin.market != self._market_type:
       return False
     if admin.gateway and admin.gateway != self._gateway_value:
@@ -707,6 +752,21 @@ class BaseSignalProcessor(ABC):
     ``<market>-<gateway>-<account_id>`` (matches the NATS connection name; see
     Settings._validate_market_requirements)."""
     return self.settings.get("account_id") or None
+
+  @property
+  def _private_admin_subject(self) -> Optional[str]:
+    """This worker's private ADMIN subject: ``ADMIN.<market>.<gateway>.<account_id>``.
+
+    The broker publishes an account-scoped FLAT here (instead of fanning it out
+    on the public ``ADMIN`` subject) so only this worker receives it. Returns
+    None when the identity is incomplete — there is nothing unique to subscribe
+    to, so the worker relies on the public subject alone."""
+    if not (self._market_type and self._gateway_value and self._account_id):
+      return None
+    return (
+      f"{NatsSubjectEnum.ADMIN.value}."
+      f"{self._market_type}.{self._gateway_value}.{self._account_id}"
+    )
 
   # Settings key holding this market's gateway enum (exchange / platform).
   # Concrete processors set it so the WORKER_CONNECTED handshake can report the

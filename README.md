@@ -443,23 +443,31 @@ With the payload above, the worker executes against the SL/TP/quantity exactly a
 
 ## 🛡️ ADMIN Subject
 
-The `ADMIN` NATS subject carries out-of-band administrative commands that operate outside the normal strategy signal flow. Messages are received by `BaseSignalProcessor._handle_admin_message`, which is shared by both markets — only *how a live close maps back to a DB row* varies per market (FOREX matches by ticket, CRYPTO by resolved exchange symbol).
+ADMIN carries out-of-band administrative commands that operate outside the normal strategy signal flow. A FLAT reaches a worker on **one of two subjects**, both handled by the shared `BaseSignalProcessor._handle_admin_message` (only *how a live close maps back to a DB row* varies per market — FOREX matches by ticket, CRYPTO by resolved exchange symbol):
+
+| Subject | Name | Scope | Routing fields |
+| --- | --- | --- | --- |
+| **Public** | `ADMIN` | Fanned out by the broker to every worker | `market` / `gateway` **optional** filters — **no `account_id`** |
+| **Private** | `ADMIN.<market>.<gateway>.<account_id>` | Addressed to exactly one worker | `market` / `gateway` / `account_id` **required** |
+
+Every worker subscribes to the public `ADMIN` subject **and** to its own private `ADMIN.<market>.<gateway>.<account_id>` subject (built from `MARKET_TYPE`, the gateway/platform setting, and the account id — `MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO). This lets the broker target a single account precisely without fanning a FLAT out to everyone.
 
 ### Action: `FLAT`
 
-Closes open positions across one or more strategies/symbols in a single command. Accepts five **optional** filter attributes — any combination can be specified; omitting all of `account_id`/`market`/`gateway`/`strategy`/`symbol` closes every tracked open position on the account.
+Closes open positions across one or more strategies/symbols in a single command.
+
+#### Public subject (`ADMIN`)
+
+The broker fans a public FLAT out to every worker; each filters only on the **optional** `market`/`gateway` dimensions. A public FLAT carries **no `account_id`** (the public subject is not account-scoped — a stray `account_id` field is ignored).
 
 | Filter | Behaviour when present |
 | --- | --- |
-| `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
 | `market` | Silently ignored if it does not match the worker's `MARKET_TYPE`; processed normally if it matches or is absent |
 | `gateway` | Silently ignored if it does not match the worker's gateway/platform setting (`MT5_PLATFORM` for FOREX, `CRYPTO_EXCHANGE` for CRYPTO); processed normally if it matches or is absent |
 | `strategy` | Restricts close to positions whose `strategy` column equals this value |
 | `symbol` | Restricts close to positions for this symbol |
 
-`account_id` alone is **not** a unique worker identity — the same raw id can collide across markets/gateways (e.g. an email used as `account_id` also matching a CRYPTO gateway name). A worker only acts on a FLAT when `account_id`, `market`, and `gateway` **all** match (each is skipped as a filter when absent from the payload).
-
-#### ADMIN FLAT Payload
+Omitting `market`/`gateway`/`strategy`/`symbol` closes every tracked open position on every worker that receives it.
 
 ```json
 {
@@ -467,23 +475,37 @@ Closes open positions across one or more strategies/symbols in a single command.
   "timestamp": "2026-06-02T08:00:00+00:00",
   "strategy": "my_strategy",
   "symbol": "XAUUSD",
-  "account_id": "123456",
   "market": "FOREX",
   "gateway": "MT5"
 }
 ```
 
-All fields except `action` and `timestamp` are optional.
+#### Private subject (`ADMIN.<market>.<gateway>.<account_id>`)
+
+An account-scoped FLAT is published to a worker's private subject. Here `market`, `gateway`, and `account_id` are **required**: the subject already addresses one worker, and the worker re-validates that all three fields match its own identity before acting (defence-in-depth against a misrouted publish). `account_id` alone is **not** a unique worker identity — the same raw id can collide across markets/gateways (e.g. an email used as `account_id` also matching a CRYPTO gateway name), which is exactly why the full composite `market`/`gateway`/`account_id` is required and re-checked. `strategy`/`symbol` remain optional close filters.
+
+```json
+{
+  "action": "FLAT",
+  "timestamp": "2026-06-02T08:00:00+00:00",
+  "strategy": "my_strategy",
+  "symbol": "XAUUSD",
+  "market": "FOREX",
+  "gateway": "MT5",
+  "account_id": "123456"
+}
+```
 
 #### Execution flow
 
 The broker/exchange is always the source of truth: live positions are closed **first**, then the DB is reconciled against what actually closed.
 
-1. Parse `AdminSignalSchema`; drop silently on validation error, and ignore any non-`FLAT` action.
-2. If any of `account_id` / `market` / `gateway` is present and does not match the worker's identity → skip (no log noise).
-3. Ensure the broker/exchange connection; abort if unreachable.
-4. **Close live positions** (`_close_live_positions_for_flat`): fetch live positions — for a given `symbol` via `get_open_positions(symbol, strategy=…)`, otherwise account-wide via `get_all_open_positions(strategy=…)` — and call `close_single_position(pos, reason="FLAT")` on each. Track every key *attempted* and the subset that *closed successfully*.
-5. **Reconcile the DB** (`_reconcile_flat_db`) against the open rows matching the filter. For each DB row:
+1. Parse the envelope (`AdminMessageSchema`); drop silently on validation error, and ignore any non-`FLAT` action.
+2. Parse the subject-specific payload — `AdminFlatSchema` (public) or `PrivateAdminFlatSchema` (private, which requires `market`/`gateway`/`account_id`); drop silently on validation error.
+3. Route to this worker: on the **public** subject, skip unless the optional `market`/`gateway` filters match; on the **private** subject, skip unless `market`/`gateway`/`account_id` all match this worker's identity. Either way, skip is silent (no log noise).
+4. Ensure the broker/exchange connection; abort if unreachable.
+5. **Close live positions** (`_close_live_positions_for_flat`): fetch live positions — for a given `symbol` via `get_open_positions(symbol, strategy=…)`, otherwise account-wide via `get_all_open_positions(strategy=…)` — and call `close_single_position(pos, reason="FLAT")` on each. Track every key *attempted* and the subset that *closed successfully*.
+6. **Reconcile the DB** (`_reconcile_flat_db`) against the open rows matching the filter. For each DB row:
    - **Matched a successful live close** → update `status → FLATTED`, set `closed_price`/return code, send `⚡ Admin FLAT Closed` Telegram notification.
    - **Never seen live on the broker** (not in the attempted set) → already closed externally → mark `FLATTED` to sync the DB (no order sent).
    - **Close was attempted but failed** → the position is **still live**, so the row is left **OPEN** and flagged loudly for manual attention — the DB never falsely reports a position flat.
