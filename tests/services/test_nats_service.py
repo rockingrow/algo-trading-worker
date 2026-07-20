@@ -1,4 +1,4 @@
-"""Tests for NATSPublisher.request() — the request/reply handshake helper.
+"""Tests for NATSPublisher.request() and NATS callback deduplication.
 
 Exercises the thread-boundary bridge (asyncio.run_coroutine_threadsafe) without
 a live NATS server: a background event loop plus a fake ``nc`` stand in for
@@ -7,11 +7,12 @@ the real nats.py client.
 
 import asyncio
 import threading
+import time
 
 import pytest
 
 from worker.schemas.nats_schema import NatsSubjectEnum
-from worker.services.nats_service import NATSPublisher
+from worker.services.nats_service import NATSPublisher, _CallbackDedup
 
 
 class _Msg:
@@ -84,3 +85,26 @@ def test_request_without_connection_raises_connection_error():
   # Never connected: _client._loop / _client.nc are both still None.
   with pytest.raises(ConnectionError):
     publisher.request(NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1)
+
+
+# ── _CallbackDedup ────────────────────────────────────────────────────
+
+
+def test_callback_dedup_suppresses_duplicate():
+  dedup = _CallbackDedup()
+  assert dedup.is_duplicate("error:EOF") is False
+  assert dedup.is_duplicate("error:EOF") is True
+
+
+def test_callback_dedup_allows_different_keys():
+  dedup = _CallbackDedup()
+  assert dedup.is_duplicate("error:EOF") is False
+  assert dedup.is_duplicate("error:Timeout") is False
+
+
+def test_callback_dedup_expires_after_window(monkeypatch):
+  dedup = _CallbackDedup()
+  dedup.is_duplicate("error:EOF")
+
+  monkeypatch.setattr("worker.services.nats_service.settings.telegram_log_dedup_window", 0)
+  assert dedup.is_duplicate("error:EOF") is False
