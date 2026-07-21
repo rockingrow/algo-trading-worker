@@ -7,6 +7,11 @@ from pydantic import BaseModel
 
 class AdminActionEnum(str, Enum):
   FLAT = "FLAT"
+  # Signal-execution control (private subject only). BLOCK_SIGNAL makes the
+  # worker skip executing every incoming SIGNAL; ALLOW_SIGNAL resumes normal
+  # execution. Account-scoped, so both travel on the private ADMIN subject.
+  BLOCK_SIGNAL = "BLOCK_SIGNAL"
+  ALLOW_SIGNAL = "ALLOW_SIGNAL"
 
 
 class AdminMessageSchema(BaseModel):
@@ -30,18 +35,29 @@ class AdminFlatSchema(AdminMessageSchema):
   gateway: Optional[str] = None
 
 
-class PrivateAdminFlatSchema(AdminMessageSchema):
-  """FLAT delivered on a worker's **private** ADMIN subject, whose name is
-  ``ADMIN.<market>.<gateway>.<account_id>``.
+class PrivateAdminSchema(AdminMessageSchema):
+  """Base for any directive delivered on a worker's **private** ADMIN subject,
+  whose name is ``ADMIN.<market>.<gateway>.<account_id>``.
 
-  Unlike the public FLAT, ``market``/``gateway``/``account_id`` are **required**
-  here: the private subject addresses exactly one worker, so the payload must
-  carry the full composite identity. The worker re-validates that all three
-  match its own identity before acting (defence-in-depth on top of the subject
-  match). ``strategy``/``symbol`` remain optional close filters."""
+  The private subject addresses exactly one worker, so the payload must carry
+  the full composite identity: ``market``/``gateway``/``account_id`` are all
+  **required**. The worker re-validates that they match its own identity before
+  acting (defence-in-depth on top of the subject match)."""
 
-  strategy: Optional[str] = None
-  symbol: Optional[str] = None
   market: str
   gateway: str
   account_id: str
+
+
+class PrivateAdminFlatSchema(PrivateAdminSchema):
+  """FLAT on the private ADMIN subject. Adds the optional ``strategy``/``symbol``
+  close filters to the required composite identity."""
+
+  strategy: Optional[str] = None
+  symbol: Optional[str] = None
+
+
+class PrivateAdminSignalControlSchema(PrivateAdminSchema):
+  """``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL`` on the private ADMIN subject — toggles
+  whether the worker executes incoming SIGNALs. Carries only the required
+  composite identity (no extra fields); the ``action`` decides block vs allow."""

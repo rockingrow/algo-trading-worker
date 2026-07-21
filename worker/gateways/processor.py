@@ -43,6 +43,7 @@ from worker.schemas.admin_schema import (
   AdminFlatSchema,
   AdminMessageSchema,
   PrivateAdminFlatSchema,
+  PrivateAdminSignalControlSchema,
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -167,6 +168,9 @@ class BaseSignalProcessor(ABC):
   #: bypass ``__init__`` in tests still resolve them).
   _footer_cache: Optional[str] = None
   _footer_cache_at: float = 0.0
+  #: Signal-execution gate (class-level default for the same reason). When True,
+  #: incoming SIGNALs are skipped — toggled by ADMIN BLOCK_SIGNAL/ALLOW_SIGNAL.
+  _signals_blocked: bool = False
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
     self.ctx = ctx
@@ -186,6 +190,11 @@ class BaseSignalProcessor(ABC):
     self.publisher: Optional[NATSPublisher] = None
     self._footer: str = ""
     self._market_type: str = self._market_type_value(settings_dict.get("market_type"))
+    # When True, incoming SIGNALs are skipped (not executed) — toggled by the
+    # private ADMIN actions BLOCK_SIGNAL / ALLOW_SIGNAL. In-memory only: a worker
+    # restart resets it to False (unblocked). Read/written on the single NATS
+    # listener thread, so no lock is needed.
+    self._signals_blocked: bool = False
 
   # ── Shared lifecycle ──────────────────────────────────────────────────── #
 
@@ -321,6 +330,18 @@ class BaseSignalProcessor(ABC):
     MAX_OPEN_ORDERS exposure guard, run it through the handler, then persist and
     notify the outcome. Split out of :meth:`_process_message` so each NATS subject
     (ADMIN / SYSTEM / signal) has its own handler."""
+    # Signal-execution gate: an ADMIN BLOCK_SIGNAL suspends *all* signal
+    # execution for this worker until an ALLOW_SIGNAL clears it. This is the
+    # single funnel for both live signals and RETRY_SIGNALS replays, so blocking
+    # here covers both. Open positions are untouched — they can still be closed
+    # out-of-band via an ADMIN FLAT.
+    if self._signals_blocked:
+      log.warning(
+        "[%s Process] Signal SKIPPED — execution is BLOCKED (BLOCK_SIGNAL) | %s | %s",
+        self.name, signal.symbol, signal.action.value,
+      )
+      return
+
     # Scale-in (averaging): the broker has already scaled SL/TP1/TP2/quantity in
     # the payload, so every downstream step (SL/TP placement, persistence,
     # notifications) consumes them verbatim. The only re-derivation happens inside
@@ -534,28 +555,22 @@ class BaseSignalProcessor(ABC):
   # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
 
   def _handle_admin_message(self, raw: str, *, private: bool = False) -> None:
-    """Handle a NATS ADMIN ``FLAT``: parse, route to this worker, close live
-    broker positions, then reconcile the DB.
+    """Parse a NATS ADMIN message and dispatch by ``action``.
 
-    A FLAT arrives on one of two subjects:
+    A message arrives on one of two subjects, selected by ``private``:
 
-    * the **public** ``ADMIN`` subject — the broker fans it out to every worker
-      with optional ``market``/``gateway`` filters and **no** ``account_id``
-      (the public subject is not account-scoped); or
+    * the **public** ``ADMIN`` subject — fanned out to every worker with optional
+      ``market``/``gateway`` filters and **no** ``account_id`` (not
+      account-scoped); or
     * this worker's **private** ``ADMIN.<market>.<gateway>.<account_id>`` subject
-      — ``market``/``gateway``/``account_id`` are required and must match this
-      worker exactly.
+      — the full composite identity is required and must match this worker.
 
-    ``private`` selects which of the two payload schemas / routing rules applies.
+    Supported actions:
 
-    The close-and-reconcile algorithm below is identical for every market and
-    both subjects; only *how a live close maps to a DB row* differs (MT5 matches
-    by ticket, a CEX by resolved symbol). That single variation point is the
-    :meth:`_flat_match_key` / :meth:`_flat_db_match_keys` pair, so the broker is
-    always the source of truth: a row is marked ``FLATTED`` only when its close
-    actually succeeded *or* the position was never live on the broker. A row
-    whose close was **attempted but failed** is left OPEN (it is still live), so
-    the DB never claims a position is flat while it is not.
+    * ``FLAT`` (both subjects) — close live positions, then reconcile the DB
+      (see :meth:`_handle_admin_flat`).
+    * ``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL`` (private only) — toggle whether this
+      worker executes incoming SIGNALs (see :meth:`_handle_signal_control`).
     """
     try:
       data = json.loads(raw)
@@ -564,36 +579,104 @@ class BaseSignalProcessor(ABC):
       log.error("[ADMIN] Parse error: %s", err)
       return
 
-    if not self._ensure_connected():
+    if admin.action == AdminActionEnum.FLAT:
+      # FLAT touches the broker (closes live positions), so it needs a live
+      # connection; the signal-control toggles below do not.
+      if not self._ensure_connected():
+        return
+      self._handle_admin_flat(data, raw, private=private)
       return
 
-    if admin.action == AdminActionEnum.FLAT:
-      schema_cls = PrivateAdminFlatSchema if private else AdminFlatSchema
-      try:
-        admin_flat_schema = schema_cls(**data)
-      except ValidationError as err:
-        log.error(
-          "[ADMIN FLAT] Invalid %s payload: %s",
-          "private" if private else "public", err,
-        )
-        return
-      if not self._flat_targets_this_worker(admin_flat_schema, private=private):
-        log.info(
-          "[ADMIN FLAT] Skipping (%s): market=%s gateway=%s account_id=%s != "
-          "worker market=%s gateway=%s account=%s",
-          "private" if private else "public",
-          admin_flat_schema.market, admin_flat_schema.gateway,
-          getattr(admin_flat_schema, "account_id", None),
-          self._market_type, self._gateway_value, self._account_id,
-        )
-        return
-      # Close live broker positions first (source of truth), then reconcile the DB.
-      closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
-      self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+    if admin.action in (AdminActionEnum.BLOCK_SIGNAL, AdminActionEnum.ALLOW_SIGNAL):
+      self._handle_signal_control(admin.action, data, private=private)
       return
 
     log.warning("[ADMIN] Unknown action: %s", admin.action)
     return
+
+  def _handle_admin_flat(self, data: dict, raw: str, *, private: bool) -> None:
+    """Route + execute a FLAT: validate the subject-specific payload, confirm it
+    targets this worker, then close live positions and reconcile the DB.
+
+    The close-and-reconcile algorithm is identical for every market and both
+    subjects; only *how a live close maps to a DB row* differs (MT5 matches by
+    ticket, a CEX by resolved symbol) — the :meth:`_flat_match_key` /
+    :meth:`_flat_db_match_keys` pair. The broker is always the source of truth: a
+    row is marked ``FLATTED`` only when its close actually succeeded *or* the
+    position was never live on the broker. A row whose close was **attempted but
+    failed** is left OPEN (it is still live), so the DB never claims a position
+    is flat while it is not."""
+    schema_cls = PrivateAdminFlatSchema if private else AdminFlatSchema
+    try:
+      admin_flat_schema = schema_cls(**data)
+    except ValidationError as err:
+      log.error(
+        "[ADMIN FLAT] Invalid %s payload: %s",
+        "private" if private else "public", err,
+      )
+      return
+    if not self._flat_targets_this_worker(admin_flat_schema, private=private):
+      log.info(
+        "[ADMIN FLAT] Skipping (%s): market=%s gateway=%s account_id=%s != "
+        "worker market=%s gateway=%s account=%s",
+        "private" if private else "public",
+        admin_flat_schema.market, admin_flat_schema.gateway,
+        getattr(admin_flat_schema, "account_id", None),
+        self._market_type, self._gateway_value, self._account_id,
+      )
+      return
+    # Close live broker positions first (source of truth), then reconcile the DB.
+    closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
+    self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+
+  def _handle_signal_control(
+    self, action: AdminActionEnum, data: dict, *, private: bool
+  ) -> None:
+    """Handle a private ADMIN ``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL``: toggle whether
+    this worker executes incoming SIGNALs.
+
+    Signal control is account-scoped, so it is only accepted on the worker's
+    **private** subject (``ADMIN.<market>.<gateway>.<account_id>``); the same
+    action arriving on the public ``ADMIN`` subject is ignored. The composite
+    identity is required and re-validated against this worker before the toggle
+    is applied."""
+    if not private:
+      log.warning(
+        "[ADMIN %s] Ignored on the public ADMIN subject — signal control is "
+        "account-scoped and only accepted on the private subject.", action.value,
+      )
+      return
+    try:
+      ctrl = PrivateAdminSignalControlSchema(**data)
+    except ValidationError as err:
+      log.error("[ADMIN %s] Invalid private payload: %s", action.value, err)
+      return
+    if not self._flat_targets_this_worker(ctrl, private=True):
+      log.info(
+        "[ADMIN %s] Skipping: market=%s gateway=%s account_id=%s != worker "
+        "market=%s gateway=%s account=%s",
+        action.value, ctrl.market, ctrl.gateway, ctrl.account_id,
+        self._market_type, self._gateway_value, self._account_id,
+      )
+      return
+    self._set_signals_blocked(action == AdminActionEnum.BLOCK_SIGNAL)
+
+  def _set_signals_blocked(self, blocked: bool) -> None:
+    """Flip the signal-execution gate and notify the operator on a real change.
+    A repeat of the current state is a no-op (logged, no duplicate alert)."""
+    state = "BLOCKED" if blocked else "ALLOWED"
+    if self._signals_blocked == blocked:
+      log.info("[ADMIN] Signal execution already %s — no change.", state)
+      return
+    self._signals_blocked = blocked
+    log.warning("[ADMIN] Signal execution now %s for this worker.", state)
+    footer = self._current_footer()
+    msg = (
+      self.presenter.signals_blocked(footer)
+      if blocked
+      else self.presenter.signals_allowed(footer)
+    )
+    self.ctx.channel_notifier.send_message(msg)
 
   def _flat_targets_this_worker(self, admin, *, private: bool = False) -> bool:
     """Whether this worker should act on an ADMIN FLAT.

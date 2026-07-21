@@ -1,0 +1,7 @@
+{
+  "action": "BLOCK_SIGNAL",
+  "timestamp": "2026-06-02T08:00:00+00:00",
+  "market": "FOREX",
+  "gateway": "MT5",
+  "account_id": "123456"
+}

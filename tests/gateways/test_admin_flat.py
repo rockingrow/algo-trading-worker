@@ -75,6 +75,14 @@ class FakePresenter:
   def admin_flat_closed(db_pos, result, footer):
     return f"Admin FLAT {db_pos['symbol']}"
 
+  @staticmethod
+  def signals_blocked(footer):
+    return "Signals Blocked"
+
+  @staticmethod
+  def signals_allowed(footer):
+    return "Signals Allowed"
+
 
 class FakeProc:
   """Minimal stand-in providing exactly the hooks the base FLAT handler touches."""
@@ -97,6 +105,7 @@ class FakeProc:
     )
     self.db = FakeDbService(flat_positions=db_positions)
     self.notifications = []
+    self._signals_blocked = False
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
@@ -110,6 +119,9 @@ class FakeProc:
   def _account_footer(self):
     return "FOOTER"
 
+  def _current_footer(self):
+    return "FOOTER"
+
   def _flat_match_key(self, pos):
     return pos.symbol if self._match_style == "symbol" else pos.ticket
 
@@ -119,6 +131,9 @@ class FakeProc:
     return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}
 
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
+  _handle_admin_flat = BaseSignalProcessor._handle_admin_flat
+  _handle_signal_control = BaseSignalProcessor._handle_signal_control
+  _set_signals_blocked = BaseSignalProcessor._set_signals_blocked
   _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
@@ -242,6 +257,77 @@ def test_private_colliding_account_id_across_gateways_only_matches_owner():
   binance_proc._handle_admin_message(payload, private=True)
   assert mt5_proc.executor.closed == []
   assert len(binance_proc.executor.closed) == 1
+
+
+# ── BLOCK_SIGNAL / ALLOW_SIGNAL (private subject only) ───────────────────────
+
+
+def _ctrl_payload(action, **fields):
+  data = {"action": action, "timestamp": "2026-06-02T08:00:00+00:00"}
+  data.update(fields)
+  return json.dumps(data)
+
+
+def test_block_signal_sets_flag_and_notifies():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", account_id="100", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is True
+  assert proc.notifications == ["Signals Blocked"]
+
+
+def test_allow_signal_clears_flag_and_notifies():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._signals_blocked = True
+  proc._handle_admin_message(
+    _ctrl_payload("ALLOW_SIGNAL", account_id="100", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is False
+  assert proc.notifications == ["Signals Allowed"]
+
+
+def test_block_signal_repeat_is_noop_no_duplicate_notification():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._signals_blocked = True
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", account_id="100", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is True
+  assert proc.notifications == []  # already blocked → no repeat alert
+
+
+def test_block_signal_ignored_on_public_subject():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", market="FOREX", gateway="MT5"), private=False
+  )
+  assert proc._signals_blocked is False  # signal control is private-only
+  assert proc.notifications == []
+
+
+def test_block_signal_wrong_account_id_skipped():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", account_id="999", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is False
+  assert proc.notifications == []
+
+
+def test_block_signal_missing_identity_dropped():
+  # market / gateway / account_id are required on the private subject.
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", market="FOREX", gateway="MT5"),  # no account_id
+    private=True,
+  )
+  assert proc._signals_blocked is False
+  assert proc.notifications == []
 
 
 # ── DB filter forwarding ─────────────────────────────────────────────────────

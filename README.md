@@ -443,14 +443,16 @@ With the payload above, the worker executes against the SL/TP/quantity exactly a
 
 ## 🛡️ ADMIN Subject
 
-ADMIN carries out-of-band administrative commands that operate outside the normal strategy signal flow. A FLAT reaches a worker on **one of two subjects**, both handled by the shared `BaseSignalProcessor._handle_admin_message` (only *how a live close maps back to a DB row* varies per market — FOREX matches by ticket, CRYPTO by resolved exchange symbol):
+ADMIN carries out-of-band administrative commands that operate outside the normal strategy signal flow, all handled by the shared `BaseSignalProcessor._handle_admin_message`. Messages travel on **one of two subjects**:
 
 | Subject | Name | Scope | Routing fields |
 | --- | --- | --- | --- |
 | **Public** | `ADMIN` | Fanned out by the broker to every worker | `market` / `gateway` **optional** filters — **no `account_id`** |
 | **Private** | `ADMIN.<market>.<gateway>.<account_id>` | Addressed to exactly one worker | `market` / `gateway` / `account_id` **required** |
 
-Every worker subscribes to the public `ADMIN` subject **and** to its own private `ADMIN.<market>.<gateway>.<account_id>` subject (built from `MARKET_TYPE`, the gateway/platform setting, and the account id — `MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO). This lets the broker target a single account precisely without fanning a FLAT out to everyone.
+Every worker subscribes to the public `ADMIN` subject **and** to its own private `ADMIN.<market>.<gateway>.<account_id>` subject (built from `MARKET_TYPE`, the gateway/platform setting, and the account id — `MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO). This lets the broker target a single account precisely without fanning a message out to everyone.
+
+`AdminActionEnum` actions: **`FLAT`** (both subjects — close positions), and **`BLOCK_SIGNAL`** / **`ALLOW_SIGNAL`** (private subject only — toggle whether the worker executes incoming SIGNALs).
 
 ### Action: `FLAT`
 
@@ -500,7 +502,7 @@ An account-scoped FLAT is published to a worker's private subject. Here `market`
 
 The broker/exchange is always the source of truth: live positions are closed **first**, then the DB is reconciled against what actually closed.
 
-1. Parse the envelope (`AdminMessageSchema`); drop silently on validation error, and ignore any non-`FLAT` action.
+1. Parse the envelope (`AdminMessageSchema`); drop silently on validation error, and dispatch by `action` (`FLAT` below; `BLOCK_SIGNAL`/`ALLOW_SIGNAL` handled separately). An unknown action is logged and ignored.
 2. Parse the subject-specific payload — `AdminFlatSchema` (public) or `PrivateAdminFlatSchema` (private, which requires `market`/`gateway`/`account_id`); drop silently on validation error.
 3. Route to this worker: on the **public** subject, skip unless the optional `market`/`gateway` filters match; on the **private** subject, skip unless `market`/`gateway`/`account_id` all match this worker's identity. Either way, skip is silent (no log noise).
 4. Ensure the broker/exchange connection; abort if unreachable.
@@ -509,6 +511,24 @@ The broker/exchange is always the source of truth: live positions are closed **f
    - **Matched a successful live close** → update `status → FLATTED`, set `closed_price`/return code, send `⚡ Admin FLAT Closed` Telegram notification.
    - **Never seen live on the broker** (not in the attempted set) → already closed externally → mark `FLATTED` to sync the DB (no order sent).
    - **Close was attempted but failed** → the position is **still live**, so the row is left **OPEN** and flagged loudly for manual attention — the DB never falsely reports a position flat.
+
+### Actions: `BLOCK_SIGNAL` / `ALLOW_SIGNAL`
+
+Toggle whether the worker **executes incoming SIGNALs**. `BLOCK_SIGNAL` suspends signal execution; `ALLOW_SIGNAL` resumes it. Both are **account-scoped**, so they are accepted on the **private subject only** (`ADMIN.<market>.<gateway>.<account_id>`) — the same action arriving on the public `ADMIN` subject is ignored. The payload (`PrivateAdminSignalControlSchema`) requires `market` / `gateway` / `account_id`, and the worker re-validates all three against its own identity before applying the toggle.
+
+While blocked (`_signals_blocked = True`), every incoming SIGNAL is skipped at the single execution funnel `_process_signal` — this covers **both** live signals and `RETRY_SIGNALS` replays. Open positions are **untouched**: they can still be closed out-of-band via an `ADMIN` `FLAT`, which is the escape hatch even while signals are blocked. A real state change is logged and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` Telegram notification; repeating the current state is a no-op (no duplicate alert).
+
+The flag is **in-memory only** — a worker restart resets it to *allowed*. There is no DB/schema change; if a durable block is needed, the broker can re-issue `BLOCK_SIGNAL` after the worker re-announces `WORKER_CONNECTED`.
+
+```json
+{
+  "action": "BLOCK_SIGNAL",
+  "timestamp": "2026-06-02T08:00:00+00:00",
+  "market": "FOREX",
+  "gateway": "MT5",
+  "account_id": "123456"
+}
+```
 
 ### Key Design Decisions
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.2.1] - Unreleased
 
+### Added
+
+- `ADMIN` `BLOCK_SIGNAL` / `ALLOW_SIGNAL` actions (private subject only) to suspend/resume the worker's execution of incoming SIGNALs. Both are account-scoped, so they are accepted **only** on the worker's private `ADMIN.<market>.<gateway>.<account_id>` subject (the same action on the public `ADMIN` subject is ignored); the payload (`PrivateAdminSignalControlSchema`) requires `market`/`gateway`/`account_id`, re-validated against the worker's identity before the toggle applies. While blocked, every incoming SIGNAL is skipped at the single `_process_signal` funnel — covering both live signals and `RETRY_SIGNALS` replays — while open positions are untouched and can still be closed via an `ADMIN` `FLAT`. A real state change logs and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` notification (repeating the current state is a no-op). The `_signals_blocked` flag is in-memory only, so a worker restart resets it to allowed. New `AdminActionEnum` members `BLOCK_SIGNAL`/`ALLOW_SIGNAL`, a `PrivateAdminSchema` base (shared required composite identity) that `PrivateAdminFlatSchema` and `PrivateAdminSignalControlSchema` extend, presenter methods `signals_blocked`/`signals_allowed`, and example payloads `examples/nats/admin.block_signal.json` / `admin.allow_signal.json`.
+
 ### Changed
 
 - **Breaking (ADMIN routing):** `ADMIN` `FLAT` commands now travel on **two** subjects with distinct rules. The **public** `ADMIN` subject (fanned out to every worker) no longer carries `account_id` at all — it is filtered only by the optional `market`/`gateway` dimensions. A new **private** subject `ADMIN.<market>.<gateway>.<account_id>` lets the broker address exactly one worker; every worker now subscribes to its own private subject (built from `MARKET_TYPE`, the gateway/platform setting, and the account id) in addition to the public one.

@@ -92,6 +92,7 @@ class _FakeProc:
   _flat_db_match_keys = ForexSignalProcessor._flat_db_match_keys
   # Real broker-agnostic skeleton.
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
+  _handle_admin_flat = BaseSignalProcessor._handle_admin_flat
   _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db

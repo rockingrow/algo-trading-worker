@@ -58,12 +58,11 @@ again inside a `SYSTEM.RETRY_SIGNALS` replay is dropped by id (checked against
 
 ## `ADMIN` / `ADMIN.<market>.<gateway>.<account_id>` — admin directives
 
-Out-of-band administrative commands. Payload is an `AdminFlatSchema` (public) or
-`PrivateAdminFlatSchema` (private), handled by
+Out-of-band administrative commands, handled by
 `BaseSignalProcessor._handle_admin_message`. `action` is one of
-`AdminActionEnum`: currently only `FLAT`.
+`AdminActionEnum`: `FLAT`, `BLOCK_SIGNAL`, `ALLOW_SIGNAL`.
 
-A FLAT reaches the worker on **one of two subjects**, and every worker
+`FLAT` reaches the worker on **one of two subjects**, and every worker
 subscribes to both:
 
 - **Private** — `ADMIN.<market>.<gateway>.<account_id>` (e.g.
@@ -84,6 +83,21 @@ subscribes to both:
 | `FLAT` | one account | `ADMIN.FOREX.MT5.123456` (private) | [`admin.flat.json`](admin.flat.json) |
 | `FLAT` | market / gateway / strategy / symbol | `ADMIN` (broadcast) | [`admin.flat.broadcast.json`](admin.flat.broadcast.json) |
 | `FLAT` | everything | `ADMIN` (broadcast) | [`admin.flat.all.json`](admin.flat.all.json) |
+
+`BLOCK_SIGNAL` / `ALLOW_SIGNAL` toggle whether the worker **executes incoming
+SIGNALs**. They are account-scoped, so they are accepted on the **private
+subject only** (the same action on the public `ADMIN` subject is ignored);
+`market` / `gateway` / `account_id` are required and re-validated against the
+worker's identity. While blocked, every incoming SIGNAL is skipped (both live
+and `RETRY_SIGNALS` replays) — open positions are untouched and can still be
+closed via an `ADMIN` `FLAT`. The state is in-memory only, so a worker restart
+resets it to allowed. Handled by `BaseSignalProcessor._handle_signal_control`
+(payload `PrivateAdminSignalControlSchema`).
+
+| Action | Scope | Subject | Example |
+| ------ | ----- | ------- | ------- |
+| `BLOCK_SIGNAL` | one account | `ADMIN.FOREX.MT5.123456` (private) | [`admin.block_signal.json`](admin.block_signal.json) |
+| `ALLOW_SIGNAL` | one account | `ADMIN.FOREX.MT5.123456` (private) | [`admin.allow_signal.json`](admin.allow_signal.json) |
 
 ## `SYSTEM` — configuration & handshake replies (broker side)
 
