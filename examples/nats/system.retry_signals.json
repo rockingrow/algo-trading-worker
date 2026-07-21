@@ -1,0 +1,32 @@
+{
+  "action": "RETRY_SIGNALS",
+  "account_id": "FOREX-MT5-1234567",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "signals": [
+    {
+      "strategy": "MT5_GOLD_M5_V1",
+      "signal_id": "be6aac4d-da0d-41a3-9798-14d0d23d3f63",
+      "timestamp": "2026-04-10T22:55:00Z",
+      "action": "LONG",
+      "symbol": "XAUUSD",
+      "price": 4858.50,
+      "quantity": 6.0000,
+      "sl": 4850.00,
+      "tp1": 4865.00,
+      "tp2": 4870.00,
+      "is_running": true,
+      "risk_percent": 3.0
+    },
+    {
+      "strategy": "MT5_GOLD_M5_V1",
+      "signal_id": "5b6aac4d-da0d-41a3-9798-14d0d23d3f65",
+      "timestamp": "2026-04-11T15:05:00Z",
+      "action": "TP1",
+      "symbol": "XAUUSD",
+      "price": 4850.00,
+      "quantity": 1.8000,
+      "is_running": true,
+      "risk_percent": 3.0
+    }
+  ]
+}
