@@ -14,7 +14,7 @@ def _run_with_mode(notification_mode: str):
   with patch("worker.context.DBService") as MockDBService, patch(
     "worker.context.TelegramNotification"
   ), patch("worker.context.settings") as mock_settings:
-    mock_settings.notification_mode = notification_mode
+    mock_settings.logging.notification_mode = notification_mode
     mock_settings.telegram_enabled = False
     mock_settings.telegram_bot_token = "tok"
     mock_settings.telegram_chat_id = "-1"
@@ -34,7 +34,7 @@ def test_individual_uses_verbose_when_silent():
   with patch("worker.context.DBService") as MockDBService, patch(
     "worker.context.TelegramNotification"
   ), patch("worker.context.settings") as mock_settings:
-    mock_settings.notification_mode = "SILENT"
+    mock_settings.logging.notification_mode = "SILENT"
     mock_settings.telegram_enabled = False
     mock_settings.telegram_bot_token = "tok"
     mock_settings.telegram_chat_id = "-1"
@@ -57,7 +57,7 @@ def test_community_uses_silent_when_silent():
   with patch("worker.context.DBService") as MockDBService, patch(
     "worker.context.TelegramNotification"
   ), patch("worker.context.settings") as mock_settings:
-    mock_settings.notification_mode = "SILENT"
+    mock_settings.logging.notification_mode = "SILENT"
     mock_settings.telegram_enabled = False
     mock_settings.telegram_bot_token = "tok"
     mock_settings.telegram_chat_id = "-1"
@@ -80,7 +80,7 @@ def test_nats_enqueue_uses_verbose_when_silent():
   with patch("worker.context.DBService") as MockDBService, patch(
     "worker.context.TelegramNotification"
   ), patch("worker.context.settings") as mock_settings:
-    mock_settings.notification_mode = "SILENT"
+    mock_settings.logging.notification_mode = "SILENT"
     mock_settings.telegram_enabled = False
     mock_settings.telegram_bot_token = "tok"
     mock_settings.telegram_chat_id = "-1"
@@ -103,7 +103,7 @@ def test_both_channels_verbose_when_verbose():
   with patch("worker.context.DBService") as MockDBService, patch(
     "worker.context.TelegramNotification"
   ), patch("worker.context.settings") as mock_settings:
-    mock_settings.notification_mode = "VERBOSE"
+    mock_settings.logging.notification_mode = "VERBOSE"
     mock_settings.telegram_enabled = False
     mock_settings.telegram_bot_token = "tok"
     mock_settings.telegram_chat_id = "-1"

@@ -23,11 +23,11 @@ def main() -> None:
   multiprocessing.freeze_support()
 
   log.info("Starting Algo Trading Worker v1.0 (market=%s)", settings.market_type.value)
-  log.info("API Server -> http://%s:%d", settings.app_host, settings.app_port)
+  log.info("API Server -> http://%s:%d", settings.web.host, settings.web.port)
   if settings.market_type == MarketTypeEnum.FOREX:
-    log.info("MT5 Server -> %s (login: %s)", settings.mt5_server, settings.mt5_login)
+    log.info("MT5 Server -> %s (login: %s)", settings.forex.server, settings.forex.login)
   else:
-    log.info("Crypto Exchange -> %s", settings.crypto_exchange.value)
+    log.info("Crypto Exchange -> %s", settings.crypto.exchange.value)
 
   import copy
 
@@ -60,9 +60,9 @@ def main() -> None:
 
   uvicorn.run(
     app,
-    host=settings.app_host,
-    port=settings.app_port,
-    log_level=settings.log_level.lower(),
+    host=settings.web.host,
+    port=settings.web.port,
+    log_level=settings.logging.level.lower(),
     log_config=log_config,
   )
 

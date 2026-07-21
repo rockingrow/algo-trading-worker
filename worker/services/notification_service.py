@@ -38,9 +38,9 @@ class TelegramNotification(Notification):
     chat_ids: list[str] | None = None,
     bot_token: SecretStr | None = None,
   ):
-    self.enabled = settings.telegram_enabled
-    self.bot_token = bot_token if bot_token is not None else settings.telegram_bot_token
-    self.chat_ids = chat_ids if chat_ids is not None else [settings.telegram_chat_id]
+    self.enabled = settings.telegram.enabled
+    self.bot_token = bot_token if bot_token is not None else settings.telegram.bot_token
+    self.chat_ids = chat_ids if chat_ids is not None else [settings.telegram.chat_id]
 
   def send_message(self, message_text: str) -> bool:
     if not self.enabled:
@@ -128,14 +128,14 @@ class TelegramLogNotification(TelegramNotification):
   otherwise falls back to the shared management chat/bot."""
 
   def __init__(self) -> None:
-    log_token = settings.telegram_log_bot_token
+    log_token = settings.telegram.log_bot_token
     bot_token = (
       log_token
       if log_token is not None and log_token.get_secret_value()
-      else settings.telegram_bot_token
+      else settings.telegram.bot_token
     )
     super().__init__(
-      chat_ids=[settings.telegram_log_chat_id or settings.telegram_chat_id],
+      chat_ids=[settings.telegram.log_chat_id or settings.telegram.chat_id],
       bot_token=bot_token,
     )
 
@@ -221,7 +221,7 @@ class TelegramLogHandler(logging.Handler):
 
   def _is_duplicate(self, message: str) -> bool:
     """Return True if *message* was forwarded within the dedup window."""
-    window = settings.telegram_log_dedup_window
+    window = settings.telegram.log_dedup_window
     now = time.monotonic()
     with self._lock:
       # Prune stale entries so the dict cannot grow unbounded.

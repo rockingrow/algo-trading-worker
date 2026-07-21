@@ -43,7 +43,7 @@ class ExecutionConfig:
 
   @classmethod
   def from_dict(cls, settings_dict: dict) -> "ExecutionConfig":
-    """Build from the plain ``settings.model_dump()`` dict passed across the
+    """Build from the flat ``settings.flat_dump()`` dict passed across the
     multiprocessing fork boundary."""
     return cls(
       volume_decision_enabled=settings_dict.get("volume_decision_enabled", True),

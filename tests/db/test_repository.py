@@ -14,7 +14,7 @@ from worker.settings import settings
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
-  monkeypatch.setattr(settings, "db_file", str(tmp_path / "repo_test.sqlite"))
+  monkeypatch.setattr(settings.database, "file", str(tmp_path / "repo_test.sqlite"))
   db_init()
   return PositionRepository()
 
@@ -49,7 +49,7 @@ def test_ref_ids_physically_stored_as_text(repo):
     ref_id="999", strategy="strat-a", symbol="BTCUSD", action="long",
     volume=1.0, opened_price=30000.0,
   )
-  rows = _raw(settings.db_file, "SELECT ref_id, ref_source_id, typeof(ref_id) AS t FROM positions")
+  rows = _raw(settings.database.file, "SELECT ref_id, ref_source_id, typeof(ref_id) AS t FROM positions")
   assert rows[0]["ref_id"] == "999"
   assert rows[0]["ref_source_id"] == "999"
   assert rows[0]["t"] == "text"
@@ -92,7 +92,7 @@ def test_prices_persisted_without_lossy_rounding(repo):
     action="SL", volume=1_000_000.0, price=close, sl=None, tp1=None,
     gateway_return_code=0, comment="", market_type="CRYPTO",
   )
-  rows = _raw(settings.db_file, "SELECT price FROM position_logs")
+  rows = _raw(settings.database.file, "SELECT price FROM position_logs")
   assert rows[0]["price"] == close
 
 
@@ -140,7 +140,7 @@ def test_log_position_persists_generic_columns(repo):
     gateway_return_code=0, comment="x", message='{"a":1}',
     author="terminal", market_type="FOREX",
   )
-  rows = _raw(settings.db_file, "SELECT ref_id, ref_source_id, gateway_return_code, gateway_message, market_type FROM position_logs")
+  rows = _raw(settings.database.file, "SELECT ref_id, ref_source_id, gateway_return_code, gateway_message, market_type FROM position_logs")
   assert rows[0]["ref_id"] == "5"
   assert rows[0]["ref_source_id"] == "5"
   assert rows[0]["gateway_message"] == '{"a":1}'
@@ -178,7 +178,7 @@ def test_insert_position_persists_signal_id(repo):
     ref_id="200", strategy="strat-a", symbol="BTCUSD", action="long",
     volume=1.0, opened_price=30000.0, signal_id="sig-open",
   )
-  rows = _raw(settings.db_file, "SELECT signal_id FROM positions WHERE ref_id='200'")
+  rows = _raw(settings.database.file, "SELECT signal_id FROM positions WHERE ref_id='200'")
   assert rows[0]["signal_id"] == "sig-open"
   # And signal_exists (which reads position_logs) is still driven by log_position,
   # not by the positions insert — a signal that only produced a positions row

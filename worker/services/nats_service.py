@@ -32,7 +32,7 @@ class _CallbackDedup:
     self._recent: dict[str, float] = {}
 
   def is_duplicate(self, key: str) -> bool:
-    window = settings.telegram_log_dedup_window
+    window = settings.telegram.log_dedup_window
     now = time.monotonic()
     with self._lock:
       self._recent = {k: ts for k, ts in self._recent.items() if now - ts < window}
