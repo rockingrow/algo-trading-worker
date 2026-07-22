@@ -379,8 +379,32 @@ worker/
 ├── nats_client.py       # NatsClient — single NATS connection lifecycle in a daemon thread
 ├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
 ├── worker_runtime.py    # run_worker() — shared child-process bootstrap
-└── settings.py          # Environment & app configuration (per-market validation)
+└── settings.py          # Environment & app configuration (grouped nested settings + per-market validation)
 ```
+
+---
+
+## ⚙️ Settings (`worker/settings.py`)
+
+Configuration is grouped into nested `<specific>Settings` sub-models on the main `Settings`, so related options live together:
+
+| Group | Access | Covers |
+| --- | --- | --- |
+| `LoggingSettings` | `settings.logging` | `notification_mode`, `log_level` |
+| `NatsSettings` | `settings.nats` | `url`, `token`, `subjects` |
+| `ForexSettings` | `settings.forex` | `platform`, MT5 `server`/`login`/`password`/`path`/`name` |
+| `CryptoSettings` | `settings.crypto` | `exchange`, API keys, `hedge_mode`, leverage caps, … |
+| `StrategySettings` | `settings.strategy` | `slippage_deviation`, `magic_map`, TP1 overrides |
+| `RiskSettings` | `settings.risk` | `capital`, `risk_percentage`, `max_open_orders`, … |
+| `TelegramSettings` | `settings.telegram` | `enabled`, tokens, chat ids, error-log hook |
+| `DatabaseSettings` | `settings.database` | `file` |
+| `WebSettings` | `settings.web` | `host`, `port` |
+| `BrokerSettings` | `settings.broker` | `api_url`, `api_key` |
+
+`market_type` and the derived `account_id` stay at the top level (`settings.market_type` / `settings.account_id`).
+
+- **Env vars are unchanged.** Each group is its own `BaseSettings` that reads the same flat variable names as before (e.g. `NATS_URL`, `MT5_LOGIN`, `MAX_LEVERAGE_CAP`) via per-field `validation_alias` — `.env` files and the initializer in `.env.example` need no changes.
+- **Flat dict for subprocesses.** `Settings.flat_dump()` reproduces the original flat `settings_dict` (legacy keys, with `SecretStr`/enum values intact) that is handed across the multiprocessing fork boundary and consumed by gateways, factories and presenters via `settings_dict.get("<flat_key>")`. Read config off the nested objects (`settings.nats.url`); consume the fork-boundary dict off the flat keys (`settings_dict["nats_url"]`).
 
 ---
 
