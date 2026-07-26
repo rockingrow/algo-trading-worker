@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import html
 
-from worker.icons import ALARM, GEAR, REJECTED, SHIELD
+from worker.icons import ALARM, GEAR, REJECTED, SHIELD, STOP, SUCCESS
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 from worker.services.notification_service import _box
 
@@ -196,6 +196,27 @@ class BaseMessagePresenter:
       f"{REJECTED} <b>Signal Rejected</b>\n\n"
       f"A signal failed validation and was <b>NOT executed</b>.\n"
       f"Reason: <b>{html.escape(reason)}</b>\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def signals_blocked(footer: str) -> str:
+    """An ADMIN ``BLOCK_SIGNAL`` took effect: the worker will now skip executing
+    every incoming SIGNAL until an ``ALLOW_SIGNAL`` clears it. Market-agnostic."""
+    return _box(
+      f"{STOP} <b>Signals Blocked</b>\n\n"
+      f"Incoming signals will be <b>skipped</b> and <b>NOT executed</b>.\n"
+      f"Open positions are unaffected; send <b>ALLOW_SIGNAL</b> to resume.\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def signals_allowed(footer: str) -> str:
+    """An ADMIN ``ALLOW_SIGNAL`` took effect: the worker resumes executing
+    incoming SIGNALs. Market-agnostic."""
+    return _box(
+      f"{SUCCESS} <b>Signals Allowed</b>\n\n"
+      f"Incoming signals will be <b>executed</b> normally again.\n"
       f"{_DIVIDER}\n{footer}"
     )
 

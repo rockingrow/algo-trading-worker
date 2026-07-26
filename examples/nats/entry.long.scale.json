@@ -1,0 +1,20 @@
+{
+  "strategy": "MT5_GOLD_M5_V1",
+  "signal_id": "ce6aac4d-da0d-41a3-9798-14d0d23d3f70",
+  "timestamp": "2026-04-11T00:30:00Z",
+  "action": "LONG",
+  "symbol": "XAUUSD",
+  "price": 4856.00,
+  "quantity": 9.0000,
+  "sl": 4849.00,
+  "tp1": 4866.00,
+  "tp2": 4872.00,
+  "is_running": true,
+  "risk_percent": 3.0,
+  "is_scale_position": true,
+  "scaling": {
+    "tp": 1.0,
+    "sl": 1.0,
+    "quantity": 1.5
+  }
+}

@@ -75,6 +75,14 @@ class FakePresenter:
   def admin_flat_closed(db_pos, result, footer):
     return f"Admin FLAT {db_pos['symbol']}"
 
+  @staticmethod
+  def signals_blocked(footer):
+    return "Signals Blocked"
+
+  @staticmethod
+  def signals_allowed(footer):
+    return "Signals Allowed"
+
 
 class FakeProc:
   """Minimal stand-in providing exactly the hooks the base FLAT handler touches."""
@@ -97,6 +105,7 @@ class FakeProc:
     )
     self.db = FakeDbService(flat_positions=db_positions)
     self.notifications = []
+    self._signals_blocked = False
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
@@ -110,6 +119,9 @@ class FakeProc:
   def _account_footer(self):
     return "FOOTER"
 
+  def _current_footer(self):
+    return "FOOTER"
+
   def _flat_match_key(self, pos):
     return pos.symbol if self._match_style == "symbol" else pos.ticket
 
@@ -119,9 +131,13 @@ class FakeProc:
     return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}
 
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
+  _handle_admin_flat = BaseSignalProcessor._handle_admin_flat
+  _handle_signal_control = BaseSignalProcessor._handle_signal_control
+  _set_signals_blocked = BaseSignalProcessor._set_signals_blocked
   _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
+  _private_admin_subject = BaseSignalProcessor._private_admin_subject
 
 
 def _payload(**fields):
@@ -130,61 +146,100 @@ def _payload(**fields):
   return json.dumps(data)
 
 
-# ── account_id routing ──────────────────────────────────────────────────────
+# ── public ADMIN subject routing (market / gateway filters) ──────────────────
+# The public ADMIN subject is fanned out to every worker. It carries NO
+# account_id (account-scoped FLATs go on the private subject); a worker filters
+# only on the optional market / gateway dimensions.
 
 
-def test_wrong_account_id_silently_skips():
-  proc = FakeProc(account_id="100", db_positions=[_db_pos()])
-  proc._handle_admin_message(_payload(account_id="999"))
-  assert proc.db.flat_calls == []
-  assert proc.executor.closed == []
-
-
-def test_matching_account_id_proceeds():
-  proc = FakeProc(account_id="100", db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)])
-  proc._handle_admin_message(_payload(account_id="100"))
-  assert len(proc.executor.closed) == 1
-
-
-def test_absent_account_id_closes_all():
+def test_public_no_filters_closes_all():
   proc = FakeProc(db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)])
   proc._handle_admin_message(_payload())
   assert len(proc.executor.closed) == 1
 
 
-# ── composite (market, gateway, account_id) routing ─────────────────────────
-# account_id alone is not a unique worker identity — it can collide across
-# markets/gateways (e.g. an email account_id also matching a CRYPTO gateway
-# name), so the broker now sends market/gateway alongside account_id and a
-# FLAT must match all three before this worker acts on it.
+def test_public_account_id_field_is_ignored():
+  # A stray account_id on the public subject is not a routing filter — it is
+  # ignored, so a matching market/gateway still proceeds.
+  proc = FakeProc(
+    account_id="100", market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+  )
+  proc._handle_admin_message(_payload(account_id="999"))
+  assert len(proc.executor.closed) == 1
 
 
-def test_matching_account_id_wrong_market_skips():
-  proc = FakeProc(account_id="100", market_type="FOREX", db_positions=[_db_pos()])
-  proc._handle_admin_message(_payload(account_id="100", market="CRYPTO"))
+def test_public_wrong_market_skips():
+  proc = FakeProc(market_type="FOREX", db_positions=[_db_pos()])
+  proc._handle_admin_message(_payload(market="CRYPTO"))
   assert proc.db.flat_calls == []
   assert proc.executor.closed == []
 
 
-def test_matching_account_id_wrong_gateway_skips():
-  proc = FakeProc(account_id="100", gateway_value="MT5", db_positions=[_db_pos()])
-  proc._handle_admin_message(_payload(account_id="100", gateway="BINANCE"))
+def test_public_wrong_gateway_skips():
+  proc = FakeProc(gateway_value="MT5", db_positions=[_db_pos()])
+  proc._handle_admin_message(_payload(gateway="BINANCE"))
   assert proc.db.flat_calls == []
   assert proc.executor.closed == []
 
 
-def test_matching_composite_key_proceeds():
+def test_public_matching_market_gateway_proceeds():
+  proc = FakeProc(
+    market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+  )
+  proc._handle_admin_message(_payload(market="FOREX", gateway="MT5"))
+  assert len(proc.executor.closed) == 1
+
+
+# ── private ADMIN subject routing (market / gateway / account_id required) ────
+# The private subject is ADMIN.<market>.<gateway>.<account_id>; the worker
+# re-validates that all three fields match its own identity before acting.
+
+
+def test_private_subject_is_market_gateway_account():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  assert proc._private_admin_subject == "ADMIN.FOREX.MT5.100"
+
+
+def test_private_matching_identity_proceeds():
   proc = FakeProc(
     account_id="100", market_type="FOREX", gateway_value="MT5",
     db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
   )
   proc._handle_admin_message(
-    _payload(account_id="100", market="FOREX", gateway="MT5")
+    _payload(account_id="100", market="FOREX", gateway="MT5"), private=True
   )
   assert len(proc.executor.closed) == 1
 
 
-def test_colliding_account_id_across_gateways_only_matches_owner():
+def test_private_wrong_account_id_skips():
+  proc = FakeProc(
+    account_id="100", market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos()],
+  )
+  proc._handle_admin_message(
+    _payload(account_id="999", market="FOREX", gateway="MT5"), private=True
+  )
+  assert proc.db.flat_calls == []
+  assert proc.executor.closed == []
+
+
+def test_private_missing_required_field_dropped():
+  # market / gateway / account_id are mandatory on the private subject — a
+  # payload missing any is rejected at validation and nothing is closed.
+  proc = FakeProc(
+    account_id="100", market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos()],
+  )
+  proc._handle_admin_message(
+    _payload(market="FOREX", gateway="MT5"), private=True  # no account_id
+  )
+  assert proc.db.flat_calls == []
+  assert proc.executor.closed == []
+
+
+def test_private_colliding_account_id_across_gateways_only_matches_owner():
   # Same raw account_id ("shared@example.com") used on two different gateways —
   # only the worker whose (market, gateway) also matches should act.
   mt5_proc = FakeProc(
@@ -198,10 +253,81 @@ def test_colliding_account_id_across_gateways_only_matches_owner():
   payload = _payload(
     account_id="shared@example.com", market="CRYPTO", gateway="BINANCE",
   )
-  mt5_proc._handle_admin_message(payload)
-  binance_proc._handle_admin_message(payload)
+  mt5_proc._handle_admin_message(payload, private=True)
+  binance_proc._handle_admin_message(payload, private=True)
   assert mt5_proc.executor.closed == []
   assert len(binance_proc.executor.closed) == 1
+
+
+# ── BLOCK_SIGNAL / ALLOW_SIGNAL (private subject only) ───────────────────────
+
+
+def _ctrl_payload(action, **fields):
+  data = {"action": action, "timestamp": "2026-06-02T08:00:00+00:00"}
+  data.update(fields)
+  return json.dumps(data)
+
+
+def test_block_signal_sets_flag_and_notifies():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", account_id="100", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is True
+  assert proc.notifications == ["Signals Blocked"]
+
+
+def test_allow_signal_clears_flag_and_notifies():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._signals_blocked = True
+  proc._handle_admin_message(
+    _ctrl_payload("ALLOW_SIGNAL", account_id="100", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is False
+  assert proc.notifications == ["Signals Allowed"]
+
+
+def test_block_signal_repeat_is_noop_no_duplicate_notification():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._signals_blocked = True
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", account_id="100", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is True
+  assert proc.notifications == []  # already blocked → no repeat alert
+
+
+def test_block_signal_ignored_on_public_subject():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", market="FOREX", gateway="MT5"), private=False
+  )
+  assert proc._signals_blocked is False  # signal control is private-only
+  assert proc.notifications == []
+
+
+def test_block_signal_wrong_account_id_skipped():
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", account_id="999", market="FOREX", gateway="MT5"),
+    private=True,
+  )
+  assert proc._signals_blocked is False
+  assert proc.notifications == []
+
+
+def test_block_signal_missing_identity_dropped():
+  # market / gateway / account_id are required on the private subject.
+  proc = FakeProc(account_id="100", market_type="FOREX", gateway_value="MT5")
+  proc._handle_admin_message(
+    _ctrl_payload("BLOCK_SIGNAL", market="FOREX", gateway="MT5"),  # no account_id
+    private=True,
+  )
+  assert proc._signals_blocked is False
+  assert proc.notifications == []
 
 
 # ── DB filter forwarding ─────────────────────────────────────────────────────

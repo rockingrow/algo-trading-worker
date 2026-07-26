@@ -106,5 +106,5 @@ def test_callback_dedup_expires_after_window(monkeypatch):
   dedup = _CallbackDedup()
   dedup.is_duplicate("error:EOF")
 
-  monkeypatch.setattr("worker.services.nats_service.settings.telegram_log_dedup_window", 0)
+  monkeypatch.setattr("worker.services.nats_service.settings.telegram.log_dedup_window", 0)
   assert dedup.is_duplicate("error:EOF") is False

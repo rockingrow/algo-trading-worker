@@ -155,8 +155,8 @@ class FakeProcessor(BaseSignalProcessor):
     return {db_pos.get("ref_id"), db_pos.get("ref_source_id")}
 
   # Override the (now concrete) shared FLAT handler to assert routing only.
-  def _handle_admin_message(self, raw):
-    self.admin_calls.append(raw)
+  def _handle_admin_message(self, raw, *, private=False):
+    self.admin_calls.append((raw, private))
 
   # Record dispatched SYSTEM actions (base parses the envelope + ensures
   # connection, then calls this hook).
@@ -233,6 +233,32 @@ def test_exit_signal_updates_status():
   assert len(proc.db.updated) == 1
   assert proc.db.updated[0]["ref_source_id"] == 5
   assert proc.notifications == ["filled:SL:5"]
+
+
+def test_blocked_signals_are_skipped():
+  # BLOCK_SIGNAL sets _signals_blocked; every incoming signal is then skipped
+  # (no order, no DB write, no notification) until ALLOW_SIGNAL clears it.
+  result = {"success": True, "ticket": 555, "price": 30000.0, "volume": 0.02}
+  proc = FakeProcessor(result)
+  proc._signals_blocked = True
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+  assert proc.db.inserted == []
+  assert proc.db.logged == []
+  assert proc.notifications == []
+
+
+def test_signals_resume_after_unblock():
+  result = {"success": True, "ticket": 555, "price": 30000.0, "volume": 0.02}
+  proc = FakeProcessor(result)
+  proc._signals_blocked = True
+  proc._signals_blocked = False  # ALLOW_SIGNAL cleared the gate
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+  assert len(proc.db.inserted) == 1
+  assert proc.notifications == ["filled:LONG:555"]
 
 
 def test_zero_fill_price_falls_back_to_signal_price():
@@ -380,7 +406,20 @@ def test_max_open_orders_zero_disables_cap():
 def test_admin_subject_routed_to_hook():
   proc = FakeProcessor({"success": True})
   proc._process_message(NatsSubjectEnum.ADMIN, '{"action":"FLAT"}')
-  assert proc.admin_calls == ['{"action":"FLAT"}']
+  assert proc.admin_calls == [('{"action":"FLAT"}', False)]
+  assert proc.db.logged == []  # not treated as a signal
+
+
+def test_private_admin_subject_routed_to_hook():
+  proc = FakeProcessor({"success": True})
+  # Give the worker a full identity so it has a private ADMIN subject:
+  # ADMIN.<market>.<gateway>.<account_id>.
+  proc._gateway_setting_key = "gateway"
+  proc.settings = {"gateway": "FAKE_GW"}
+  subject = proc._private_admin_subject
+  assert subject == "ADMIN.FAKE_MKT.FAKE_GW.ACC"
+  proc._process_message(subject, '{"action":"FLAT"}')
+  assert proc.admin_calls == [('{"action":"FLAT"}', True)]
   assert proc.db.logged == []  # not treated as a signal
 
 

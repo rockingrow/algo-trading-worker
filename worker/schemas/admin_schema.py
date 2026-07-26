@@ -7,23 +7,57 @@ from pydantic import BaseModel
 
 class AdminActionEnum(str, Enum):
   FLAT = "FLAT"
+  # Signal-execution control (private subject only). BLOCK_SIGNAL makes the
+  # worker skip executing every incoming SIGNAL; ALLOW_SIGNAL resumes normal
+  # execution. Account-scoped, so both travel on the private ADMIN subject.
+  BLOCK_SIGNAL = "BLOCK_SIGNAL"
+  ALLOW_SIGNAL = "ALLOW_SIGNAL"
 
 
 class AdminMessageSchema(BaseModel):
   action: AdminActionEnum
   timestamp: datetime
 
+
 class AdminFlatSchema(AdminMessageSchema):
-  """``account_id`` alone is not a unique worker identity — the same raw id can
-  collide across markets/gateways (e.g. an email used as ``account_id`` also
-  matching a CRYPTO gateway name). The broker now sends ``market``/``gateway``
-  alongside ``account_id`` so a FLAT can be routed by the full composite key,
-  mirroring ``SystemWorkerConnectedSchema``. Each of the three fields is an
-  optional filter: unset means "don't filter on this dimension" (e.g. no
-  account_id → broadcast to every worker matching strategy/symbol)."""
+  """FLAT delivered on the **public** ``ADMIN`` subject.
+
+  The broker fans a public FLAT out to every worker, so it carries no
+  ``account_id`` — the public subject is not account-scoped. ``market`` and
+  ``gateway`` are optional filters: unset means "don't filter on this
+  dimension" (a broadcast FLAT with both unset targets every worker matching
+  strategy/symbol). Account-scoped FLATs travel on the private subject instead
+  (see :class:`PrivateAdminFlatSchema`)."""
 
   strategy: Optional[str] = None
   symbol: Optional[str] = None
-  account_id: Optional[str] = None
   market: Optional[str] = None
   gateway: Optional[str] = None
+
+
+class PrivateAdminSchema(AdminMessageSchema):
+  """Base for any directive delivered on a worker's **private** ADMIN subject,
+  whose name is ``ADMIN.<market>.<gateway>.<account_id>``.
+
+  The private subject addresses exactly one worker, so the payload must carry
+  the full composite identity: ``market``/``gateway``/``account_id`` are all
+  **required**. The worker re-validates that they match its own identity before
+  acting (defence-in-depth on top of the subject match)."""
+
+  market: str
+  gateway: str
+  account_id: str
+
+
+class PrivateAdminFlatSchema(PrivateAdminSchema):
+  """FLAT on the private ADMIN subject. Adds the optional ``strategy``/``symbol``
+  close filters to the required composite identity."""
+
+  strategy: Optional[str] = None
+  symbol: Optional[str] = None
+
+
+class PrivateAdminSignalControlSchema(PrivateAdminSchema):
+  """``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL`` on the private ADMIN subject — toggles
+  whether the worker executes incoming SIGNALs. Carries only the required
+  composite identity (no extra fields); the ``action`` decides block vs allow."""

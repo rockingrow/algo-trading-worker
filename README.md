@@ -379,8 +379,32 @@ worker/
 ├── nats_client.py       # NatsClient — single NATS connection lifecycle in a daemon thread
 ├── process_manager.py   # WorkerProcessManager — generic subprocess supervisor
 ├── worker_runtime.py    # run_worker() — shared child-process bootstrap
-└── settings.py          # Environment & app configuration (per-market validation)
+└── settings.py          # Environment & app configuration (grouped nested settings + per-market validation)
 ```
+
+---
+
+## ⚙️ Settings (`worker/settings.py`)
+
+Configuration is grouped into nested `<specific>Settings` sub-models on the main `Settings`, so related options live together:
+
+| Group | Access | Covers |
+| --- | --- | --- |
+| `LoggingSettings` | `settings.logging` | `notification_mode`, `log_level` |
+| `NatsSettings` | `settings.nats` | `url`, `token`, `subjects` |
+| `ForexSettings` | `settings.forex` | `platform`, MT5 `server`/`login`/`password`/`path`/`name` |
+| `CryptoSettings` | `settings.crypto` | `exchange`, API keys, `hedge_mode`, leverage caps, … |
+| `StrategySettings` | `settings.strategy` | `slippage_deviation`, `magic_map`, TP1 overrides |
+| `RiskSettings` | `settings.risk` | `capital`, `risk_percentage`, `max_open_orders`, … |
+| `TelegramSettings` | `settings.telegram` | `enabled`, tokens, chat ids, error-log hook |
+| `DatabaseSettings` | `settings.database` | `file` |
+| `WebSettings` | `settings.web` | `host`, `port` |
+| `BrokerSettings` | `settings.broker` | `api_url`, `api_key` |
+
+`market_type` and the derived `account_id` stay at the top level (`settings.market_type` / `settings.account_id`).
+
+- **Env vars are unchanged.** Each group is its own `BaseSettings` that reads the same flat variable names as before (e.g. `NATS_URL`, `MT5_LOGIN`, `MAX_LEVERAGE_CAP`) via per-field `validation_alias` — `.env` files and the initializer in `.env.example` need no changes.
+- **Flat dict for subprocesses.** `Settings.flat_dump()` reproduces the original flat `settings_dict` (legacy keys, with `SecretStr`/enum values intact) that is handed across the multiprocessing fork boundary and consumed by gateways, factories and presenters via `settings_dict.get("<flat_key>")`. Read config off the nested objects (`settings.nats.url`); consume the fork-boundary dict off the flat keys (`settings_dict["nats_url"]`).
 
 ---
 
@@ -443,23 +467,33 @@ With the payload above, the worker executes against the SL/TP/quantity exactly a
 
 ## 🛡️ ADMIN Subject
 
-The `ADMIN` NATS subject carries out-of-band administrative commands that operate outside the normal strategy signal flow. Messages are received by `BaseSignalProcessor._handle_admin_message`, which is shared by both markets — only *how a live close maps back to a DB row* varies per market (FOREX matches by ticket, CRYPTO by resolved exchange symbol).
+ADMIN carries out-of-band administrative commands that operate outside the normal strategy signal flow, all handled by the shared `BaseSignalProcessor._handle_admin_message`. Messages travel on **one of two subjects**:
+
+| Subject | Name | Scope | Routing fields |
+| --- | --- | --- | --- |
+| **Public** | `ADMIN` | Fanned out by the broker to every worker | `market` / `gateway` **optional** filters — **no `account_id`** |
+| **Private** | `ADMIN.<market>.<gateway>.<account_id>` | Addressed to exactly one worker | `market` / `gateway` / `account_id` **required** |
+
+Every worker subscribes to the public `ADMIN` subject **and** to its own private `ADMIN.<market>.<gateway>.<account_id>` subject (built from `MARKET_TYPE`, the gateway/platform setting, and the account id — `MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO). This lets the broker target a single account precisely without fanning a message out to everyone.
+
+`AdminActionEnum` actions: **`FLAT`** (both subjects — close positions), and **`BLOCK_SIGNAL`** / **`ALLOW_SIGNAL`** (private subject only — toggle whether the worker executes incoming SIGNALs).
 
 ### Action: `FLAT`
 
-Closes open positions across one or more strategies/symbols in a single command. Accepts five **optional** filter attributes — any combination can be specified; omitting all of `account_id`/`market`/`gateway`/`strategy`/`symbol` closes every tracked open position on the account.
+Closes open positions across one or more strategies/symbols in a single command.
+
+#### Public subject (`ADMIN`)
+
+The broker fans a public FLAT out to every worker; each filters only on the **optional** `market`/`gateway` dimensions. A public FLAT carries **no `account_id`** (the public subject is not account-scoped — a stray `account_id` field is ignored).
 
 | Filter | Behaviour when present |
 | --- | --- |
-| `account_id` | Silently ignored if it does not match the worker's account id (`MT5_LOGIN` for FOREX, `CRYPTO_ACCOUNT_ID` for CRYPTO); processed normally if it matches or is absent |
 | `market` | Silently ignored if it does not match the worker's `MARKET_TYPE`; processed normally if it matches or is absent |
 | `gateway` | Silently ignored if it does not match the worker's gateway/platform setting (`MT5_PLATFORM` for FOREX, `CRYPTO_EXCHANGE` for CRYPTO); processed normally if it matches or is absent |
 | `strategy` | Restricts close to positions whose `strategy` column equals this value |
 | `symbol` | Restricts close to positions for this symbol |
 
-`account_id` alone is **not** a unique worker identity — the same raw id can collide across markets/gateways (e.g. an email used as `account_id` also matching a CRYPTO gateway name). A worker only acts on a FLAT when `account_id`, `market`, and `gateway` **all** match (each is skipped as a filter when absent from the payload).
-
-#### ADMIN FLAT Payload
+Omitting `market`/`gateway`/`strategy`/`symbol` closes every tracked open position on every worker that receives it.
 
 ```json
 {
@@ -467,26 +501,58 @@ Closes open positions across one or more strategies/symbols in a single command.
   "timestamp": "2026-06-02T08:00:00+00:00",
   "strategy": "my_strategy",
   "symbol": "XAUUSD",
-  "account_id": "123456",
   "market": "FOREX",
   "gateway": "MT5"
 }
 ```
 
-All fields except `action` and `timestamp` are optional.
+#### Private subject (`ADMIN.<market>.<gateway>.<account_id>`)
+
+An account-scoped FLAT is published to a worker's private subject. Here `market`, `gateway`, and `account_id` are **required**: the subject already addresses one worker, and the worker re-validates that all three fields match its own identity before acting (defence-in-depth against a misrouted publish). `account_id` alone is **not** a unique worker identity — the same raw id can collide across markets/gateways (e.g. an email used as `account_id` also matching a CRYPTO gateway name), which is exactly why the full composite `market`/`gateway`/`account_id` is required and re-checked. `strategy`/`symbol` remain optional close filters.
+
+```json
+{
+  "action": "FLAT",
+  "timestamp": "2026-06-02T08:00:00+00:00",
+  "strategy": "my_strategy",
+  "symbol": "XAUUSD",
+  "market": "FOREX",
+  "gateway": "MT5",
+  "account_id": "123456"
+}
+```
 
 #### Execution flow
 
 The broker/exchange is always the source of truth: live positions are closed **first**, then the DB is reconciled against what actually closed.
 
-1. Parse `AdminSignalSchema`; drop silently on validation error, and ignore any non-`FLAT` action.
-2. If any of `account_id` / `market` / `gateway` is present and does not match the worker's identity → skip (no log noise).
-3. Ensure the broker/exchange connection; abort if unreachable.
-4. **Close live positions** (`_close_live_positions_for_flat`): fetch live positions — for a given `symbol` via `get_open_positions(symbol, strategy=…)`, otherwise account-wide via `get_all_open_positions(strategy=…)` — and call `close_single_position(pos, reason="FLAT")` on each. Track every key *attempted* and the subset that *closed successfully*.
-5. **Reconcile the DB** (`_reconcile_flat_db`) against the open rows matching the filter. For each DB row:
+1. Parse the envelope (`AdminMessageSchema`); drop silently on validation error, and dispatch by `action` (`FLAT` below; `BLOCK_SIGNAL`/`ALLOW_SIGNAL` handled separately). An unknown action is logged and ignored.
+2. Parse the subject-specific payload — `AdminFlatSchema` (public) or `PrivateAdminFlatSchema` (private, which requires `market`/`gateway`/`account_id`); drop silently on validation error.
+3. Route to this worker: on the **public** subject, skip unless the optional `market`/`gateway` filters match; on the **private** subject, skip unless `market`/`gateway`/`account_id` all match this worker's identity. Either way, skip is silent (no log noise).
+4. Ensure the broker/exchange connection; abort if unreachable.
+5. **Close live positions** (`_close_live_positions_for_flat`): fetch live positions — for a given `symbol` via `get_open_positions(symbol, strategy=…)`, otherwise account-wide via `get_all_open_positions(strategy=…)` — and call `close_single_position(pos, reason="FLAT")` on each. Track every key *attempted* and the subset that *closed successfully*.
+6. **Reconcile the DB** (`_reconcile_flat_db`) against the open rows matching the filter. For each DB row:
    - **Matched a successful live close** → update `status → FLATTED`, set `closed_price`/return code, send `⚡ Admin FLAT Closed` Telegram notification.
    - **Never seen live on the broker** (not in the attempted set) → already closed externally → mark `FLATTED` to sync the DB (no order sent).
    - **Close was attempted but failed** → the position is **still live**, so the row is left **OPEN** and flagged loudly for manual attention — the DB never falsely reports a position flat.
+
+### Actions: `BLOCK_SIGNAL` / `ALLOW_SIGNAL`
+
+Toggle whether the worker **executes incoming SIGNALs**. `BLOCK_SIGNAL` suspends signal execution; `ALLOW_SIGNAL` resumes it. Both are **account-scoped**, so they are accepted on the **private subject only** (`ADMIN.<market>.<gateway>.<account_id>`) — the same action arriving on the public `ADMIN` subject is ignored. The payload (`PrivateAdminSignalControlSchema`) requires `market` / `gateway` / `account_id`, and the worker re-validates all three against its own identity before applying the toggle.
+
+While blocked (`_signals_blocked = True`), every incoming SIGNAL is skipped at the single execution funnel `_process_signal` — this covers **both** live signals and `RETRY_SIGNALS` replays. Open positions are **untouched**: they can still be closed out-of-band via an `ADMIN` `FLAT`, which is the escape hatch even while signals are blocked. A real state change is logged and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` Telegram notification; repeating the current state is a no-op (no duplicate alert).
+
+The flag is **in-memory only** — a worker restart resets it to *allowed*. There is no DB/schema change; if a durable block is needed, the broker can re-issue `BLOCK_SIGNAL` after the worker re-announces `WORKER_CONNECTED`.
+
+```json
+{
+  "action": "BLOCK_SIGNAL",
+  "timestamp": "2026-06-02T08:00:00+00:00",
+  "market": "FOREX",
+  "gateway": "MT5",
+  "account_id": "123456"
+}
+```
 
 ### Key Design Decisions
 

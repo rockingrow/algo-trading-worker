@@ -22,7 +22,7 @@ from worker.settings import settings
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
-  monkeypatch.setattr(settings, "db_file", str(tmp_path / "flat_test.sqlite"))
+  monkeypatch.setattr(settings.database, "file", str(tmp_path / "flat_test.sqlite"))
   db_init()
   r = PositionRepository()
   # Three distinct active positions + one closed one that must never match.
