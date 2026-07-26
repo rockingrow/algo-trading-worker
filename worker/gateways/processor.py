@@ -360,12 +360,16 @@ class BaseSignalProcessor(ABC):
       self.name, signal.symbol, signal.action.value, signal.timestamp,
     )
 
-    # Exposure guard: a new entry that would exceed MAX_OPEN_ORDERS is never sent
-    # to the broker. It is still recorded (status REJECTED), forwarded to the broker
-    # via CDC on the TRADE subject, and notified. Exits are never gated here so a
-    # position can always be closed even at the cap.
+    # Entry guards: a rejected entry is never sent to the broker. It is still
+    # recorded (status REJECTED), forwarded to the broker via CDC on the TRADE
+    # subject, and notified. Exits are never gated here so a position can always
+    # be closed. The single-position-per-symbol guard runs first (it is the
+    # stricter rule): while any order is open on the symbol, no new entry is
+    # placed regardless of strategy.
     if signal.action in _ENTRY_ACTIONS:
-      reject_reason = self._max_open_orders_rejection(signal)
+      reject_reason = self._symbol_open_rejection(signal)
+      if reject_reason is None:
+        reject_reason = self._max_open_orders_rejection(signal)
       if reject_reason is not None:
         self._reject_signal(signal, reject_reason)
         return
@@ -463,6 +467,30 @@ class BaseSignalProcessor(ABC):
           comment=result.get("comment", ""),
           message=signal_json,
         )
+
+  # ── Shared single-position-per-symbol guard ───────────────────────────── #
+
+  def _symbol_open_rejection(self, signal: SignalSchema) -> Optional[str]:
+    """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
+    because an order is already open on its symbol — across *every* strategy —
+    else ``None``.
+
+    One-open-order-per-symbol policy: any active (OPENED/TP1) position on the
+    symbol blocks a fresh entry, no matter which strategy holds it. This is
+    stricter than MAX_OPEN_ORDERS and intentionally also rejects a same-strategy
+    re-entry or scale-in — while any order is live on the symbol, no new order is
+    placed. The rejected entry is still logged and forwarded to the broker with
+    status REJECTED by :meth:`_reject_signal`.
+    """
+    open_positions = self.ctx.db_service.get_open_positions_for_flat(symbol=signal.symbol)
+    if not open_positions:
+      return None
+    holders = sorted({p.get("strategy") for p in open_positions if p.get("strategy")})
+    held_by = f" (held by {', '.join(holders)})" if holders else ""
+    return (
+      f"{signal.symbol} already has an open order{held_by}; "
+      f"entry not placed (open position on symbol)."
+    )
 
   # ── Shared MAX_OPEN_ORDERS exposure guard ─────────────────────────────── #
 
