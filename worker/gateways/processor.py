@@ -34,6 +34,7 @@ from pydantic import ValidationError
 
 from worker.context import WorkerContext
 from worker.gateways.config import ExecutionConfig
+from worker.gateways import guard
 from worker.gateways.market_strategy import MarketStrategyFactory
 from worker.gateways.signal_handler import SignalHandler
 from worker.interfaces.trade_presenter_protocol import TradePresenterProtocol
@@ -367,9 +368,11 @@ class BaseSignalProcessor(ABC):
     # stricter rule): while any order is open on the symbol, no new entry is
     # placed regardless of strategy.
     if signal.action in _ENTRY_ACTIONS:
-      reject_reason = self._symbol_open_rejection(signal)
+      reject_reason = guard.symbol_open_rejection(self.ctx.db_service, signal)
       if reject_reason is None:
-        reject_reason = self._max_open_orders_rejection(signal)
+        reject_reason = guard.max_open_orders_rejection(
+          self.ctx.db_service, self.settings, signal
+        )
       if reject_reason is not None:
         self._reject_signal(signal, reject_reason)
         return
@@ -467,61 +470,6 @@ class BaseSignalProcessor(ABC):
           comment=result.get("comment", ""),
           message=signal_json,
         )
-
-  # ── Shared single-position-per-symbol guard ───────────────────────────── #
-
-  def _symbol_open_rejection(self, signal: SignalSchema) -> Optional[str]:
-    """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
-    because an order is already open on its symbol — across *every* strategy —
-    else ``None``.
-
-    One-open-order-per-symbol policy: any active (OPENED/TP1) position on the
-    symbol blocks a fresh entry, no matter which strategy holds it. This is
-    stricter than MAX_OPEN_ORDERS and intentionally also rejects a same-strategy
-    re-entry or scale-in — while any order is live on the symbol, no new order is
-    placed. The rejected entry is still logged and forwarded to the broker with
-    status REJECTED by :meth:`_reject_signal`.
-    """
-    open_positions = self.ctx.db_service.get_open_positions_for_flat(symbol=signal.symbol)
-    if not open_positions:
-      return None
-    holders = sorted({p.get("strategy") for p in open_positions if p.get("strategy")})
-    held_by = f" (held by {', '.join(holders)})" if holders else ""
-    return (
-      f"{signal.symbol} already has an open order{held_by}; "
-      f"entry not placed (open position on symbol)."
-    )
-
-  # ── Shared MAX_OPEN_ORDERS exposure guard ─────────────────────────────── #
-
-  def _max_open_orders_rejection(self, signal: SignalSchema) -> Optional[str]:
-    """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
-    because the worker is already at its MAX_OPEN_ORDERS cap, else ``None``.
-
-    The cap counts active (OPENED/TP1) positions across every strategy/symbol. A
-    re-entry or scale-in on a symbol this strategy already holds replaces the
-    existing position rather than opening a new slot, so it is never counted
-    against the cap. A value of 0 (or unset) disables the limit.
-    """
-    max_orders = self.settings.get("max_open_orders")
-    if not max_orders or max_orders <= 0:
-      return None
-
-    open_positions = self.ctx.db_service.get_open_positions_for_flat()
-    already_held = any(
-      p.get("strategy") == signal.strategy and p.get("symbol") == signal.symbol
-      for p in open_positions
-    )
-    if already_held:
-      return None
-
-    open_count = len(open_positions)
-    if open_count < max_orders:
-      return None
-    return (
-      f"Max open orders reached ({open_count}/{max_orders}); "
-      f"entry not placed (MAX_OPEN_ORDERS)."
-    )
 
   def _reject_signal(self, signal: SignalSchema, reason: str) -> None:
     """Handle a policy-rejected entry end-to-end without touching the broker.
