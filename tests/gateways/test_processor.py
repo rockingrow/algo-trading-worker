@@ -76,7 +76,12 @@ class FakeDb:
     self.updated.append(kw)
 
   def get_open_positions_for_flat(self, strategy=None, symbol=None):
-    return list(self.open_positions)
+    return [
+      p
+      for p in self.open_positions
+      if (strategy is None or p.get("strategy") == strategy)
+      and (symbol is None or p.get("symbol") == symbol)
+    ]
 
   def signal_exists(self, signal_id):
     return signal_id in self.known_signal_ids
@@ -355,20 +360,60 @@ def test_entry_allowed_when_below_max_open_orders():
   assert proc.notifications == ["filled:LONG:1"]
 
 
-def test_reentry_on_held_symbol_not_rejected_at_cap():
-  # A re-entry/scale-in on a symbol this strategy already holds replaces the
-  # existing position rather than opening a new slot, so it is allowed at the cap.
-  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
-  proc.settings = {"max_open_orders": 2}
-  proc.db.open_positions = [_open_row("strat-1", "XAUUSD"), _open_row("s2", "BBB")]
+def test_entry_rejected_when_symbol_already_open_same_strategy():
+  # One-open-order-per-symbol: an entry on a symbol this same strategy already
+  # holds is REJECTED (no re-entry/scale-in while an order is live on the symbol).
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+  seen = _capturing_handler(proc, {"success": True})
 
   proc._process_message(
     NatsSubjectEnum.SIGNAL,
-    make_signal(SignalActionEnum.LONG, symbol="XAUUSD").model_dump_json(),
+    make_signal(SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-1").model_dump_json(),
+  )
+
+  # Broker execution never runs; recorded as a REJECTED row + audit log + notice.
+  assert seen == []
+  assert proc.db.inserted == []
+  assert len(proc.db.rejected) == 1
+  rej = proc.db.rejected[0]
+  assert rej["symbol"] == "XAUUSD"
+  assert "open position on symbol" in rej["comment"]
+  assert len(proc.db.logged) == 1
+  assert proc.notifications == ["order_rejected:LONG:" + rej["comment"]]
+
+
+def test_entry_rejected_when_symbol_open_under_other_strategy():
+  # An order open on the symbol under a *different* strategy also blocks a new
+  # entry (regardless of the MAX_OPEN_ORDERS cap, which is disabled here).
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+  seen = _capturing_handler(proc, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-2").model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "strat-1" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_allowed_when_symbol_has_no_open_order():
+  # A different symbol with no open order proceeds normally even while another
+  # symbol is held.
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSDT").model_dump_json(),
   )
 
   assert proc.db.rejected == []
   assert len(proc.db.inserted) == 1
+  assert proc.notifications == ["filled:LONG:1"]
 
 
 def test_exit_signal_not_gated_by_max_open_orders():
