@@ -42,16 +42,19 @@ class ExecutionConfig:
   tp1_move_sl_to_breakeven: Optional[bool] = None
   # Allow multiple strategies to trade the same symbol simultaneously. Resolved
   # per market from FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL /
-  # CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL (see ``from_dict``), because the two
-  # markets differ fundamentally:
-  #   FOREX  — each strategy trades under its own magic number, so the platform
-  #            keeps concurrent positions on one symbol genuinely isolated
-  #            (requires a hedging account).
-  #   CRYPTO — Binance USDⓈ-M netting merges them into one net position at the
-  #            exchange, so enabling it there is an explicit "I know" override.
-  # Default False enforces one-strategy-per-symbol and rejects new entries that
-  # would violate it. It never relaxes the one-active-position-per-(strategy,
-  # symbol) invariant, which holds in both markets.
+  # CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL (see ``from_dict``); what it unlocks
+  # differs per market:
+  #   FOREX  — the real feature. Each strategy trades under its own magic
+  #            number, so concurrent positions on one symbol stay isolated, and
+  #            ``ForexMarket`` reports the capability to SignalHandler, which
+  #            then permits the parallel entry (requires a hedging account).
+  #   CRYPTO — relaxes ``CryptoExecutor._netting_conflict`` only. A CEX cannot
+  #            isolate two strategies on one symbol, so ``CryptoMarket`` does
+  #            NOT report the capability and the handler still rejects the
+  #            entry. See CryptoMarket's docstring for why.
+  # Default False enforces one-strategy-per-symbol. It never relaxes the
+  # one-active-position-per-(strategy, symbol) invariant, which holds in both
+  # markets.
   allow_multi_strategy_per_symbol: bool = False
   # When True, always use risk_percentage from settings regardless of signal.
   # When False (default): use signal.risk_percent if present, else risk_percentage.

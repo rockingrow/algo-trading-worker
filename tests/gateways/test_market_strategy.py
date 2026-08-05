@@ -5,6 +5,7 @@ import pytest
 from helpers import make_signal
 
 from worker.gateways.market_strategy import (
+  CryptoMarket,
   ForexMarket,
   MarketStrategyFactory,
 )
@@ -106,7 +107,7 @@ def test_factory_requires_config():
 # ── Multi-strategy-per-symbol capability ─────────────────────────────────── #
 
 @pytest.mark.parametrize("allowed", [True, False])
-def test_allows_multi_strategy_per_symbol_follows_config(config, allowed):
+def test_forex_allows_multi_strategy_per_symbol_follows_config(config, allowed):
   """The capability SignalHandler reads is the resolved config flag, nothing else."""
   market = ForexMarket(FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=allowed))
   assert market.allows_multi_strategy_per_symbol is allowed
@@ -114,6 +115,15 @@ def test_allows_multi_strategy_per_symbol_follows_config(config, allowed):
 
 def test_allows_multi_strategy_per_symbol_defaults_to_disabled(config):
   assert ForexMarket(FakeExecutor(), config).allows_multi_strategy_per_symbol is False
+
+
+def test_crypto_never_allows_multi_strategy_per_symbol(config):
+  """A CEX cannot isolate two strategies on one symbol: CryptoExecutor ignores the
+  `strategy` filter and cancels resting orders symbol-wide, so the capability must
+  stay off even when CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL flipped the config
+  flag (which only relaxes CryptoExecutor._netting_conflict)."""
+  market = CryptoMarket(FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=True))
+  assert market.allows_multi_strategy_per_symbol is False
 
 
 # ── Signal-level tp1_percent / move_sl_to_be fallback ────────────────────── #

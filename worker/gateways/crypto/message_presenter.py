@@ -53,7 +53,6 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"{CryptoMessagePresenter._tp1_percent_line(s)}"
       f"{CryptoMessagePresenter._tp1_be_line(s)}"
       f"{CryptoMessagePresenter._max_open_orders_line(s)}"
-      f"{CryptoMessagePresenter._multi_strategy_line(s, 'CRYPTO')}"
     )
     return _box(f"{CONNECTED} <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")
 

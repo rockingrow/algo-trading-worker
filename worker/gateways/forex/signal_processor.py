@@ -42,6 +42,12 @@ from worker.settings import (
 
 log = get_logger("worker.gateways.forex.signal_processor")
 
+# MT5 ``account_info().margin_mode`` value for ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
+# — the only mode in which one symbol can hold several independent positions
+# (0 = RETAIL_NETTING, 1 = EXCHANGE). Hard-coded rather than read off the mt5
+# module so this file stays importable without the native MetaTrader5 stack.
+MT5_MARGIN_MODE_HEDGING = 2
+
 
 # ── Child-process helpers ────────────────────────────────────────────────── #
 
@@ -204,7 +210,54 @@ class ForexSignalProcessor(BaseSignalProcessor):
     )
 
   def _connect_broker(self) -> bool:
-    return self.gateway.reconnect(max_attempts=0, delay_seconds=10.0)
+    connected = self.gateway.reconnect(max_attempts=0, delay_seconds=10.0)
+    if connected:
+      self._warn_if_multi_strategy_needs_hedging()
+    return connected
+
+  def _warn_if_multi_strategy_needs_hedging(self) -> None:
+    """Escalate when FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL is on but the account
+    cannot actually hold parallel positions.
+
+    The toggle relies on the platform keeping one position *per magic*. That is
+    only true on a **hedging** account: a netting account merges every order on
+    a symbol into a single position, so a second strategy's entry silently grows
+    the first strategy's position instead of opening its own. The second
+    strategy then owns nothing — each of its TP1/TP2/SL signals fails with "No
+    open position" while the merged volume runs on unmanaged. Nothing else in
+    the pipeline can detect that, so it is checked once, loudly, at connect.
+
+    Warn-only by design: the operator may be mid-migration between accounts, and
+    refusing to trade at all is worse than trading with the toggle's guarantee
+    reduced to the pre-existing one-strategy-per-symbol behaviour.
+    """
+    if not self.settings.get("forex_allow_multi_strategy_per_symbol", False):
+      return
+    account = self.gateway.get_account() or {}
+    margin_mode = account.get("margin_mode")
+    # Absent → the platform does not report a margin mode (non-MT5 gateway or a
+    # stubbed account): nothing to assert, stay quiet rather than cry wolf.
+    if margin_mode is None or margin_mode == MT5_MARGIN_MODE_HEDGING:
+      return
+    log.error(
+      "[%s Process] FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL is ENABLED but the "
+      "account margin_mode=%s is not hedging (%s). Positions from different "
+      "strategies on the same symbol will be MERGED by the broker and only the "
+      "first strategy will own the resulting position.",
+      self.name, margin_mode, MT5_MARGIN_MODE_HEDGING,
+    )
+    self.ctx.notifier.send_message(
+      _box(
+        f"{WARNING} <b>[Config] Multi-strategy per symbol needs a hedging account</b>\n\n"
+        f"<b>FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL</b> is enabled, but this "
+        f"account is not in hedging mode (margin_mode=<b>{margin_mode}</b>).\n"
+        f"Two strategies entering the same symbol will be merged into one "
+        f"broker position — the second strategy will not own a position and its "
+        f"exits will fail.\n"
+        f"Either switch to a hedging account or set the flag back to false."
+        f"{self.gateway.get_account_footer()}"
+      )
+    )
 
   def _disconnect_broker(self) -> None:
     self.gateway.close()

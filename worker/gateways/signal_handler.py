@@ -201,10 +201,12 @@ class SignalHandler:
     # symbol-scoped, not strategy-scoped — proceeding while another strategy has
     # resting orders on the symbol would silently wipe their SL/TP.
     #
-    # Skipped when the market allows multi-strategy symbols (FOREX on a hedging
-    # account, where each strategy's magic keeps its ticket/SL/TP isolated):
-    # there the concurrent position is intended, not a conflict. This strategy's
-    # own position is still replaced rather than stacked (step 1 below), so the
+    # Skipped only when the market can really keep the two apart — FOREX with
+    # FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL, where each strategy's magic isolates
+    # its ticket/SL/TP: there the concurrent position is intended, not a
+    # conflict. ``CryptoMarket`` never reports the capability, so the cleanup
+    # below can't reach another strategy's orders on a CEX. This strategy's own
+    # position is still replaced rather than stacked (step 1 below), so the
     # one-open-order-per-(strategy, symbol) rule holds either way.
     other_holders = {
       r["strategy"]
@@ -220,7 +222,8 @@ class SignalHandler:
         )
         return TradeResult.fail(
           f"Netting conflict: {symbol} already held by {sorted(other_holders)}. "
-          "Set FOREX_/CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true to override.",
+          "Parallel strategies on one symbol are FOREX-only "
+          "(FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL).",
           retcode=-1,
         )
       logger.info(

@@ -129,14 +129,6 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     self._executor = executor
     self._config = config
 
-  # ── Capabilities ──────────────────────────────────────────────────────── #
-
-  @property
-  def allows_multi_strategy_per_symbol(self) -> bool:
-    """Driven by config — ``FOREX_/CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL``
-    resolved for the active market by :meth:`ExecutionConfig.from_dict`."""
-    return self._config.allow_multi_strategy_per_symbol
-
   # ── Entry ────────────────────────────────────────────────────────────── #
 
   def entry(self, signal: SignalSchema) -> TradeResult:
@@ -306,9 +298,33 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 class ForexMarket(ExecutorBackedMarket):
   """FOREX / CFD market via a trading platform (backed by ``ForexExecutor``)."""
 
+  @property
+  def allows_multi_strategy_per_symbol(self) -> bool:
+    """FOREX is the only market that can hold parallel positions on one symbol.
+
+    Every operation ``SignalHandler`` performs is scoped by the strategy's own
+    magic number — ``get_open_positions``/``close_all_positions`` filter on it,
+    closes and SL edits target a specific ticket — so strategies sharing a
+    symbol never touch each other. Driven by
+    ``FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL`` (needs a hedging account; see
+    ``ForexSignalProcessor._warn_if_multi_strategy_needs_hedging``).
+    """
+    return self._config.allow_multi_strategy_per_symbol
+
 
 class CryptoMarket(ExecutorBackedMarket):
-  """CRYPTO market via a centralized exchange (backed by ``CryptoExecutor``)."""
+  """CRYPTO market via a centralized exchange (backed by ``CryptoExecutor``).
+
+  Deliberately keeps the base ``allows_multi_strategy_per_symbol = False``: a
+  CEX cannot isolate two strategies on one symbol. ``CryptoExecutor``
+  *ignores* the ``strategy`` argument in ``get_open_positions`` (there is no
+  magic-number equivalent) and cancels resting orders **symbol-wide**
+  (``cancel_all_orders``), so letting a second strategy in would make the
+  entry's stale-cleanup close the first strategy's position and wipe its
+  SL/TP. ``CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL`` therefore only relaxes
+  ``CryptoExecutor._netting_conflict``; the handler-level guard still rejects
+  the entry.
+  """
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

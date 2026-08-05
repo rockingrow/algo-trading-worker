@@ -416,6 +416,36 @@ class Settings(BaseSettings):
         self.account_id = f"{self.market_type.value}-{self.crypto.exchange.value}-{self.crypto.account_id}"
     return self
 
+  @model_validator(mode="after")
+  def _validate_multi_strategy_magics(self):
+    """Reject duplicate magic numbers when multi-strategy-per-symbol is on.
+
+    With the toggle enabled, the magic number is the *only* thing separating two
+    strategies that share a symbol: `get_open_positions(symbol, strategy)`
+    filters on it, so two strategies mapped to the same magic would see — and
+    force-close, on the next entry — each other's positions. Elsewhere a
+    duplicate magic is merely a misconfiguration; here it silently defeats the
+    isolation the feature is built on, so it fails fast at startup instead.
+    """
+    if not (
+      self.market_type == MarketTypeEnum.FOREX
+      and self.forex.allow_multi_strategy_per_symbol
+    ):
+      return self
+    seen: dict[int, str] = {}
+    collisions: list[str] = []
+    for strategy, magic in self.strategy.magic_map.items():
+      if magic in seen:
+        collisions.append(f"{seen[magic]} + {strategy} → {magic}")
+      else:
+        seen[magic] = strategy
+    if collisions:
+      raise ValueError(
+        "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true requires a unique magic "
+        f"number per strategy in STRATEGY_MAGIC_MAP; duplicates: {'; '.join(collisions)}"
+      )
+    return self
+
   def flat_dump(self) -> dict:
     """Reproduce the legacy flat ``settings_dict`` (original flat keys, with
     ``SecretStr`` / enum members preserved) that worker subprocesses, gateways

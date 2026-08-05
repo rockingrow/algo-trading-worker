@@ -194,10 +194,11 @@ class BaseMessagePresenter:
   def _multi_strategy_line(settings_dict: dict, market: str) -> str:
     """Render the ALLOW_MULTI_STRATEGY_PER_SYMBOL line, or '' when disabled.
 
-    *market* selects which env var is reported ("FOREX" / "CRYPTO"), so the
-    banner names the variable the operator actually set. Omitted when off — the
-    default one-strategy-per-symbol behaviour needs no announcement; showing it
-    only when enabled makes the riskier mode stand out.
+    *market* selects which env var is reported; only FOREX actually supports
+    parallel strategies on one symbol today (see ``CryptoMarket``), so only the
+    forex banner calls this. Omitted when off — the default
+    one-strategy-per-symbol behaviour needs no announcement; showing it only
+    when enabled makes the riskier mode stand out.
     """
     key = f"{market.lower()}_allow_multi_strategy_per_symbol"
     if not settings_dict.get(key, False):
