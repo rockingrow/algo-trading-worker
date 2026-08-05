@@ -191,6 +191,20 @@ class BaseMessagePresenter:
     return f"MAX_OPEN_ORDERS: <b>{limit}</b>\n"
 
   @staticmethod
+  def _multi_strategy_line(settings_dict: dict, market: str) -> str:
+    """Render the ALLOW_MULTI_STRATEGY_PER_SYMBOL line, or '' when disabled.
+
+    *market* selects which env var is reported ("FOREX" / "CRYPTO"), so the
+    banner names the variable the operator actually set. Omitted when off — the
+    default one-strategy-per-symbol behaviour needs no announcement; showing it
+    only when enabled makes the riskier mode stand out.
+    """
+    key = f"{market.lower()}_allow_multi_strategy_per_symbol"
+    if not settings_dict.get(key, False):
+      return ""
+    return f"{market.upper()}_ALLOW_MULTI_STRATEGY_PER_SYMBOL: <b>ENABLED</b>\n"
+
+  @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
       f"{REJECTED} <b>Signal Rejected</b>\n\n"

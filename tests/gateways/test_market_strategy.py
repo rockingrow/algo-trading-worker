@@ -103,6 +103,19 @@ def test_factory_requires_config():
     MarketStrategyFactory.create(MarketTypeEnum.FOREX, executor=FakeExecutor(), config=None)
 
 
+# ── Multi-strategy-per-symbol capability ─────────────────────────────────── #
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_allows_multi_strategy_per_symbol_follows_config(config, allowed):
+  """The capability SignalHandler reads is the resolved config flag, nothing else."""
+  market = ForexMarket(FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=allowed))
+  assert market.allows_multi_strategy_per_symbol is allowed
+
+
+def test_allows_multi_strategy_per_symbol_defaults_to_disabled(config):
+  assert ForexMarket(FakeExecutor(), config).allows_multi_strategy_per_symbol is False
+
+
 # ── Signal-level tp1_percent / move_sl_to_be fallback ────────────────────── #
 
 def test_handle_tp1_uses_signal_tp1_percent_when_config_is_none(config):

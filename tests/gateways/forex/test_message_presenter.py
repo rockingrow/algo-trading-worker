@@ -33,6 +33,20 @@ def test_startup_banner_omits_max_open_orders_when_disabled():
   assert "MAX_OPEN_ORDERS" not in msg
 
 
+def test_startup_banner_shows_multi_strategy_when_enabled():
+  msg = ForexMessagePresenter.startup(
+    {"capital": 1000, "forex_allow_multi_strategy_per_symbol": True}, "FOOTER"
+  )
+  assert "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL: <b>ENABLED</b>" in msg
+
+
+def test_startup_banner_omits_multi_strategy_when_disabled():
+  msg = ForexMessagePresenter.startup(
+    {"capital": 1000, "forex_allow_multi_strategy_per_symbol": False}, "FOOTER"
+  )
+  assert "MULTI_STRATEGY" not in msg
+
+
 def test_format_volume_auto_calculated_has_icon():
   out = format_volume(0.5, auto_calculated=True)
   assert "0.5 lot" in out and GEAR in out

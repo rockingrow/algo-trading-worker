@@ -61,6 +61,20 @@ class SignalHandler:
     }
 
   # ------------------------------------------------------------------ #
+  #  Market capabilities                                                 #
+  # ------------------------------------------------------------------ #
+
+  @property
+  def _multi_strategy_allowed(self) -> bool:
+    """True when the active market may hold several strategies on one symbol.
+
+    ``getattr`` with a ``False`` default so any strategy implementation that
+    predates the capability (or a lightweight test double) keeps the safe
+    one-strategy-per-symbol behaviour.
+    """
+    return bool(getattr(self.strategy, "allows_multi_strategy_per_symbol", False))
+
+  # ------------------------------------------------------------------ #
   #  SQLite lookup helper                                                #
   # ------------------------------------------------------------------ #
 
@@ -174,7 +188,8 @@ class SignalHandler:
 
   def _handle_entry(self, signal: SignalSchema) -> TradeResult:
     """
-    1. Reject if another strategy already holds this symbol (netting conflict).
+    1. Reject if another strategy already holds this symbol (netting conflict),
+       unless the market allows multiple strategies per symbol.
     2. Check for any stale position on this symbol and force-close it.
     3. Open a fresh position via strategy.entry (direction in signal.action).
     """
@@ -185,20 +200,33 @@ class SignalHandler:
     # This MUST run before the stale-cleanup below because cancel_all_orders is
     # symbol-scoped, not strategy-scoped — proceeding while another strategy has
     # resting orders on the symbol would silently wipe their SL/TP.
+    #
+    # Skipped when the market allows multi-strategy symbols (FOREX on a hedging
+    # account, where each strategy's magic keeps its ticket/SL/TP isolated):
+    # there the concurrent position is intended, not a conflict. This strategy's
+    # own position is still replaced rather than stacked (step 1 below), so the
+    # one-open-order-per-(strategy, symbol) rule holds either way.
     other_holders = {
       r["strategy"]
       for r in self._db.get_open_positions_for_flat(symbol=symbol)
       if r.get("strategy") != strategy
     }
     if other_holders:
-      logger.warning(
-        "[SignalHandler._handle_entry] Netting conflict for %s: already held by "
-        "%s — rejecting %s entry to protect their orders.",
+      if not self._multi_strategy_allowed:
+        logger.warning(
+          "[SignalHandler._handle_entry] Netting conflict for %s: already held by "
+          "%s — rejecting %s entry to protect their orders.",
+          symbol, sorted(other_holders), strategy,
+        )
+        return TradeResult.fail(
+          f"Netting conflict: {symbol} already held by {sorted(other_holders)}. "
+          "Set FOREX_/CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true to override.",
+          retcode=-1,
+        )
+      logger.info(
+        "[SignalHandler._handle_entry] %s also held by %s — multi-strategy per "
+        "symbol is enabled, opening %s alongside them.",
         symbol, sorted(other_holders), strategy,
-      )
-      return TradeResult.fail(
-        f"Netting conflict: {symbol} already held by {sorted(other_holders)}.",
-        retcode=-1,
       )
 
     # Step 1 — Pre-flight: close this strategy's stale position to start clean.
@@ -346,15 +374,30 @@ class SignalHandler:
       # Strategy-scoped lookup may have returned empty because the DB is out of
       # sync (positions exist in MT5 but have no DB record, so _filter_by_strategy
       # drops them). Retry without the strategy filter to catch those positions.
-      logger.warning(
-        "[SignalHandler._handle_flat] Strategy-scoped close found no positions for "
-        "strategy=%s symbol=%s — retrying without strategy filter (DB may be out of sync)",
-        signal.strategy,
-        signal.symbol,
-      )
-      result = self.strategy.close_all_positions(
-        signal.symbol, reason="FLAT", strategy=None
-      )
+      #
+      # Not when multiple strategies may share the symbol: an unscoped close
+      # there would flatten the *other* strategies' live positions to clean up
+      # this one, which is far worse than leaving an untracked position open for
+      # the terminal-close detector / reconciler to pick up.
+      if self._multi_strategy_allowed:
+        logger.warning(
+          "[SignalHandler._handle_flat] Strategy-scoped close found no positions for "
+          "strategy=%s symbol=%s — skipping the unscoped retry because other "
+          "strategies may hold %s (multi-strategy per symbol enabled).",
+          signal.strategy,
+          signal.symbol,
+          signal.symbol,
+        )
+      else:
+        logger.warning(
+          "[SignalHandler._handle_flat] Strategy-scoped close found no positions for "
+          "strategy=%s symbol=%s — retrying without strategy filter (DB may be out of sync)",
+          signal.strategy,
+          signal.symbol,
+        )
+        result = self.strategy.close_all_positions(
+          signal.symbol, reason="FLAT", strategy=None
+        )
 
     if result.get("success"):
       db_pos = self._get_db_position(signal.strategy, signal.symbol)

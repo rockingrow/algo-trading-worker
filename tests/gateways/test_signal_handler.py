@@ -10,11 +10,18 @@ from worker.schemas.signal_schema import SignalActionEnum
 
 
 class FakeStrategy(BaseMarketStrategy):
-  def __init__(self, open_positions=None, entry_ok=True, cleanup_ok=True):
+  def __init__(
+    self, open_positions=None, entry_ok=True, cleanup_ok=True, multi_strategy=False
+  ):
     self.calls = []
     self._open = open_positions if open_positions is not None else []
     self._entry_ok = entry_ok
     self._cleanup_ok = cleanup_ok
+    self._multi_strategy = multi_strategy
+
+  @property
+  def allows_multi_strategy_per_symbol(self):
+    return self._multi_strategy
 
   def entry(self, signal):
     self.calls.append("entry")
@@ -166,6 +173,60 @@ def test_entry_rejected_when_other_strategy_holds_symbol():
   # No exchange calls — stale cleanup must never run when a conflict exists.
   assert not any("close_all" in c for c in strat.calls)
   assert "entry" not in strat.calls
+
+
+def test_entry_allowed_alongside_other_strategy_when_multi_strategy_enabled():
+  """With multi-strategy-per-symbol on (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL),
+  a second strategy may open its own position on a symbol another strategy
+  already holds — each strategy keeps its own isolated order."""
+  strat = FakeStrategy(open_positions=[], multi_strategy=True)
+  store = FakeStore(
+    flat_positions=[{"strategy": "strat-A", "ref_source_id": "9", "ref_id": "9"}],
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="XAUUSD"))
+  assert res["success"] is True
+  assert "entry" in strat.calls
+  # The other strategy's position must not be touched: every close is scoped to
+  # the entering strategy.
+  assert not any(c.startswith("close_all") and c.endswith(":None") for c in strat.calls)
+
+
+def test_entry_still_replaces_own_position_when_multi_strategy_enabled():
+  """The toggle relaxes the *cross-strategy* rule only — a strategy re-entering
+  its own symbol still replaces its position instead of stacking a second one."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)], multi_strategy=True)
+  store = FakeStore(
+    positions=[{"ref_source_id": "9", "ref_id": "9", "volume": 1.0}],
+    flat_positions=[{"strategy": "strat-A", "ref_source_id": "1", "ref_id": "1"}],
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="XAUUSD"))
+  assert res["success"] is True
+  assert "close_all:STALE_CLEANUP:strat-B" in strat.calls
+  assert store.status_updates[0]["status"] == PositionStatusEnum.FORCED_CLOSED
+
+
+def test_flat_falls_back_to_unscoped_close_when_multi_strategy_disabled():
+  """Default behaviour: a strategy-scoped FLAT that finds nothing retries
+  unscoped, so a position missing from the DB is still closed."""
+  strat = FakeStrategy(open_positions=[], cleanup_ok=False)
+  store = FakeStore(positions=[])
+  handler = SignalHandler(strat, store)
+  handler.handle(make_signal(SignalActionEnum.FLAT, strategy="strat-1"))
+  assert "close_all:FLAT:strat-1" in strat.calls
+  assert "close_all:FLAT:None" in strat.calls
+
+
+def test_flat_skips_unscoped_close_when_multi_strategy_enabled():
+  """With several strategies sharing a symbol, the unscoped FLAT retry would
+  flatten the other strategies' live positions — it must be skipped."""
+  strat = FakeStrategy(open_positions=[], cleanup_ok=False, multi_strategy=True)
+  store = FakeStore(positions=[])
+  handler = SignalHandler(strat, store)
+  handler.handle(make_signal(SignalActionEnum.FLAT, strategy="strat-1"))
+  assert "close_all:FLAT:strat-1" in strat.calls
+  assert "close_all:FLAT:None" not in strat.calls
 
 
 def test_entry_aborts_when_cleanup_fails():

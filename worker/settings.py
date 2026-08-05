@@ -104,7 +104,6 @@ def _opt(default: Any, env: str, dump: str, **kwargs) -> Any:
   """An optional group field with *default*: env var *env*, dump key *dump*."""
   return Field(default, validation_alias=AliasChoices(env), serialization_alias=dump, **kwargs)
 
-
 #: Order the settings groups are flattened in by :meth:`Settings.flat_dump`
 #: (no key clashes — every ``serialization_alias`` is unique across groups).
 _FLAT_GROUPS = (
@@ -149,6 +148,19 @@ class ForexSettings(BaseSettings):
   password: Optional[SecretStr] = _opt(None, "MT5_PASSWORD", "mt5_password")
   path: Optional[str] = _opt(None, "MT5_PATH", "mt5_path")
   name: Optional[str] = _opt(None, "MT5_NAME", "mt5_name")
+  # FOREX is the only market that can genuinely hold several *independent*
+  # positions on one symbol: every strategy trades under its own magic number
+  # (``strategy_magic_map``), so the platform keeps their tickets, SL/TP and
+  # closes fully isolated. Set to True to let a second strategy enter a symbol
+  # another strategy already holds. The one-active-position-per-(strategy,
+  # symbol) rule still applies — a strategy re-entering its own symbol replaces
+  # its existing position, it never stacks a second one.
+  # Default False keeps the conservative one-strategy-per-symbol behaviour.
+  # Requires a hedging-enabled account: on a netting account the broker merges
+  # both strategies into a single net position and the isolation is lost.
+  allow_multi_strategy_per_symbol: bool = _opt(
+    False, "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL", "forex_allow_multi_strategy_per_symbol"
+  )
 
 
 class CryptoSettings(BaseSettings):

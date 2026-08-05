@@ -72,6 +72,20 @@ class BaseMarketStrategy(ABC):
   def handle_full_close(self, signal: SignalSchema) -> TradeResult:
     """Close all remaining volume. ``signal.action`` carries the exit reason."""
 
+  # ── Capabilities ──────────────────────────────────────────────────────── #
+
+  @property
+  def allows_multi_strategy_per_symbol(self) -> bool:
+    """Whether two different strategies may hold the same symbol at once.
+
+    Concrete (not abstract) with a conservative ``False`` default so a market
+    implementation only opts in when its broker can really keep the positions
+    isolated. ``SignalHandler`` reads it to decide whether a second strategy
+    entering an already-held symbol is a netting conflict or a legitimate
+    parallel position.
+    """
+    return False
+
   # ── Position helpers ──────────────────────────────────────────────────── #
 
   @abstractmethod
@@ -114,6 +128,14 @@ class ExecutorBackedMarket(BaseMarketStrategy):
   ) -> None:
     self._executor = executor
     self._config = config
+
+  # ── Capabilities ──────────────────────────────────────────────────────── #
+
+  @property
+  def allows_multi_strategy_per_symbol(self) -> bool:
+    """Driven by config — ``FOREX_/CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL``
+    resolved for the active market by :meth:`ExecutionConfig.from_dict`."""
+    return self._config.allow_multi_strategy_per_symbol
 
   # ── Entry ────────────────────────────────────────────────────────────── #
 

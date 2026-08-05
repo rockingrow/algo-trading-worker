@@ -21,7 +21,8 @@ from worker.settings import (
 _LEGACY_FLAT_KEYS = {
   "notification_mode", "nats_url", "nats_token", "nats_subjects", "market_type",
   "account_id", "forex_platform", "mt5_server", "mt5_login", "mt5_password",
-  "mt5_path", "mt5_name", "crypto_exchange", "crypto_quote_asset", "crypto_api_key",
+  "mt5_path", "mt5_name", "forex_allow_multi_strategy_per_symbol",
+  "crypto_exchange", "crypto_quote_asset", "crypto_api_key",
   "crypto_api_secret", "crypto_account_id", "crypto_testnet", "crypto_hedge_mode",
   "crypto_allow_multi_strategy_per_symbol", "crypto_leverage_init_symbols",
   "max_leverage_cap", "min_leverage_cap", "use_custom_leverage", "slippage_deviation",
