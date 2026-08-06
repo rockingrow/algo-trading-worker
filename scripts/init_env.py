@@ -84,7 +84,6 @@ DESCRIPTIONS = {
   "MAX_LEVERAGE_CAP": "Upper bound applied by the leverage init job (e.g. 10)",
   "MIN_LEVERAGE_CAP": "Fallback floor when a -4421 cap can't be parsed (e.g. 5)",
   "SLIPPAGE_DEVIATION": "Max slippage in points (100 = $1.00)",
-  "STRATEGY_MAGIC_MAP": "Legacy/offline fallback only — the broker now pushes magics via the SYSTEM STRATEGY_MAGIC_MAP action",
   "POSITION_TP1_PERCENT": "Percent of the position closed at the first take-profit",
   "TP1_MOVE_SL_TO_BREAKEVEN": "After TP1, move stop to breakeven (else keep entry SL)",
   "CAPITAL": "Initial capital used for risk sizing",
@@ -117,12 +116,6 @@ QUOTED_KEYS = {
   "TELEGRAM_CHAT_CHANNEL_ID",
   "CRYPTO_LEVERAGE_INIT_SYMBOLS",
 }
-
-# Values for these keys are written with single quotes (JSON content with double quotes inside).
-SINGLE_QUOTED_KEYS = {
-  "STRATEGY_MAGIC_MAP",
-}
-
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 def split_value_comment(raw: str) -> tuple[str, str]:
@@ -238,11 +231,8 @@ def section(title: str) -> None:
 # ── Rendering ────────────────────────────────────────────────────────────────
 def format_kv(key: str, value: str, comment: str) -> str:
   already_quoted = value[:1] in ('"', "'") and value[-1:] == value[:1]
-  if not already_quoted:
-    if key in SINGLE_QUOTED_KEYS:
-      value = f"'{value}'"
-    elif key in QUOTED_KEYS:
-      value = f'"{value}"'
+  if not already_quoted and key in QUOTED_KEYS:
+    value = f'"{value}"'
   line = f"{key}={value}"
   return f"{line}  {comment}" if comment else line
 
