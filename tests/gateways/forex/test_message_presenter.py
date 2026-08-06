@@ -4,7 +4,7 @@ from worker.gateways.forex.message_presenter import (
   ForexMessagePresenter,
   format_volume,
 )
-from worker.icons import GEAR, REJECTED
+from worker.icons import GEAR, REJECTED, SYNC
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -196,4 +196,18 @@ def test_admin_flat_closed_contains_key_fields():
   assert "strat-A" in msg
   assert "2001.5" in msg
   assert "10" in msg
+  assert "FOOTER" in msg
+
+
+def test_position_reconciled_closed_contains_key_fields():
+  db_pos = {
+    "symbol": "XAUUSD", "strategy": "strat-A", "ref_source_id": "4587420656",
+    "volume": 0.01,
+  }
+  msg = ForexMessagePresenter.position_reconciled_closed(db_pos, 2000.0, "FOOTER")
+  assert "Position Reconciled" in msg and SYNC in msg
+  assert "XAUUSD" in msg and "strat-A" in msg
+  assert "0.01 lot" in msg
+  assert "2000.0" in msg
+  assert "4587420656" in msg
   assert "FOOTER" in msg
