@@ -54,6 +54,7 @@ from worker.schemas.system_schema import (
   SystemActionEnum,
   SystemRetrySignalsSchema,
   SystemSchema,
+  SystemStrategyMagicMapSchema,
   SystemWorkerConnectedErrorSchema,
   SystemWorkerConnectedSchema,
 )
@@ -1044,19 +1045,74 @@ class BaseSignalProcessor(ABC):
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
     """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
 
-    ``RETRY_SIGNALS`` is handled here for every market — the base owns the
-    dedup+timeout gate so both FOREX and CRYPTO get identical replay semantics.
-    Markets that add their own SYSTEM actions override this hook and delegate
-    to ``super()`` so the shared actions still fire.
+    ``RETRY_SIGNALS`` and ``STRATEGY_MAGIC_MAP`` are handled here for every
+    market — the base owns the dedup+timeout gate for replays and the magic-map
+    store so both FOREX and CRYPTO behave identically. Markets that add their own
+    SYSTEM actions override this hook and delegate to ``super()`` so the shared
+    actions still fire.
     """
     if action == SystemActionEnum.RETRY_SIGNALS:
       self._handle_retry_signals(data)
+      return
+    if action == SystemActionEnum.STRATEGY_MAGIC_MAP:
+      self._handle_strategy_magic_map(data)
       return
     log.info(
       "[%s SYSTEM] No handler for action=%s — ignoring.",
       self.name,
       getattr(action, "value", action),
     )
+
+  def _handle_strategy_magic_map(self, data: dict) -> None:
+    """Apply a ``STRATEGY_MAGIC_MAP`` push: store the broker's per-strategy magic
+    map into the live settings (replacing the legacy ``STRATEGY_MAGIC_MAP`` .env
+    value) so the executor and :class:`PositionCDC` resolve magics from it exactly
+    as before.
+
+    Only entries for strategies this worker actually subscribes to (its
+    ``NATS_SUBJECTS`` minus the control subjects) are kept — the map is scoped to
+    this worker so it never claims a magic for a strategy it does not trade. A bad
+    envelope is dropped rather than crashing the SYSTEM listener.
+
+    Normally delivered as the ``WORKER_CONNECTED`` reply, i.e. during ``connect()``
+    before ``start_market_jobs()`` builds the CDC / close-detection jobs, so those
+    jobs read the freshly-stored map. The already-built executor is updated in
+    place via :meth:`_set_executor_magic_map` so magic resolution and
+    ``owned_magics()`` reflect the push immediately, on connect or at runtime.
+    """
+    try:
+      envelope = SystemStrategyMagicMapSchema(**data)
+    except ValidationError as err:
+      log.error("[%s SYSTEM] STRATEGY_MAGIC_MAP envelope invalid: %s", self.name, err)
+      return
+
+    subscribed = set(self._subscribed_strategies())
+    mapping = {
+      strategy: magic
+      for strategy, magic in envelope.strategy_magic_map.items()
+      if strategy in subscribed
+    }
+    ignored = sorted(set(envelope.strategy_magic_map) - subscribed)
+    if ignored:
+      log.warning(
+        "[%s SYSTEM] STRATEGY_MAGIC_MAP: ignoring %d entr%s for strategies this "
+        "worker does not subscribe to: %s",
+        self.name, len(ignored), "y" if len(ignored) == 1 else "ies", ", ".join(ignored),
+      )
+
+    self.settings["strategy_magic_map"] = mapping
+    self._set_executor_magic_map(mapping)
+    log.info(
+      "[%s SYSTEM] STRATEGY_MAGIC_MAP applied | strategies=%d", self.name, len(mapping)
+    )
+
+  def _set_executor_magic_map(self, mapping: dict) -> None:  # noqa: B027 - optional hook
+    """Propagate an updated strategy→magic map to the already-built executor.
+
+    Default no-op: a market with no magic concept (e.g. CRYPTO) resolves nothing
+    on the executor and its :class:`PositionCDC` reads the map straight from
+    settings, so storing it there is enough. FOREX overrides this to refresh the
+    executor's in-memory map (magic resolution + ``owned_magics()``)."""
 
   def _handle_retry_signals(self, data: dict) -> None:
     """Execute a RETRY_SIGNALS replay: for each signal, drop it if already

@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+import pytest
 from helpers import FakePlatformGateway, make_platform_position, make_signal
 
 from worker.gateways.forex.executor import ForexExecutor
@@ -120,3 +121,36 @@ def test_close_all_for_one_strategy_leaves_the_others_position_open(config):
   closed_tickets = [c["position"].ticket for c in ex._gateway.closed]
   assert closed_tickets == [201]
   assert 202 not in closed_tickets
+
+
+def test_set_strategy_magic_map_replaces_resolution_and_owned_magics(config):
+  """The broker pushes the magic map at runtime via SYSTEM STRATEGY_MAGIC_MAP, so
+  ``set_strategy_magic_map`` must repoint both ``_magic_for`` and
+  ``owned_magics`` at the new mapping."""
+  ex = _executor(config)
+  assert ex._magic_for("strat-1") == 12345
+  assert ex.owned_magics() == {12345}
+
+  ex.set_strategy_magic_map({"strat-2": 999, "strat-3": 111})
+  assert ex._magic_for("strat-2") == 999
+  assert ex.owned_magics() == {999, 111}
+  # The previous strategy is gone — resolving it now raises (unmapped strategy).
+  with pytest.raises(KeyError):
+    ex._magic_for("strat-1")
+
+
+def test_set_strategy_magic_map_none_clears(config):
+  """A ``None``/empty push clears the worker's magics rather than crashing."""
+  ex = _executor(config)
+  ex.set_strategy_magic_map(None)
+  assert ex.owned_magics() == set()
+
+
+def test_set_strategy_magic_map_copies_input(config):
+  """The executor stores a copy so a later mutation of the caller's dict — the
+  live settings entry — can't silently change the executor's map."""
+  ex = _executor(config)
+  source = {"strat-9": 42}
+  ex.set_strategy_magic_map(source)
+  source["strat-9"] = 0
+  assert ex._magic_for("strat-9") == 42

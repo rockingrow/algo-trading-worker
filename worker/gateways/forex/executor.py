@@ -71,6 +71,16 @@ class ForexExecutor:
     terminal-close detection)."""
     return set(self._strategy_magic_map.values())
 
+  def set_strategy_magic_map(self, mapping: Optional[Dict[str, int]]) -> None:
+    """Replace the per-strategy magic map at runtime.
+
+    The broker owns the mapping and pushes it via the SYSTEM
+    ``STRATEGY_MAGIC_MAP`` action (normally the ``WORKER_CONNECTED`` reply, before
+    trading starts), so :meth:`_magic_for` and :meth:`owned_magics` resolve
+    against the broker-managed mapping rather than a static .env value. A copy is
+    stored so a later mutation of the caller's dict can't alter it underneath us."""
+    self._strategy_magic_map = dict(mapping or {})
+
   # ── Symbol / volume helpers (delegated to the agnostic math) ──────────── #
 
   def get_symbol(self, base_symbol: str) -> str:

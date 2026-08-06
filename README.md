@@ -567,16 +567,17 @@ The flag is **in-memory only** — a worker restart resets it to *allowed*. Ther
 
 ## 🚦 SYSTEM Subject
 
-The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Inbound messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp`) and dispatches the action to the market-specific `_handle_system_action` hook. An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless. FOREX currently handles no inbound `SYSTEM` actions besides the `WORKER_CONNECTED` reply.
+The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Inbound messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp` + `account_id`) and dispatches the action to the market-specific `_handle_system_action` hook. Two actions are handled by the **base** for every market — `RETRY_SIGNALS` (signal replay) and `STRATEGY_MAGIC_MAP` (per-strategy magic map, see below) — while a market adds its own (CRYPTO handles `CRYPTO_LEVERAGE_INIT`). An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless.
 
 ### WORKER_CONNECTED handshake (request/reply)
 
-Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected` sends `WORKER_CONNECTED` on `SYSTEM` as a NATS **request** (`nc.request`, not a fire-and-forget publish) so the broker always replies on a private inbox rather than staying silent. The broker's reply is one of three actions:
+Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected` sends `WORKER_CONNECTED` on `SYSTEM` as a NATS **request** (`nc.request`, not a fire-and-forget publish) so the broker always replies on a private inbox rather than staying silent. The broker's reply is one of these actions:
 
 | Reply action | Meaning | Worker behaviour |
 | --- | --- | --- |
 | `CRYPTO_LEVERAGE_INIT` | Crypto worker, config attached | Routed through the normal `_handle_system_action` hook — applies `symbols` + `default_leverage` exactly as if received on the subscription (see below); handshake complete |
-| `WORKER_CONNECTED_ACK` | Non-crypto (or no init needed) | Handshake complete, nothing further to apply |
+| `STRATEGY_MAGIC_MAP` | FOREX worker, magic map attached | Routed through `_handle_system_action` — stores the per-strategy magic map into settings and refreshes the executor (see [Action: `STRATEGY_MAGIC_MAP`](#action-strategy_magic_map-forex)); handshake complete |
+| `WORKER_CONNECTED_ACK` | No init needed (e.g. a worker with no magics/leverage to push) | Handshake complete, nothing further to apply |
 | `WORKER_CONNECTED_ERROR` | Broker received it but couldn't process it (missing settings, invalid leverage config, …) | Logged with `reason` for operator attention; not retried — a config problem on the broker side isn't fixed by resending the same request |
 
 If the broker doesn't reply within the request timeout (5s), the worker retries with backoff (5s → 10s → 20s, capped) **indefinitely** — the handshake is idempotent on the broker side and gates trading (crypto specifically needs `default_leverage` before it's safe to size an order), so the worker blocks here rather than falling back to running without config. A random 0–500ms jitter is added before the very first attempt only, to desynchronise a reconnect storm (every connected worker reconnects and re-announces at roughly the same instant after a NATS/broker restart). From the 3rd consecutive timeout onward, the retry log escalates from `WARNING` to `ERROR` so it's forwarded to Telegram (`TelegramLogHandler`), alerting an operator that the broker looks unreachable rather than just transiently slow.
@@ -634,13 +635,44 @@ Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisatio
 2. Ensure the broker/exchange connection; abort if unreachable.
 3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)`. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are unchanged; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
 
+### Action: `STRATEGY_MAGIC_MAP` (FOREX)
+
+Pushes the **per-strategy MT5 magic-number map** to the worker. The broker owns this mapping centrally and pushes it here, so it is **no longer configured per worker in `.env`** — `STRATEGY_MAGIC_MAP` in `.env` is now only an offline/legacy fallback default (empty by default), and a broker push always replaces it. Normally returned as the reply to this worker's `WORKER_CONNECTED` handshake (so it applies during `connect()`, before `start_market_jobs` builds the CDC and terminal-close jobs); it can also be sent standalone on the `SYSTEM` subject when the mapping changes.
+
+Handled generically by `BaseSignalProcessor._handle_strategy_magic_map` for every market (CRYPTO stores it too — its `PositionCDC` stamps `strategy_code` from it — but has no executor magic to refresh):
+
+1. Parse `SystemStrategyMagicMapSchema`; drop on validation error.
+2. **Scope to this worker:** keep only entries whose key is one of the strategies this worker subscribes to (its `NATS_SUBJECTS` minus the control subjects, via `_subscribed_strategies()`). Any entry for a strategy the worker does not trade is ignored with a warning, so the worker never claims a magic it shouldn't own.
+3. Store the filtered map into the live settings under `strategy_magic_map` — the exact key the old `.env` value populated, so `PositionCDC` and every other consumer read it unchanged.
+4. Refresh the already-built executor via the `_set_executor_magic_map` hook. FOREX calls `ForexExecutor.set_strategy_magic_map`, so `_magic_for` (order stamping) and `owned_magics()` (account-wide queries + `MT5EventJob` terminal-close detection) reflect the new map immediately; CRYPTO no-ops.
+
+| Field | Behaviour |
+| --- | --- |
+| `strategy_magic_map` | `{strategy_name: magic_number}` for the strategies this worker subscribes to. Entries for other strategies are ignored; an empty map clears the worker's magics |
+
+#### STRATEGY_MAGIC_MAP Payload
+
+```json
+{
+  "action": "STRATEGY_MAGIC_MAP",
+  "account_id": "FOREX-MT5-1234567",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "strategy_magic_map": {
+    "MT5_GOLD_M5_V1": 20260409,
+    "MT5_FX_M15_V2": 20260410
+  }
+}
+```
+
+`action`, `timestamp` and `account_id` are required; `strategy_magic_map` defaults to an empty object.
+
 ---
 
 ## 🧠 Signal Execution — Key Design Decisions
 
 - **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation differs per gateway:
 
-  - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number via `STRATEGY_MAGIC_MAP`. `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
+  - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number, supplied by the broker via the SYSTEM [`STRATEGY_MAGIC_MAP`](#action-strategy_magic_map-forex) push (stored in settings under `strategy_magic_map`). `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
   - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol)` DB invariant and the `strategy` column.
 
 - **Multiple strategies on one symbol — FOREX only (`FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL`, default `false`):** By default a `LONG`/`SHORT` entry on a symbol **another strategy already holds** is rejected as a netting conflict (`SignalHandler._handle_entry`, before any cleanup runs). With the toggle on, a FOREX worker lets the entry through and the two strategies hold *parallel* positions on that symbol. The handler asks the market for the capability (`BaseMarketStrategy.allows_multi_strategy_per_symbol`) rather than reading config directly, and only `ForexMarket` ever reports it:
@@ -692,7 +724,7 @@ Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisatio
 
 Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/gateways/forex/mt5/close_detector.py`), which:
 
-1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (all `STRATEGY_MAGIC_MAP` values, via `ForexExecutor.owned_magics()`) → `current_tickets`
+1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (all `strategy_magic_map` values from the broker's `STRATEGY_MAGIC_MAP` push, via `ForexExecutor.owned_magics()`) → `current_tickets`
 2. Diffs against an internal `seen_tickets` set maintained across polls
 3. For each ticket that disappeared, calls `mt5.history_deals_get(position=ticket)` to find the closing deal
 4. Reads `deal.reason` to classify the closure:

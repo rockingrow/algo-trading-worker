@@ -264,6 +264,12 @@ class StrategySettings(BaseSettings):
   model_config = _GROUP_CONFIG
 
   slippage_deviation: int = _opt(100, "SLIPPAGE_DEVIATION", "slippage_deviation")
+  # Per-strategy MT5 magic numbers. The broker now owns this mapping and pushes it
+  # at runtime via the SYSTEM ``STRATEGY_MAGIC_MAP`` action (normally the
+  # WORKER_CONNECTED reply), scoped to the strategies this worker subscribes to —
+  # BaseSignalProcessor._handle_strategy_magic_map overwrites this key in the live
+  # settings dict on receipt. The ``STRATEGY_MAGIC_MAP`` env var is kept only as an
+  # offline/legacy fallback default (empty by default); a broker push replaces it.
   magic_map: dict[str, int] = _opt({}, "STRATEGY_MAGIC_MAP", "strategy_magic_map")
   use_custom_position_tp1_percent: bool = _opt(
     False, "USE_CUSTOM_POSITION_TP1_PERCENT", "use_custom_position_tp1_percent"

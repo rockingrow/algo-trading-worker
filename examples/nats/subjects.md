@@ -114,6 +114,7 @@ shared `SYSTEM` subject, so they reach only the worker that asked.
 | `WORKER_CONNECTED_ACK` | reply inbox | Handshake accepted; no extra config needed (e.g. a non-crypto worker) | [`system.worker_connected_ack.json`](system.worker_connected_ack.json) |
 | `WORKER_CONNECTED_ERROR` | reply inbox | Handshake received but the broker could not build the initial config (carries `reason`) | [`system.worker_connected_error.json`](system.worker_connected_error.json) |
 | `CRYPTO_LEVERAGE_INIT` | reply inbox or `SYSTEM` | Push allowed crypto `symbols` + `default_leverage` to a crypto worker (on connect, or when an admin changes the setting) | [`system.crypto_leverage_init.json`](system.crypto_leverage_init.json) |
+| `STRATEGY_MAGIC_MAP` | reply inbox or `SYSTEM` | Push the per-strategy MT5 magic-number map (`strategy_magic_map`) to a FOREX worker, scoped to the strategies it subscribes to. Replaces the static `STRATEGY_MAGIC_MAP` .env value; the worker keeps only entries for its own `NATS_SUBJECTS` strategies and stores them in settings | [`system.strategy_magic_map.json`](system.strategy_magic_map.json) |
 | `RETRY_SIGNALS` | reply inbox or `SYSTEM` | Replay of recent SIGNALs for the worker's subscribed strategies so a reconnecting worker catches up; each is deduped by `signal_id` and age-gated against `MAX_RETRY_TIMEOUT` | [`system.retry_signals.json`](system.retry_signals.json) |
 
 ---

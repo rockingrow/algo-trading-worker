@@ -1160,3 +1160,96 @@ def test_retry_signals_dispatched_via_worker_connected_reply():
 
   assert len(proc.db.inserted) == 1
   assert proc.db.inserted[0]["symbol"] == "ZZZ"
+
+
+# ── STRATEGY_MAGIC_MAP SYSTEM action ───────────────────────────────────────── #
+
+
+def _magic_map_payload(mapping, account_id="FAKE_MKT-FAKE_GW-acct-1"):
+  """Serialise a STRATEGY_MAGIC_MAP envelope with the given map."""
+  import json as _json
+
+  return _json.dumps({
+    "action": SystemActionEnum.STRATEGY_MAGIC_MAP.value,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "account_id": account_id,
+    "strategy_magic_map": mapping,
+  })
+
+
+def _magic_map_proc(nats_subjects="MT5_GOLD,MT5_FX,ADMIN,SYSTEM"):
+  """A connected FakeProcessor wired to run the real base STRATEGY_MAGIC_MAP
+  handler and record every executor-refresh call."""
+  proc = FakeProcessor({"success": True})
+  proc.settings = {
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "nats_subjects": nats_subjects,
+  }
+  proc.executor_magic_maps = []
+  proc._set_executor_magic_map = lambda mapping: proc.executor_magic_maps.append(mapping)
+  # Route through the real base dispatch so _handle_strategy_magic_map runs
+  # instead of the FakeProcessor's test-only capture.
+  proc._handle_system_action = lambda action, data: BaseSignalProcessor._handle_system_action(
+    proc, action, data
+  )
+  return proc
+
+
+def test_strategy_magic_map_stored_in_settings_and_propagated_to_executor():
+  # A subscribed-strategy map is stored under the same settings key the legacy
+  # .env value used, and pushed to the already-built executor.
+  proc = _magic_map_proc()
+  raw = _magic_map_payload({"MT5_GOLD": 20260409, "MT5_FX": 20260410})
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409, "MT5_FX": 20260410}
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409, "MT5_FX": 20260410}]
+
+
+def test_strategy_magic_map_filters_to_subscribed_strategies():
+  # Only entries for strategies in NATS_SUBJECTS are kept — a magic for a
+  # strategy this worker does not subscribe to is ignored, so both settings and
+  # the executor see just the subscribed subset.
+  proc = _magic_map_proc(nats_subjects="MT5_GOLD,ADMIN,SYSTEM")
+  raw = _magic_map_payload({"MT5_GOLD": 20260409, "MT5_OTHER": 999})
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409}]
+
+
+def test_strategy_magic_map_empty_clears():
+  # An empty push clears the worker's magics (still propagated to the executor).
+  proc = _magic_map_proc()
+  proc._process_message(NatsSubjectEnum.SYSTEM, _magic_map_payload({}))
+
+  assert proc.settings["strategy_magic_map"] == {}
+  assert proc.executor_magic_maps == [{}]
+
+
+def test_strategy_magic_map_invalid_envelope_dropped_without_side_effects():
+  # A non-int magic fails schema validation → drop the message, leaving settings
+  # and the executor untouched (never crash the SYSTEM listener).
+  proc = _magic_map_proc()
+  raw = _magic_map_payload({"MT5_GOLD": "not-an-int"})
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert "strategy_magic_map" not in proc.settings
+  assert proc.executor_magic_maps == []
+
+
+def test_strategy_magic_map_dispatched_via_worker_connected_reply():
+  # STRATEGY_MAGIC_MAP is a valid WORKER_CONNECTED reply (the broker's normal
+  # delivery path on connect): the reply router must apply it through the same
+  # handler as a SYSTEM-subject push.
+  proc = _magic_map_proc()
+  proc.subscriber = None
+  proc.publisher = FakePublisher([_magic_map_payload({"MT5_GOLD": 20260409})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409}]

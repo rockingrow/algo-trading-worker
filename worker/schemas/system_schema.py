@@ -25,6 +25,12 @@ class SystemActionEnum(str, Enum):
   # signal_id and only executed when still within MAX_RETRY_TIMEOUT of its
   # own timestamp — a stale replay is dropped rather than fired late.
   RETRY_SIGNALS = "RETRY_SIGNALS"
+  # Inbound (broker → worker): push the per-strategy magic-number map. Replaces
+  # the static STRATEGY_MAGIC_MAP .env config — the broker owns the mapping and
+  # pushes it (as the WORKER_CONNECTED reply, or standalone on SYSTEM), scoped to
+  # the strategies this worker subscribes to. The worker stores it in settings so
+  # the executor / PositionCDC resolve magics from it exactly as before.
+  STRATEGY_MAGIC_MAP = "STRATEGY_MAGIC_MAP"
 
 
 class SystemSchema(BaseModel):
@@ -87,3 +93,20 @@ class SystemRetrySignalsSchema(SystemSchema):
 
   action: SystemActionEnum = SystemActionEnum.RETRY_SIGNALS
   signals: list[SignalSchema] = Field(default_factory=list)
+
+
+class SystemStrategyMagicMapSchema(SystemSchema):
+  """Broker → worker push of the per-strategy magic-number map.
+
+  ``strategy_magic_map`` maps each strategy name (a subject in the worker's
+  ``NATS_SUBJECTS``) to its dedicated MT5 magic number. It replaces the static
+  ``STRATEGY_MAGIC_MAP`` .env config: the broker owns the mapping centrally and
+  pushes it — normally as the reply to this worker's ``WORKER_CONNECTED``
+  handshake (before trading starts), or standalone on the ``SYSTEM`` subject when
+  the mapping changes. The worker keeps only the entries for the strategies it
+  actually subscribes to and stores them in settings, from where the executor and
+  ``PositionCDC`` read them exactly as they read the old .env value. Sending an
+  empty map clears the worker's magics."""
+
+  action: SystemActionEnum = SystemActionEnum.STRATEGY_MAGIC_MAP
+  strategy_magic_map: dict[str, int] = Field(default_factory=dict)

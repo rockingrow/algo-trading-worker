@@ -84,7 +84,7 @@ DESCRIPTIONS = {
   "MAX_LEVERAGE_CAP": "Upper bound applied by the leverage init job (e.g. 10)",
   "MIN_LEVERAGE_CAP": "Fallback floor when a -4421 cap can't be parsed (e.g. 5)",
   "SLIPPAGE_DEVIATION": "Max slippage in points (100 = $1.00)",
-  "STRATEGY_MAGIC_MAP": "JSON mapping each strategy/subject to its MT5 magic number",
+  "STRATEGY_MAGIC_MAP": "Legacy/offline fallback only — the broker now pushes magics via the SYSTEM STRATEGY_MAGIC_MAP action",
   "POSITION_TP1_PERCENT": "Percent of the position closed at the first take-profit",
   "TP1_MOVE_SL_TO_BREAKEVEN": "After TP1, move stop to breakeven (else keep entry SL)",
   "CAPITAL": "Initial capital used for risk sizing",

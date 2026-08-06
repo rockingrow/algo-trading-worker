@@ -296,6 +296,14 @@ class ForexSignalProcessor(BaseSignalProcessor):
   def _magic_for(self, strategy: str) -> Optional[int]:
     return self.executor._magic_for(strategy)
 
+  def _set_executor_magic_map(self, mapping: Dict[str, int]) -> None:
+    """Refresh the executor's magic map when the broker pushes a SYSTEM
+    ``STRATEGY_MAGIC_MAP`` (see ``BaseSignalProcessor._handle_strategy_magic_map``),
+    so magic resolution and ``owned_magics()`` reflect it. The push normally
+    arrives on connect, before ``start_market_jobs`` builds the close-detection
+    job from ``owned_magics()``."""
+    self.executor.set_strategy_magic_map(mapping)
+
   def _position_cdc_kwargs(self) -> Dict[str, Any]:
     return {
       "account_info_fn": self.gateway.get_account,
