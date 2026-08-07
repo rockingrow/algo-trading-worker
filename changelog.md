@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `PositionEvent` (the `TRADE` subject payload) gains a `gateway` field, populated from `BaseSignalProcessor._gateway_value` and threaded through `PositionCDC(gateway=...)`. Its market field is renamed `market_type` → `market` to match the Broker's field name; the broker can now upsert a Trade row by the full `(market, gateway, account_id, ticket)` key instead of `account_id + ticket`.
   - `examples/signals/admin.flat.json` updated with `market` / `gateway`.
   - NATS error/disconnect callbacks now deduplicate at source — nats.py fires `error_cb`/`disconnected_cb` from multiple internal coroutines (reader, flusher, pinger) for the same connection event, producing duplicate Telegram error-log messages that the downstream `TelegramLogHandler` dedup did not reliably catch. A per-connection `_CallbackDedup` guard on both `NATSSubscriber` and `NATSPublisher` now suppresses identical callbacks within the configured `TELEGRAM_LOG_DEDUP_WINDOW` (default 60 s) before they reach the logger.
+- Extracted the entry guards (`MAX_OPEN_ORDERS` cap and one-open-order-per-symbol) out of `BaseSignalProcessor` into a new `worker/gateways/guard.py` module — `guard.symbol_open_rejection(db_service, signal)` / `guard.max_open_orders_rejection(db_service, settings, signal)` are now plain functions (taking the DB service/settings/signal explicitly) rather than processor methods, called from `_process_signal` in their place. Pure code-organization change with no behavioural difference; keeps `processor.py` focused on message dispatch.
+
+### Fixed
+
+- A FOREX signal for a strategy missing from `STRATEGY_MAGIC_MAP` used to bubble a `KeyError` out of the executor as an unhandled "manual reconciliation may be required" error at the top of the NATS loop — alarming for the operator and giving no clue what to fix. `BaseSignalProcessor._process_signal` now probes `_magic_for(signal.strategy)` up front; on `KeyError`/`ValueError` the signal is skipped cleanly with an `ERROR` log (naming the missing strategy and pointing at `STRATEGY_MAGIC_MAP`/`NATS_SUBJECTS`) and a `signal_rejected` operator notification, before any DB row is written or the broker is contacted. CRYPTO's `_magic_for` always returns `None`, so the guard is a no-op there.
 
 ## [1.2.0] - 2026-07-18
 
