@@ -343,6 +343,29 @@ class BaseSignalProcessor(ABC):
       )
       return
 
+    # Unknown-strategy guard: a signal whose strategy has no isolation handle
+    # (FOREX: no STRATEGY_MAGIC_MAP entry) can't be routed — every code path
+    # downstream calls _magic_for and would raise KeyError deep in the executor,
+    # bubbling up as an unhandled "manual reconciliation may be required" error.
+    # Skip cleanly with an operator alert so the misconfig (subscribed on NATS
+    # but not mapped) is visible and correctable. Crypto's _magic_for returns
+    # None, so this is a no-op there.
+    try:
+      self._magic_for(signal.strategy)
+    except (KeyError, ValueError) as exc:
+      reason = (
+        f"Unknown strategy '{signal.strategy}' — no STRATEGY_MAGIC_MAP entry."
+      )
+      log.error(
+        "[%s Process] Signal SKIPPED — %s (%s) | %s | %s. "
+        "Add it to STRATEGY_MAGIC_MAP or remove it from NATS_SUBJECTS.",
+        self.name, reason, exc, signal.symbol, signal.action.value,
+      )
+      self.ctx.notifier.send_message(
+        self.presenter.signal_rejected(reason, self._current_footer())
+      )
+      return
+
     # Scale-in (averaging): the broker has already scaled SL/TP1/TP2/quantity in
     # the payload, so every downstream step (SL/TP placement, persistence,
     # notifications) consumes them verbatim. The only re-derivation happens inside

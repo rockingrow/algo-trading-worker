@@ -226,7 +226,9 @@ def test_entry_signal_inserts_position_with_market_and_magic():
   assert row["market_type"] == "FAKE_MKT"
   assert row["action"] == "long"
   assert proc.notifications == ["filled:LONG:555"]
-  assert proc.magic_calls == ["strat-1"]
+  # _magic_for is called twice: once by the unknown-strategy guard, once by
+  # _persist_success when stamping the OPENED row's strategy_code.
+  assert proc.magic_calls == ["strat-1", "strat-1"]
 
 
 def test_exit_signal_updates_status():
@@ -446,6 +448,35 @@ def test_max_open_orders_zero_disables_cap():
 
   assert proc.db.rejected == []
   assert len(proc.db.inserted) == 1
+
+
+def test_unknown_strategy_signal_is_skipped_with_alert():
+  # A FOREX signal for a strategy that isn't in STRATEGY_MAGIC_MAP used to bubble
+  # a KeyError out of the executor as an unhandled "manual reconciliation may be
+  # required" error. It must now be skipped cleanly with an operator alert.
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  seen = _capturing_handler(proc, {"success": True})
+
+  def _raise_key_error(strategy):
+    proc.magic_calls.append(strategy)
+    raise KeyError(f"Strategy '{strategy}' not found in strategy_magic_map.")
+
+  proc._magic_for = _raise_key_error
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, strategy="MT5_MULTI_M5_V1").model_dump_json(),
+  )
+
+  # Broker execution never runs; nothing recorded in the DB.
+  assert seen == []
+  assert proc.db.inserted == []
+  assert proc.db.logged == []
+  assert proc.db.rejected == []
+  assert proc.notifications == []
+  # Operator is alerted via the management notifier (routes to Telegram).
+  assert len(proc.mgmt_notifications) == 1
+  assert "MT5_MULTI_M5_V1" in proc.mgmt_notifications[0]
 
 
 def test_admin_subject_routed_to_hook():
