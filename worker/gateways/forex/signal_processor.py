@@ -8,8 +8,10 @@ Implements the broker-specific hooks of
 :class:`~worker.gateways.processor.BaseSignalProcessor`: the platform gateway
 (built by :class:`~worker.gateways.forex.factory.PlatformFactory`), the forex
 executor, reconnect handling, and the platform background jobs (health thread,
-terminal-close detection). Everything market-agnostic — the NATS loop, signal
-persistence, notifications, position CDC — is inherited from the base.
+terminal-close detection, and the
+:class:`~worker.gateways.forex.reconcile_job.ForexReconcileJob` broker↔DB
+backstop). Everything market-agnostic — the NATS loop, signal persistence,
+notifications, position CDC — is inherited from the base.
 
 Nothing here imports MetaTrader5 directly; the concrete platform (and its heavy
 native stack) is loaded only by the factory inside the child process
@@ -25,9 +27,12 @@ from worker.context import WorkerContext
 from worker.gateways.forex.executor import ForexExecutor
 from worker.gateways.forex.factory import PlatformFactory
 from worker.gateways.forex.message_presenter import ForexMessagePresenter
+from worker.gateways.forex.reconcile_job import ForexReconcileJob
 from worker.gateways.processor import BaseSignalProcessor
 from worker.icons import CONNECTED, DISCONNECTED, WARNING
 from worker.logger import get_logger
+from worker.schemas.job_schema import LogAuthorEnum
+from worker.schemas.position_schema import PositionStatusEnum
 from worker.services.notification_service import _box
 from worker.settings import (
   MT5_HEALTH_INTERVAL,
@@ -239,6 +244,75 @@ class ForexSignalProcessor(BaseSignalProcessor):
     )
     if job is not None:
       job.start(stop_event=stop_event)
+
+    # Durability backstop: the close-detection job above only reports closes the
+    # *terminal* initiated — a position closed by our own order_send (e.g. a TP1
+    # partial whose volume equalled the whole position) is deliberately skipped
+    # there, and a close during downtime is never seen at all. This periodic
+    # reconciler marks any DB-open row that no longer matches a live platform
+    # position as closed, so a missed close self-heals instead of leaving the row
+    # stuck OPENED/TP1 and blocking later signals.
+    ForexReconcileJob(
+      db_service=self.ctx.db_service,
+      executor=self.executor,
+      handler=self._on_missed_close,
+      gateway=self.gateway,
+      magic_for=self._magic_for,
+    ).start(stop_event=stop_event)
+
+  # ── Reconciler backstop (from ForexReconcileJob) ──────────────────────── #
+
+  def _on_missed_close(self, row: Dict[str, Any]) -> None:
+    """Mark a DB-open position closed after the reconciler confirmed it no longer
+    exists on the platform (a close the terminal-event job never reported).
+
+    The exact reason/price is unknown — the deal-history event is what carries
+    those — so the close is recorded as ``TERMINAL_CLOSED`` (the same status
+    ``MT5EventJob`` uses for a platform-side close) with a best-effort mid price
+    and a comment flagging it as reconciled. The CDC job then propagates the
+    status downstream as usual.
+    """
+    close_price = self._best_effort_price(row.get("symbol"))
+    comment = "Reconciled: closed on broker (close event missed)"
+
+    self.ctx.db_service.log_position(
+      strategy=row.get("strategy"),
+      ref_id=None,
+      ref_source_id=row.get("ref_source_id"),
+      symbol=row["symbol"],
+      action=PositionStatusEnum.TERMINAL_CLOSED.value,
+      volume=row.get("volume"),
+      price=close_price,
+      sl=None,
+      tp1=None,
+      gateway_return_code=0,
+      comment=comment,
+      author=LogAuthorEnum.TERMINAL.value,
+      market_type=self._market_type,
+    )
+    self.ctx.db_service.update_position_status(
+      ref_source_id=row.get("ref_source_id"),
+      status=PositionStatusEnum.TERMINAL_CLOSED,
+      closed_price=close_price,
+      gateway_return_code=0,
+      comment=comment,
+    )
+    self.ctx.channel_notifier.send_message(
+      ForexMessagePresenter.position_reconciled_closed(
+        row, close_price, self._account_footer()
+      )
+    )
+
+  def _best_effort_price(self, symbol: Optional[str]) -> Optional[float]:
+    """Current mid price as an approximate close price; ``None`` if unreadable."""
+    try:
+      tick = self.gateway.get_tick(self.executor.get_symbol(symbol))
+    except Exception as exc:  # pragma: no cover - best effort
+      log.warning("[FOREX Reconcile] tick unavailable for %s: %s", symbol, exc)
+      return None
+    if tick is None:
+      return None
+    return (tick.bid + tick.ask) / 2
 
   # ── ADMIN FLAT match keys (forex reconciles against live tickets) ──────── #
 

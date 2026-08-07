@@ -26,6 +26,7 @@ from worker.icons import (
   GEAR,
   STOP,
   SUCCESS,
+  SYNC,
   WARNING,
 )
 from worker.schemas.signal_schema import SignalSchema
@@ -127,6 +128,24 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
       f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
+      f"{_DIVIDER}\n"
+      f"{footer}"
+    )
+
+  @staticmethod
+  def position_reconciled_closed(db_pos: dict, close_price: Any, footer: str) -> str:
+    """The periodic reconciler found a DB-open position that no longer exists on
+    the platform (a close no terminal event reported — e.g. a TP1 partial that
+    closed the whole position) and synced the DB to live state."""
+    return _box(
+      f"{SYNC} <b>Position Reconciled — Closed on Broker</b>\n\n"
+      f"The position is <b>no longer open</b> on the platform; the DB was synced "
+      f"from live state.\n"
+      f"Symbol: <b>{db_pos.get('symbol')}</b>\n"
+      f"Strategy: <b>{db_pos.get('strategy')}</b>\n"
+      f"Volume: <b>{db_pos.get('volume')} lot</b>\n"
+      f"Approx Close: <b>{close_price}</b>\n"
+      f"Source Ticket: <b>{db_pos.get('ref_source_id')}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )
