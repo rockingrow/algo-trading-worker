@@ -239,6 +239,30 @@ def test_private_missing_required_field_dropped():
   assert proc.executor.closed == []
 
 
+def test_private_numeric_account_id_is_coerced_to_str():
+  # Broker publishes a private ADMIN FLAT with ``account_id`` as an int
+  # (e.g. MT5 login 413652379) — regression for a silently-dropped FLAT where
+  # pydantic v2's non-coercing ``str`` field rejected the numeric payload,
+  # logging a ValidationError but never closing the position. The private
+  # schema now normalises int → str so the identity re-check compares equal
+  # to the worker's stringified ``_account_id``.
+  proc = FakeProc(
+    account_id="413652379", market_type="FOREX", gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+  )
+  raw = json.dumps({
+    "action": "FLAT",
+    "timestamp": "2026-08-08T21:29:02+00:00",
+    "strategy": None,
+    "symbol": None,
+    "account_id": 413652379,  # <-- int, not str
+    "market": "FOREX",
+    "gateway": "MT5",
+  })
+  proc._handle_admin_message(raw, private=True)
+  assert len(proc.executor.closed) == 1
+
+
 def test_private_colliding_account_id_across_gateways_only_matches_owner():
   # Same raw account_id ("shared@example.com") used on two different gateways —
   # only the worker whose (market, gateway) also matches should act.
