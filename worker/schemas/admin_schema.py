@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class AdminActionEnum(str, Enum):
@@ -42,7 +42,15 @@ class PrivateAdminSchema(AdminMessageSchema):
   The private subject addresses exactly one worker, so the payload must carry
   the full composite identity: ``market``/``gateway``/``account_id`` are all
   **required**. The worker re-validates that they match its own identity before
-  acting (defence-in-depth on top of the subject match)."""
+  acting (defence-in-depth on top of the subject match).
+
+  ``coerce_numbers_to_str`` lets ``account_id`` arrive as either the raw broker
+  id (e.g. MT5 login as int ``413652379``) or the already-stringified form —
+  both are normalised to ``str`` before the identity re-check. Without this,
+  pydantic v2 rejects the int payload with a ``string_type`` ValidationError
+  and the FLAT is silently dropped (logged but no close happens)."""
+
+  model_config = ConfigDict(coerce_numbers_to_str=True)
 
   market: str
   gateway: str
