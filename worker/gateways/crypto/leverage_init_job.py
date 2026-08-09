@@ -69,7 +69,8 @@ class LeverageInitJob:
 
     log.info(
       "[LeverageInit] Initialising leverage symbols: %s (cap=%s)…",
-      ", ".join(self._symbols), self._cap,
+      ", ".join(self._symbols),
+      self._cap,
     )
     for raw in self._symbols:
       self._init_one(raw)
@@ -80,22 +81,31 @@ class LeverageInitJob:
     if max_lev is None or max_lev <= 0:
       log.warning(
         "[LeverageInit] %s (%s): max leverage unavailable — skipped.",
-        raw_symbol, resolved,
+        raw_symbol,
+        resolved,
       )
       return
 
     target = min(max_lev, self._cap)
-    applied = self._gateway.set_leverage(resolved, target, min_leverage_cap=self._min_cap)
+    applied = self._gateway.set_leverage(
+      resolved, target, min_leverage_cap=self._min_cap
+    )
     if applied:
       # `applied` can be below `target` when an account-level cap (sub-account /
       # VIP tier) — invisible to get_max_leverage — forces the gateway lower.
       log.info(
         "[LeverageInit] %s (%s): exchange_max=%s cap=%s → set leverage=%s",
-        raw_symbol, resolved, max_lev, self._cap, applied,
+        raw_symbol,
+        resolved,
+        max_lev,
+        self._cap,
+        applied,
       )
     else:
       log.error(
         "[LeverageInit] %s (%s): set_leverage(%s) failed — symbol left at its "
         "current exchange setting.",
-        raw_symbol, resolved, target,
+        raw_symbol,
+        resolved,
+        target,
       )

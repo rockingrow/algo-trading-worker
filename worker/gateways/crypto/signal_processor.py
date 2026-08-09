@@ -82,7 +82,8 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     ok = self.gateway.set_position_mode(hedge_mode)
     log.info(
       "[CRYPTO Process] set_position_mode(%s) -> %s",
-      "HEDGE" if hedge_mode else "ONE-WAY", "ok" if ok else "failed, keeping account's current mode",
+      "HEDGE" if hedge_mode else "ONE-WAY",
+      "ok" if ok else "failed, keeping account's current mode",
     )
     return True
 
@@ -107,19 +108,28 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     if self.settings.get("use_custom_leverage", False):
       log.info(
         "[CRYPTO Process] use_custom_leverage on — overriding requested cap=%s with MAX_LEVERAGE_CAP=%s",
-        max_leverage_cap, self.settings.get("max_leverage_cap", 10),
+        max_leverage_cap,
+        self.settings.get("max_leverage_cap", 10),
       )
       max_leverage_cap = self.settings.get("max_leverage_cap", 10)
     log.info(
       "[CRYPTO Process] Running leverage init | symbols=%s cap=%s",
-      symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
-      max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
+      symbols
+      if symbols is not None
+      else (self.settings.get("crypto_leverage_init_symbols") or []),
+      max_leverage_cap
+      if max_leverage_cap is not None
+      else self.settings.get("max_leverage_cap", 10),
     )
     try:
       LeverageInitJob(
         gateway=self.gateway,
-        symbols=symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
-        max_leverage_cap=max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
+        symbols=symbols
+        if symbols is not None
+        else (self.settings.get("crypto_leverage_init_symbols") or []),
+        max_leverage_cap=max_leverage_cap
+        if max_leverage_cap is not None
+        else self.settings.get("max_leverage_cap", 10),
         resolve_symbol=self.executor.get_symbol,
         min_leverage_cap=self.settings.get("min_leverage_cap", 5),
       ).run()
@@ -136,7 +146,8 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       msg = SystemCryptoLeverageInitSchema(**data)
       log.info(
         "[CRYPTO SYSTEM] CRYPTO_LEVERAGE_INIT | symbols=%s default_leverage=%s",
-        msg.symbols, msg.default_leverage,
+        msg.symbols,
+        msg.default_leverage,
       )
       # Either field omitted → fall back to the configured default for that field
       # (CRYPTO_LEVERAGE_INIT_SYMBOLS / MAX_LEVERAGE_CAP). default_leverage acts as
@@ -198,17 +209,22 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   # ── Exchange-triggered close handler (from the user data stream) ──────── #
 
   def _on_exchange_close(self, event: ExchangeCloseEvent) -> None:
-    status = _EXCHANGE_CLOSE_STATUS.get(event.reason, PositionStatusEnum.TERMINAL_CLOSED)
+    status = _EXCHANGE_CLOSE_STATUS.get(
+      event.reason, PositionStatusEnum.TERMINAL_CLOSED
+    )
     log.info(
       "[Crypto Event] Exchange close | symbol=%s reason=%s price=%s",
-      event.symbol, event.reason.value, event.close_price,
+      event.symbol,
+      event.reason.value,
+      event.close_price,
     )
 
     # Match by resolved exchange symbol: the DB stores the original signal symbol
     # (e.g. BTCUSD) while the event carries the exchange symbol (e.g. BTCUSDT).
     open_rows = self.ctx.db_service.get_open_positions_for_flat()
     matched = [
-      row for row in open_rows
+      row
+      for row in open_rows
       if self.executor.get_symbol(row["symbol"]) == event.symbol
     ]
     if not matched:
@@ -222,7 +238,8 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       log.warning(
         "[Crypto Event] %d DB rows matched %s — netting mode: one exchange fill "
         "closes all. Check CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL config.",
-        len(matched), event.symbol,
+        len(matched),
+        event.symbol,
       )
 
     close_comment = (
@@ -361,7 +378,9 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     try:
       return self.gateway.get_mark_price(resolved_symbol)
     except Exception as exc:  # pragma: no cover - best effort
-      log.warning("[Crypto Reconcile] mark price unavailable for %s: %s", resolved_symbol, exc)
+      log.warning(
+        "[Crypto Reconcile] mark price unavailable for %s: %s", resolved_symbol, exc
+      )
       return None
 
   # ── ADMIN FLAT match keys (crypto reconciles by resolved symbol) ──────── #

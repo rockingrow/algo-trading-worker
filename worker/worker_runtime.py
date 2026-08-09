@@ -38,7 +38,9 @@ def run_worker(
   ``run(stop_event)``, ``shutdown()`` and ``send_shutdown_notification()`` — i.e.
   a :class:`~worker.gateways.processor.BaseSignalProcessor`.
   """
-  log.info("[%s Process] Started (PID=%d)", label, multiprocessing.current_process().pid)
+  log.info(
+    "[%s Process] Started (PID=%d)", label, multiprocessing.current_process().pid
+  )
 
   ctx = WorkerContext(settings_dict)
   ctx.start_notification_job(stop_event)

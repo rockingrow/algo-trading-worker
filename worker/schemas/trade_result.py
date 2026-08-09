@@ -65,7 +65,9 @@ class TradeResult:
     return cls(success=True, retcode=retcode, extra=extra, **known)
 
   @classmethod
-  def fail(cls, comment: str = "", *, retcode: int = -1, **kwargs: Any) -> "TradeResult":
+  def fail(
+    cls, comment: str = "", *, retcode: int = -1, **kwargs: Any
+  ) -> "TradeResult":
     """Build a failed result. Unknown keys are kept in ``extra``."""
     known, extra = cls._split(kwargs)
     return cls(success=False, retcode=retcode, comment=comment, extra=extra, **known)

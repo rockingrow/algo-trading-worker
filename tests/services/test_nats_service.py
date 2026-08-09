@@ -7,7 +7,6 @@ the real nats.py client.
 
 import asyncio
 import threading
-import time
 
 import pytest
 
@@ -54,7 +53,9 @@ def running_loop():
 
 
 def _publisher_with_fake_client(loop, nc) -> NATSPublisher:
-  publisher = NATSPublisher(url="nats://fake", publish_subjects=[NatsSubjectEnum.SYSTEM])
+  publisher = NATSPublisher(
+    url="nats://fake", publish_subjects=[NatsSubjectEnum.SYSTEM]
+  )
   # Bypass the real connect(): wire the fake loop/nc directly onto the
   # underlying NatsClient, exactly as NatsClient._run() would after connecting.
   publisher._client._loop = loop
@@ -66,7 +67,9 @@ def test_request_returns_decoded_reply(running_loop):
   nc = FakeNc(reply=b'{"action":"WORKER_CONNECTED_ACK"}')
   publisher = _publisher_with_fake_client(running_loop, nc)
 
-  result = publisher.request(NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1)
+  result = publisher.request(
+    NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1
+  )
 
   assert result == '{"action":"WORKER_CONNECTED_ACK"}'
   assert nc.calls == [("SYSTEM", b'{"action":"WORKER_CONNECTED"}', 1)]
@@ -77,14 +80,20 @@ def test_request_propagates_transport_errors(running_loop):
   publisher = _publisher_with_fake_client(running_loop, nc)
 
   with pytest.raises(TimeoutError):
-    publisher.request(NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1)
+    publisher.request(
+      NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1
+    )
 
 
 def test_request_without_connection_raises_connection_error():
-  publisher = NATSPublisher(url="nats://fake", publish_subjects=[NatsSubjectEnum.SYSTEM])
+  publisher = NATSPublisher(
+    url="nats://fake", publish_subjects=[NatsSubjectEnum.SYSTEM]
+  )
   # Never connected: _client._loop / _client.nc are both still None.
   with pytest.raises(ConnectionError):
-    publisher.request(NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1)
+    publisher.request(
+      NatsSubjectEnum.SYSTEM, '{"action":"WORKER_CONNECTED"}', timeout=1
+    )
 
 
 # ── _CallbackDedup ────────────────────────────────────────────────────
@@ -106,5 +115,7 @@ def test_callback_dedup_expires_after_window(monkeypatch):
   dedup = _CallbackDedup()
   dedup.is_duplicate("error:EOF")
 
-  monkeypatch.setattr("worker.services.nats_service.settings.telegram.log_dedup_window", 0)
+  monkeypatch.setattr(
+    "worker.services.nats_service.settings.telegram.log_dedup_window", 0
+  )
   assert dedup.is_duplicate("error:EOF") is False

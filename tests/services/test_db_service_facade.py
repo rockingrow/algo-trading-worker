@@ -23,7 +23,11 @@ class RecordingRepo:
 def make_service():
   positions = RecordingRepo()
   notifications = RecordingRepo()
-  return DBService(positions=positions, notifications=notifications), positions, notifications
+  return (
+    DBService(positions=positions, notifications=notifications),
+    positions,
+    notifications,
+  )
 
 
 def test_position_methods_delegate_to_position_repo():

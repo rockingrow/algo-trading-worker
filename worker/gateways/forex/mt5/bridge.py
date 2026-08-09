@@ -1,4 +1,4 @@
-﻿import os
+import os
 import subprocess
 import time
 from typing import Any, Dict, Optional
@@ -13,6 +13,7 @@ logger = get_logger("worker.gateways.forex.mt5")
 
 class MT5:
   """Wrapper around the MetaTrader5 Python API."""
+
   def __init__(
     self, server: str, login: int, password: str, path: Optional[str] = None
   ):

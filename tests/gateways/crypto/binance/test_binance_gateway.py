@@ -35,20 +35,42 @@ def make_gateway(monkeypatch, hedge_mode=False):
   calls = []
 
   def fake_send(session, config, *, method, path, payload, is_signed, response_model):
-    calls.append({"method": method, "path": str(path), "payload": payload, "signed": is_signed})
+    calls.append(
+      {"method": method, "path": str(path), "payload": payload, "signed": is_signed}
+    )
     if str(path) == "/fapi/v1/order":
-      return FakeResp({"orderId": 555, "avgPrice": "30000", "executedQty": "0.02", "status": "FILLED"})
+      return FakeResp(
+        {"orderId": 555, "avgPrice": "30000", "executedQty": "0.02", "status": "FILLED"}
+      )
     if str(path) == "/fapi/v1/algoOrder":
       return FakeResp({"algoId": 777, "status": "NEW"})
     if str(path) == "/fapi/v1/algoOpenOrders":
-      return FakeResp({"code": 200, "msg": "The algo open order cancellation request is successfully sent."})
+      return FakeResp(
+        {
+          "code": 200,
+          "msg": "The algo open order cancellation request is successfully sent.",
+        }
+      )
     if str(path) == "/fapi/v2/positionRisk":
-      return FakeResp([
-        {"symbol": "BTCUSDT", "positionAmt": "0.02", "entryPrice": "30000", "unRealizedProfit": "1.5"},
-        {"symbol": "ETHUSDT", "positionAmt": "0", "entryPrice": "0"},
-      ])
+      return FakeResp(
+        [
+          {
+            "symbol": "BTCUSDT",
+            "positionAmt": "0.02",
+            "entryPrice": "30000",
+            "unRealizedProfit": "1.5",
+          },
+          {"symbol": "ETHUSDT", "positionAmt": "0", "entryPrice": "0"},
+        ]
+      )
     if str(path) == "/fapi/v2/account":
-      return FakeResp({"totalWalletBalance": "1000", "totalMarginBalance": "1010", "availableBalance": "900"})
+      return FakeResp(
+        {
+          "totalWalletBalance": "1000",
+          "totalMarginBalance": "1010",
+          "availableBalance": "900",
+        }
+      )
     if str(path) == "/fapi/v1/exchangeInfo":
       return FakeResp(_exchange_info())
     if str(path) == "/fapi/v1/premiumIndex":
@@ -58,13 +80,17 @@ def make_gateway(monkeypatch, hedge_mode=False):
     return FakeResp({})
 
   monkeypatch.setattr(gw_mod, "send_request", fake_send)
-  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True, hedge_mode=hedge_mode)
+  gw = gw_mod.BinanceFuturesGateway(
+    "key", "secret", testnet=True, hedge_mode=hedge_mode
+  )
   return gw, calls
 
 
 def test_place_market_order_open_long(monkeypatch):
   gw, calls = make_gateway(monkeypatch)
-  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, reduce_only=False, client_order_id="x-1")
+  res = gw.place_market_order(
+    "BTCUSDT", SIDE_LONG, 0.02, reduce_only=False, client_order_id="x-1"
+  )
   assert res["success"] is True
   assert res["ticket"] == "555" and res["price"] == 30000.0 and res["volume"] == 0.02
   c = calls[-1]
@@ -92,16 +118,16 @@ def test_set_stop_loss_is_conditional_algo_order_close_position(monkeypatch):
   gw, calls = make_gateway(monkeypatch)
   res = gw.set_stop_loss("BTCUSDT", SIDE_LONG, stop_price=29000.0, quantity=0.02)
   assert res["success"] is True
-  assert res["ticket"] == "777"                # algoId mapped to ticket
+  assert res["ticket"] == "777"  # algoId mapped to ticket
   c = calls[-1]
   assert c["path"] == "/fapi/v1/algoOrder" and c["signed"] is True
   assert c["payload"]["algo_type"] == "CONDITIONAL"
   assert c["payload"]["type"] == "STOP_MARKET"
-  assert c["payload"]["side"] == "SELL"        # close a LONG
+  assert c["payload"]["side"] == "SELL"  # close a LONG
   assert c["payload"]["trigger_price"] == 29000.0
   assert c["payload"]["close_position"] == "true"
-  assert "stop_price" not in c["payload"]      # legacy field must not leak through
-  assert "quantity" not in c["payload"]        # closePosition forbids quantity
+  assert "stop_price" not in c["payload"]  # legacy field must not leak through
+  assert "quantity" not in c["payload"]  # closePosition forbids quantity
 
 
 def test_set_stop_loss_snaps_trigger_price_to_tick(monkeypatch):
@@ -119,12 +145,12 @@ def test_set_take_profit_is_conditional_algo_order_close_position(monkeypatch):
   gw, calls = make_gateway(monkeypatch)
   res = gw.set_take_profit("BTCUSDT", SIDE_LONG, tp_price=31000.0, quantity=0.02)
   assert res["success"] is True
-  assert res["ticket"] == "777"                # algoId mapped to ticket
+  assert res["ticket"] == "777"  # algoId mapped to ticket
   c = calls[-1]
   assert c["path"] == "/fapi/v1/algoOrder" and c["signed"] is True
   assert c["payload"]["algo_type"] == "CONDITIONAL"
   assert c["payload"]["type"] == "TAKE_PROFIT_MARKET"
-  assert c["payload"]["side"] == "SELL"        # close a LONG
+  assert c["payload"]["side"] == "SELL"  # close a LONG
   assert c["payload"]["trigger_price"] == 31000.0
 
 
@@ -139,7 +165,9 @@ def test_place_market_order_hedge_mode_sends_position_side_not_reduce_only(monke
   assert "reduce_only" not in c["payload"]
 
 
-def test_place_market_order_hedge_mode_close_keeps_position_side_of_the_position(monkeypatch):
+def test_place_market_order_hedge_mode_close_keeps_position_side_of_the_position(
+  monkeypatch,
+):
   # Closing a LONG in Hedge Mode still sells, but positionSide stays LONG (the
   # position being reduced) — it must not flip to SHORT.
   gw, calls = make_gateway(monkeypatch, hedge_mode=True)
@@ -171,9 +199,9 @@ def test_set_take_profit_hedge_mode_sends_position_side(monkeypatch):
   gw.set_take_profit("BTCUSDT", SIDE_SHORT, tp_price=28000.0, quantity=0.02)
   c = calls[-1]
   assert c["payload"]["position_side"] == "SHORT"
-  assert c["payload"]["side"] == "BUY"         # close a SHORT
+  assert c["payload"]["side"] == "BUY"  # close a SHORT
   assert c["payload"]["close_position"] == "true"
-  assert "quantity" not in c["payload"]        # closePosition forbids quantity
+  assert "quantity" not in c["payload"]  # closePosition forbids quantity
 
 
 def test_set_take_profit_snaps_trigger_price_to_tick(monkeypatch):
@@ -208,24 +236,33 @@ def test_leverage_cap_parsed_from_4421_message():
 
 
 def test_leverage_cap_ignored_for_non_4421_error():
-  assert gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
-    _cap_err("greater than 5x", code=-1102), upper_bound=10
-  ) is None
+  assert (
+    gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+      _cap_err("greater than 5x", code=-1102), upper_bound=10
+    )
+    is None
+  )
 
 
 def test_leverage_cap_at_or_above_request_is_treated_as_anomaly():
   # A -4421 is by definition a restriction below what we asked; a parsed value
   # >= request means we grabbed the wrong number — discard it.
-  assert gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
-    _cap_err("greater than 10x"), upper_bound=10
-  ) is None
+  assert (
+    gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+      _cap_err("greater than 10x"), upper_bound=10
+    )
+    is None
+  )
 
 
 def test_leverage_cap_unparseable_returns_none():
   # Reworded message the regex no longer matches.
-  assert gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
-    _cap_err("Leverage is limited to 5 for this account."), upper_bound=10
-  ) is None
+  assert (
+    gw_mod.BinanceFuturesGateway._leverage_cap_from_error(
+      _cap_err("Leverage is limited to 5 for this account."), upper_bound=10
+    )
+    is None
+  )
 
 
 def _leverage_gateway(monkeypatch, error_on_first):
@@ -290,7 +327,7 @@ def test_set_leverage_success_first_try(monkeypatch):
 def test_get_positions_maps_and_filters_zero(monkeypatch):
   gw, _ = make_gateway(monkeypatch)
   positions = gw.get_positions("BTCUSDT")
-  assert len(positions) == 1                    # the zero ETHUSDT row is dropped
+  assert len(positions) == 1  # the zero ETHUSDT row is dropped
   p = positions[0]
   assert p.symbol == "BTCUSDT" and p.side == SIDE_LONG
   assert p.quantity == 0.02 and p.entry_price == 30000.0
@@ -381,20 +418,24 @@ def test_signed_request_resyncs_and_retries_on_minus_1021(monkeypatch):
   state = {"first": True}
 
   def flaky_send(session, config, *, method, path, payload, is_signed, response_model):
-    calls.append({"method": method, "path": str(path), "payload": payload, "signed": is_signed})
+    calls.append(
+      {"method": method, "path": str(path), "payload": payload, "signed": is_signed}
+    )
     if str(path) == "/fapi/v1/time":
       return FakeResp({"serverTime": 1_700_000_000_000})
     if str(path) == "/fapi/v1/order" and state["first"]:
       state["first"] = False
       raise BadRequestError(error_message="Timestamp ... ahead", status_code=-1021)
-    return FakeResp({"orderId": 7, "avgPrice": "10", "executedQty": "1", "status": "FILLED"})
+    return FakeResp(
+      {"orderId": 7, "avgPrice": "10", "executedQty": "1", "status": "FILLED"}
+    )
 
   monkeypatch.setattr(gw_mod, "send_request", flaky_send)
   res = gw.place_market_order("BTCUSDT", SIDE_LONG, 1.0)
   assert res["success"] is True and res["ticket"] == "7"
   paths = [c["path"] for c in calls]
-  assert paths.count("/fapi/v1/order") == 2          # original + retry
-  assert "/fapi/v1/time" in paths                    # re-synced between attempts
+  assert paths.count("/fapi/v1/order") == 2  # original + retry
+  assert "/fapi/v1/time" in paths  # re-synced between attempts
 
 
 def test_signed_request_does_not_retry_on_other_errors(monkeypatch):
@@ -408,7 +449,7 @@ def test_signed_request_does_not_retry_on_other_errors(monkeypatch):
 
   monkeypatch.setattr(gw_mod, "send_request", boom)
   res = gw.place_market_order("BTCUSDT", SIDE_LONG, 1.0)
-  assert res["success"] is False                     # surfaced, not retried
+  assert res["success"] is False  # surfaced, not retried
   assert calls.count({"path": "/fapi/v1/order"}) == 1
   assert "/fapi/v1/time" not in [c["path"] for c in calls]
 
@@ -432,13 +473,15 @@ def test_order_result_falls_back_to_cumquote_when_avgprice_zero(monkeypatch):
   gw, _ = make_gateway(monkeypatch)
 
   def fake_send(session, config, *, method, path, payload, is_signed, response_model):
-    return FakeResp({
-      "orderId": 999,
-      "avgPrice": "0",
-      "executedQty": "0.0333",
-      "cumQuote": "2179.15",
-      "status": "FILLED",
-    })
+    return FakeResp(
+      {
+        "orderId": 999,
+        "avgPrice": "0",
+        "executedQty": "0.0333",
+        "cumQuote": "2179.15",
+        "status": "FILLED",
+      }
+    )
 
   monkeypatch.setattr(gw_mod, "send_request", fake_send)
   res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.0333)
@@ -473,7 +516,9 @@ def test_set_position_mode_treats_no_change_as_success(monkeypatch):
   gw, _ = make_gateway(monkeypatch)
 
   def already(session, config, *, method, path, payload, is_signed, response_model):
-    raise BadRequestError(error_message="No need to change position side.", status_code=-4059)
+    raise BadRequestError(
+      error_message="No need to change position side.", status_code=-4059
+    )
 
   monkeypatch.setattr(gw_mod, "send_request", already)
   assert gw.set_position_mode(True) is True
@@ -487,7 +532,9 @@ def test_set_position_mode_returns_false_on_reject(monkeypatch):
   gw, _ = make_gateway(monkeypatch)
 
   def boom(session, config, *, method, path, payload, is_signed, response_model):
-    raise BadRequestError(error_message="Position side cannot be changed", status_code=-4068)
+    raise BadRequestError(
+      error_message="Position side cannot be changed", status_code=-4068
+    )
 
   monkeypatch.setattr(gw_mod, "send_request", boom)
   assert gw.set_position_mode(True) is False

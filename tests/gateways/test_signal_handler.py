@@ -10,15 +10,28 @@ from worker.schemas.signal_schema import SignalActionEnum
 
 
 class FakeStrategy(BaseMarketStrategy):
-  def __init__(self, open_positions=None, entry_ok=True, cleanup_ok=True):
+  def __init__(
+    self, open_positions=None, entry_ok=True, cleanup_ok=True, multi_strategy=False
+  ):
     self.calls = []
     self._open = open_positions if open_positions is not None else []
     self._entry_ok = entry_ok
     self._cleanup_ok = cleanup_ok
+    self._multi_strategy = multi_strategy
+
+  @property
+  def allows_multi_strategy_per_symbol(self):
+    return self._multi_strategy
 
   def entry(self, signal):
     self.calls.append("entry")
-    return {"success": self._entry_ok, "retcode": 0, "ticket": 1, "volume": 1, "price": 2}
+    return {
+      "success": self._entry_ok,
+      "retcode": 0,
+      "ticket": 1,
+      "volume": 1,
+      "price": 2,
+    }
 
   def handle_tp1(self, signal):
     self.calls.append("tp1")
@@ -68,7 +81,9 @@ class FakeStore:
 def test_dispatch_routes_every_action(action, expected):
   open_pos = [SimpleNamespace(ticket=9)]
   strat = FakeStrategy(open_positions=open_pos)
-  store = FakeStore(positions=[{"ref_source_id": "9", "ref_id": "9", "status": "OPENED"}])
+  store = FakeStore(
+    positions=[{"ref_source_id": "9", "ref_id": "9", "status": "OPENED"}]
+  )
   handler = SignalHandler(strat, store)
   handler.handle(make_signal(action))
   assert strat.calls[-1] == expected
@@ -77,7 +92,9 @@ def test_dispatch_routes_every_action(action, expected):
 def test_flat_routes_through_handler():
   """Regression: FLAT must go through the handler, not a special pre-branch."""
   strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)])
-  store = FakeStore(positions=[{"ref_source_id": "9", "ref_id": "9", "status": "OPENED"}])
+  store = FakeStore(
+    positions=[{"ref_source_id": "9", "ref_id": "9", "status": "OPENED"}]
+  )
   handler = SignalHandler(strat, store)
   res = handler.handle(make_signal(SignalActionEnum.FLAT))
   assert res["success"] is True
@@ -97,7 +114,9 @@ def test_flat_closes_mt5_when_no_db_record():
 def test_flat_syncs_stale_db_record_when_no_mt5_positions():
   """FLAT must mark stale DB records as FLATTED when MT5 has no open positions."""
   strat = FakeStrategy(open_positions=[], cleanup_ok=False)
-  store = FakeStore(positions=[{"ref_source_id": "7", "ref_id": "7", "status": "OPENED"}])
+  store = FakeStore(
+    positions=[{"ref_source_id": "7", "ref_id": "7", "status": "OPENED"}]
+  )
   handler = SignalHandler(strat, store)
   res = handler.handle(make_signal(SignalActionEnum.FLAT))
   assert res["success"] is False
@@ -160,12 +179,72 @@ def test_entry_rejected_when_other_strategy_holds_symbol():
     flat_positions=[{"strategy": "strat-A", "ref_source_id": "9", "ref_id": "9"}],
   )
   handler = SignalHandler(strat, store)
-  res = handler.handle(make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="BTCUSD"))
+  res = handler.handle(
+    make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="BTCUSD")
+  )
   assert res["success"] is False
   assert "strat-A" in res["comment"]
   # No exchange calls — stale cleanup must never run when a conflict exists.
   assert not any("close_all" in c for c in strat.calls)
   assert "entry" not in strat.calls
+
+
+def test_entry_allowed_alongside_other_strategy_when_multi_strategy_enabled():
+  """With multi-strategy-per-symbol on (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL),
+  a second strategy may open its own position on a symbol another strategy
+  already holds — each strategy keeps its own isolated order."""
+  strat = FakeStrategy(open_positions=[], multi_strategy=True)
+  store = FakeStore(
+    flat_positions=[{"strategy": "strat-A", "ref_source_id": "9", "ref_id": "9"}],
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(
+    make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="XAUUSD")
+  )
+  assert res["success"] is True
+  assert "entry" in strat.calls
+  # The other strategy's position must not be touched: every close is scoped to
+  # the entering strategy.
+  assert not any(c.startswith("close_all") and c.endswith(":None") for c in strat.calls)
+
+
+def test_entry_still_replaces_own_position_when_multi_strategy_enabled():
+  """The toggle relaxes the *cross-strategy* rule only — a strategy re-entering
+  its own symbol still replaces its position instead of stacking a second one."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)], multi_strategy=True)
+  store = FakeStore(
+    positions=[{"ref_source_id": "9", "ref_id": "9", "volume": 1.0}],
+    flat_positions=[{"strategy": "strat-A", "ref_source_id": "1", "ref_id": "1"}],
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(
+    make_signal(SignalActionEnum.LONG, strategy="strat-B", symbol="XAUUSD")
+  )
+  assert res["success"] is True
+  assert "close_all:STALE_CLEANUP:strat-B" in strat.calls
+  assert store.status_updates[0]["status"] == PositionStatusEnum.FORCED_CLOSED
+
+
+def test_flat_falls_back_to_unscoped_close_when_multi_strategy_disabled():
+  """Default behaviour: a strategy-scoped FLAT that finds nothing retries
+  unscoped, so a position missing from the DB is still closed."""
+  strat = FakeStrategy(open_positions=[], cleanup_ok=False)
+  store = FakeStore(positions=[])
+  handler = SignalHandler(strat, store)
+  handler.handle(make_signal(SignalActionEnum.FLAT, strategy="strat-1"))
+  assert "close_all:FLAT:strat-1" in strat.calls
+  assert "close_all:FLAT:None" in strat.calls
+
+
+def test_flat_skips_unscoped_close_when_multi_strategy_enabled():
+  """With several strategies sharing a symbol, the unscoped FLAT retry would
+  flatten the other strategies' live positions — it must be skipped."""
+  strat = FakeStrategy(open_positions=[], cleanup_ok=False, multi_strategy=True)
+  store = FakeStore(positions=[])
+  handler = SignalHandler(strat, store)
+  handler.handle(make_signal(SignalActionEnum.FLAT, strategy="strat-1"))
+  assert "close_all:FLAT:strat-1" in strat.calls
+  assert "close_all:FLAT:None" not in strat.calls
 
 
 def test_entry_aborts_when_cleanup_fails():
@@ -188,7 +267,9 @@ def test_exit_returns_failure_when_no_db_record():
 
 def test_exit_returns_failure_when_no_live_mt5_position():
   strat = FakeStrategy(open_positions=[])  # gone from MT5
-  store = FakeStore(positions=[{"ref_source_id": "9", "ref_id": "9", "status": "OPENED"}])
+  store = FakeStore(
+    positions=[{"ref_source_id": "9", "ref_id": "9", "status": "OPENED"}]
+  )
   handler = SignalHandler(strat, store)
   res = handler.handle(make_signal(SignalActionEnum.SL))
   assert res["success"] is False
@@ -201,7 +282,7 @@ def test_get_db_position_heals_duplicate_active_rows():
   dup_rows = [
     {"ref_source_id": "10", "ref_id": "10", "status": "OPENED"},
     {"ref_source_id": "11", "ref_id": "11", "status": "OPENED"},  # duplicate
-    {"ref_source_id": "12", "ref_id": "12", "status": "TP1"},     # duplicate
+    {"ref_source_id": "12", "ref_id": "12", "status": "TP1"},  # duplicate
   ]
   strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=10)])
   store = FakeStore(positions=dup_rows)

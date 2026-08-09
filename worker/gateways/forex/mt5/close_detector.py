@@ -1,4 +1,4 @@
-﻿"""
+"""
 worker/gateways/forex/mt5/close_detector.py
 ───────────────────────────────────────────
 Scans MT5 deal history to detect positions closed server-side (SL, TP, stop-out,
@@ -82,7 +82,7 @@ class TerminalClosedEvent:
   symbol: str
   # Close details
   close_reason: TerminalCloseReason
-  deal_reason: int          # raw MT5 DEAL_REASON_* integer (4=SL, 5=TP, 6=SO, 0-2=MANUAL)
+  deal_reason: int  # raw MT5 DEAL_REASON_* integer (4=SL, 5=TP, 6=SO, 0-2=MANUAL)
   close_price: float
   close_volume: float
   close_time: datetime
@@ -134,7 +134,9 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
   closing_deal = next((d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT), None)
 
   if closing_deal is None:
-    log.warning("[close_detector] No closing deal found for position=%d", position_ticket)
+    log.warning(
+      "[close_detector] No closing deal found for position=%d", position_ticket
+    )
     return None
 
   reason = _REASON_MAP.get(closing_deal.reason)

@@ -46,9 +46,7 @@ def _spy_notifier_init(monkeypatch) -> list:
     captured.append((chat_ids, bot_token))
     original_init(self, chat_ids=chat_ids, bot_token=bot_token)
 
-  monkeypatch.setattr(
-    notification_service.TelegramNotification, "__init__", spy_init
-  )
+  monkeypatch.setattr(notification_service.TelegramNotification, "__init__", spy_init)
 
   def fake_send(self, message_text: str) -> bool:
     return True

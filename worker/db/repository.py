@@ -67,12 +67,36 @@ class PositionRepository:
         # assumption) corrupts low-priced crypto (e.g. SHIB → 0.00) and is
         # inconsistent with sl/tp1, which are already stored unrounded. The caller
         # supplies a price already quantized to the instrument's tick.
-        (strategy, ref_id, ref_source_id, signal_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, message, author, market_type),
+        (
+          strategy,
+          ref_id,
+          ref_source_id,
+          signal_id,
+          symbol,
+          action,
+          volume,
+          price,
+          sl,
+          tp1,
+          gateway_return_code,
+          comment,
+          message,
+          author,
+          market_type,
+        ),
       )
       conn.commit()
-      logger.debug(f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}")
+      logger.debug(
+        f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}"
+      )
     except Exception as exc:
-      logger.error("log_position failed (strategy=%s symbol=%s action=%s): %s", strategy, symbol, action, exc)
+      logger.error(
+        "log_position failed (strategy=%s symbol=%s action=%s): %s",
+        strategy,
+        symbol,
+        action,
+        exc,
+      )
     finally:
       if conn:
         conn.close()
@@ -108,7 +132,22 @@ class PositionRepository:
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
         # Broker-native price, no rounding — see log_position for the rationale.
-        (ref_id, ref_id, signal_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, message, strategy_code, market_type),
+        (
+          ref_id,
+          ref_id,
+          signal_id,
+          strategy,
+          symbol,
+          action,
+          volume,
+          opened_price,
+          status,
+          gateway_return_code,
+          comment,
+          message,
+          strategy_code,
+          market_type,
+        ),
       )
       conn.commit()
     finally:
@@ -132,17 +171,31 @@ class PositionRepository:
   ):
     try:
       self._insert_position_row(
-        ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
-        volume=volume, opened_price=opened_price, status="OPENED",
-        gateway_return_code=gateway_return_code, comment=comment, message=message,
-        strategy_code=strategy_code, market_type=market_type, signal_id=signal_id,
+        ref_id=ref_id,
+        strategy=strategy,
+        symbol=symbol,
+        action=action,
+        volume=volume,
+        opened_price=opened_price,
+        status="OPENED",
+        gateway_return_code=gateway_return_code,
+        comment=comment,
+        message=message,
+        strategy_code=strategy_code,
+        market_type=market_type,
+        signal_id=signal_id,
       )
-      logger.debug(f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}")
+      logger.debug(
+        f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}"
+      )
     except Exception as exc:
       logger.critical(
         "insert_position FAILED (ref_id=%s strategy=%s symbol=%s): %s — "
         "position is open on exchange but NOT tracked in DB. Manual reconciliation required.",
-        ref_id, strategy, symbol, exc,
+        ref_id,
+        strategy,
+        symbol,
+        exc,
       )
       raise
 
@@ -170,17 +223,30 @@ class PositionRepository:
     processing (the operator notification still needs to fire)."""
     try:
       self._insert_position_row(
-        ref_id=ref_id, strategy=strategy, symbol=symbol, action=action,
-        volume=volume, opened_price=opened_price,
+        ref_id=ref_id,
+        strategy=strategy,
+        symbol=symbol,
+        action=action,
+        volume=volume,
+        opened_price=opened_price,
         status=PositionStatusEnum.REJECTED.value,
-        gateway_return_code=gateway_return_code, comment=comment, message=message,
-        strategy_code=strategy_code, market_type=market_type, signal_id=signal_id,
+        gateway_return_code=gateway_return_code,
+        comment=comment,
+        message=message,
+        strategy_code=strategy_code,
+        market_type=market_type,
+        signal_id=signal_id,
       )
-      logger.debug(f"Rejected entry recorded: ref_source_id={ref_id}, symbol={symbol}, action={action}")
+      logger.debug(
+        f"Rejected entry recorded: ref_source_id={ref_id}, symbol={symbol}, action={action}"
+      )
     except Exception as exc:
       logger.error(
         "insert_rejected_position failed (ref_id=%s strategy=%s symbol=%s): %s",
-        ref_id, strategy, symbol, exc,
+        ref_id,
+        strategy,
+        symbol,
+        exc,
       )
 
   def update_position_status(
@@ -211,15 +277,27 @@ class PositionRepository:
               WHERE ref_source_id = ?
           """,
         # Broker-native close price, no rounding — see log_position for the rationale.
-        (status.value, ref_id, closed_price, gateway_return_code, comment, message, ref_source_id),
+        (
+          status.value,
+          ref_id,
+          closed_price,
+          gateway_return_code,
+          comment,
+          message,
+          ref_source_id,
+        ),
       )
       conn.commit()
-      logger.debug(f"Position updated: ref_source_id={ref_source_id}, new ref_id={ref_id}, status={status}")
+      logger.debug(
+        f"Position updated: ref_source_id={ref_source_id}, new ref_id={ref_id}, status={status}"
+      )
     except Exception as exc:
       logger.critical(
         "update_position_status FAILED (ref_source_id=%s status=%s): %s — "
         "position status not updated in DB. Manual reconciliation may be required.",
-        ref_source_id, status, exc,
+        ref_source_id,
+        status,
+        exc,
       )
       raise
     finally:
@@ -232,7 +310,9 @@ class PositionRepository:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
       cursor = conn.cursor()
-      cursor.execute("SELECT * FROM positions WHERE ref_source_id = ?", (ref_source_id,))
+      cursor.execute(
+        "SELECT * FROM positions WHERE ref_source_id = ?", (ref_source_id,)
+      )
       row = cursor.fetchone()
       return self._row_to_dict(row) if row else None
     except Exception as e:
@@ -295,7 +375,9 @@ class PositionRepository:
       rows = cursor.fetchall()
       return [self._row_to_dict(row) for row in rows]
     except Exception as e:
-      logger.exception(f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}")
+      logger.exception(
+        f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}"
+      )
       return []
     finally:
       if conn:
@@ -348,11 +430,15 @@ class PositionRepository:
       if symbol:
         conditions.append("symbol = ?")
         params.append(symbol)
-      cursor.execute(f"SELECT * FROM positions WHERE {' AND '.join(conditions)}", params)
+      cursor.execute(
+        f"SELECT * FROM positions WHERE {' AND '.join(conditions)}", params
+      )
       rows = cursor.fetchall()
       return [self._row_to_dict(row) for row in rows]
     except Exception as e:
-      logger.exception(f"Failed to fetch open positions for flat (strategy={strategy}, symbol={symbol}): {e}")
+      logger.exception(
+        f"Failed to fetch open positions for flat (strategy={strategy}, symbol={symbol}): {e}"
+      )
       return []
     finally:
       if conn:
@@ -380,7 +466,14 @@ class NotificationOutboxRepository:
               INSERT INTO notifications (platform, channel, category, message_text, mode, max_attempts)
               VALUES (?, ?, ?, ?, ?, ?)
           """,
-        (platform.value, channel.value, category, message_text, mode.value, max_attempts),
+        (
+          platform.value,
+          channel.value,
+          category,
+          message_text,
+          mode.value,
+          max_attempts,
+        ),
       )
       conn.commit()
     except Exception as exc:
@@ -428,7 +521,9 @@ class NotificationOutboxRepository:
       if conn:
         conn.close()
 
-  def mark_notification_failed(self, notification_id: int, error: str, next_attempt_at: str) -> None:
+  def mark_notification_failed(
+    self, notification_id: int, error: str, next_attempt_at: str
+  ) -> None:
     conn = None
     try:
       conn = _get_conn()

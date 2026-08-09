@@ -89,7 +89,9 @@ def _manual_proc():
   return proc, inserts, logs, notes
 
 
-def _exchange_position(symbol="BTCUSDT", side="LONG", quantity=0.02, entry_price=64000.0):
+def _exchange_position(
+  symbol="BTCUSDT", side="LONG", quantity=0.02, entry_price=64000.0
+):
   # Mirrors ExchangePosition: exposes .symbol/.side plus volume/price_open aliases.
   return SimpleNamespace(
     symbol=symbol,

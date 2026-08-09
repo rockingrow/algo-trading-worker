@@ -1,4 +1,4 @@
-﻿"""Crypto (CEX) integration package.
+"""Crypto (CEX) integration package.
 
 Exchange-agnostic by design: business logic depends on
 :class:`~worker.gateways.crypto.base.BaseExchangeGateway`, and

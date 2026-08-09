@@ -30,7 +30,9 @@ class FakeExecutor:
   def convert_quantity_to_lots(self, symbol, quantity):
     return quantity
 
-  def partial_close_position(self, symbol, close_volume, position_ticket=None, strategy=None):
+  def partial_close_position(
+    self, symbol, close_volume, position_ticket=None, strategy=None
+  ):
     self.calls.append(("partial", close_volume, position_ticket, strategy))
     return {"success": True, "volume": close_volume}
 
@@ -45,8 +47,13 @@ class FakeExecutor:
 
   def close_all_positions(self, symbol, reason="CLOSE", strategy=None):
     self.calls.append(("close_all", reason, strategy))
-    return {"success": self._failsafe_ok, "reason": reason, "volume": 0.014, "price": 30000.0,
-            "comment": "" if self._failsafe_ok else "exchange error"}
+    return {
+      "success": self._failsafe_ok,
+      "reason": reason,
+      "volume": 0.014,
+      "price": 30000.0,
+      "comment": "" if self._failsafe_ok else "exchange error",
+    }
 
 
 def test_factory_builds_crypto_market(config):

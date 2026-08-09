@@ -72,6 +72,20 @@ class BaseMarketStrategy(ABC):
   def handle_full_close(self, signal: SignalSchema) -> TradeResult:
     """Close all remaining volume. ``signal.action`` carries the exit reason."""
 
+  # ── Capabilities ──────────────────────────────────────────────────────── #
+
+  @property
+  def allows_multi_strategy_per_symbol(self) -> bool:
+    """Whether two different strategies may hold the same symbol at once.
+
+    Concrete (not abstract) with a conservative ``False`` default so a market
+    implementation only opts in when its broker can really keep the positions
+    isolated. ``SignalHandler`` reads it to decide whether a second strategy
+    entering an already-held symbol is a netting conflict or a legitimate
+    parallel position.
+    """
+    return False
+
   # ── Position helpers ──────────────────────────────────────────────────── #
 
   @abstractmethod
@@ -109,9 +123,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
   any compatible fake.
   """
 
-  def __init__(
-    self, executor: TradeExecutorProtocol, config: ExecutionConfig
-  ) -> None:
+  def __init__(self, executor: TradeExecutorProtocol, config: ExecutionConfig) -> None:
     self._executor = executor
     self._config = config
 
@@ -138,12 +150,15 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     move_sl_to_be = (
       self._config.tp1_move_sl_to_breakeven
       if self._config.tp1_move_sl_to_breakeven is not None
-      else signal.move_sl_to_be if signal.move_sl_to_be is not None
+      else signal.move_sl_to_be
+      if signal.move_sl_to_be is not None
       else False
     )
     return tp1_percent, move_sl_to_be
 
-  def _resolve_tp1_volume(self, signal: SignalSchema, pos, tp1_percent: float) -> TradeResult | float:
+  def _resolve_tp1_volume(
+    self, signal: SignalSchema, pos, tp1_percent: float
+  ) -> TradeResult | float:
     """Derive close volume; returns TradeResult.fail on error, float on success."""
     symbol = signal.symbol
     if self._config.volume_decision_enabled:
@@ -160,7 +175,10 @@ class ExecutorBackedMarket(BaseMarketStrategy):
       logger.info(
         "[handle_tp1] VOLUME_DECISION mode | position_volume=%s tp1_percent=%s%% "
         "calculated=%s → close_volume=%s",
-        pos.volume, tp1_percent, calculated, close_volume,
+        pos.volume,
+        tp1_percent,
+        calculated,
+        close_volume,
       )
       return close_volume
     if signal.quantity is None:
@@ -168,7 +186,8 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
     logger.info(
       "[handle_tp1] Payload quantity mode | qty=%s → close_volume=%s",
-      signal.quantity, close_volume,
+      signal.quantity,
+      close_volume,
     )
     return close_volume
 
@@ -284,9 +303,33 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 class ForexMarket(ExecutorBackedMarket):
   """FOREX / CFD market via a trading platform (backed by ``ForexExecutor``)."""
 
+  @property
+  def allows_multi_strategy_per_symbol(self) -> bool:
+    """FOREX is the only market that can hold parallel positions on one symbol.
+
+    Every operation ``SignalHandler`` performs is scoped by the strategy's own
+    magic number — ``get_open_positions``/``close_all_positions`` filter on it,
+    closes and SL edits target a specific ticket — so strategies sharing a
+    symbol never touch each other. Driven by
+    ``FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL`` (needs a hedging account; see
+    ``ForexSignalProcessor._warn_if_multi_strategy_needs_hedging``).
+    """
+    return self._config.allow_multi_strategy_per_symbol
+
 
 class CryptoMarket(ExecutorBackedMarket):
-  """CRYPTO market via a centralized exchange (backed by ``CryptoExecutor``)."""
+  """CRYPTO market via a centralized exchange (backed by ``CryptoExecutor``).
+
+  Deliberately keeps the base ``allows_multi_strategy_per_symbol = False``: a
+  CEX cannot isolate two strategies on one symbol. ``CryptoExecutor``
+  *ignores* the ``strategy`` argument in ``get_open_positions`` (there is no
+  magic-number equivalent) and cancels resting orders **symbol-wide**
+  (``cancel_all_orders``), so letting a second strategy in would make the
+  entry's stale-cleanup close the first strategy's position and wipe its
+  SL/TP. ``CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL`` therefore only relaxes
+  ``CryptoExecutor._netting_conflict``; the handler-level guard still rejects
+  the entry.
+  """
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

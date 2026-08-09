@@ -37,7 +37,10 @@ class ForexPlatformEnum(str, Enum):
   MT5 = "MT5"
 
 
-NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {NatsSubjectEnum.ADMIN, NatsSubjectEnum.SYSTEM}
+NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {
+  NatsSubjectEnum.ADMIN,
+  NatsSubjectEnum.SYSTEM,
+}
 WATCHDOG_INTERVAL = 10  # seconds
 # Maximum age (seconds, against the signal's own timestamp) a replayed signal
 # from a SYSTEM RETRY_SIGNALS may still be executed at. Older replays are
@@ -55,7 +58,7 @@ MT5_HEALTH_INTERVAL_WEEKEND = 15 * 60  # seconds between health checks while clo
 # times (17:00 ET) in winter; during northern-hemisphere summer (DST) the market
 # opens/closes an hour earlier, so set both to 21 if your broker follows it.
 MARKET_CLOSE_HOUR_UTC = 22  # Friday: market closed at/after this UTC hour
-MARKET_OPEN_HOUR_UTC = 22   # Sunday: market open at/after this UTC hour
+MARKET_OPEN_HOUR_UTC = 22  # Sunday: market open at/after this UTC hour
 
 
 def is_market_closed(now: Optional[datetime] = None) -> bool:
@@ -102,14 +105,24 @@ def _req(env: str, dump: str, **kwargs) -> Any:
 
 def _opt(default: Any, env: str, dump: str, **kwargs) -> Any:
   """An optional group field with *default*: env var *env*, dump key *dump*."""
-  return Field(default, validation_alias=AliasChoices(env), serialization_alias=dump, **kwargs)
+  return Field(
+    default, validation_alias=AliasChoices(env), serialization_alias=dump, **kwargs
+  )
 
 
 #: Order the settings groups are flattened in by :meth:`Settings.flat_dump`
 #: (no key clashes — every ``serialization_alias`` is unique across groups).
 _FLAT_GROUPS = (
-  "logging", "nats", "forex", "crypto", "strategy",
-  "risk", "telegram", "database", "web", "broker",
+  "logging",
+  "nats",
+  "forex",
+  "crypto",
+  "strategy",
+  "risk",
+  "telegram",
+  "database",
+  "web",
+  "broker",
 )
 
 
@@ -118,7 +131,9 @@ class LoggingSettings(BaseSettings):
 
   model_config = _GROUP_CONFIG
 
-  notification_mode: str = _opt("VERBOSE", "NOTIFICATION_MODE", "notification_mode")  # VERBOSE, SILENT, or ERROR
+  notification_mode: str = _opt(
+    "VERBOSE", "NOTIFICATION_MODE", "notification_mode"
+  )  # VERBOSE, SILENT, or ERROR
   level: str = _opt("INFO", "LOG_LEVEL", "log_level")
 
 
@@ -143,12 +158,29 @@ class ForexSettings(BaseSettings):
 
   model_config = _GROUP_CONFIG
 
-  platform: ForexPlatformEnum = _opt(ForexPlatformEnum.MT5, "FOREX_PLATFORM", "forex_platform")
+  platform: ForexPlatformEnum = _opt(
+    ForexPlatformEnum.MT5, "FOREX_PLATFORM", "forex_platform"
+  )
   server: Optional[str] = _opt(None, "MT5_SERVER", "mt5_server")
   login: Optional[int] = _opt(None, "MT5_LOGIN", "mt5_login")
   password: Optional[SecretStr] = _opt(None, "MT5_PASSWORD", "mt5_password")
   path: Optional[str] = _opt(None, "MT5_PATH", "mt5_path")
   name: Optional[str] = _opt(None, "MT5_NAME", "mt5_name")
+  # FOREX is the only market that can genuinely hold several *independent*
+  # positions on one symbol: every strategy trades under its own magic number
+  # (``strategy_magic_map``), so the platform keeps their tickets, SL/TP and
+  # closes fully isolated. Set to True to let a second strategy enter a symbol
+  # another strategy already holds. The one-active-position-per-(strategy,
+  # symbol) rule still applies — a strategy re-entering its own symbol replaces
+  # its existing position, it never stacks a second one.
+  # Default False keeps the conservative one-strategy-per-symbol behaviour.
+  # Requires a hedging-enabled account: on a netting account the broker merges
+  # both strategies into a single net position and the isolation is lost.
+  allow_multi_strategy_per_symbol: bool = _opt(
+    False,
+    "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL",
+    "forex_allow_multi_strategy_per_symbol",
+  )
 
 
 class CryptoSettings(BaseSettings):
@@ -156,8 +188,12 @@ class CryptoSettings(BaseSettings):
 
   model_config = _GROUP_CONFIG
 
-  exchange: CryptoExchangeEnum = _opt(CryptoExchangeEnum.BINANCE, "CRYPTO_EXCHANGE", "crypto_exchange")
-  quote_asset: str = _opt("USDT", "CRYPTO_QUOTE_ASSET", "crypto_quote_asset")  # quote currency appended to bare symbols
+  exchange: CryptoExchangeEnum = _opt(
+    CryptoExchangeEnum.BINANCE, "CRYPTO_EXCHANGE", "crypto_exchange"
+  )
+  quote_asset: str = _opt(
+    "USDT", "CRYPTO_QUOTE_ASSET", "crypto_quote_asset"
+  )  # quote currency appended to bare symbols
   api_key: Optional[SecretStr] = _opt(None, "CRYPTO_API_KEY", "crypto_api_key")
   api_secret: Optional[SecretStr] = _opt(None, "CRYPTO_API_SECRET", "crypto_api_secret")
   account_id: Optional[str] = _opt(None, "CRYPTO_ACCOUNT_ID", "crypto_account_id")
@@ -180,7 +216,9 @@ class CryptoSettings(BaseSettings):
   # hedge_mode — it does not manage simultaneous LONG and SHORT positions on the
   # same symbol even when the account is in Hedge mode.
   allow_multi_strategy_per_symbol: bool = _opt(
-    False, "CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL", "crypto_allow_multi_strategy_per_symbol"
+    False,
+    "CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL",
+    "crypto_allow_multi_strategy_per_symbol",
   )
   # Symbols whose leverage must be initialised at worker startup. The
   # LeverageInitJob walks this list once after gateway.connect() succeeds and
@@ -206,7 +244,9 @@ class CryptoSettings(BaseSettings):
   # sub-accounts can take (5x on Binance); if an account is restricted below
   # this, the retry still fails and the symbol is logged for manual fixing.
   min_leverage_cap: int = _opt(5, "MIN_LEVERAGE_CAP", "min_leverage_cap")
-  use_custom_leverage: bool = _opt(False, "USE_CUSTOM_LEVERAGE", "use_custom_leverage")  # If true, force use custom leverage instead of broker crypto leverage initialization
+  use_custom_leverage: bool = _opt(
+    False, "USE_CUSTOM_LEVERAGE", "use_custom_leverage"
+  )  # If true, force use custom leverage instead of broker crypto leverage initialization
 
   @field_validator("leverage_init_symbols", mode="before")
   @classmethod
@@ -246,12 +286,18 @@ class RiskSettings(BaseSettings):
 
   capital: float = _opt(1000, "CAPITAL", "capital")
   capital_currency: str = _opt("USD", "CAPITAL_CURRENCY", "capital_currency")
-  volume_decision_enabled: bool = _opt(True, "VOLUME_DECISION_ENABLED", "volume_decision_enabled")
+  volume_decision_enabled: bool = _opt(
+    True, "VOLUME_DECISION_ENABLED", "volume_decision_enabled"
+  )
   use_custom_risk_percentage: bool = _opt(
     False, "USE_CUSTOM_RISK_PERCENTAGE", "use_custom_risk_percentage"
   )  # If true, use custom risk percentage instead of signal's risk percentage
-  risk_percentage: float = _opt(2.0, "RISK_PERCENTAGE", "risk_percentage")  # Risk 2% of capital per trade
-  use_account_equity: bool = _opt(False, "USE_ACCOUNT_EQUITY", "use_account_equity")  # If true, use account equity instead of initial capital for entry volume calculation
+  risk_percentage: float = _opt(
+    2.0, "RISK_PERCENTAGE", "risk_percentage"
+  )  # Risk 2% of capital per trade
+  use_account_equity: bool = _opt(
+    False, "USE_ACCOUNT_EQUITY", "use_account_equity"
+  )  # If true, use account equity instead of initial capital for entry volume calculation
   # Maximum number of concurrently open orders (OPENED/TP1 positions) this worker
   # may hold. A new entry (LONG/SHORT) that would exceed the cap is not sent to the
   # broker: it is recorded with status REJECTED, reported to the broker on the TRADE
@@ -268,7 +314,9 @@ class TelegramSettings(BaseSettings):
 
   enabled: bool = _req("TELEGRAM_ENABLED", "telegram_enabled")
   bot_token: SecretStr = _req("TELEGRAM_BOT_TOKEN", "telegram_bot_token")
-  chat_id: str = _req("TELEGRAM_CHAT_ID", "telegram_chat_id")  # management: NATS events, service start/stop, MT5 health
+  chat_id: str = _req(
+    "TELEGRAM_CHAT_ID", "telegram_chat_id"
+  )  # management: NATS events, service start/stop, MT5 health
   # NoDecode (see crypto leverage_init_symbols): the documented unquoted
   # comma-separated form (-100123,-100987) is not valid JSON, so let
   # parse_channel_ids split the raw string instead of pydantic JSON-decoding it.
@@ -281,10 +329,16 @@ class TelegramSettings(BaseSettings):
   # forwarded to Telegram. The dedicated log bot/chat is kept separate from the
   # main bot so an outage/ban on one never affects the other; both fall back to
   # bot_token / chat_id when left empty.
-  log_errors_enabled: bool = _opt(False, "TELEGRAM_LOG_ERRORS_ENABLED", "telegram_log_errors_enabled")
-  log_dedup_window: int = _opt(60, "TELEGRAM_LOG_DEDUP_WINDOW", "telegram_log_dedup_window")  # seconds — suppress identical messages
+  log_errors_enabled: bool = _opt(
+    False, "TELEGRAM_LOG_ERRORS_ENABLED", "telegram_log_errors_enabled"
+  )
+  log_dedup_window: int = _opt(
+    60, "TELEGRAM_LOG_DEDUP_WINDOW", "telegram_log_dedup_window"
+  )  # seconds — suppress identical messages
   log_chat_id: str = _opt("", "TELEGRAM_LOG_CHAT_ID", "telegram_log_chat_id")
-  log_bot_token: Optional[SecretStr] = _opt(None, "TELEGRAM_LOG_BOT_TOKEN", "telegram_log_bot_token")
+  log_bot_token: Optional[SecretStr] = _opt(
+    None, "TELEGRAM_LOG_BOT_TOKEN", "telegram_log_bot_token"
+  )
 
   @field_validator("chat_channel_id", mode="before")
   @classmethod
@@ -381,10 +435,10 @@ class Settings(BaseSettings):
         if not value
       ]
       if missing:
-        raise ValueError(
-          f"MARKET_TYPE=FOREX requires: {', '.join(missing)}"
-        )
-      self.account_id = f"{self.market_type.value}-{self.forex.platform.value}-{self.forex.login}"
+        raise ValueError(f"MARKET_TYPE=FOREX requires: {', '.join(missing)}")
+      self.account_id = (
+        f"{self.market_type.value}-{self.forex.platform.value}-{self.forex.login}"
+      )
     elif self.market_type == MarketTypeEnum.CRYPTO:
       if self.crypto.exchange == CryptoExchangeEnum.BINANCE:
         missing = [
@@ -402,6 +456,36 @@ class Settings(BaseSettings):
             f"MARKET_TYPE=CRYPTO (BINANCE) requires: {', '.join(missing)}"
           )
         self.account_id = f"{self.market_type.value}-{self.crypto.exchange.value}-{self.crypto.account_id}"
+    return self
+
+  @model_validator(mode="after")
+  def _validate_multi_strategy_magics(self):
+    """Reject duplicate magic numbers when multi-strategy-per-symbol is on.
+
+    With the toggle enabled, the magic number is the *only* thing separating two
+    strategies that share a symbol: `get_open_positions(symbol, strategy)`
+    filters on it, so two strategies mapped to the same magic would see — and
+    force-close, on the next entry — each other's positions. Elsewhere a
+    duplicate magic is merely a misconfiguration; here it silently defeats the
+    isolation the feature is built on, so it fails fast at startup instead.
+    """
+    if not (
+      self.market_type == MarketTypeEnum.FOREX
+      and self.forex.allow_multi_strategy_per_symbol
+    ):
+      return self
+    seen: dict[int, str] = {}
+    collisions: list[str] = []
+    for strategy, magic in self.strategy.magic_map.items():
+      if magic in seen:
+        collisions.append(f"{seen[magic]} + {strategy} → {magic}")
+      else:
+        seen[magic] = strategy
+    if collisions:
+      raise ValueError(
+        "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true requires a unique magic "
+        f"number per strategy in STRATEGY_MAGIC_MAP; duplicates: {'; '.join(collisions)}"
+      )
     return self
 
   def flat_dump(self) -> dict:

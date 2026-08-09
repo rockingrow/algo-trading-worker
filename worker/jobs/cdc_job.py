@@ -84,7 +84,6 @@ class PositionCDC:
       return None
     return self._strategy_magic_map.get(strategy)
 
-
   def start(self, stop_event=None) -> None:
     if stop_event is not None:
       self._stop_event = stop_event

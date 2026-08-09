@@ -53,6 +53,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"{ForexMessagePresenter._tp1_percent_line(s)}"
       f"{ForexMessagePresenter._tp1_be_line(s)}"
       f"{ForexMessagePresenter._max_open_orders_line(s)}"
+      f"{ForexMessagePresenter._multi_strategy_line(s, 'FOREX')}"
     )
     return _box(
       f"{CONNECTED} <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
@@ -78,8 +79,12 @@ class ForexMessagePresenter(BaseMessagePresenter):
 
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None, settings_dict: dict | None = None,
+    signal: SignalSchema,
+    result: dict,
+    pos_ticket: Any,
+    footer: str,
+    risk_info=None,
+    settings_dict: dict | None = None,
   ) -> str:
     volume = format_volume(result.get("volume"), auto_calculated=True)
     qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)

@@ -168,9 +168,7 @@ class BasePositionReconcileJob(ABC):
     live_keys = self._collect_live_keys(live_positions)
 
     stale: Dict[Any, Dict[str, Any]] = {
-      row["ref_source_id"]: row
-      for row in db_rows
-      if self._is_row_stale(row, live_keys)
+      row["ref_source_id"]: row for row in db_rows if self._is_row_stale(row, live_keys)
     }
 
     # Confirm only rows stale on this scan AND the previous one.
@@ -181,7 +179,10 @@ class BasePositionReconcileJob(ABC):
       log.warning(
         "[%s] DB row open but broker flat | symbol=%s strategy=%s "
         "ref_source_id=%s — reconciling as closed (missed close event).",
-        self.name, row.get("symbol"), row.get("strategy"), row.get("ref_source_id"),
+        self.name,
+        row.get("symbol"),
+        row.get("strategy"),
+        row.get("ref_source_id"),
       )
       try:
         self._handler(row)
@@ -189,7 +190,9 @@ class BasePositionReconcileJob(ABC):
         # Leave the row open; it stays stale and is retried on the next scan.
         log.exception(
           "[%s] handler failed for ref_source_id=%s: %s",
-          self.name, row.get("ref_source_id"), exc,
+          self.name,
+          row.get("ref_source_id"),
+          exc,
         )
 
   def _is_row_stale(self, row: Dict[str, Any], live_keys: Set[Any]) -> bool:
@@ -204,13 +207,16 @@ class BasePositionReconcileJob(ABC):
     except Exception as exc:
       log.warning(
         "[%s] Cannot resolve match keys for ref_source_id=%s (%s) — treating as live.",
-        self.name, row.get("ref_source_id"), exc,
+        self.name,
+        row.get("ref_source_id"),
+        exc,
       )
       return False
     if not keys:
       log.warning(
         "[%s] No match keys for ref_source_id=%s — treating as live.",
-        self.name, row.get("ref_source_id"),
+        self.name,
+        row.get("ref_source_id"),
       )
       return False
     return keys.isdisjoint(live_keys)
@@ -237,7 +243,9 @@ class BasePositionReconcileJob(ABC):
         log.warning(
           "[%s] Cannot resolve match keys for ref_source_id=%s (%s) — "
           "skipping manual-import pass this scan.",
-          self.name, row.get("ref_source_id"), exc,
+          self.name,
+          row.get("ref_source_id"),
+          exc,
         )
         return
 
@@ -256,7 +264,9 @@ class BasePositionReconcileJob(ABC):
       log.warning(
         "[%s] Broker position untracked in DB | symbol=%s side=%s vol=%s — "
         "importing (opened outside the worker).",
-        self.name, getattr(pos, "symbol", None), getattr(pos, "side", None),
+        self.name,
+        getattr(pos, "symbol", None),
+        getattr(pos, "side", None),
         getattr(pos, "volume", None),
       )
       try:
@@ -265,7 +275,9 @@ class BasePositionReconcileJob(ABC):
         # Leave it unimported; it stays untracked and is retried on the next scan.
         log.exception(
           "[%s] manual_handler failed for symbol=%s: %s",
-          self.name, getattr(pos, "symbol", None), exc,
+          self.name,
+          getattr(pos, "symbol", None),
+          exc,
         )
 
   # ── helpers ─────────────────────────────────────────────────────────────── #
