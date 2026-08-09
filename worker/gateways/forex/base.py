@@ -158,7 +158,10 @@ class BasePlatformGateway(ABC):
 
   @abstractmethod
   def close_position(
-    self, position: PlatformPosition, volume: Optional[float] = None, comment: str = "Close"
+    self,
+    position: PlatformPosition,
+    volume: Optional[float] = None,
+    comment: str = "Close",
   ) -> TradeResult:
     """Close (or partially close) *position* with a counter-direction market order.
 

@@ -165,9 +165,7 @@ class NATSSubscriber:
     logger.info("NATS subscriber stop requested. Closing...")
     self._client.stop()
 
-  def listen(
-    self, stop_event=None
-  ) -> Generator[tuple[_Subject, str], None, None]:
+  def listen(self, stop_event=None) -> Generator[tuple[_Subject, str], None, None]:
     logger.info(
       "Started listening for NATS messages on subjects: %s",
       ", ".join(_subject_str(s) for s in self.subjects),

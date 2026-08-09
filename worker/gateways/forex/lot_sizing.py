@@ -60,7 +60,9 @@ class LotSizer:
 
     point = spec.point
     if point <= 0:
-      logger.error("Symbol spec has invalid point value. Falling back to minimum lot size.")
+      logger.error(
+        "Symbol spec has invalid point value. Falling back to minimum lot size."
+      )
       return spec.volume_min
 
     sl_distance_points = abs(entry_price - sl_price) / point
@@ -103,9 +105,7 @@ class LotSizer:
 
     contract_size = spec.contract_size
     if contract_size <= 0:
-      logger.warning(
-        f"Invalid contract size: {contract_size}. Using raw quantity."
-      )
+      logger.warning(f"Invalid contract size: {contract_size}. Using raw quantity.")
       return quantity
 
     step = spec.volume_step

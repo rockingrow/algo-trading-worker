@@ -1,4 +1,4 @@
-﻿"""
+"""
 worker/gateways/forex/mt5/symbol_resolver.py
 ────────────────────────────────────────────
 Resolves a base symbol (e.g. ``XAUUSD``) to the broker's actual tradeable

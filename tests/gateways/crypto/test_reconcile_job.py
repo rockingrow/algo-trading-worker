@@ -79,7 +79,9 @@ def _manual_job(db, executor):
     # Mimic the real handler: the imported position is now DB-tracked.
     db._rows.append(_row(f"MANUAL-{pos.symbol}", symbol=pos.symbol, strategy="MANUAL"))
 
-  return CryptoReconcileJob(db, executor, handler, manual_handler=manual_handler), imported
+  return CryptoReconcileJob(
+    db, executor, handler, manual_handler=manual_handler
+  ), imported
 
 
 def test_missed_close_confirmed_after_two_scans():
@@ -208,7 +210,9 @@ def test_manual_import_skipped_when_no_manual_handler():
 
 def test_fetch_failure_leaves_manual_suspects_untouched():
   db = _FakeDb([])
-  job, imported = _manual_job(db, _FakeExecutor(live_symbols={"BTCUSDT"}, raise_on_fetch=True))
+  job, imported = _manual_job(
+    db, _FakeExecutor(live_symbols={"BTCUSDT"}, raise_on_fetch=True)
+  )
   with pytest.raises(RuntimeError):
     job._scan()
   assert imported == []

@@ -1,4 +1,4 @@
-﻿"""
+"""
 worker/crypto/message_presenter.py
 ──────────────────────────────────
 Telegram message strings for the crypto worker's trade lifecycle events.
@@ -54,7 +54,9 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"{CryptoMessagePresenter._tp1_be_line(s)}"
       f"{CryptoMessagePresenter._max_open_orders_line(s)}"
     )
-    return _box(f"{CONNECTED} <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}")
+    return _box(
+      f"{CONNECTED} <b>[Connected] Crypto Worker</b>\n\n{cfg}{_DIVIDER}\n{footer}"
+    )
 
   @staticmethod
   def shutdown(footer: str) -> str:
@@ -75,8 +77,12 @@ class CryptoMessagePresenter(BaseMessagePresenter):
 
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None, settings_dict: dict | None = None,
+    signal: SignalSchema,
+    result: dict,
+    pos_ticket: Any,
+    footer: str,
+    risk_info=None,
+    settings_dict: dict | None = None,
   ) -> str:
     qty = result.get("volume")
     qty_suffix = CryptoMessagePresenter._tp1_qty_suffix(signal, settings_dict)

@@ -28,7 +28,9 @@ class FakeExecutor:
   def convert_quantity_to_lots(self, symbol, quantity):
     return quantity / 100.0
 
-  def partial_close_position(self, symbol, close_volume, position_ticket=None, strategy=None):
+  def partial_close_position(
+    self, symbol, close_volume, position_ticket=None, strategy=None
+  ):
     self.calls.append(("partial", close_volume, position_ticket, strategy))
     return {"success": True, "volume": close_volume, "ticket": 1}
 
@@ -101,15 +103,20 @@ def test_factory_requires_executor(config):
 
 def test_factory_requires_config():
   with pytest.raises(ValueError):
-    MarketStrategyFactory.create(MarketTypeEnum.FOREX, executor=FakeExecutor(), config=None)
+    MarketStrategyFactory.create(
+      MarketTypeEnum.FOREX, executor=FakeExecutor(), config=None
+    )
 
 
 # ── Multi-strategy-per-symbol capability ─────────────────────────────────── #
 
+
 @pytest.mark.parametrize("allowed", [True, False])
 def test_forex_allows_multi_strategy_per_symbol_follows_config(config, allowed):
   """The capability SignalHandler reads is the resolved config flag, nothing else."""
-  market = ForexMarket(FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=allowed))
+  market = ForexMarket(
+    FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=allowed)
+  )
   assert market.allows_multi_strategy_per_symbol is allowed
 
 
@@ -122,11 +129,14 @@ def test_crypto_never_allows_multi_strategy_per_symbol(config):
   `strategy` filter and cancels resting orders symbol-wide, so the capability must
   stay off even when CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL flipped the config
   flag (which only relaxes CryptoExecutor._netting_conflict)."""
-  market = CryptoMarket(FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=True))
+  market = CryptoMarket(
+    FakeExecutor(), replace(config, allow_multi_strategy_per_symbol=True)
+  )
   assert market.allows_multi_strategy_per_symbol is False
 
 
 # ── Signal-level tp1_percent / move_sl_to_be fallback ────────────────────── #
+
 
 def test_handle_tp1_uses_signal_tp1_percent_when_config_is_none(config):
   """signal.tp1_percent is used when config.position_tp1_percent is None."""
@@ -142,7 +152,9 @@ def test_handle_tp1_uses_signal_tp1_percent_when_config_is_none(config):
 
 def test_handle_tp1_falls_back_to_config_when_signal_has_no_tp1_percent(config):
   """When use_custom=False and signal has no tp1_percent, config.position_tp1_percent is used."""
-  cfg = replace(config, use_custom_position_tp1_percent=False, position_tp1_percent=50.0)
+  cfg = replace(
+    config, use_custom_position_tp1_percent=False, position_tp1_percent=50.0
+  )
   pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
   ex = FakeExecutor(positions=[pos])
   market = ForexMarket(ex, cfg)
@@ -154,7 +166,9 @@ def test_handle_tp1_falls_back_to_config_when_signal_has_no_tp1_percent(config):
 
 def test_handle_tp1_signal_tp1_percent_used_when_not_custom(config):
   """use_custom_position_tp1_percent=False: signal.tp1_percent wins over config."""
-  cfg = replace(config, use_custom_position_tp1_percent=False)  # config has position_tp1_percent=30
+  cfg = replace(
+    config, use_custom_position_tp1_percent=False
+  )  # config has position_tp1_percent=30
   pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
   ex = FakeExecutor(positions=[pos])
   market = ForexMarket(ex, cfg)
@@ -167,7 +181,9 @@ def test_handle_tp1_signal_tp1_percent_used_when_not_custom(config):
 
 def test_handle_tp1_custom_tp1_percent_overrides_signal(config):
   """use_custom_position_tp1_percent=True: config.position_tp1_percent wins over signal.tp1_percent."""
-  cfg = replace(config, use_custom_position_tp1_percent=True)  # config has position_tp1_percent=30
+  cfg = replace(
+    config, use_custom_position_tp1_percent=True
+  )  # config has position_tp1_percent=30
   pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
   ex = FakeExecutor(positions=[pos])
   market = ForexMarket(ex, cfg)
@@ -235,8 +251,10 @@ def test_handle_tp1_fails_when_no_tp1_percent_anywhere(config):
   """VOLUME_DECISION mode with no tp1_percent in config *or* signal must fail
   cleanly instead of crashing on ``None / 100``."""
   cfg = replace(
-    config, volume_decision_enabled=True,
-    use_custom_position_tp1_percent=False, position_tp1_percent=None,
+    config,
+    volume_decision_enabled=True,
+    use_custom_position_tp1_percent=False,
+    position_tp1_percent=None,
   )
   pos = SimpleNamespace(ticket=7, volume=1.0, price_open=2000.0)
   ex = FakeExecutor(positions=[pos])

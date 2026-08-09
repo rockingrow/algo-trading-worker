@@ -123,9 +123,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
   any compatible fake.
   """
 
-  def __init__(
-    self, executor: TradeExecutorProtocol, config: ExecutionConfig
-  ) -> None:
+  def __init__(self, executor: TradeExecutorProtocol, config: ExecutionConfig) -> None:
     self._executor = executor
     self._config = config
 
@@ -152,12 +150,15 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     move_sl_to_be = (
       self._config.tp1_move_sl_to_breakeven
       if self._config.tp1_move_sl_to_breakeven is not None
-      else signal.move_sl_to_be if signal.move_sl_to_be is not None
+      else signal.move_sl_to_be
+      if signal.move_sl_to_be is not None
       else False
     )
     return tp1_percent, move_sl_to_be
 
-  def _resolve_tp1_volume(self, signal: SignalSchema, pos, tp1_percent: float) -> TradeResult | float:
+  def _resolve_tp1_volume(
+    self, signal: SignalSchema, pos, tp1_percent: float
+  ) -> TradeResult | float:
     """Derive close volume; returns TradeResult.fail on error, float on success."""
     symbol = signal.symbol
     if self._config.volume_decision_enabled:
@@ -174,7 +175,10 @@ class ExecutorBackedMarket(BaseMarketStrategy):
       logger.info(
         "[handle_tp1] VOLUME_DECISION mode | position_volume=%s tp1_percent=%s%% "
         "calculated=%s → close_volume=%s",
-        pos.volume, tp1_percent, calculated, close_volume,
+        pos.volume,
+        tp1_percent,
+        calculated,
+        close_volume,
       )
       return close_volume
     if signal.quantity is None:
@@ -182,7 +186,8 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     close_volume = self._executor.convert_quantity_to_lots(symbol, signal.quantity)
     logger.info(
       "[handle_tp1] Payload quantity mode | qty=%s → close_volume=%s",
-      signal.quantity, close_volume,
+      signal.quantity,
+      close_volume,
     )
     return close_volume
 

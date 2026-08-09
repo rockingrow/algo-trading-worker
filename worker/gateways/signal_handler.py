@@ -218,7 +218,9 @@ class SignalHandler:
         logger.warning(
           "[SignalHandler._handle_entry] Netting conflict for %s: already held by "
           "%s — rejecting %s entry to protect their orders.",
-          symbol, sorted(other_holders), strategy,
+          symbol,
+          sorted(other_holders),
+          strategy,
         )
         return TradeResult.fail(
           f"Netting conflict: {symbol} already held by {sorted(other_holders)}. "
@@ -229,7 +231,9 @@ class SignalHandler:
       logger.info(
         "[SignalHandler._handle_entry] %s also held by %s — multi-strategy per "
         "symbol is enabled, opening %s alongside them.",
-        symbol, sorted(other_holders), strategy,
+        symbol,
+        sorted(other_holders),
+        strategy,
       )
 
     # Step 1 — Pre-flight: close this strategy's stale position to start clean.

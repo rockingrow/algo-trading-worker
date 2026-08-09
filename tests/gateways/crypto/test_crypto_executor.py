@@ -30,10 +30,18 @@ class FakeGateway:
   def get_positions(self, symbol=None):
     return list(self._positions)
 
-  def place_market_order(self, symbol, side, quantity, reduce_only=False, client_order_id=None):
+  def place_market_order(
+    self, symbol, side, quantity, reduce_only=False, client_order_id=None
+  ):
     self.orders.append((symbol, side, quantity, reduce_only))
     self.client_order_ids.append(client_order_id)
-    return {"success": True, "retcode": 0, "ticket": 99, "price": self._mark, "volume": quantity}
+    return {
+      "success": True,
+      "retcode": 0,
+      "ticket": 99,
+      "price": self._mark,
+      "volume": quantity,
+    }
 
   def set_stop_loss(self, symbol, position_side, stop_price, quantity):
     self.stops.append((symbol, position_side, stop_price, quantity))
@@ -108,7 +116,9 @@ def test_calculate_quantity_risk_based(config):
 def test_open_position_risk_mode_places_order_and_stop(config):
   gw = FakeGateway()
   ex = CryptoExecutor(gw, config)
-  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0)
+  )
   assert res["success"] is True
   assert gw.orders == [("BTCUSDT", "LONG", 0.02, False)]
   assert gw.stops and gw.stops[0][2] == 29000.0
@@ -120,7 +130,9 @@ def test_open_position_sizes_against_account_equity_when_enabled(config):
   gw = FakeGateway()  # equity = 5000
   ex = CryptoExecutor(gw, cfg)
   # equity=5000, risk=2% → $100 risk; |30000-29000|=1000 → 0.1 (vs 0.02 on CAPITAL=1000)
-  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0)
+  )
   assert res["success"] is True
   assert gw.orders == [("BTCUSDT", "LONG", 0.1, False)]
 
@@ -131,7 +143,9 @@ def test_open_position_account_equity_unavailable_falls_back_to_min_qty(config):
   gw = FakeGateway(step=0.001)
   gw.get_account = lambda: None
   ex = CryptoExecutor(gw, cfg)
-  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0)
+  )
   assert res["success"] is True
   assert gw.orders[0][2] == 0.001  # min_qty
 
@@ -140,7 +154,9 @@ def test_open_position_rolls_back_when_sl_fails(config):
   """A filled entry whose protective stop fails must be closed, not persisted."""
   gw = FakeGateway(sl_ok=False)
   ex = CryptoExecutor(gw, config)
-  res = ex.open_position(make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0))
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0)
+  )
 
   assert res["success"] is False
   assert "stop-loss failed" in res["comment"]
@@ -229,7 +245,11 @@ def test_open_position_no_tp_when_signal_has_no_tp2(config):
 def test_open_position_tolerates_tp_failure(config):
   """A failed TP placement is logged but does not roll back the SL-protected entry."""
   gw = FakeGateway()
-  gw.set_take_profit = lambda *a, **k: {"success": False, "retcode": -1, "comment": "TP rejected"}
+  gw.set_take_profit = lambda *a, **k: {
+    "success": False,
+    "retcode": -1,
+    "comment": "TP rejected",
+  }
   ex = CryptoExecutor(gw, config)
   res = ex.open_position(
     make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0, tp2=31000.0)
@@ -257,10 +277,12 @@ def test_update_sl_replaces_tp2_from_persisted_entry_signal(config):
   gw = FakeGateway(positions=[_long_pos()])
   db = _FakeDB([{"gateway_message": json.dumps({"tp2": 31000.0})}])
   ex = CryptoExecutor(gw, config, db=db)
-  res = ex.update_position_sl("BTCUSD", new_sl=30000.0, position_ticket=7, strategy="strat-1")
+  res = ex.update_position_sl(
+    "BTCUSD", new_sl=30000.0, position_ticket=7, strategy="strat-1"
+  )
   assert res["success"] is True
-  assert gw.cancelled == ["BTCUSDT"]            # old SL + old TP cleared
-  assert gw.stops[0][2] == 30000.0              # breakeven stop re-placed
+  assert gw.cancelled == ["BTCUSDT"]  # old SL + old TP cleared
+  assert gw.stops[0][2] == 30000.0  # breakeven stop re-placed
   assert gw.takes == [("BTCUSDT", "LONG", 31000.0, 0.02)]  # TP2 re-established
 
 
@@ -268,7 +290,9 @@ def test_update_sl_no_tp_replace_when_unavailable(config):
   """No DB / no recoverable TP2 → breakeven SL still set, no TP re-placed."""
   gw = FakeGateway(positions=[_long_pos()])
   ex = CryptoExecutor(gw, config)  # db=None
-  res = ex.update_position_sl("BTCUSD", new_sl=30000.0, position_ticket=7, strategy="strat-1")
+  res = ex.update_position_sl(
+    "BTCUSD", new_sl=30000.0, position_ticket=7, strategy="strat-1"
+  )
   assert res["success"] is True
   assert gw.stops[0][2] == 30000.0
   assert gw.takes == []

@@ -178,10 +178,12 @@ def test_another_strategys_position_does_not_keep_row_live():
 def test_only_stale_rows_reconciled_in_mixed_book():
   # strat-a's XAUUSD position is gone; strat-b's EURUSD one is still live.
   live = make_platform_position(ticket=222, magic=_MAGICS["strat-b"], symbol="EURUSDc")
-  db = _FakeDb([
-    _row("111", symbol="XAUUSD", strategy="strat-a"),
-    _row("222", symbol="EURUSD", strategy="strat-b"),
-  ])
+  db = _FakeDb(
+    [
+      _row("111", symbol="XAUUSD", strategy="strat-a"),
+      _row("222", symbol="EURUSD", strategy="strat-b"),
+    ]
+  )
   job, handled = _job(db, _FakeExecutor(positions=[live]))
   job._scan()
   job._scan()
@@ -264,7 +266,9 @@ def test_disconnected_platform_skips_scan():
   # positions_get() returns None while the terminal is offline and the gateway
   # maps that to [] — which must never be read as "the account is flat".
   db = _FakeDb([_row("111")])
-  job, handled = _job(db, _FakeExecutor(positions=[]), gateway=_FakeGateway(connected=False))
+  job, handled = _job(
+    db, _FakeExecutor(positions=[]), gateway=_FakeGateway(connected=False)
+  )
   job._scan()
   job._scan()
   assert handled == []
@@ -315,9 +319,11 @@ class _ResolvingGateway:
 def test_real_executor_reconciles_row_whose_magic_is_no_longer_live():
   # Drives the real ForexExecutor: get_all_open_positions() filters to the magics
   # this worker owns, so strat-a's row is stale while strat-b's stays live.
-  gateway = _ResolvingGateway([
-    make_platform_position(ticket=222, magic=_MAGICS["strat-b"], symbol="EURUSDc"),
-  ])
+  gateway = _ResolvingGateway(
+    [
+      make_platform_position(ticket=222, magic=_MAGICS["strat-b"], symbol="EURUSDc"),
+    ]
+  )
   executor = ForexExecutor(
     gateway=gateway,
     config=ExecutionConfig(
@@ -328,10 +334,12 @@ def test_real_executor_reconciles_row_whose_magic_is_no_longer_live():
     ),
     strategy_magic_map=_MAGICS,
   )
-  db = _FakeDb([
-    _row("111", symbol="XAUUSD", strategy="strat-a"),
-    _row("222", symbol="EURUSD", strategy="strat-b"),
-  ])
+  db = _FakeDb(
+    [
+      _row("111", symbol="XAUUSD", strategy="strat-a"),
+      _row("222", symbol="EURUSD", strategy="strat-b"),
+    ]
+  )
   job, handled = _job(db, executor, gateway=gateway)
   job._magic_for = executor._magic_for
 

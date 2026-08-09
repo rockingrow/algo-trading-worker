@@ -35,8 +35,8 @@ def test_unknown_kwargs_go_to_extra():
 
 def test_mapping_setitem_known_and_unknown():
   r = TradeResult.ok(ticket="1")
-  r["source_ticket"] = "9"     # known field → attribute
-  r["custom"] = "y"            # unknown → extra
+  r["source_ticket"] = "9"  # known field → attribute
+  r["custom"] = "y"  # unknown → extra
   assert r.source_ticket == "9"
   assert r["source_ticket"] == "9"
   assert r.extra["custom"] == "y"
@@ -46,12 +46,12 @@ def test_get_default_and_contains():
   r = TradeResult.fail("x")
   assert r.get("missing") is None
   assert r.get("missing", 42) == 42
-  assert "ticket" in r          # declared field always "in"
+  assert "ticket" in r  # declared field always "in"
   assert "nope" not in r
 
 
 def test_setdefault_only_fills_missing():
-  r = TradeResult.ok()          # volume is None
+  r = TradeResult.ok()  # volume is None
   assert r.setdefault("volume", 0.5) == 0.5
   assert r.volume == 0.5
   # already set → unchanged

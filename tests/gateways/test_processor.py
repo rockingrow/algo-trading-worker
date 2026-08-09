@@ -34,7 +34,9 @@ class FakePresenter:
     return f"force_closed:{symbol}"
 
   @staticmethod
-  def order_filled(signal, result, pos_ticket, footer, risk_info=None, settings_dict=None):
+  def order_filled(
+    signal, result, pos_ticket, footer, risk_info=None, settings_dict=None
+  ):
     return f"filled:{signal.action.value}:{pos_ticket}"
 
   @staticmethod
@@ -218,7 +220,9 @@ def test_incomplete_subclass_is_abstract():
 def test_entry_signal_inserts_position_with_market_and_magic():
   result = {"success": True, "ticket": 555, "price": 30000.0, "volume": 0.02}
   proc = FakeProcessor(result)
-  proc._process_message(NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json())
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
 
   assert len(proc.db.inserted) == 1
   row = proc.db.inserted[0]
@@ -232,9 +236,17 @@ def test_entry_signal_inserts_position_with_market_and_magic():
 
 
 def test_exit_signal_updates_status():
-  result = {"success": True, "ticket": 9, "source_ticket": 5, "price": 31000.0, "volume": 0.02}
+  result = {
+    "success": True,
+    "ticket": 9,
+    "source_ticket": 5,
+    "price": 31000.0,
+    "volume": 0.02,
+  }
   proc = FakeProcessor(result)
-  proc._process_message(NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.SL).model_dump_json())
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.SL).model_dump_json()
+  )
 
   assert proc.db.inserted == []
   assert len(proc.db.updated) == 1
@@ -272,7 +284,13 @@ def test_zero_fill_price_falls_back_to_signal_price():
   # Binance testnet can return price=0 on a filled MARKET order (entries AND
   # closes such as FLAT). The processor must substitute signal.price so neither
   # the DB row nor the notification records a misleading 0.0.
-  result = {"success": True, "ticket": 9, "source_ticket": 5, "price": 0.0, "volume": 0.02}
+  result = {
+    "success": True,
+    "ticket": 9,
+    "source_ticket": 5,
+    "price": 0.0,
+    "volume": 0.02,
+  }
   proc = FakeProcessor(result)
   proc._process_message(
     NatsSubjectEnum.SIGNAL,
@@ -286,7 +304,13 @@ def test_zero_fill_price_falls_back_to_signal_price():
 def test_zero_fill_price_with_no_signal_price_stays_zero():
   # No fallback available (signal carries no price) → leave the result untouched
   # rather than inventing a price.
-  result = {"success": True, "ticket": 9, "source_ticket": 5, "price": 0.0, "volume": 0.02}
+  result = {
+    "success": True,
+    "ticket": 9,
+    "source_ticket": 5,
+    "price": 0.0,
+    "volume": 0.02,
+  }
   proc = FakeProcessor(result)
   proc._process_message(
     NatsSubjectEnum.SIGNAL,
@@ -297,7 +321,9 @@ def test_zero_fill_price_with_no_signal_price_stays_zero():
 
 def test_failed_result_sends_failure_notification():
   proc = FakeProcessor({"success": False, "retcode": -1, "comment": "boom"})
-  proc._process_message(NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json())
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
   assert proc.db.inserted == []
   assert proc.notifications == ["failed:LONG"]
 
@@ -307,7 +333,9 @@ def test_failed_result_sends_failure_notification():
 
 def _open_row(strategy, symbol):
   return {
-    "strategy": strategy, "symbol": symbol, "status": "OPENED",
+    "strategy": strategy,
+    "symbol": symbol,
+    "status": "OPENED",
     "ref_source_id": f"{strategy}:{symbol}",
   }
 
@@ -371,7 +399,9 @@ def test_entry_rejected_when_symbol_already_open_same_strategy():
 
   proc._process_message(
     NatsSubjectEnum.SIGNAL,
-    make_signal(SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-1").model_dump_json(),
+    make_signal(
+      SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-1"
+    ).model_dump_json(),
   )
 
   # Broker execution never runs; recorded as a REJECTED row + audit log + notice.
@@ -394,12 +424,52 @@ def test_entry_rejected_when_symbol_open_under_other_strategy():
 
   proc._process_message(
     NatsSubjectEnum.SIGNAL,
-    make_signal(SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-2").model_dump_json(),
+    make_signal(
+      SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-2"
+    ).model_dump_json(),
   )
 
   assert seen == []
   assert len(proc.db.rejected) == 1
   assert "strat-1" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_allowed_when_symbol_open_under_other_strategy_and_multi_allowed():
+  # FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL: a different strategy's position on
+  # the symbol no longer blocks — the market keeps them isolated via magic.
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+  seen = _capturing_handler(proc, {"success": True, "ticket": 1})
+  proc.handler.strategy = SimpleNamespace(allows_multi_strategy_per_symbol=True)
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-2"
+    ).model_dump_json(),
+  )
+
+  assert len(seen) == 1
+  assert proc.db.rejected == []
+
+
+def test_entry_rejected_when_symbol_open_under_same_strategy_even_if_multi_allowed():
+  # The toggle exempts *other* strategies only — this strategy's own open
+  # position on the symbol still blocks a fresh entry.
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = SimpleNamespace(allows_multi_strategy_per_symbol=True)
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-1"
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
 
 
 def test_entry_allowed_when_symbol_has_no_open_order():
@@ -547,7 +617,9 @@ def test_system_malformed_json_dropped_without_dispatch():
 def test_system_invalid_envelope_dropped_without_dispatch():
   proc = FakeProcessor({"success": True})
   # Unknown action fails SystemActionEnum validation → dropped before dispatch.
-  proc._process_message(NatsSubjectEnum.SYSTEM, '{"action":"NOPE","timestamp":"2026-06-30T00:00:00+00:00"}')
+  proc._process_message(
+    NatsSubjectEnum.SYSTEM, '{"action":"NOPE","timestamp":"2026-06-30T00:00:00+00:00"}'
+  )
   assert proc.system_calls == []
 
 
@@ -606,10 +678,12 @@ def _no_handshake_jitter(monkeypatch):
 
 def test_announce_worker_connected_ack_needs_no_dispatch():
   proc = _connected_proc()
-  proc.publisher = FakePublisher([
-    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
-  ])
+  proc.publisher = FakePublisher(
+    [
+      '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+      '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
+    ]
+  )
   proc._announce_worker_connected()
 
   assert len(proc.publisher.requests) == 1
@@ -624,10 +698,12 @@ def test_announce_worker_connected_ack_needs_no_dispatch():
 
 def test_announce_worker_connected_routes_crypto_leverage_init_reply():
   proc = _connected_proc()
-  proc.publisher = FakePublisher([
-    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC"],"default_leverage":10}'
-  ])
+  proc.publisher = FakePublisher(
+    [
+      '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
+      '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC"],"default_leverage":10}'
+    ]
+  )
   proc._announce_worker_connected()
 
   assert len(proc.system_calls) == 1
@@ -639,10 +715,12 @@ def test_announce_worker_connected_routes_crypto_leverage_init_reply():
 
 def test_announce_worker_connected_error_reply_logged_without_retry():
   proc = _connected_proc()
-  proc.publisher = FakePublisher([
-    '{"action":"WORKER_CONNECTED_ERROR","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","reason":"missing settings"}'
-  ])
+  proc.publisher = FakePublisher(
+    [
+      '{"action":"WORKER_CONNECTED_ERROR","timestamp":"2026-06-30T00:00:00+00:00",'
+      '"account_id":"FAKE_MKT-FAKE_GW-acct-1","reason":"missing settings"}'
+    ]
+  )
   proc._announce_worker_connected()
 
   # The broker responded (not a timeout) — a config problem on its side isn't
@@ -655,12 +733,14 @@ def test_announce_worker_connected_retries_with_backoff_on_timeout(monkeypatch):
   sleeps = []
   monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
   proc = _connected_proc()
-  proc.publisher = FakePublisher([
-    TimeoutError("no reply"),
-    TimeoutError("no reply"),
-    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
-  ])
+  proc.publisher = FakePublisher(
+    [
+      TimeoutError("no reply"),
+      TimeoutError("no reply"),
+      '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+      '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+    ]
+  )
   proc._announce_worker_connected()
 
   assert len(proc.publisher.requests) == 3
@@ -671,14 +751,16 @@ def test_announce_worker_connected_retries_indefinitely_until_success(monkeypatc
   sleeps = []
   monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
   proc = _connected_proc()
-  proc.publisher = FakePublisher([
-    TimeoutError("no reply"),
-    TimeoutError("no reply"),
-    TimeoutError("no reply"),
-    TimeoutError("no reply"),
-    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
-  ])
+  proc.publisher = FakePublisher(
+    [
+      TimeoutError("no reply"),
+      TimeoutError("no reply"),
+      TimeoutError("no reply"),
+      TimeoutError("no reply"),
+      '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+      '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+    ]
+  )
   proc._announce_worker_connected()
 
   assert len(proc.publisher.requests) == 5
@@ -690,16 +772,22 @@ def test_announce_worker_connected_retries_indefinitely_until_success(monkeypatc
 def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatch):
   monkeypatch.setattr(time, "sleep", lambda s: None)
   levels = []
-  monkeypatch.setattr(processor_module.log, "warning", lambda *a, **k: levels.append("WARNING"))
-  monkeypatch.setattr(processor_module.log, "error", lambda *a, **k: levels.append("ERROR"))
+  monkeypatch.setattr(
+    processor_module.log, "warning", lambda *a, **k: levels.append("WARNING")
+  )
+  monkeypatch.setattr(
+    processor_module.log, "error", lambda *a, **k: levels.append("ERROR")
+  )
   proc = _connected_proc()
-  proc.publisher = FakePublisher([
-    TimeoutError("no reply"),
-    TimeoutError("no reply"),
-    TimeoutError("no reply"),
-    '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
-  ])
+  proc.publisher = FakePublisher(
+    [
+      TimeoutError("no reply"),
+      TimeoutError("no reply"),
+      TimeoutError("no reply"),
+      '{"action":"WORKER_CONNECTED_ACK","timestamp":"2026-06-30T00:00:00+00:00",'
+      '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}',
+    ]
+  )
   proc._announce_worker_connected()
 
   # First two timeouts stay WARNING; from _HANDSHAKE_ALERT_THRESHOLD (3) onward
@@ -753,7 +841,9 @@ def test_malformed_json_signal_is_dropped_without_notification():
 
 def test_not_connected_short_circuits():
   proc = FakeProcessor({"success": True}, connected=False)
-  proc._process_message(NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json())
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
   assert proc.db.logged == []
   assert proc.notifications == []
 
@@ -819,8 +909,12 @@ def test_non_scale_position_signal_is_untouched():
 def test_parse_strategy_subjects_keeps_only_strategy_names():
   # Control subjects (ADMIN/SYSTEM/SIGNAL/TRADE) are filtered out; blank and
   # duplicate entries are dropped; order of first occurrence is preserved.
-  assert parse_strategy_subjects("MT5_GOLD,ADMIN,MT5_FX, ,MT5_GOLD,SYSTEM,CRYPTO_ETH") == [
-    "MT5_GOLD", "MT5_FX", "CRYPTO_ETH",
+  assert parse_strategy_subjects(
+    "MT5_GOLD,ADMIN,MT5_FX, ,MT5_GOLD,SYSTEM,CRYPTO_ETH"
+  ) == [
+    "MT5_GOLD",
+    "MT5_FX",
+    "CRYPTO_ETH",
   ]
 
 
@@ -865,12 +959,14 @@ def _retry_signals_payload(signals, account_id="FAKE_MKT-FAKE_GW-acct-1"):
   """Serialise a RETRY_SIGNALS envelope with the given signal payloads."""
   import json as _json
 
-  return _json.dumps({
-    "action": SystemActionEnum.RETRY_SIGNALS.value,
-    "timestamp": datetime.now(timezone.utc).isoformat(),
-    "account_id": account_id,
-    "signals": [s.model_dump(mode="json") for s in signals],
-  })
+  return _json.dumps(
+    {
+      "action": SystemActionEnum.RETRY_SIGNALS.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": account_id,
+      "signals": [s.model_dump(mode="json") for s in signals],
+    }
+  )
 
 
 def _fresh_signal(action=SignalActionEnum.LONG, **overrides):
@@ -885,8 +981,8 @@ def _retry_proc():
   proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
   # Route RETRY_SIGNALS through the real base handler instead of the FakeProcessor
   # test-only capture, so the dedup + timeout + _process_signal path is exercised.
-  proc._handle_system_action = lambda action, data: BaseSignalProcessor._handle_system_action(
-    proc, action, data
+  proc._handle_system_action = lambda action, data: (
+    BaseSignalProcessor._handle_system_action(proc, action, data)
   )
   return proc
 
@@ -947,7 +1043,9 @@ def test_retry_signals_mixed_batch_only_executes_eligible():
     SignalActionEnum.LONG,
     signal_id="stale",
     symbol="CCC",
-    timestamp=(datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 5)).isoformat(),
+    timestamp=(
+      datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 5)
+    ).isoformat(),
   )
   raw = _retry_signals_payload([fresh, duplicate, stale])
 
@@ -997,10 +1095,16 @@ def test_retry_signals_handles_batch_of_ten_mixed_signals():
     _fresh_signal(SignalActionEnum.LONG, signal_id="dup-1", symbol="DUPA"),
     _fresh_signal(SignalActionEnum.LONG, signal_id="dup-2", symbol="DUPB"),
   ]
-  stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 30)).isoformat()
+  stale_ts = (
+    datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 30)
+  ).isoformat()
   stale = [
-    _fresh_signal(SignalActionEnum.LONG, signal_id="stale-1", symbol="STA", timestamp=stale_ts),
-    _fresh_signal(SignalActionEnum.LONG, signal_id="stale-2", symbol="STB", timestamp=stale_ts),
+    _fresh_signal(
+      SignalActionEnum.LONG, signal_id="stale-1", symbol="STA", timestamp=stale_ts
+    ),
+    _fresh_signal(
+      SignalActionEnum.LONG, signal_id="stale-2", symbol="STB", timestamp=stale_ts
+    ),
   ]
   failing = _fresh_signal(SignalActionEnum.LONG, signal_id="boom", symbol="BOOM")
 
@@ -1020,7 +1124,9 @@ def test_retry_signals_handles_batch_of_ten_mixed_signals():
   proc._process_message(NatsSubjectEnum.SYSTEM, raw)
 
   # The 5 fresh, eligible entries all executed and were persisted + notified.
-  assert sorted(row["symbol"] for row in proc.db.inserted) == [f"SYM{i}" for i in range(5)]
+  assert sorted(row["symbol"] for row in proc.db.inserted) == [
+    f"SYM{i}" for i in range(5)
+  ]
   assert len(proc.notifications) == 5
   # Duplicates, stale entries, and the failing signal never reach persistence.
   assert not any(
@@ -1034,18 +1140,20 @@ def test_retry_signals_dispatched_via_worker_connected_reply():
   SYSTEM push. The reply router must dispatch through the same handler."""
   proc = _connected_proc()
   # Wire the real base action-dispatch so RETRY_SIGNALS hits _handle_retry_signals.
-  proc._handle_system_action = lambda action, data: BaseSignalProcessor._handle_system_action(
-    proc, action, data
+  proc._handle_system_action = lambda action, data: (
+    BaseSignalProcessor._handle_system_action(proc, action, data)
   )
   sig = _fresh_signal(SignalActionEnum.LONG, signal_id="wc-retry", symbol="ZZZ")
   import json as _json
 
-  reply = _json.dumps({
-    "action": SystemActionEnum.RETRY_SIGNALS.value,
-    "timestamp": datetime.now(timezone.utc).isoformat(),
-    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
-    "signals": [sig.model_dump(mode="json")],
-  })
+  reply = _json.dumps(
+    {
+      "action": SystemActionEnum.RETRY_SIGNALS.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+      "signals": [sig.model_dump(mode="json")],
+    }
+  )
   proc.publisher = FakePublisher([reply])
 
   proc._announce_worker_connected()

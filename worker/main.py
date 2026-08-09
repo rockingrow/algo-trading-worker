@@ -25,7 +25,9 @@ def main() -> None:
   log.info("Starting Algo Trading Worker v1.0 (market=%s)", settings.market_type.value)
   log.info("API Server -> http://%s:%d", settings.web.host, settings.web.port)
   if settings.market_type == MarketTypeEnum.FOREX:
-    log.info("MT5 Server -> %s (login: %s)", settings.forex.server, settings.forex.login)
+    log.info(
+      "MT5 Server -> %s (login: %s)", settings.forex.server, settings.forex.login
+    )
   else:
     log.info("Crypto Exchange -> %s", settings.crypto.exchange.value)
 

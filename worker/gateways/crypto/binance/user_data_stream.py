@@ -28,11 +28,11 @@ from worker.logger import get_logger
 
 log = get_logger("worker.gateways.crypto.binance.user_data_stream")
 
-_KEEPALIVE_INTERVAL    = 30 * 60   # seconds (Binance expires the listenKey at 60 min)
-_KEEPALIVE_RETRY       = 30        # seconds — back off this long after a failed keepalive
-_KEEPALIVE_MAX_FAILURES = 5        # reconnect after this many consecutive keepalive failures
-_PING_INTERVAL         =  3 * 60   # seconds between active WS ping probes
-_PING_TIMEOUT          = 15        # seconds to wait for the ping frame to be written
+_KEEPALIVE_INTERVAL = 30 * 60  # seconds (Binance expires the listenKey at 60 min)
+_KEEPALIVE_RETRY = 30  # seconds — back off this long after a failed keepalive
+_KEEPALIVE_MAX_FAILURES = 5  # reconnect after this many consecutive keepalive failures
+_PING_INTERVAL = 3 * 60  # seconds between active WS ping probes
+_PING_TIMEOUT = 15  # seconds to wait for the ping frame to be written
 
 
 class ExchangeCloseReason(str, Enum):
@@ -115,7 +115,10 @@ def parse_order_trade_update(msg: Dict[str, Any]) -> Optional[ExchangeCloseEvent
     log.warning(
       "[parse_order_trade_update] Ignoring %s fill with incomplete fields "
       "(symbol=%r price=%s volume=%s).",
-      reason.value, symbol, close_price, close_volume,
+      reason.value,
+      symbol,
+      close_price,
+      close_volume,
     )
     return None
 
@@ -213,7 +216,7 @@ class BinanceUserDataStream:
         if self._testnet
         else DERIVATIVES_TRADING_USDS_FUTURES_WS_STREAMS_PROD_URL
       ),
-      https_agent=ssl_context
+      https_agent=ssl_context,
     )
     return DerivativesTradingUsdsFutures(
       config_rest_api=rest_cfg, config_ws_streams=ws_cfg
@@ -241,7 +244,9 @@ class BinanceUserDataStream:
       None,
     )
     if ws_conn is None or ws_conn.websocket.closed:
-      log.warning("[BinanceUserDataStream] Private WebSocket unavailable — reconnecting.")
+      log.warning(
+        "[BinanceUserDataStream] Private WebSocket unavailable — reconnecting."
+      )
       return True
     try:
       await asyncio.wait_for(ws_conn.websocket.ping(), timeout=_PING_TIMEOUT)
@@ -249,11 +254,14 @@ class BinanceUserDataStream:
       return False
     except Exception as exc:
       log.warning(
-        "[BinanceUserDataStream] WS ping failed (%s) — reconnecting.", type(exc).__name__
+        "[BinanceUserDataStream] WS ping failed (%s) — reconnecting.",
+        type(exc).__name__,
       )
       return True
 
-  async def _keepalive_check(self, client: Any, now: float) -> tuple[Optional[float], bool]:
+  async def _keepalive_check(
+    self, client: Any, now: float
+  ) -> tuple[Optional[float], bool]:
     """Refresh the listenKey. Returns (next_keepalive_time, succeeded).
 
     Returns (None, False) when the listenKey no longer exists on Binance (-1125)
@@ -269,7 +277,8 @@ class BinanceUserDataStream:
       code = getattr(exc, "status_code", None)
       log.warning(
         "[BinanceUserDataStream] keepalive failed: %s — retrying in %ds.",
-        exc, _KEEPALIVE_RETRY,
+        exc,
+        _KEEPALIVE_RETRY,
       )
       if code == -1125:
         # listenKey already expired on Binance — retrying is pointless, reconnect.
@@ -279,7 +288,7 @@ class BinanceUserDataStream:
   async def _run_loop(self, connection: Any, client: Any) -> None:
     """Tick the ping and keepalive timers until a stop/reconnect condition is met."""
     next_keepalive = time.monotonic() + _KEEPALIVE_INTERVAL
-    next_ping      = time.monotonic() + _PING_INTERVAL
+    next_ping = time.monotonic() + _PING_INTERVAL
     keepalive_failures = 0
     while not self._stop_event.is_set():
       await asyncio.sleep(1.0)

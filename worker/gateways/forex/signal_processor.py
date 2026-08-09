@@ -80,22 +80,7 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
         # it once and stay idle at the slow weekend cadence until the market
         # reopens; the paired MT5EventJob likewise pauses its polling.
         if not closed_for_weekend:
-          log.info(
-            "[%s Health] Weekend market close — closing %s connection until the market reopens.",
-            name, name,
-          )
-          notifier.send_message(
-            _box(
-              f"{DISCONNECTED} <b>[Market Closed] {name}</b>\n\n"
-              f"Broker trade server is offline for the weekend. Connection closed — "
-              f"{name} will reconnect automatically when the market reopens."
-              f"{footer_fn()}"
-            )
-          )
-          try:
-            gateway.close()
-          except Exception:
-            log.exception("[%s Health] Error closing %s for the weekend.", name, name)
+          _close_for_weekend(gateway, notifier, footer_fn, name, log)
           closed_for_weekend = True
         continue
 
@@ -109,62 +94,95 @@ def _health_thread(gateway, notifier, footer_fn, stop_event, log) -> None:
       if gateway.is_connected():
         continue
 
-      log.warning(
-        "[%s Health] %s disconnected — attempting to relaunch/reconnect...", name, name
-      )
-      notifier.send_message(
-        _box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer_fn()}")
-      )
-      reconnected = gateway.reconnect(max_attempts=15, delay_seconds=10.0)
-      if reconnected:
-        log.info("[%s Health] %s reconnected successfully.", name, name)
-        notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer_fn()}"))
-      else:
-        log.warning(
-          "[%s Health] %s reconnect failed after 15 attempts — killing and restarting terminal...",
-          name, name,
-        )
-        notifier.send_message(
-          _box(
-            f"{DISCONNECTED} <b>[Disconnected] {name} reconnect failed</b>\n\n"
-            f"Killing and restarting terminal…{footer_fn()}"
-          )
-        )
-        restarted = gateway.restart_terminal(startup_wait=15.0)
-        if restarted:
-          log.info("[%s Health] terminal restarted — retrying reconnect...", name)
-          reconnected = gateway.reconnect(max_attempts=15, delay_seconds=10.0)
-          if reconnected:
-            log.info("[%s Health] %s reconnected after terminal restart.", name, name)
-            notifier.send_message(
-              _box(f"{CONNECTED} <b>[Connected] {name} after terminal restart</b>{footer_fn()}")
-            )
-          else:
-            log.error(
-              "[%s Health] %s still unreachable after terminal restart — manual intervention required.",
-              name, name,
-            )
-            notifier.send_message(
-              _box(
-                f"{DISCONNECTED} <b>{name} CRASHED</b>\n\n"
-                f"Failed to reconnect even after restarting the terminal.\n"
-                f"Please restart the terminal manually.{footer_fn()}"
-              )
-            )
-        else:
-          log.error(
-            "[%s Health] terminal restart failed (path not configured or exe missing) — manual intervention required.",
-            name,
-          )
-          notifier.send_message(
-            _box(
-              f"{DISCONNECTED} <b>{name} CRASHED</b>\n\n"
-              f"terminal restart failed — path not configured or exe missing.\n"
-              f"Please restart the terminal manually.{footer_fn()}"
-            )
-          )
+      _reconnect_or_restart(gateway, notifier, footer_fn, name, log)
     except Exception as exc:
       log.exception("[%s Health] Unexpected error in health thread: %s", name, exc)
+
+
+def _close_for_weekend(gateway, notifier, footer_fn, name, log) -> None:
+  """Close the platform connection for the weekend and notify once."""
+  log.info(
+    "[%s Health] Weekend market close — closing %s connection until the market reopens.",
+    name,
+    name,
+  )
+  notifier.send_message(
+    _box(
+      f"{DISCONNECTED} <b>[Market Closed] {name}</b>\n\n"
+      f"Broker trade server is offline for the weekend. Connection closed — "
+      f"{name} will reconnect automatically when the market reopens."
+      f"{footer_fn()}"
+    )
+  )
+  try:
+    gateway.close()
+  except Exception:
+    log.exception("[%s Health] Error closing %s for the weekend.", name, name)
+
+
+def _reconnect_or_restart(gateway, notifier, footer_fn, name, log) -> None:
+  """Attempt a plain reconnect; escalate to a terminal restart on failure."""
+  log.warning(
+    "[%s Health] %s disconnected — attempting to relaunch/reconnect...", name, name
+  )
+  notifier.send_message(
+    _box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer_fn()}")
+  )
+  if gateway.reconnect(max_attempts=15, delay_seconds=10.0):
+    log.info("[%s Health] %s reconnected successfully.", name, name)
+    notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer_fn()}"))
+    return
+
+  log.warning(
+    "[%s Health] %s reconnect failed after 15 attempts — killing and restarting terminal...",
+    name,
+    name,
+  )
+  notifier.send_message(
+    _box(
+      f"{DISCONNECTED} <b>[Disconnected] {name} reconnect failed</b>\n\n"
+      f"Killing and restarting terminal…{footer_fn()}"
+    )
+  )
+  _restart_terminal_and_reconnect(gateway, notifier, footer_fn, name, log)
+
+
+def _restart_terminal_and_reconnect(gateway, notifier, footer_fn, name, log) -> None:
+  """Kill/relaunch the terminal and retry the reconnect once more."""
+  if not gateway.restart_terminal(startup_wait=15.0):
+    log.error(
+      "[%s Health] terminal restart failed (path not configured or exe missing) — manual intervention required.",
+      name,
+    )
+    notifier.send_message(
+      _box(
+        f"{DISCONNECTED} <b>{name} CRASHED</b>\n\n"
+        f"terminal restart failed — path not configured or exe missing.\n"
+        f"Please restart the terminal manually.{footer_fn()}"
+      )
+    )
+    return
+
+  log.info("[%s Health] terminal restarted — retrying reconnect...", name)
+  if gateway.reconnect(max_attempts=15, delay_seconds=10.0):
+    log.info("[%s Health] %s reconnected after terminal restart.", name, name)
+    notifier.send_message(
+      _box(f"{CONNECTED} <b>[Connected] {name} after terminal restart</b>{footer_fn()}")
+    )
+    return
+
+  log.error(
+    "[%s Health] %s still unreachable after terminal restart — manual intervention required.",
+    name,
+    name,
+  )
+  notifier.send_message(
+    _box(
+      f"{DISCONNECTED} <b>{name} CRASHED</b>\n\n"
+      f"Failed to reconnect even after restarting the terminal.\n"
+      f"Please restart the terminal manually.{footer_fn()}"
+    )
+  )
 
 
 def _ensure_gateway_connected(gateway, notifier, footer: str, log) -> bool:
@@ -173,13 +191,17 @@ def _ensure_gateway_connected(gateway, notifier, footer: str, log) -> bool:
   if gateway.is_connected():
     return True
   log.warning("[%s Process] %s connection lost. Reconnecting...", name, name)
-  notifier.send_message(_box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer}"))
+  notifier.send_message(
+    _box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer}")
+  )
   reconnected = gateway.reconnect(max_attempts=0, delay_seconds=10.0)
   if reconnected:
     notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer}"))
   else:
     notifier.send_message(
-      _box(f"{DISCONNECTED} <b>[Disconnected] {name} reconnect failed — signal dropped</b>{footer}")
+      _box(
+        f"{DISCONNECTED} <b>[Disconnected] {name} reconnect failed — signal dropped</b>{footer}"
+      )
     )
   return reconnected
 
@@ -244,7 +266,9 @@ class ForexSignalProcessor(BaseSignalProcessor):
       "account margin_mode=%s is not hedging (%s). Positions from different "
       "strategies on the same symbol will be MERGED by the broker and only the "
       "first strategy will own the resulting position.",
-      self.name, margin_mode, MT5_MARGIN_MODE_HEDGING,
+      self.name,
+      margin_mode,
+      MT5_MARGIN_MODE_HEDGING,
     )
     self.ctx.notifier.send_message(
       _box(
@@ -285,7 +309,13 @@ class ForexSignalProcessor(BaseSignalProcessor):
   def _start_broker_jobs(self, stop_event) -> None:
     threading.Thread(
       target=_health_thread,
-      args=(self.gateway, self.ctx.notifier, self.gateway.get_account_footer, stop_event, log),
+      args=(
+        self.gateway,
+        self.ctx.notifier,
+        self.gateway.get_account_footer,
+        stop_event,
+        log,
+      ),
       name="forex-health",
       daemon=True,
     ).start()

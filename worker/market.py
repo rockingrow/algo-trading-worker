@@ -11,6 +11,7 @@ log = get_logger("worker.market")
 
 class MarketOrchestrator(ABC):
   """Abstract base class for market orchestrators."""
+
   @abstractmethod
   async def startup(self) -> None: ...
 
@@ -61,7 +62,9 @@ class GatewayProcessOrchestrator(MarketOrchestrator):
       if self._manager.stopping:
         break
       if not self._manager.is_alive:
-        log.warning("[%s] Worker process died unexpectedly — restarting...", self._label)
+        log.warning(
+          "[%s] Worker process died unexpectedly — restarting...", self._label
+        )
         try:
           await asyncio.to_thread(self._manager.restart)
           log.info("[%s] Worker process restarted successfully.", self._label)

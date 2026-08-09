@@ -66,7 +66,9 @@ def test_silent_when_account_is_hedging():
 
 def test_silent_when_toggle_is_off_even_on_a_netting_account():
   """No behavioural claim is being made, so a netting account is fine."""
-  proc = _processor({"forex_allow_multi_strategy_per_symbol": False}, {"margin_mode": 0})
+  proc = _processor(
+    {"forex_allow_multi_strategy_per_symbol": False}, {"margin_mode": 0}
+  )
   proc._warn_if_multi_strategy_needs_hedging()
   assert proc.ctx.notifier.messages == []
 

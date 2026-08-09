@@ -45,11 +45,17 @@ class FakeDbService:
 
 
 class FakeExecutor:
-  def __init__(self, positions=None, close_result=None, results_by_key=None, match_style="ticket"):
+  def __init__(
+    self, positions=None, close_result=None, results_by_key=None, match_style="ticket"
+  ):
     self._positions = list(positions or [])
     self._default = close_result or {
-      "success": True, "retcode": 0, "ticket": 999, "price": 2000.0,
-      "volume": 0.5, "comment": "Closed [FLAT]",
+      "success": True,
+      "retcode": 0,
+      "ticket": 999,
+      "price": 2000.0,
+      "volume": 0.5,
+      "comment": "Closed [FLAT]",
     }
     self._results_by_key = results_by_key or {}
     self._match_style = match_style
@@ -88,9 +94,17 @@ class FakeProc:
   """Minimal stand-in providing exactly the hooks the base FLAT handler touches."""
 
   def __init__(
-    self, *, account_id="100", market_type="FOREX", gateway_value="MT5",
-    db_positions=None, positions=None,
-    close_result=None, results_by_key=None, match_style="ticket", connected=True,
+    self,
+    *,
+    account_id="100",
+    market_type="FOREX",
+    gateway_value="MT5",
+    db_positions=None,
+    positions=None,
+    close_result=None,
+    results_by_key=None,
+    match_style="ticket",
+    connected=True,
   ):
     self.name = "TEST"
     self.presenter = FakePresenter
@@ -100,8 +114,10 @@ class FakeProc:
     self._connected = connected
     self._match_style = match_style
     self.executor = FakeExecutor(
-      positions=positions, close_result=close_result,
-      results_by_key=results_by_key, match_style=match_style,
+      positions=positions,
+      close_result=close_result,
+      results_by_key=results_by_key,
+      match_style=match_style,
     )
     self.db = FakeDbService(flat_positions=db_positions)
     self.notifications = []
@@ -162,8 +178,11 @@ def test_public_account_id_field_is_ignored():
   # A stray account_id on the public subject is not a routing filter — it is
   # ignored, so a matching market/gateway still proceeds.
   proc = FakeProc(
-    account_id="100", market_type="FOREX", gateway_value="MT5",
-    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+    account_id="100",
+    market_type="FOREX",
+    gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)],
+    positions=[_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload(account_id="999"))
   assert len(proc.executor.closed) == 1
@@ -185,8 +204,10 @@ def test_public_wrong_gateway_skips():
 
 def test_public_matching_market_gateway_proceeds():
   proc = FakeProc(
-    market_type="FOREX", gateway_value="MT5",
-    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+    market_type="FOREX",
+    gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)],
+    positions=[_pos(ticket=1)],
   )
   proc._handle_admin_message(_payload(market="FOREX", gateway="MT5"))
   assert len(proc.executor.closed) == 1
@@ -204,8 +225,11 @@ def test_private_subject_is_market_gateway_account():
 
 def test_private_matching_identity_proceeds():
   proc = FakeProc(
-    account_id="100", market_type="FOREX", gateway_value="MT5",
-    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+    account_id="100",
+    market_type="FOREX",
+    gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)],
+    positions=[_pos(ticket=1)],
   )
   proc._handle_admin_message(
     _payload(account_id="100", market="FOREX", gateway="MT5"), private=True
@@ -215,7 +239,9 @@ def test_private_matching_identity_proceeds():
 
 def test_private_wrong_account_id_skips():
   proc = FakeProc(
-    account_id="100", market_type="FOREX", gateway_value="MT5",
+    account_id="100",
+    market_type="FOREX",
+    gateway_value="MT5",
     db_positions=[_db_pos()],
   )
   proc._handle_admin_message(
@@ -229,11 +255,14 @@ def test_private_missing_required_field_dropped():
   # market / gateway / account_id are mandatory on the private subject — a
   # payload missing any is rejected at validation and nothing is closed.
   proc = FakeProc(
-    account_id="100", market_type="FOREX", gateway_value="MT5",
+    account_id="100",
+    market_type="FOREX",
+    gateway_value="MT5",
     db_positions=[_db_pos()],
   )
   proc._handle_admin_message(
-    _payload(market="FOREX", gateway="MT5"), private=True  # no account_id
+    _payload(market="FOREX", gateway="MT5"),
+    private=True,  # no account_id
   )
   assert proc.db.flat_calls == []
   assert proc.executor.closed == []
@@ -247,18 +276,23 @@ def test_private_numeric_account_id_is_coerced_to_str():
   # schema now normalises int → str so the identity re-check compares equal
   # to the worker's stringified ``_account_id``.
   proc = FakeProc(
-    account_id="413652379", market_type="FOREX", gateway_value="MT5",
-    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+    account_id="413652379",
+    market_type="FOREX",
+    gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)],
+    positions=[_pos(ticket=1)],
   )
-  raw = json.dumps({
-    "action": "FLAT",
-    "timestamp": "2026-08-08T21:29:02+00:00",
-    "strategy": None,
-    "symbol": None,
-    "account_id": 413652379,  # <-- int, not str
-    "market": "FOREX",
-    "gateway": "MT5",
-  })
+  raw = json.dumps(
+    {
+      "action": "FLAT",
+      "timestamp": "2026-08-08T21:29:02+00:00",
+      "strategy": None,
+      "symbol": None,
+      "account_id": 413652379,  # <-- int, not str
+      "market": "FOREX",
+      "gateway": "MT5",
+    }
+  )
   proc._handle_admin_message(raw, private=True)
   assert len(proc.executor.closed) == 1
 
@@ -267,15 +301,23 @@ def test_private_colliding_account_id_across_gateways_only_matches_owner():
   # Same raw account_id ("shared@example.com") used on two different gateways —
   # only the worker whose (market, gateway) also matches should act.
   mt5_proc = FakeProc(
-    account_id="shared@example.com", market_type="FOREX", gateway_value="MT5",
-    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+    account_id="shared@example.com",
+    market_type="FOREX",
+    gateway_value="MT5",
+    db_positions=[_db_pos(ref_id=1)],
+    positions=[_pos(ticket=1)],
   )
   binance_proc = FakeProc(
-    account_id="shared@example.com", market_type="CRYPTO", gateway_value="BINANCE",
-    db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)],
+    account_id="shared@example.com",
+    market_type="CRYPTO",
+    gateway_value="BINANCE",
+    db_positions=[_db_pos(ref_id=1)],
+    positions=[_pos(ticket=1)],
   )
   payload = _payload(
-    account_id="shared@example.com", market="CRYPTO", gateway="BINANCE",
+    account_id="shared@example.com",
+    market="CRYPTO",
+    gateway="BINANCE",
   )
   mt5_proc._handle_admin_message(payload, private=True)
   binance_proc._handle_admin_message(payload, private=True)
@@ -389,7 +431,9 @@ def test_live_positions_closed_even_with_no_db_records():
 
 
 def test_successful_close_updates_db_status():
-  proc = FakeProc(db_positions=[_db_pos(ref_id=1, ref_source_id=1)], positions=[_pos(ticket=1)])
+  proc = FakeProc(
+    db_positions=[_db_pos(ref_id=1, ref_source_id=1)], positions=[_pos(ticket=1)]
+  )
   proc._handle_admin_message(_payload())
   assert len(proc.db.status_updates) == 1
   upd = proc.db.status_updates[0]

@@ -59,9 +59,23 @@ def make_tick(ask=2000.0, bid=1999.5):
   return SimpleNamespace(ask=ask, bid=bid)
 
 
-def make_position(ticket=111, type_=0, volume=1.0, price_open=2000.0, tp=2050.0, magic=42, symbol="XAUUSDc"):
+def make_position(
+  ticket=111,
+  type_=0,
+  volume=1.0,
+  price_open=2000.0,
+  tp=2050.0,
+  magic=42,
+  symbol="XAUUSDc",
+):
   return SimpleNamespace(
-    ticket=ticket, type=type_, volume=volume, price_open=price_open, tp=tp, magic=magic, symbol=symbol
+    ticket=ticket,
+    type=type_,
+    volume=volume,
+    price_open=price_open,
+    tp=tp,
+    magic=magic,
+    symbol=symbol,
   )
 
 
@@ -171,12 +185,24 @@ def make_symbol_spec(**overrides):
 
 
 def make_platform_position(
-  ticket=111, side=SIDE_LONG, volume=1.0, price_open=2000.0, tp=2050.0, sl=0.0,
-  magic=42, symbol="XAUUSDc",
+  ticket=111,
+  side=SIDE_LONG,
+  volume=1.0,
+  price_open=2000.0,
+  tp=2050.0,
+  sl=0.0,
+  magic=42,
+  symbol="XAUUSDc",
 ):
   return PlatformPosition(
-    ticket=ticket, magic=magic, side=side, volume=volume, price_open=price_open,
-    sl=sl, tp=tp, symbol=symbol,
+    ticket=ticket,
+    magic=magic,
+    side=side,
+    volume=volume,
+    price_open=price_open,
+    sl=sl,
+    tp=tp,
+    symbol=symbol,
   )
 
 
@@ -200,7 +226,9 @@ class FakePlatformGateway:
     self._spec = spec if spec is not None else make_symbol_spec()
     self._tick = tick if tick is not None else Tick(bid=1999.5, ask=2000.0)
     self._positions = list(positions or [])
-    self._account = account if account is not None else {"balance": 10000.0, "equity": 10000.0}
+    self._account = (
+      account if account is not None else {"balance": 10000.0, "equity": 10000.0}
+    )
     self._place_results = list(place_results or [])
     self._close_results = list(close_results or [])
     self._modify_results = list(modify_results or [])
@@ -248,10 +276,18 @@ class FakePlatformGateway:
 
   # ── Orders ────────────────────────────────────────────────────────────── #
   def place_order(self, symbol, side, volume, price, sl, tp, magic, comment):
-    self.placed.append({
-      "symbol": symbol, "side": side, "volume": volume, "price": price,
-      "sl": sl, "tp": tp, "magic": magic, "comment": comment,
-    })
+    self.placed.append(
+      {
+        "symbol": symbol,
+        "side": side,
+        "volume": volume,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": magic,
+        "comment": comment,
+      }
+    )
     if self._place_results:
       return self._place_results.pop(0)
     return TradeResult.ok(retcode=10009, ticket="999", price=price, volume=volume)
@@ -276,9 +312,9 @@ class FakePlatformGateway:
 def make_symbol_filter(**overrides):
   """Return a SymbolFilter with sensible BTC-futures defaults."""
   defaults = {
-    "step_size": 0.001,   # 0.001 BTC minimum increment
+    "step_size": 0.001,  # 0.001 BTC minimum increment
     "min_qty": 0.001,
-    "tick_size": 0.1,     # $0.10 price tick
+    "tick_size": 0.1,  # $0.10 price tick
   }
   defaults.update(overrides)
   return SymbolFilter(**defaults)
@@ -333,19 +369,21 @@ class FakeExchangeGateway(BaseExchangeGateway):
     mark_price: float = 30000.0,
     symbol_filter=None,
     account=None,
-    place_results=None,   # pre-queued TradeResults for place_market_order
-    sl_results=None,      # pre-queued TradeResults for set_stop_loss
+    place_results=None,  # pre-queued TradeResults for place_market_order
+    sl_results=None,  # pre-queued TradeResults for set_stop_loss
   ):
     self._positions = list(positions or [])
     self._mark = mark_price
     self._filter = symbol_filter if symbol_filter is not None else make_symbol_filter()
-    self._account = account if account is not None else {"balance": 1000.0, "equity": 5000.0}
+    self._account = (
+      account if account is not None else {"balance": 1000.0, "equity": 5000.0}
+    )
     self._place_results = list(place_results or [])
     self._sl_results = list(sl_results or [])
-    self.orders: List[tuple] = []     # (symbol, side, quantity, reduce_only)
-    self.stops: List[tuple] = []      # (symbol, position_side, stop_price, quantity)
-    self.takes: List[tuple] = []      # (symbol, position_side, tp_price, quantity)
-    self.cancelled: List[str] = []    # symbols whose open orders were cancelled
+    self.orders: List[tuple] = []  # (symbol, side, quantity, reduce_only)
+    self.stops: List[tuple] = []  # (symbol, position_side, stop_price, quantity)
+    self.takes: List[tuple] = []  # (symbol, position_side, tp_price, quantity)
+    self.cancelled: List[str] = []  # symbols whose open orders were cancelled
 
   # ── Lifecycle ─────────────────────────────────────────────────────────── #
 
@@ -378,17 +416,13 @@ class FakeExchangeGateway(BaseExchangeGateway):
       return self._place_results.pop(0)
     return TradeResult.ok(retcode=0, ticket="99", price=self._mark, volume=quantity)
 
-  def set_stop_loss(
-    self, symbol, position_side, stop_price, quantity
-  ) -> TradeResult:
+  def set_stop_loss(self, symbol, position_side, stop_price, quantity) -> TradeResult:
     self.stops.append((symbol, position_side, stop_price, quantity))
     if self._sl_results:
       return self._sl_results.pop(0)
     return TradeResult.ok(retcode=0, ticket="100")
 
-  def set_take_profit(
-    self, symbol, position_side, tp_price, quantity
-  ) -> TradeResult:
+  def set_take_profit(self, symbol, position_side, tp_price, quantity) -> TradeResult:
     self.takes.append((symbol, position_side, tp_price, quantity))
     return TradeResult.ok(retcode=0, ticket="101")
 

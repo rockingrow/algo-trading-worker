@@ -33,8 +33,8 @@ from typing import Any, Dict, Optional
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
-from worker.gateways.config import ExecutionConfig
 from worker.gateways import guard
+from worker.gateways.config import ExecutionConfig
 from worker.gateways.market_strategy import MarketStrategyFactory
 from worker.gateways.signal_handler import SignalHandler
 from worker.interfaces.trade_presenter_protocol import TradePresenterProtocol
@@ -218,7 +218,10 @@ class BaseSignalProcessor(ABC):
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
       subjects=subjects,
-      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM], # purpose just only show on Notification
+      publish_subjects=[
+        NatsSubjectEnum.TRADE,
+        NatsSubjectEnum.SYSTEM,
+      ],  # purpose just only show on Notification
       token=nats_token,
       account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
@@ -283,7 +286,8 @@ class BaseSignalProcessor(ABC):
         log.exception(
           "[%s Process] Unhandled error processing message — skipping. "
           "CRITICAL: manual reconciliation may be required. raw=%r",
-          self.name, raw,
+          self.name,
+          raw,
         )
 
   # ── Shared message processing ─────────────────────────────────────────── #
@@ -339,7 +343,9 @@ class BaseSignalProcessor(ABC):
     if self._signals_blocked:
       log.warning(
         "[%s Process] Signal SKIPPED — execution is BLOCKED (BLOCK_SIGNAL) | %s | %s",
-        self.name, signal.symbol, signal.action.value,
+        self.name,
+        signal.symbol,
+        signal.action.value,
       )
       return
 
@@ -353,13 +359,15 @@ class BaseSignalProcessor(ABC):
     try:
       self._magic_for(signal.strategy)
     except (KeyError, ValueError) as exc:
-      reason = (
-        f"Unknown strategy '{signal.strategy}' — no STRATEGY_MAGIC_MAP entry."
-      )
+      reason = f"Unknown strategy '{signal.strategy}' — no STRATEGY_MAGIC_MAP entry."
       log.error(
         "[%s Process] Signal SKIPPED — %s (%s) | %s | %s. "
         "Add it to STRATEGY_MAGIC_MAP or remove it from NATS_SUBJECTS.",
-        self.name, reason, exc, signal.symbol, signal.action.value,
+        self.name,
+        reason,
+        exc,
+        signal.symbol,
+        signal.action.value,
       )
       self.ctx.notifier.send_message(
         self.presenter.signal_rejected(reason, self._current_footer())
@@ -375,13 +383,21 @@ class BaseSignalProcessor(ABC):
     if signal.is_scale_position:
       log.info(
         "[%s Process] Scale-in position | %s | scaling=%s | sl=%s tp1=%s tp2=%s qty=%s",
-        self.name, signal.symbol, signal.scaling,
-        signal.sl, signal.tp1, signal.tp2, signal.quantity,
+        self.name,
+        signal.symbol,
+        signal.scaling,
+        signal.sl,
+        signal.tp1,
+        signal.tp2,
+        signal.quantity,
       )
 
     log.info(
       "[%s Process] Processing Signal: %s | %s | TV Time: %s",
-      self.name, signal.symbol, signal.action.value, signal.timestamp,
+      self.name,
+      signal.symbol,
+      signal.action.value,
+      signal.timestamp,
     )
 
     # Entry guards: a rejected entry is never sent to the broker. It is still
@@ -389,9 +405,20 @@ class BaseSignalProcessor(ABC):
     # subject, and notified. Exits are never gated here so a position can always
     # be closed. The single-position-per-symbol guard runs first (it is the
     # stricter rule): while any order is open on the symbol, no new entry is
-    # placed regardless of strategy.
+    # placed — unless the market allows multiple strategies per symbol
+    # (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
+    # already held by *this* strategy still blocks.
     if signal.action in _ENTRY_ACTIONS:
-      reject_reason = guard.symbol_open_rejection(self.ctx.db_service, signal)
+      allow_multi_strategy = bool(
+        getattr(
+          getattr(self.handler, "strategy", None),
+          "allows_multi_strategy_per_symbol",
+          False,
+        )
+      )
+      reject_reason = guard.symbol_open_rejection(
+        self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
+      )
       if reject_reason is None:
         reject_reason = guard.max_open_orders_rejection(
           self.ctx.db_service, self.settings, signal
@@ -440,8 +467,12 @@ class BaseSignalProcessor(ABC):
       else:
         risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
-          signal, result, result.get("source_ticket") or result.get("ticket"), footer,
-          risk_info=risk_info, settings_dict=self.settings,
+          signal,
+          result,
+          result.get("source_ticket") or result.get("ticket"),
+          footer,
+          risk_info=risk_info,
+          settings_dict=self.settings,
         )
     else:
       msg = self.presenter.order_failed(signal, result, footer)
@@ -503,14 +534,20 @@ class BaseSignalProcessor(ABC):
     """
     log.warning(
       "[%s Process] Entry REJECTED | %s %s | %s",
-      self.name, signal.symbol, signal.action.value, reason,
+      self.name,
+      signal.symbol,
+      signal.action.value,
+      reason,
     )
     footer = self._current_footer()
     signal_json = signal.model_dump_json()
     # No broker order exists, so there's no ticket to key on — echo the broker's
     # signal_id (falling back to a deterministic tag) so the rejection is still
     # correlatable end-to-end.
-    ref = signal.signal_id or f"REJECTED-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
+    ref = (
+      signal.signal_id
+      or f"REJECTED-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
+    )
     volume = signal.quantity or 0.0
     price = signal.price or 0.0
 
@@ -611,7 +648,8 @@ class BaseSignalProcessor(ABC):
     except ValidationError as err:
       log.error(
         "[ADMIN FLAT] Invalid %s payload: %s",
-        "private" if private else "public", err,
+        "private" if private else "public",
+        err,
       )
       return
     if not self._flat_targets_this_worker(admin_flat_schema, private=private):
@@ -619,9 +657,12 @@ class BaseSignalProcessor(ABC):
         "[ADMIN FLAT] Skipping (%s): market=%s gateway=%s account_id=%s != "
         "worker market=%s gateway=%s account=%s",
         "private" if private else "public",
-        admin_flat_schema.market, admin_flat_schema.gateway,
+        admin_flat_schema.market,
+        admin_flat_schema.gateway,
         getattr(admin_flat_schema, "account_id", None),
-        self._market_type, self._gateway_value, self._account_id,
+        self._market_type,
+        self._gateway_value,
+        self._account_id,
       )
       return
     # Close live broker positions first (source of truth), then reconcile the DB.
@@ -642,7 +683,8 @@ class BaseSignalProcessor(ABC):
     if not private:
       log.warning(
         "[ADMIN %s] Ignored on the public ADMIN subject — signal control is "
-        "account-scoped and only accepted on the private subject.", action.value,
+        "account-scoped and only accepted on the private subject.",
+        action.value,
       )
       return
     try:
@@ -654,8 +696,13 @@ class BaseSignalProcessor(ABC):
       log.info(
         "[ADMIN %s] Skipping: market=%s gateway=%s account_id=%s != worker "
         "market=%s gateway=%s account=%s",
-        action.value, ctrl.market, ctrl.gateway, ctrl.account_id,
-        self._market_type, self._gateway_value, self._account_id,
+        action.value,
+        ctrl.market,
+        ctrl.gateway,
+        ctrl.account_id,
+        self._market_type,
+        self._gateway_value,
+        self._account_id,
       )
       return
     self._set_signals_blocked(action == AdminActionEnum.BLOCK_SIGNAL)
@@ -710,19 +757,26 @@ class BaseSignalProcessor(ABC):
     never live).
     """
     if admin.symbol:
-      positions = self.executor.get_open_positions(admin.symbol, strategy=admin.strategy)
+      positions = self.executor.get_open_positions(
+        admin.symbol, strategy=admin.strategy
+      )
     else:
       positions = self.executor.get_all_open_positions(strategy=admin.strategy)
 
     if positions:
       log.info(
         "[ADMIN FLAT] Closing %d %s position(s) (strategy=%s, symbol=%s)",
-        len(positions), self.name, admin.strategy, admin.symbol,
+        len(positions),
+        self.name,
+        admin.strategy,
+        admin.symbol,
       )
     else:
       log.warning(
         "[ADMIN FLAT] No open %s positions (strategy=%s, symbol=%s)",
-        self.name, admin.strategy, admin.symbol,
+        self.name,
+        admin.strategy,
+        admin.symbol,
       )
 
     attempted: set = set()
@@ -733,12 +787,21 @@ class BaseSignalProcessor(ABC):
       result = self.executor.close_single_position(pos, reason="FLAT")
       if result.get("success"):
         closed[key] = result
-        log.info("[ADMIN FLAT] Closed %s key=%s vol=%s", self.name, key, result.get("volume"))
+        log.info(
+          "[ADMIN FLAT] Closed %s key=%s vol=%s", self.name, key, result.get("volume")
+        )
       else:
-        log.error("[ADMIN FLAT] Failed to close %s key=%s: %s", self.name, key, result.get("comment"))
+        log.error(
+          "[ADMIN FLAT] Failed to close %s key=%s: %s",
+          self.name,
+          key,
+          result.get("comment"),
+        )
     return closed, attempted
 
-  def _reconcile_flat_db(self, admin, closed: Dict[Any, dict], attempted: set, raw: str) -> None:
+  def _reconcile_flat_db(
+    self, admin, closed: Dict[Any, dict], attempted: set, raw: str
+  ) -> None:
     """Reconcile DB rows against what actually closed.
 
     A row is marked ``FLATTED`` only when its close succeeded, or when it was never
@@ -770,7 +833,8 @@ class BaseSignalProcessor(ABC):
         # Never seen live on the broker → already closed externally; sync the DB.
         log.warning(
           "[ADMIN FLAT] %s in DB but not found on %s — marking FLATTED",
-          db_pos.get("symbol"), self.name,
+          db_pos.get("symbol"),
+          self.name,
         )
         self.ctx.db_service.update_position_status(
           ref_source_id=db_pos.get("ref_source_id"),
@@ -784,7 +848,8 @@ class BaseSignalProcessor(ABC):
         log.error(
           "[ADMIN FLAT] %s close FAILED — DB row left OPEN (still live on %s, "
           "manual check required).",
-          db_pos.get("symbol"), self.name,
+          db_pos.get("symbol"),
+          self.name,
         )
 
   # ── Shared SYSTEM handling ────────────────────────────────────────────── #
@@ -809,7 +874,9 @@ class BaseSignalProcessor(ABC):
 
     log.info(
       "[%s SYSTEM] Received action=%s account_id=%s",
-      self.name, getattr(system.action, "value", system.action), system.account_id,
+      self.name,
+      getattr(system.action, "value", system.action),
+      system.account_id,
     )
 
     if not self._ensure_connected():
@@ -821,8 +888,10 @@ class BaseSignalProcessor(ABC):
     if system.account_id and system.account_id != self._system_account_id:
       log.info(
         "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
-        self.name, getattr(system.action, "value", system.action),
-        system.account_id, self._system_account_id,
+        self.name,
+        getattr(system.action, "value", system.action),
+        system.account_id,
+        self._system_account_id,
       )
       return
 
@@ -904,7 +973,8 @@ class BaseSignalProcessor(ABC):
     if self.subscriber is not None and not self.subscriber.wait_subscribed(timeout=10):
       log.warning(
         "[%s Process] SYSTEM subscription not confirmed within timeout — "
-        "announcing WORKER_CONNECTED anyway (reply may be missed).", self.name
+        "announcing WORKER_CONNECTED anyway (reply may be missed).",
+        self.name,
       )
 
     # Desynchronise a reconnect storm (see _HANDSHAKE_JITTER_MAX) before the
@@ -923,14 +993,18 @@ class BaseSignalProcessor(ABC):
         log_fn = log.error if attempt >= _HANDSHAKE_ALERT_THRESHOLD else log.warning
         log_fn(
           "[%s Process] WORKER_CONNECTED handshake failed (%s) — attempt %d, retrying in %ds.",
-          self.name, exc, attempt, delay,
+          self.name,
+          exc,
+          attempt,
+          delay,
         )
         time.sleep(delay)
         continue
 
       log.info(
         "[%s Process] Announced WORKER_CONNECTED account_id=%s",
-        self.name, self._system_account_id,
+        self.name,
+        self._system_account_id,
       )
       self._handle_worker_connected_response(raw_response)
       return
@@ -952,12 +1026,17 @@ class BaseSignalProcessor(ABC):
     if action == SystemActionEnum.WORKER_CONNECTED_ERROR:
       error = SystemWorkerConnectedErrorSchema(**data)
       log.error(
-        "[%s Process] WORKER_CONNECTED_ERROR: %s", self.name, error.reason or "(no reason given)"
+        "[%s Process] WORKER_CONNECTED_ERROR: %s",
+        self.name,
+        error.reason or "(no reason given)",
       )
       return
 
     if action == SystemActionEnum.WORKER_CONNECTED_ACK:
-      log.info("[%s Process] WORKER_CONNECTED_ACK — handshake complete, no init config needed.", self.name)
+      log.info(
+        "[%s Process] WORKER_CONNECTED_ACK — handshake complete, no init config needed.",
+        self.name,
+      )
       return
 
     self._handle_system_action(action, data)
@@ -975,7 +1054,8 @@ class BaseSignalProcessor(ABC):
       return
     log.info(
       "[%s SYSTEM] No handler for action=%s — ignoring.",
-      self.name, getattr(action, "value", action),
+      self.name,
+      getattr(action, "value", action),
     )
 
   def _handle_retry_signals(self, data: dict) -> None:
@@ -1009,7 +1089,8 @@ class BaseSignalProcessor(ABC):
         skipped_dedup += 1
         log.info(
           "[%s SYSTEM] RETRY_SIGNALS: skip signal_id=%s (already processed).",
-          self.name, signal.signal_id,
+          self.name,
+          signal.signal_id,
         )
         continue
 
@@ -1019,8 +1100,12 @@ class BaseSignalProcessor(ABC):
         log.info(
           "[%s SYSTEM] RETRY_SIGNALS: skip signal_id=%s symbol=%s action=%s — "
           "age=%.1fs > MAX_RETRY_TIMEOUT=%ds.",
-          self.name, signal.signal_id, signal.symbol, signal.action.value,
-          age if age is not None else float("nan"), MAX_RETRY_TIMEOUT,
+          self.name,
+          signal.signal_id,
+          signal.symbol,
+          signal.action.value,
+          age if age is not None else float("nan"),
+          MAX_RETRY_TIMEOUT,
         )
         continue
 
@@ -1031,12 +1116,18 @@ class BaseSignalProcessor(ABC):
         failed += 1
         log.exception(
           "[%s SYSTEM] RETRY_SIGNALS: signal_id=%s failed — continuing batch.",
-          self.name, signal.signal_id,
+          self.name,
+          signal.signal_id,
         )
 
     log.info(
       "[%s SYSTEM] RETRY_SIGNALS done | executed=%d dedup=%d stale=%d failed=%d total=%d",
-      self.name, executed, skipped_dedup, skipped_stale, failed, len(signals),
+      self.name,
+      executed,
+      skipped_dedup,
+      skipped_stale,
+      failed,
+      len(signals),
     )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #
@@ -1051,7 +1142,10 @@ class BaseSignalProcessor(ABC):
     ``is_custom`` is True when USE_CUSTOM_RISK_PERCENTAGE overrides the signal's
     own risk_percent (so the gear icon is shown in notifications).
     """
-    if signal.action.value not in ("LONG", "SHORT") or not self.config.volume_decision_enabled:
+    if (
+      signal.action.value not in ("LONG", "SHORT")
+      or not self.config.volume_decision_enabled
+    ):
       return None
     if self.config.use_custom_risk_percentage:
       return (self.config.risk_percentage, True)

@@ -69,7 +69,9 @@ class ExecutionConfig:
       capital=settings_dict.get("capital", 1000.0),
       risk_percentage=settings_dict.get("risk_percentage", 1.0),
       use_account_equity=settings_dict.get("use_account_equity", False),
-      use_custom_position_tp1_percent=settings_dict.get("use_custom_position_tp1_percent", False),
+      use_custom_position_tp1_percent=settings_dict.get(
+        "use_custom_position_tp1_percent", False
+      ),
       position_tp1_percent=settings_dict.get("position_tp1_percent"),
       tp1_move_sl_to_breakeven=settings_dict.get("tp1_move_sl_to_breakeven"),
       allow_multi_strategy_per_symbol=cls._resolve_multi_strategy(settings_dict),

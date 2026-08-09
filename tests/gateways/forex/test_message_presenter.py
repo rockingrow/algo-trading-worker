@@ -15,7 +15,9 @@ def test_format_volume_plain():
 def test_order_rejected_contains_reason_and_fields():
   signal = make_signal(SignalActionEnum.LONG)
   msg = ForexMessagePresenter.order_rejected(
-    signal, "Max open orders reached (5/5); entry not placed (MAX_OPEN_ORDERS).", "FOOTER"
+    signal,
+    "Max open orders reached (5/5); entry not placed (MAX_OPEN_ORDERS).",
+    "FOOTER",
   )
   assert "Order Rejected" in msg and REJECTED in msg
   assert "XAUUSD" in msg and "strat-1" in msg and "LONG" in msg
@@ -190,10 +192,14 @@ def test_startup_message_tp1_be_line():
     "risk_percentage": 2.0,
     "use_account_equity": False,
   }
-  msg_on = ForexMessagePresenter.startup({**base, "tp1_move_sl_to_breakeven": True}, "F")
+  msg_on = ForexMessagePresenter.startup(
+    {**base, "tp1_move_sl_to_breakeven": True}, "F"
+  )
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (true)</b>" in msg_on
 
-  msg_off = ForexMessagePresenter.startup({**base, "tp1_move_sl_to_breakeven": False}, "F")
+  msg_off = ForexMessagePresenter.startup(
+    {**base, "tp1_move_sl_to_breakeven": False}, "F"
+  )
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (false)</b>" in msg_off
 
 
@@ -215,7 +221,9 @@ def test_admin_flat_closed_contains_key_fields():
 
 def test_position_reconciled_closed_contains_key_fields():
   db_pos = {
-    "symbol": "XAUUSD", "strategy": "strat-A", "ref_source_id": "4587420656",
+    "symbol": "XAUUSD",
+    "strategy": "strat-A",
+    "ref_source_id": "4587420656",
     "volume": 0.01,
   }
   msg = ForexMessagePresenter.position_reconciled_closed(db_pos, 2000.0, "FOOTER")

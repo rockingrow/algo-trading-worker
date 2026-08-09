@@ -74,19 +74,19 @@ _bc_utils.get_timestamp = _offset_timestamp
 
 
 class _API_Endpoints(Enum):
-  TIME             = ("GET",    "/fapi/v1/time")
-  BALANCE          = ("GET",    "/fapi/v2/balance")
-  EXCHANGE_INFO    = ("GET",    "/fapi/v1/exchangeInfo")
-  PREMIUM_INDEX    = ("GET",    "/fapi/v1/premiumIndex")
-  POSITION_RISK    = ("GET",    "/fapi/v2/positionRisk")
-  ORDER            = ("POST",   "/fapi/v1/order")
-  ALGO_ORDER       = ("POST",   "/fapi/v1/algoOrder")
+  TIME = ("GET", "/fapi/v1/time")
+  BALANCE = ("GET", "/fapi/v2/balance")
+  EXCHANGE_INFO = ("GET", "/fapi/v1/exchangeInfo")
+  PREMIUM_INDEX = ("GET", "/fapi/v1/premiumIndex")
+  POSITION_RISK = ("GET", "/fapi/v2/positionRisk")
+  ORDER = ("POST", "/fapi/v1/order")
+  ALGO_ORDER = ("POST", "/fapi/v1/algoOrder")
   ALGO_OPEN_ORDERS = ("DELETE", "/fapi/v1/algoOpenOrders")
-  ALL_OPEN_ORDERS  = ("DELETE", "/fapi/v1/allOpenOrders")
-  ACCOUNT          = ("GET",    "/fapi/v2/account")
-  LEVERAGE_BRACKET = ("GET",    "/fapi/v1/leverageBracket")
-  LEVERAGE         = ("POST",   "/fapi/v1/leverage")
-  POSITION_MODE    = ("POST",   "/fapi/v1/positionSide/dual")
+  ALL_OPEN_ORDERS = ("DELETE", "/fapi/v1/allOpenOrders")
+  ACCOUNT = ("GET", "/fapi/v2/account")
+  LEVERAGE_BRACKET = ("GET", "/fapi/v1/leverageBracket")
+  LEVERAGE = ("POST", "/fapi/v1/leverage")
+  POSITION_MODE = ("POST", "/fapi/v1/positionSide/dual")
 
   @property
   def method(self) -> str:
@@ -278,7 +278,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       logger.warning(
         "[Binance] set_position_mode(%s) failed (%s); leaving the account on its "
         "current mode — a mismatch will surface as -4061 on the first order.",
-        target, exc,
+        target,
+        exc,
       )
       return False
 
@@ -422,7 +423,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     if self._hedge_mode:
       payload["position_side"] = position_side
     try:
-      return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
+      return self._order_result(
+        self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True)
+      )
     except Exception as exc:
       logger.exception("[Binance] set_stop_loss failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -449,7 +452,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     if self._hedge_mode:
       payload["position_side"] = position_side
     try:
-      return self._order_result(self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True))
+      return self._order_result(
+        self._send(_API_Endpoints.ALGO_ORDER, payload, signed=True)
+      )
     except Exception as exc:
       logger.exception("[Binance] set_take_profit failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -483,7 +488,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     rather than mis-size.
     """
     try:
-      data = self._send(_API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True)
+      data = self._send(
+        _API_Endpoints.LEVERAGE_BRACKET, {"symbol": symbol}, signed=True
+      )
     except Exception as exc:
       logger.warning("[Binance] leverageBracket(%s) failed: %s", symbol, exc)
       return None
@@ -521,7 +528,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     """
     leverage = int(leverage)
     try:
-      data = self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": leverage}, signed=True)
+      data = self._send(
+        _API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": leverage}, signed=True
+      )
       # Return what the exchange actually applied (response carries the live
       # `leverage`), not the requested value — covers the case where Binance
       # silently clamps to a lower account cap instead of rejecting.
@@ -534,24 +543,30 @@ class BinanceFuturesGateway(BaseExchangeGateway):
         cap = min(int(min_leverage_cap), leverage)
         logger.warning(
           "[Binance] set_leverage(%s=%s) hit -4421 but cap was unparseable; "
-          "falling back to known floor %sx.", symbol, leverage, cap,
+          "falling back to known floor %sx.",
+          symbol,
+          leverage,
+          cap,
         )
       if cap is not None and cap < leverage:
         logger.warning(
           "[Binance] set_leverage(%s=%s) rejected by account cap (-4421); "
-          "retrying at %sx.", symbol, leverage, cap,
+          "retrying at %sx.",
+          symbol,
+          leverage,
+          cap,
         )
         try:
-          data = self._send(_API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": cap}, signed=True)
+          data = self._send(
+            _API_Endpoints.LEVERAGE, {"symbol": symbol, "leverage": cap}, signed=True
+          )
           return self._applied_leverage(data, cap)
         except Exception as exc2:
           logger.warning(
             "[Binance] set_leverage(%s=%s) retry failed: %s", symbol, cap, exc2
           )
           return None
-      logger.warning(
-        "[Binance] set_leverage(%s=%s) failed: %s", symbol, leverage, exc
-      )
+      logger.warning("[Binance] set_leverage(%s=%s) failed: %s", symbol, leverage, exc)
       return None
 
   @staticmethod
@@ -569,7 +584,9 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     return getattr(exc, "status_code", None) == _LEVERAGE_CAP_CODE
 
   @classmethod
-  def _leverage_cap_from_error(cls, exc: Exception, upper_bound: Optional[int] = None) -> Optional[int]:
+  def _leverage_cap_from_error(
+    cls, exc: Exception, upper_bound: Optional[int] = None
+  ) -> Optional[int]:
     """Pull the account leverage ceiling out of a -4421 error, else ``None``.
 
     ``upper_bound`` (the leverage we requested, already ``min(exchange_max,
@@ -587,7 +604,8 @@ class BinanceFuturesGateway(BaseExchangeGateway):
       # can be updated instead of silently losing the retry path.
       logger.warning(
         "[Binance] -4421 leverage cap but message did not match parser; "
-        "skipping cap-retry. message=%r", msg,
+        "skipping cap-retry. message=%r",
+        msg,
       )
       return None
     cap = int(match.group(1))
@@ -596,7 +614,10 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     if upper_bound is not None and cap >= upper_bound:
       logger.warning(
         "[Binance] -4421 parsed cap %sx >= requested %sx — treating as parse "
-        "anomaly and ignoring. message=%r", cap, upper_bound, msg,
+        "anomaly and ignoring. message=%r",
+        cap,
+        upper_bound,
+        msg,
       )
       return None
     return cap

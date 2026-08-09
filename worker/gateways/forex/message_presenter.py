@@ -79,8 +79,12 @@ class ForexMessagePresenter(BaseMessagePresenter):
 
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None, settings_dict: dict | None = None,
+    signal: SignalSchema,
+    result: dict,
+    pos_ticket: Any,
+    footer: str,
+    risk_info=None,
+    settings_dict: dict | None = None,
   ) -> str:
     volume = format_volume(result.get("volume"), auto_calculated=True)
     qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)

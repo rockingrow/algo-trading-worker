@@ -60,7 +60,12 @@ def test_run_worker_drives_full_lifecycle(monkeypatch):
 
   run_worker(factory, {}, stop_event=object(), label="TEST")
   assert captured["proc"].calls == [
-    "connect", "startup", "jobs", "run", "shutdown", "shutdown_notify"
+    "connect",
+    "startup",
+    "jobs",
+    "run",
+    "shutdown",
+    "shutdown_notify",
   ]
 
 
