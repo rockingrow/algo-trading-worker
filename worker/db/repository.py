@@ -386,7 +386,7 @@ class PositionRepository:
   def signal_exists(self, signal_id: str) -> bool:
     """True if any position_logs row already carries this ``signal_id``.
 
-    Called by the RETRY_SIGNALS handler in
+    Called by the ACK signal-replay handler in
     :class:`~worker.gateways.processor.BaseSignalProcessor` to skip a replay for
     a signal the worker has already processed (successfully or as a REJECT).
     An empty/None ``signal_id`` is treated as "not seen" — the caller decides

@@ -296,6 +296,32 @@ class ForexSignalProcessor(BaseSignalProcessor):
   def _magic_for(self, strategy: str) -> Optional[int]:
     return self.executor._magic_for(strategy)
 
+  def _set_executor_magic_map(self, mapping: Dict[str, int]) -> None:
+    """Refresh the executor's magic map when the broker pushes a
+    ``strategy_magic_map`` (see ``BaseSignalProcessor._apply_strategy_magic_map``),
+    so magic resolution and ``owned_magics()`` reflect it. The push arrives in the
+    WORKER_CONNECTED_ACK on connect, before ``start_market_jobs`` builds the
+    close-detection job from ``owned_magics()``."""
+    self.executor.set_strategy_magic_map(mapping)
+
+  def _replay_blocked_reason(self) -> Optional[str]:
+    """Block the ACK's signal replay until this worker actually holds a magic map.
+
+    Every FOREX order is routed by its strategy's magic, so with an empty map
+    ``_magic_for`` raises and each replayed signal is rejected as an unknown
+    strategy. The map is broker-owned now (``STRATEGY_MAGIC_MAP`` ships empty),
+    so an ACK that carries a replay but no usable ``strategy_magic_map`` — the
+    section omitted, or dropped by the salvage pass — is a broker-side config
+    fault, not a per-signal one. Report it once instead of rejecting the batch
+    signal-by-signal.
+    """
+    if self.settings.get("strategy_magic_map"):
+      return None
+    return (
+      "this worker has no strategy_magic_map (the ACK pushed none, or it was "
+      "dropped) — FOREX orders cannot be routed without a magic per strategy"
+    )
+
   def _position_cdc_kwargs(self) -> Dict[str, Any]:
     return {
       "account_info_fn": self.gateway.get_account,
@@ -321,7 +347,11 @@ class ForexSignalProcessor(BaseSignalProcessor):
     ).start()
 
     job = self.gateway.create_close_detection_job(
-      magic_numbers=self.executor.owned_magics(),
+      # The bound method, not its result: the magic map is broker-owned and
+      # re-pushed on every WORKER_CONNECTED_ACK (a NATS reconnect re-runs the
+      # handshake), so a set snapshotted here would go stale and the job would
+      # stop recognising this worker's own tickets.
+      magic_numbers=self.executor.owned_magics,
       db_service=self.ctx.db_service,
       notifier=self.ctx.channel_notifier,
     )

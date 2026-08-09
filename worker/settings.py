@@ -42,10 +42,10 @@ NATS_REQUIRED_LISTENING_SUBJECTS: set[NatsSubjectEnum] = {
   NatsSubjectEnum.SYSTEM,
 }
 WATCHDOG_INTERVAL = 10  # seconds
-# Maximum age (seconds, against the signal's own timestamp) a replayed signal
-# from a SYSTEM RETRY_SIGNALS may still be executed at. Older replays are
-# dropped so the worker never fires a stale entry/exit fill hours after the
-# market moved. See BaseSignalProcessor._handle_retry_signals.
+# Maximum age (seconds, against the signal's own timestamp) a signal replayed in
+# the WORKER_CONNECTED_ACK may still be executed at. Older replays are dropped so
+# the worker never fires a stale entry/exit fill hours after the market moved.
+# See BaseSignalProcessor._apply_retry_signals.
 MAX_RETRY_TIMEOUT = 60  # seconds
 MT5_HEALTH_INTERVAL = 15  # seconds between MT5 connection health checks
 # The FOREX market is closed from Friday 22:00 UTC to Sunday 22:00 UTC, when the
@@ -264,6 +264,12 @@ class StrategySettings(BaseSettings):
   model_config = _GROUP_CONFIG
 
   slippage_deviation: int = _opt(100, "SLIPPAGE_DEVIATION", "slippage_deviation")
+  # Per-strategy MT5 magic numbers. The broker now owns this mapping and pushes it
+  # on connect in the WORKER_CONNECTED_ACK (``strategy_magic_map``), scoped to the
+  # strategies this worker subscribes to — BaseSignalProcessor.
+  # _apply_strategy_magic_map overwrites this key in the live settings dict on
+  # receipt. The ``STRATEGY_MAGIC_MAP`` env var is kept only as an offline/legacy
+  # fallback default (empty by default); a broker push replaces it.
   magic_map: dict[str, int] = _opt({}, "STRATEGY_MAGIC_MAP", "strategy_magic_map")
   use_custom_position_tp1_percent: bool = _opt(
     False, "USE_CUSTOM_POSITION_TP1_PERCENT", "use_custom_position_tp1_percent"

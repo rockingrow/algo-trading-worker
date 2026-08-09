@@ -40,10 +40,14 @@ class TerminalCloseReason(str, Enum):
 # closing the position via the ZMQ pipeline — we must not double-fire.
 _REASON_MAP: dict[int, TerminalCloseReason] = {}
 
+# Deal ``entry`` values that take volume *out* of a position: a normal close and
+# a close-by (the position was closed against an opposite one).
+_CLOSING_ENTRIES: tuple[int, ...] = ()
 
-def _build_reason_map() -> None:
-  """Populate _REASON_MAP lazily (mt5 constants are only valid after import)."""
-  global _REASON_MAP
+
+def _build_mt5_maps() -> None:
+  """Populate the mt5-constant lookups lazily (only valid after import)."""
+  global _REASON_MAP, _CLOSING_ENTRIES
   _REASON_MAP = {
     mt5.DEAL_REASON_SL: TerminalCloseReason.SL,
     mt5.DEAL_REASON_TP: TerminalCloseReason.TP,
@@ -52,6 +56,10 @@ def _build_reason_map() -> None:
     mt5.DEAL_REASON_MOBILE: TerminalCloseReason.MANUAL,
     mt5.DEAL_REASON_WEB: TerminalCloseReason.MANUAL,
   }
+  _CLOSING_ENTRIES = (
+    mt5.DEAL_ENTRY_OUT,
+    getattr(mt5, "DEAL_ENTRY_OUT_BY", mt5.DEAL_ENTRY_OUT),
+  )
 
 
 # ── Data transfer objects ─────────────────────────────────────────────────── #
@@ -123,7 +131,7 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
   history is unavailable.
   """
   if not _REASON_MAP:
-    _build_reason_map()
+    _build_mt5_maps()
 
   deals = mt5.history_deals_get(position=position_ticket)
   if not deals:
@@ -131,7 +139,18 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
     return None
 
   opening_deal = next((d for d in deals if d.entry == mt5.DEAL_ENTRY_IN), None)
-  closing_deal = next((d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT), None)
+
+  # The deal that actually flattened the position is the *last* one out, not the
+  # first. A position can have several OUT deals — a TP1 partial we sent
+  # ourselves (DEAL_REASON_EXPERT) followed by a manual close, say. Taking the
+  # first one made the EXPERT partial mask the real close: its reason maps to
+  # nothing, so the whole event was discarded and the manual close went
+  # unreported. Ordering is not assumed; pick the newest explicitly (ticket
+  # breaks a same-second tie).
+  closing_deals = [d for d in deals if d.entry in _CLOSING_ENTRIES]
+  closing_deal = (
+    max(closing_deals, key=lambda d: (d.time, d.ticket)) if closing_deals else None
+  )
 
   if closing_deal is None:
     log.warning(

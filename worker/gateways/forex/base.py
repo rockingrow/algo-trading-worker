@@ -181,6 +181,10 @@ class BasePlatformGateway(ABC):
     """Return a startable job that detects platform-side closes (terminal SL/TP/
     stop-out/manual), or ``None`` when the platform pushes such events instead.
 
+    *magic_numbers* is a **callable** returning the magics the worker currently
+    owns, not a fixed set: the broker re-pushes the strategy→magic map on every
+    handshake, so the job must resolve it per scan rather than hold a snapshot.
+
     The returned object must expose ``start(stop_event=...)``.
     """
     return None

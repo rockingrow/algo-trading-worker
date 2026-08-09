@@ -165,8 +165,8 @@ class FakeProcessor(BaseSignalProcessor):
   def _handle_admin_message(self, raw, *, private=False):
     self.admin_calls.append((raw, private))
 
-  # Record dispatched SYSTEM actions (base parses the envelope + ensures
-  # connection, then calls this hook).
+  # Record dispatched runtime SYSTEM actions (base parses the envelope + ensures
+  # connection + routes by identity, then calls this hook).
   def _handle_system_action(self, action, data):
     self.system_calls.append((action, data))
 
@@ -569,14 +569,30 @@ def test_private_admin_subject_routed_to_hook():
   assert proc.db.logged == []  # not treated as a signal
 
 
+# A runtime SYSTEM broadcast: the broker's leverage settings changed after this
+# worker was already connected, so it cannot ride in the handshake ACK.
+def _leverage_broadcast(account_id="FAKE_MKT-FAKE_GW-acct-1", **fields):
+  import json as _json
+
+  return _json.dumps(
+    {
+      "action": SystemActionEnum.CRYPTO_LEVERAGE_INIT.value,
+      "timestamp": "2026-06-30T00:00:00+00:00",
+      "account_id": account_id,
+      **fields,
+    }
+  )
+
+
 def test_system_subject_parsed_and_dispatched_to_action_hook():
   proc = FakeProcessor({"success": True})
   proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
-  raw = (
-    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC","ETH"],"default_leverage":10}'
+
+  proc._process_message(
+    NatsSubjectEnum.SYSTEM,
+    _leverage_broadcast(symbols=["BTC", "ETH"], default_leverage=10),
   )
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
   assert len(proc.system_calls) == 1
   action, data = proc.system_calls[0]
   assert action == SystemActionEnum.CRYPTO_LEVERAGE_INIT
@@ -589,22 +605,22 @@ def test_system_matching_account_id_dispatched():
   # account_id is already "<market>-<gateway>-<id>" by the time Settings hands
   # it over (see Settings._validate_market_requirements) — processor compares as-is.
   proc.settings = {"account_id": "FAKE_MKT-acct-1"}
-  raw = (
-    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-acct-1","symbols":["BTC"]}'
+
+  proc._process_message(
+    NatsSubjectEnum.SYSTEM, _leverage_broadcast("FAKE_MKT-acct-1", symbols=["BTC"])
   )
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
   assert len(proc.system_calls) == 1
 
 
 def test_system_wrong_account_id_silently_skips():
   proc = FakeProcessor({"success": True})
   proc.settings = {"account_id": "FAKE_MKT-acct-1"}
-  raw = (
-    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-other","symbols":["BTC"]}'
+
+  proc._process_message(
+    NatsSubjectEnum.SYSTEM, _leverage_broadcast("FAKE_MKT-other", symbols=["BTC"])
   )
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
   assert proc.system_calls == []
 
 
@@ -693,24 +709,6 @@ def test_announce_worker_connected_ack_needs_no_dispatch():
 
   assert _json.loads(payload)["action"] == SystemActionEnum.WORKER_CONNECTED.value
   assert timeout == 5
-  assert proc.system_calls == []
-
-
-def test_announce_worker_connected_routes_crypto_leverage_init_reply():
-  proc = _connected_proc()
-  proc.publisher = FakePublisher(
-    [
-      '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-      '"account_id":"FAKE_MKT-FAKE_GW-acct-1","symbols":["BTC"],"default_leverage":10}'
-    ]
-  )
-  proc._announce_worker_connected()
-
-  assert len(proc.system_calls) == 1
-  action, data = proc.system_calls[0]
-  assert action == SystemActionEnum.CRYPTO_LEVERAGE_INIT
-  assert data["symbols"] == ["BTC"]
-  assert data["default_leverage"] == 10
 
 
 def test_announce_worker_connected_error_reply_logged_without_retry():
@@ -726,7 +724,7 @@ def test_announce_worker_connected_error_reply_logged_without_retry():
   # The broker responded (not a timeout) — a config problem on its side isn't
   # fixed by retrying, so the handshake attempt ends here, logged for an operator.
   assert len(proc.publisher.requests) == 1
-  assert proc.system_calls == []
+  assert "strategy_magic_map" not in proc.settings  # nothing applied
 
 
 def test_announce_worker_connected_retries_with_backoff_on_timeout(monkeypatch):
@@ -798,11 +796,9 @@ def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatc
 def test_system_not_connected_short_circuits():
   proc = FakeProcessor({"success": True}, connected=False)
   proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
-  raw = (
-    '{"action":"CRYPTO_LEVERAGE_INIT","timestamp":"2026-06-30T00:00:00+00:00",'
-    '"account_id":"FAKE_MKT-FAKE_GW-acct-1"}'
-  )
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  proc._process_message(NatsSubjectEnum.SYSTEM, _leverage_broadcast())
+
   assert proc.system_calls == []
 
 
@@ -937,7 +933,7 @@ def test_worker_connected_payload_includes_strategies_from_settings():
   payload = _json.loads(proc._worker_connected_payload())
   # The subscribed strategies (nats_subjects minus control subjects) are shipped
   # so the broker knows which strategies' recent signals to include in a
-  # RETRY_SIGNALS reply for this worker.
+  # replay in the ACK for this worker.
   assert payload["strategies"] == ["MT5_GOLD", "MT5_FX"]
 
 
@@ -952,21 +948,36 @@ def test_worker_connected_payload_strategies_defaults_to_empty_when_unset():
   assert payload["strategies"] == []
 
 
-# ── RETRY_SIGNALS SYSTEM action ────────────────────────────────────────────── #
+# ── WORKER_CONNECTED_ACK payload ───────────────────────────────────────────── #
+#
+# Both connect-time config sections (magic map + signal replay) now ride inside
+# the single ACK: a NATS request inbox resolves on the first message and
+# unsubscribes, so anything the broker sent after it was silently dropped.
 
 
-def _retry_signals_payload(signals, account_id="FAKE_MKT-FAKE_GW-acct-1"):
-  """Serialise a RETRY_SIGNALS envelope with the given signal payloads."""
+def _ack_payload(
+  *,
+  account_id="FAKE_MKT-FAKE_GW-acct-1",
+  strategy_magic_map=None,
+  crypto_leverage_init=None,
+  retry_signals=None,
+):
+  """Serialise a WORKER_CONNECTED_ACK. A section left as ``None`` is omitted from
+  the JSON entirely (the broker has nothing to push for it)."""
   import json as _json
 
-  return _json.dumps(
-    {
-      "action": SystemActionEnum.RETRY_SIGNALS.value,
-      "timestamp": datetime.now(timezone.utc).isoformat(),
-      "account_id": account_id,
-      "signals": [s.model_dump(mode="json") for s in signals],
-    }
-  )
+  payload = {
+    "action": SystemActionEnum.WORKER_CONNECTED_ACK.value,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "account_id": account_id,
+  }
+  if strategy_magic_map is not None:
+    payload["strategy_magic_map"] = strategy_magic_map
+  if crypto_leverage_init is not None:
+    payload["crypto_leverage_init"] = crypto_leverage_init
+  if retry_signals is not None:
+    payload["retry_signals"] = [s.model_dump(mode="json") for s in retry_signals]
+  return _json.dumps(payload)
 
 
 def _fresh_signal(action=SignalActionEnum.LONG, **overrides):
@@ -976,23 +987,28 @@ def _fresh_signal(action=SignalActionEnum.LONG, **overrides):
   return make_signal(action, **overrides)
 
 
+# ── ACK: retry_signals replay ──────────────────────────────────────────────── #
+
+
 def _retry_proc():
   proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
-  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
-  # Route RETRY_SIGNALS through the real base handler instead of the FakeProcessor
-  # test-only capture, so the dedup + timeout + _process_signal path is exercised.
-  proc._handle_system_action = lambda action, data: (
-    BaseSignalProcessor._handle_system_action(proc, action, data)
-  )
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
   return proc
+
+
+def _replay(proc, signals):
+  """Deliver *signals* the way the broker does — as the ACK's replay section."""
+  proc.publisher = FakePublisher([_ack_payload(retry_signals=signals)])
+  proc._announce_worker_connected()
 
 
 def test_retry_signals_executes_fresh_signal_via_process_signal():
   proc = _retry_proc()
   sig = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-fresh", symbol="AAA")
-  raw = _retry_signals_payload([sig])
 
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, [sig])
 
   # The eligible signal went through the normal pipeline: it was persisted as
   # an OPENED position and a fill notification was sent to the channel.
@@ -1005,9 +1021,8 @@ def test_retry_signals_skips_signal_already_processed():
   proc = _retry_proc()
   proc.db.known_signal_ids.add("dup-1")
   sig = _fresh_signal(SignalActionEnum.LONG, signal_id="dup-1", symbol="AAA")
-  raw = _retry_signals_payload([sig])
 
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, [sig])
 
   # A signal we've already processed must not be re-executed — no DB writes,
   # no channel notification.
@@ -1026,9 +1041,8 @@ def test_retry_signals_skips_signal_older_than_max_retry_timeout():
     symbol="AAA",
     timestamp=stale_ts.isoformat(),
   )
-  raw = _retry_signals_payload([sig])
 
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, [sig])
 
   assert proc.db.inserted == []
   assert proc.notifications == []
@@ -1047,9 +1061,8 @@ def test_retry_signals_mixed_batch_only_executes_eligible():
       datetime.now(timezone.utc) - timedelta(seconds=MAX_RETRY_TIMEOUT + 5)
     ).isoformat(),
   )
-  raw = _retry_signals_payload([fresh, duplicate, stale])
 
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, [fresh, duplicate, stale])
 
   # Only the fresh (non-dup, in-window) signal reaches the broker path.
   assert [row["symbol"] for row in proc.db.inserted] == ["AAA"]
@@ -1058,9 +1071,20 @@ def test_retry_signals_mixed_batch_only_executes_eligible():
 
 def test_retry_signals_empty_batch_is_a_no_op():
   proc = _retry_proc()
-  raw = _retry_signals_payload([])
 
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, [])
+
+  assert proc.db.inserted == []
+  assert proc.notifications == []
+
+
+def test_ack_without_retry_signals_section_is_a_no_op():
+  """An ACK that omits ``retry_signals`` entirely (the common case — nothing to
+  catch up on) completes the handshake without touching the signal pipeline."""
+  proc = _retry_proc()
+  proc.publisher = FakePublisher([_ack_payload()])
+
+  proc._announce_worker_connected()
 
   assert proc.db.inserted == []
   assert proc.notifications == []
@@ -1068,12 +1092,11 @@ def test_retry_signals_empty_batch_is_a_no_op():
 
 def test_retry_signals_marks_executed_signal_id_in_db():
   """The processed signal_id is stored in position_logs + positions so a
-  subsequent RETRY_SIGNALS carrying the same id dedups against it."""
+  subsequent replay carrying the same id dedups against it."""
   proc = _retry_proc()
   sig = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-persist", symbol="AAA")
-  raw = _retry_signals_payload([sig])
 
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, [sig])
 
   assert proc.db.logged[0]["signal_id"] == "sig-persist"
   assert proc.db.inserted[0]["signal_id"] == "sig-persist"
@@ -1120,8 +1143,7 @@ def test_retry_signals_handles_batch_of_ten_mixed_signals():
 
   proc.handler = SimpleNamespace(handle=handle)
 
-  raw = _retry_signals_payload(signals)
-  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+  _replay(proc, signals)
 
   # The 5 fresh, eligible entries all executed and were persisted + notified.
   assert sorted(row["symbol"] for row in proc.db.inserted) == [
@@ -1134,29 +1156,468 @@ def test_retry_signals_handles_batch_of_ten_mixed_signals():
   )
 
 
-def test_retry_signals_dispatched_via_worker_connected_reply():
-  """RETRY_SIGNALS is also a valid WORKER_CONNECTED reply — the broker can
-  replay in-flight signals right after the handshake instead of on a separate
-  SYSTEM push. The reply router must dispatch through the same handler."""
-  proc = _connected_proc()
-  # Wire the real base action-dispatch so RETRY_SIGNALS hits _handle_retry_signals.
-  proc._handle_system_action = lambda action, data: (
-    BaseSignalProcessor._handle_system_action(proc, action, data)
-  )
-  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="wc-retry", symbol="ZZZ")
-  import json as _json
+# ── ACK: strategy_magic_map ────────────────────────────────────────────────── #
 
-  reply = _json.dumps(
-    {
-      "action": SystemActionEnum.RETRY_SIGNALS.value,
-      "timestamp": datetime.now(timezone.utc).isoformat(),
-      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
-      "signals": [sig.model_dump(mode="json")],
-    }
+
+def _magic_map_proc(nats_subjects="MT5_GOLD,MT5_FX,ADMIN,SYSTEM"):
+  """A connected FakeProcessor that records every executor-refresh call."""
+  proc = FakeProcessor({"success": True})
+  proc.settings = {
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "gw_key": "FAKE_GW",
+    "nats_subjects": nats_subjects,
+  }
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  proc.executor_magic_maps = []
+  proc._set_executor_magic_map = lambda mapping: proc.executor_magic_maps.append(
+    mapping
   )
-  proc.publisher = FakePublisher([reply])
+  return proc
+
+
+def _push_magic_map(proc, mapping):
+  """Deliver *mapping* the way the broker does — as the ACK's magic-map section."""
+  proc.publisher = FakePublisher([_ack_payload(strategy_magic_map=mapping)])
+  proc._announce_worker_connected()
+
+
+def test_strategy_magic_map_stored_in_settings_and_propagated_to_executor():
+  # A subscribed-strategy map is stored under the same settings key the legacy
+  # .env value used, and pushed to the already-built executor.
+  proc = _magic_map_proc()
+
+  _push_magic_map(proc, {"MT5_GOLD": 20260409, "MT5_FX": 20260410})
+
+  assert proc.settings["strategy_magic_map"] == {
+    "MT5_GOLD": 20260409,
+    "MT5_FX": 20260410,
+  }
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409, "MT5_FX": 20260410}]
+
+
+def test_strategy_magic_map_filters_to_subscribed_strategies():
+  # Only entries for strategies in NATS_SUBJECTS are kept — a magic for a
+  # strategy this worker does not subscribe to is ignored, so both settings and
+  # the executor see just the subscribed subset.
+  proc = _magic_map_proc(nats_subjects="MT5_GOLD,ADMIN,SYSTEM")
+
+  _push_magic_map(proc, {"MT5_GOLD": 20260409, "MT5_OTHER": 999})
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409}]
+
+
+def test_strategy_magic_map_empty_clears():
+  # An explicit empty map clears the worker's magics (still propagated to the
+  # executor) — distinct from omitting the section, which leaves them untouched.
+  proc = _magic_map_proc()
+
+  _push_magic_map(proc, {})
+
+  assert proc.settings["strategy_magic_map"] == {}
+  assert proc.executor_magic_maps == [{}]
+
+
+def test_ack_without_magic_map_section_leaves_existing_map_untouched():
+  """Omitting ``strategy_magic_map`` means "nothing to push", not "clear it" —
+  a reconnect ACK that arrives without the section must not wipe the magics the
+  worker is already trading under."""
+  proc = _magic_map_proc()
+  proc.settings["strategy_magic_map"] = {"MT5_GOLD": 20260409}
+  proc.publisher = FakePublisher([_ack_payload()])
 
   proc._announce_worker_connected()
 
-  assert len(proc.db.inserted) == 1
-  assert proc.db.inserted[0]["symbol"] == "ZZZ"
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == []
+
+
+def test_strategy_magic_map_unparseable_leaves_settings_untouched():
+  # Nothing salvageable in the push → the section is skipped entirely rather
+  # than stored as an empty map, so settings and the executor stay untouched
+  # (and the handshake never crashes).
+  proc = _magic_map_proc()
+
+  _push_magic_map(proc, {"MT5_GOLD": "not-an-int"})
+
+  assert "strategy_magic_map" not in proc.settings
+  assert proc.executor_magic_maps == []
+
+
+# ── ACK: both sections in one payload ──────────────────────────────────────── #
+
+
+def test_ack_applies_every_config_section_before_replaying_signals():
+  """Ordering is load-bearing: a replayed FOREX entry is routed by its strategy's
+  magic and a replayed CRYPTO entry is sized against the exchange's leverage, so
+  both config sections must land before the replay runs — otherwise the replay
+  fires orders against config that hasn't been applied yet."""
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "gw_key": "FAKE_GW",
+    "nats_subjects": "MT5_GOLD,ADMIN,SYSTEM",
+  }
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+
+  order = []
+  proc._set_executor_magic_map = lambda mapping: order.append(("magic_map", mapping))
+  proc._apply_market_init = lambda ack: order.append(
+    ("market_init", ack.crypto_leverage_init.default_leverage)
+  )
+  original_process_signal = proc._process_signal
+
+  def tracking_process_signal(signal):
+    order.append(("signal", signal.signal_id))
+    return original_process_signal(signal)
+
+  proc._process_signal = tracking_process_signal
+
+  sig = _fresh_signal(
+    SignalActionEnum.LONG, signal_id="ack-all", symbol="AAA", strategy="MT5_GOLD"
+  )
+  proc.publisher = FakePublisher(
+    [
+      _ack_payload(
+        strategy_magic_map={"MT5_GOLD": 20260409},
+        crypto_leverage_init={"symbols": ["BTC"], "default_leverage": 10},
+        retry_signals=[sig],
+      )
+    ]
+  )
+
+  proc._announce_worker_connected()
+
+  assert order == [
+    ("magic_map", {"MT5_GOLD": 20260409}),
+    ("market_init", 10),
+    ("signal", "ack-all"),
+  ]
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.db.inserted[0]["symbol"] == "AAA"
+
+
+# ── ACK: the replay is gated on the config it depends on ───────────────────── #
+
+
+def _gated_proc(blocked_reason):
+  """A processor whose market blocks (or allows) the replay — standing in for
+  ForexSignalProcessor._replay_blocked_reason without the MT5 stack."""
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "gw_key": "FAKE_GW",
+    "nats_subjects": "MT5_GOLD,ADMIN,SYSTEM",
+  }
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  proc._replay_blocked_reason = lambda: blocked_reason
+  return proc
+
+
+def test_replay_skipped_when_the_market_has_no_usable_config():
+  """Ordering alone doesn't guarantee the magic map *landed*: an ACK that omits it
+  (or whose map was dropped by the salvage pass) leaves a first-connect FOREX
+  worker with an empty map, and every replayed entry would then be rejected as an
+  unknown strategy. Skip the batch instead, so the operator gets one line naming
+  the root cause."""
+  proc = _gated_proc("no strategy_magic_map")
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="gated", symbol="AAA")
+
+  proc.publisher = FakePublisher([_ack_payload(retry_signals=[sig])])
+  proc._announce_worker_connected()
+
+  assert proc.db.inserted == []  # nothing executed
+  assert proc.notifications == []  # and no per-signal rejection spam
+
+
+def test_replay_runs_once_the_market_reports_its_config_is_ready():
+  # Same ACK, nothing blocking → the batch replays as usual.
+  proc = _gated_proc(None)
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="ungated", symbol="AAA")
+
+  proc.publisher = FakePublisher([_ack_payload(retry_signals=[sig])])
+  proc._announce_worker_connected()
+
+  assert [p["symbol"] for p in proc.db.inserted] == ["AAA"]
+
+
+def test_replay_gate_is_checked_after_every_config_section_is_applied():
+  """The gate asks "did the config land?", so it must run *after* the sections —
+  checking it earlier would block a replay whose magic map is in the very same
+  ACK."""
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {
+    "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+    "gw_key": "FAKE_GW",
+    "nats_subjects": "MT5_GOLD,ADMIN,SYSTEM",
+  }
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  # Mirrors ForexSignalProcessor._replay_blocked_reason: ready once the map is in
+  # settings — which only the ACK's own magic-map section puts there.
+  proc._replay_blocked_reason = lambda: (
+    None if proc.settings.get("strategy_magic_map") else "no strategy_magic_map"
+  )
+
+  sig = _fresh_signal(
+    SignalActionEnum.LONG, signal_id="same-ack", symbol="AAA", strategy="MT5_GOLD"
+  )
+  proc.publisher = FakePublisher(
+    [_ack_payload(strategy_magic_map={"MT5_GOLD": 20260409}, retry_signals=[sig])]
+  )
+
+  proc._announce_worker_connected()
+
+  assert [p["symbol"] for p in proc.db.inserted] == ["AAA"]
+
+
+def test_worker_connected_reply_payload_logged_before_parsing(monkeypatch):
+  """A handshake reply lands on the request's private inbox, so it never passes
+  through the subscriber's "Received NATS message" DEBUG line. Log the raw bytes
+  here instead — and *before* parsing, so a payload that doesn't parse at all is
+  still visible rather than leaving only an exception."""
+  debug_lines = []
+  monkeypatch.setattr(
+    processor_module.log,
+    "debug",
+    lambda msg, *a, **k: debug_lines.append(msg % a if a else msg),
+  )
+  proc = _connected_proc()
+  proc.publisher = FakePublisher(["not-json{"])
+
+  proc._announce_worker_connected()
+
+  assert any("reply payload: not-json{" in line for line in debug_lines)
+
+
+def test_worker_connected_request_payload_logged_before_sending(monkeypatch):
+  """The outbound handshake rides ``publisher.request``, not ``publisher.publish``,
+  so it never passes through the subscriber's "Received NATS message" DEBUG line
+  either. Log the raw JSON here so ``market``/``gateway``/``strategies`` are
+  visible without inferring them from the account_id-only INFO summary."""
+  debug_lines = []
+  monkeypatch.setattr(
+    processor_module.log,
+    "debug",
+    lambda msg, *a, **k: debug_lines.append(msg % a if a else msg),
+  )
+  proc = _connected_proc()
+  proc.publisher = FakePublisher([_ack_payload()])
+
+  proc._announce_worker_connected()
+
+  assert any(
+    "request payload: " in line and '"action":"WORKER_CONNECTED"' in line
+    for line in debug_lines
+  )
+
+
+def test_ack_crypto_leverage_init_section_reaches_the_market_hook():
+  """The leverage-init pass is now an ACK section rather than a standalone SYSTEM
+  action; the base parses it and hands the typed section to the market hook."""
+  proc = _connected_proc()
+  seen = []
+  proc._apply_market_init = lambda ack: seen.append(ack.crypto_leverage_init)
+  proc.publisher = FakePublisher(
+    [_ack_payload(crypto_leverage_init={"symbols": ["BTC"], "default_leverage": 10})]
+  )
+
+  proc._announce_worker_connected()
+
+  assert len(seen) == 1
+  assert seen[0].symbols == ["BTC"]
+  assert seen[0].default_leverage == 10
+
+
+def test_ack_without_leverage_section_hands_the_hook_nothing():
+  """Omitting the section skips the leverage pass — it is the only trigger, so a
+  worker that wasn't asked must not re-initialise anything on its own."""
+  proc = _connected_proc()
+  seen = []
+  proc._apply_market_init = lambda ack: seen.append(ack.crypto_leverage_init)
+  proc.publisher = FakePublisher([_ack_payload(strategy_magic_map={})])
+
+  proc._announce_worker_connected()
+
+  assert seen == [None]
+
+
+def test_ack_invalid_leverage_section_does_not_cost_the_other_sections():
+  """Sections are salvaged independently — a malformed leverage block is dropped
+  on its own while the magic map in the same payload still applies."""
+  proc = _magic_map_proc()
+  seen = []
+  proc._apply_market_init = lambda ack: seen.append(ack.crypto_leverage_init)
+  proc.publisher = FakePublisher(
+    [
+      _ack_payload(
+        strategy_magic_map={"MT5_GOLD": 20260409},
+        crypto_leverage_init={"default_leverage": "not-an-int"},
+      )
+    ]
+  )
+
+  proc._announce_worker_connected()
+
+  assert seen == [None]
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+
+
+def test_ack_invalid_signal_does_not_cost_the_magic_map():
+  """Sections are salvaged independently: a malformed signal in the replay must
+  not stop the magic map from landing. Without the map a FOREX worker rejects
+  *every* signal as an unknown strategy, so letting one bad replay entry take it
+  down would turn a cosmetic broker bug into a full trading outage."""
+  proc = _magic_map_proc()
+  import json as _json
+
+  raw = _json.dumps(
+    {
+      "action": SystemActionEnum.WORKER_CONNECTED_ACK.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+      "strategy_magic_map": {"MT5_GOLD": 20260409},
+      "retry_signals": [
+        {"strategy": "MT5_GOLD", "symbol": "AAA"}
+      ],  # no action/timestamp
+    }
+  )
+  proc.publisher = FakePublisher([raw])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409}]
+  # The unparseable signal itself is still dropped — never executed.
+  assert proc.db.inserted == []
+
+
+def test_ack_drops_only_the_bad_signal_and_replays_the_rest():
+  """One malformed entry must not cancel the gap-fill the rest of the batch
+  provides — each signal is validated on its own."""
+  proc = _retry_proc()
+  good = _fresh_signal(SignalActionEnum.LONG, signal_id="good", symbol="AAA")
+  import json as _json
+
+  raw = _json.dumps(
+    {
+      "action": SystemActionEnum.WORKER_CONNECTED_ACK.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+      "retry_signals": [
+        {"strategy": "S", "symbol": "BAD"},  # no action/timestamp
+        good.model_dump(mode="json"),
+      ],
+    }
+  )
+  proc.publisher = FakePublisher([raw])
+
+  proc._announce_worker_connected()
+
+  assert [row["symbol"] for row in proc.db.inserted] == ["AAA"]
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_ack_magic_map_keeps_the_parseable_entries():
+  """A corrupt magic for one strategy costs that strategy only. Its own signals
+  are then rejected loudly by the unknown-strategy guard, which is a far better
+  failure than every strategy losing its magic at once."""
+  proc = _magic_map_proc(nats_subjects="MT5_GOLD,MT5_FX,ADMIN,SYSTEM")
+
+  _push_magic_map(proc, {"MT5_GOLD": 20260409, "MT5_FX": "not-an-int"})
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == [{"MT5_GOLD": 20260409}]
+
+
+def test_ack_wholly_unparseable_magic_map_is_not_read_as_a_clear():
+  """Salvaging nothing from a non-empty push leaves the current map alone rather
+  than storing ``{}`` — an empty map is the broker's explicit "clear my magics"
+  instruction, and a parse failure must never be mistaken for one."""
+  proc = _magic_map_proc()
+  proc.settings["strategy_magic_map"] = {"MT5_GOLD": 20260409}
+
+  _push_magic_map(proc, {"MT5_GOLD": "not-an-int"})
+
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+  assert proc.executor_magic_maps == []
+
+
+def test_ack_envelope_error_still_drops_everything():
+  """Section salvage does not extend to the envelope: an ACK with no account_id
+  addresses nobody, so there is nothing to apply it to."""
+  proc = _magic_map_proc()
+  import json as _json
+
+  raw = _json.dumps(
+    {
+      "action": SystemActionEnum.WORKER_CONNECTED_ACK.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "strategy_magic_map": {"MT5_GOLD": 20260409},
+    }
+  )
+  proc.publisher = FakePublisher([raw])
+
+  proc._announce_worker_connected()
+
+  assert "strategy_magic_map" not in proc.settings
+  assert proc.executor_magic_maps == []
+
+
+@pytest.mark.parametrize("action", ["RETRY_SIGNALS", "STRATEGY_MAGIC_MAP"])
+def test_removed_system_actions_are_no_longer_recognised(action):
+  """Neither survives as a standalone SYSTEM action — both are connect-time only
+  and the broker delivers them as sections of the ACK. A stale broker still
+  publishing them fails envelope validation and is ignored, never executed.
+  (``CRYPTO_LEVERAGE_INIT`` deliberately remains: it is the one piece of config
+  that also changes at runtime, so it needs the always-live SYSTEM broadcast.)"""
+  assert not hasattr(SystemActionEnum, action)
+
+  proc = _magic_map_proc()
+  import json as _json
+
+  raw = _json.dumps(
+    {
+      "action": action,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+      "strategy_magic_map": {"MT5_GOLD": 20260409},
+    }
+  )
+  proc._process_message(NatsSubjectEnum.SYSTEM, raw)
+
+  assert "strategy_magic_map" not in proc.settings
+  assert proc.executor_magic_maps == []
+
+
+def test_leverage_init_reaches_the_same_pass_from_both_delivery_paths():
+  """The ACK section and the runtime SYSTEM broadcast carry the same payload and
+  must converge on one leverage-init pass — the connect-time and runtime paths
+  differ only in how the message got here."""
+  from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
+  from worker.schemas.inbox_schema import WorkerConnectedAckSchema
+  from worker.schemas.system_schema import SystemCryptoLeverageInitSchema
+
+  runs = []
+  proc = CryptoSignalProcessor.__new__(CryptoSignalProcessor)
+  proc._run_leverage_init = lambda symbols=None, max_leverage_cap=None: runs.append(
+    (symbols, max_leverage_cap)
+  )
+
+  ack = WorkerConnectedAckSchema(
+    account_id="CRYPTO-BINANCE-1",
+    crypto_leverage_init={"symbols": ["BTC"], "default_leverage": 10},
+  )
+  proc._apply_market_init(ack)
+
+  proc._handle_system_action(
+    SystemActionEnum.CRYPTO_LEVERAGE_INIT,
+    SystemCryptoLeverageInitSchema(
+      account_id="CRYPTO-BINANCE-1", symbols=["BTC"], default_leverage=10
+    ).model_dump(mode="json"),
+  )
+
+  assert runs == [(["BTC"], 10), (["BTC"], 10)]

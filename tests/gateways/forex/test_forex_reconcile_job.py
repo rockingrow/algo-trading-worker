@@ -245,21 +245,37 @@ def test_symbol_resolution_failure_treats_row_as_live():
   assert job._suspected == set()
 
 
-def test_weekend_skips_scan_entirely():
+def test_weekend_still_scans_while_the_terminal_is_connected():
+  # The reported bug: 24/7 instruments (crypto CFDs like BTCUSD) trade straight
+  # through the FOREX weekend window with the terminal up. Gating the scan on the
+  # calendar made a manual close there invisible — the row stayed OPENED all
+  # weekend and blocked every later signal on the symbol.
   db = _FakeDb([_row("111")])
   job, handled = _job(db, _FakeExecutor(positions=[]), market_closed=True)
+
   job._scan()
   job._scan()
-  assert handled == []
-  assert job._suspected == set()
+  assert len(handled) == 1 and handled[0]["ref_source_id"] == "111"
 
 
-def test_weekend_backs_off_to_weekend_interval():
+def test_weekend_backs_off_only_once_the_connection_is_parked():
+  # The health thread closes the connection a few minutes into the window; until
+  # it does, the normal cadence must hold so a 24/7 close is caught in two scans.
   db = _FakeDb([])
   open_job, _ = _job(db, _FakeExecutor(), market_closed=False)
-  closed_job, _ = _job(db, _FakeExecutor(), market_closed=True)
+  weekend_connected, _ = _job(db, _FakeExecutor(), market_closed=True)
+  weekend_parked, _ = _job(
+    db, _FakeExecutor(), gateway=_FakeGateway(connected=False), market_closed=True
+  )
+  # A weekday disconnect keeps the fast cadence so the job resumes on reconnect.
+  weekday_disconnected, _ = _job(
+    db, _FakeExecutor(), gateway=_FakeGateway(connected=False), market_closed=False
+  )
+
   assert open_job._next_interval() == open_job._poll_interval
-  assert closed_job._next_interval() == MT5_HEALTH_INTERVAL_WEEKEND
+  assert weekend_connected._next_interval() == weekend_connected._poll_interval
+  assert weekend_parked._next_interval() == MT5_HEALTH_INTERVAL_WEEKEND
+  assert weekday_disconnected._next_interval() == weekday_disconnected._poll_interval
 
 
 def test_disconnected_platform_skips_scan():
