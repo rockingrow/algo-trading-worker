@@ -158,7 +158,10 @@ class BasePlatformGateway(ABC):
 
   @abstractmethod
   def close_position(
-    self, position: PlatformPosition, volume: Optional[float] = None, comment: str = "Close"
+    self,
+    position: PlatformPosition,
+    volume: Optional[float] = None,
+    comment: str = "Close",
   ) -> TradeResult:
     """Close (or partially close) *position* with a counter-direction market order.
 
@@ -177,6 +180,10 @@ class BasePlatformGateway(ABC):
   ):  # pragma: no cover - default no-op
     """Return a startable job that detects platform-side closes (terminal SL/TP/
     stop-out/manual), or ``None`` when the platform pushes such events instead.
+
+    *magic_numbers* is a **callable** returning the magics the worker currently
+    owns, not a fixed set: the broker re-pushes the strategy→magic map on every
+    handshake, so the job must resolve it per scan rather than hold a snapshot.
 
     The returned object must expose ``start(stop_event=...)``.
     """

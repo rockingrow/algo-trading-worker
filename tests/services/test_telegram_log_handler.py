@@ -46,9 +46,7 @@ def _spy_notifier_init(monkeypatch) -> list:
     captured.append((chat_ids, bot_token))
     original_init(self, chat_ids=chat_ids, bot_token=bot_token)
 
-  monkeypatch.setattr(
-    notification_service.TelegramNotification, "__init__", spy_init
-  )
+  monkeypatch.setattr(notification_service.TelegramNotification, "__init__", spy_init)
 
   def fake_send(self, message_text: str) -> bool:
     return True
@@ -124,10 +122,10 @@ def test_emit_without_start_lazily_forwards(sent):
 def test_worker_uses_dedicated_log_chat_id(monkeypatch):
   """When telegram_log_chat_id is set, the worker must target that chat."""
   monkeypatch.setattr(
-    notification_service.settings, "telegram_log_chat_id", "999", raising=False
+    notification_service.settings.telegram, "log_chat_id", "999", raising=False
   )
   monkeypatch.setattr(
-    notification_service.settings, "telegram_chat_id", "111", raising=False
+    notification_service.settings.telegram, "chat_id", "111", raising=False
   )
   captured = _spy_notifier_init(monkeypatch)
 
@@ -145,14 +143,14 @@ def test_worker_uses_dedicated_log_chat_id(monkeypatch):
 def test_worker_uses_dedicated_log_bot_token(monkeypatch):
   """When telegram_log_bot_token is set, the worker must send via that bot."""
   monkeypatch.setattr(
-    notification_service.settings,
-    "telegram_log_bot_token",
+    notification_service.settings.telegram,
+    "log_bot_token",
     SecretStr("log-bot-tok"),
     raising=False,
   )
   monkeypatch.setattr(
-    notification_service.settings,
-    "telegram_bot_token",
+    notification_service.settings.telegram,
+    "bot_token",
     SecretStr("main-bot-tok"),
     raising=False,
   )
@@ -172,11 +170,11 @@ def test_worker_uses_dedicated_log_bot_token(monkeypatch):
 def test_worker_falls_back_to_shared_bot_token(monkeypatch):
   """When telegram_log_bot_token is empty, the worker must reuse the shared bot."""
   monkeypatch.setattr(
-    notification_service.settings, "telegram_log_bot_token", None, raising=False
+    notification_service.settings.telegram, "log_bot_token", None, raising=False
   )
   monkeypatch.setattr(
-    notification_service.settings,
-    "telegram_bot_token",
+    notification_service.settings.telegram,
+    "bot_token",
     SecretStr("main-bot-tok"),
     raising=False,
   )

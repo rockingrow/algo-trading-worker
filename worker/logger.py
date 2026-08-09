@@ -46,7 +46,7 @@ def get_logger(name: str) -> logging.Logger:
   logger = logging.getLogger(name)
 
   if not logger.handlers:
-    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    level = getattr(logging, settings.logging.level.upper(), logging.INFO)
     logger.setLevel(level)
 
     console_handler = logging.StreamHandler(sys.stdout)
@@ -79,7 +79,7 @@ def _maybe_attach_telegram_handler(logger: logging.Logger) -> None:
   Imported lazily to avoid a circular import (``notification_service`` imports
   this module). Skipped while ``notification_service`` is still initializing —
   its own logger is filtered from forwarding anyway."""
-  if not (settings.telegram_enabled and settings.telegram_log_errors_enabled):
+  if not (settings.telegram.enabled and settings.telegram.log_errors_enabled):
     return
 
   from worker.services import notification_service

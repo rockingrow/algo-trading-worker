@@ -29,9 +29,11 @@ from worker.gateways.crypto.leverage_init_job import LeverageInitJob
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
 from worker.gateways.processor import BaseSignalProcessor
 from worker.logger import get_logger
+from worker.schemas.inbox_schema import WorkerConnectedAckSchema
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.system_schema import (
+  CryptoLeverageInitSchema,
   SystemActionEnum,
   SystemCryptoLeverageInitSchema,
 )
@@ -82,7 +84,8 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     ok = self.gateway.set_position_mode(hedge_mode)
     log.info(
       "[CRYPTO Process] set_position_mode(%s) -> %s",
-      "HEDGE" if hedge_mode else "ONE-WAY", "ok" if ok else "failed, keeping account's current mode",
+      "HEDGE" if hedge_mode else "ONE-WAY",
+      "ok" if ok else "failed, keeping account's current mode",
     )
     return True
 
@@ -91,35 +94,44 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     symbols: Optional[list[str]] = None,
     max_leverage_cap: Optional[int] = None,
   ) -> None:
-    """Run :class:`LeverageInitJob` once, triggered by the SYSTEM
-    ``CRYPTO_LEVERAGE_INIT`` action (see :meth:`_handle_system_action`).
+    """Run :class:`LeverageInitJob` once, triggered by either delivery path via
+    :meth:`_leverage_init_from`.
 
     ``symbols`` / ``max_leverage_cap`` default to the configured values
-    (``CRYPTO_LEVERAGE_INIT_SYMBOLS`` / ``MAX_LEVERAGE_CAP``); a SYSTEM message
+    (``CRYPTO_LEVERAGE_INIT_SYMBOLS`` / ``MAX_LEVERAGE_CAP``); the payload
     may override either to re-initialise an ad-hoc set of symbols or cap. Failures
     inside the job are logged per symbol and never propagate — a missed leverage
     init is recoverable on the next re-trigger, but aborting over it would drop
     the message.
     """
     # When use_custom_leverage is on, the configured MAX_LEVERAGE_CAP always
-    # wins: any per-call override (e.g. a SYSTEM message's default_leverage) is
+    # wins: any per-call override (e.g. the ACK section's default_leverage) is
     # ignored so the worker forces its own cap instead of the broker/ad-hoc one.
     if self.settings.get("use_custom_leverage", False):
       log.info(
         "[CRYPTO Process] use_custom_leverage on — overriding requested cap=%s with MAX_LEVERAGE_CAP=%s",
-        max_leverage_cap, self.settings.get("max_leverage_cap", 10),
+        max_leverage_cap,
+        self.settings.get("max_leverage_cap", 10),
       )
       max_leverage_cap = self.settings.get("max_leverage_cap", 10)
     log.info(
       "[CRYPTO Process] Running leverage init | symbols=%s cap=%s",
-      symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
-      max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
+      symbols
+      if symbols is not None
+      else (self.settings.get("crypto_leverage_init_symbols") or []),
+      max_leverage_cap
+      if max_leverage_cap is not None
+      else self.settings.get("max_leverage_cap", 10),
     )
     try:
       LeverageInitJob(
         gateway=self.gateway,
-        symbols=symbols if symbols is not None else (self.settings.get("crypto_leverage_init_symbols") or []),
-        max_leverage_cap=max_leverage_cap if max_leverage_cap is not None else self.settings.get("max_leverage_cap", 10),
+        symbols=symbols
+        if symbols is not None
+        else (self.settings.get("crypto_leverage_init_symbols") or []),
+        max_leverage_cap=max_leverage_cap
+        if max_leverage_cap is not None
+        else self.settings.get("max_leverage_cap", 10),
         resolve_symbol=self.executor.get_symbol,
         min_leverage_cap=self.settings.get("min_leverage_cap", 5),
       ).run()
@@ -129,24 +141,48 @@ class CryptoSignalProcessor(BaseSignalProcessor):
         "remain at their current exchange settings."
       )
 
-  # ── SYSTEM actions (crypto handles CRYPTO_LEVERAGE_INIT) ──────────────── #
+  # ── Leverage init: connect-time (ACK section) + runtime (SYSTEM) ──────── #
+  #
+  # The broker reaches this pass two ways and both land on _run_leverage_init:
+  # the WORKER_CONNECTED_ACK section on connect, and a SYSTEM broadcast when an
+  # admin changes the account's leverage settings later.
+
+  def _apply_market_init(self, ack: WorkerConnectedAckSchema) -> None:
+    """Run the leverage-init pass the broker asked for in the handshake ACK.
+
+    Omitting the section skips the connect-time pass — there is no startup pass,
+    so nothing runs unless asked. It happens before the ACK's signal replay, so a
+    replayed entry is sized against the leverage it was meant to trade at.
+    """
+    if ack.crypto_leverage_init is not None:
+      self._leverage_init_from(ack.crypto_leverage_init, source="ACK")
 
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
+    """Re-run the leverage-init pass on a runtime ``CRYPTO_LEVERAGE_INIT``
+    broadcast — the same payload the ACK carries, sent after the handshake when
+    an admin edits a sub-account's leverage cap or onboards new symbols."""
     if action == SystemActionEnum.CRYPTO_LEVERAGE_INIT:
-      msg = SystemCryptoLeverageInitSchema(**data)
-      log.info(
-        "[CRYPTO SYSTEM] CRYPTO_LEVERAGE_INIT | symbols=%s default_leverage=%s",
-        msg.symbols, msg.default_leverage,
-      )
-      # Either field omitted → fall back to the configured default for that field
-      # (CRYPTO_LEVERAGE_INIT_SYMBOLS / MAX_LEVERAGE_CAP). default_leverage acts as
-      # the cap: each symbol is set to min(exchange_max, default_leverage).
-      self._run_leverage_init(
-        symbols=msg.symbols,
-        max_leverage_cap=msg.default_leverage,
-      )
+      self._leverage_init_from(SystemCryptoLeverageInitSchema(**data), source="SYSTEM")
       return
     super()._handle_system_action(action, data)
+
+  def _leverage_init_from(self, msg: CryptoLeverageInitSchema, *, source: str) -> None:
+    """Shared entry point for both delivery paths: log which one triggered the
+    pass (so an operator can tell a connect-time init from a runtime change),
+    then run it."""
+    log.info(
+      "[CRYPTO Process] crypto_leverage_init via %s | symbols=%s default_leverage=%s",
+      source,
+      msg.symbols,
+      msg.default_leverage,
+    )
+    # Either field omitted → fall back to the configured default for that field
+    # (CRYPTO_LEVERAGE_INIT_SYMBOLS / MAX_LEVERAGE_CAP). default_leverage acts as
+    # the cap: each symbol is set to min(exchange_max, default_leverage).
+    self._run_leverage_init(
+      symbols=msg.symbols,
+      max_leverage_cap=msg.default_leverage,
+    )
 
   def _disconnect_broker(self) -> None:
     self.gateway.close()
@@ -198,17 +234,22 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   # ── Exchange-triggered close handler (from the user data stream) ──────── #
 
   def _on_exchange_close(self, event: ExchangeCloseEvent) -> None:
-    status = _EXCHANGE_CLOSE_STATUS.get(event.reason, PositionStatusEnum.TERMINAL_CLOSED)
+    status = _EXCHANGE_CLOSE_STATUS.get(
+      event.reason, PositionStatusEnum.TERMINAL_CLOSED
+    )
     log.info(
       "[Crypto Event] Exchange close | symbol=%s reason=%s price=%s",
-      event.symbol, event.reason.value, event.close_price,
+      event.symbol,
+      event.reason.value,
+      event.close_price,
     )
 
     # Match by resolved exchange symbol: the DB stores the original signal symbol
     # (e.g. BTCUSD) while the event carries the exchange symbol (e.g. BTCUSDT).
     open_rows = self.ctx.db_service.get_open_positions_for_flat()
     matched = [
-      row for row in open_rows
+      row
+      for row in open_rows
       if self.executor.get_symbol(row["symbol"]) == event.symbol
     ]
     if not matched:
@@ -222,7 +263,8 @@ class CryptoSignalProcessor(BaseSignalProcessor):
       log.warning(
         "[Crypto Event] %d DB rows matched %s — netting mode: one exchange fill "
         "closes all. Check CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL config.",
-        len(matched), event.symbol,
+        len(matched),
+        event.symbol,
       )
 
     close_comment = (
@@ -361,7 +403,9 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     try:
       return self.gateway.get_mark_price(resolved_symbol)
     except Exception as exc:  # pragma: no cover - best effort
-      log.warning("[Crypto Reconcile] mark price unavailable for %s: %s", resolved_symbol, exc)
+      log.warning(
+        "[Crypto Reconcile] mark price unavailable for %s: %s", resolved_symbol, exc
+      )
       return None
 
   # ── ADMIN FLAT match keys (crypto reconciles by resolved symbol) ──────── #

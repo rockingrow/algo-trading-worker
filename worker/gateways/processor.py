@@ -6,7 +6,8 @@ Market-agnostic signal-processor skeleton (Template Method pattern).
 Both the FOREX (MT5) and CRYPTO (CEX) gateways run the *same* algorithm:
 
     connect → subscribe to NATS → for each message:
-        ADMIN  → validate + reconcile a FLAT
+        ADMIN  → validate + reconcile a FLAT (public fanout ``ADMIN``, or the
+                 worker's private ``ADMIN.<market>.<gateway>.<account_id>``)
         SIGNAL → handle, persist the position, notify
 
 Only a handful of steps actually differ per broker (how to connect, how to read
@@ -32,6 +33,7 @@ from typing import Any, Dict, Optional
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
+from worker.gateways import guard
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.market_strategy import MarketStrategyFactory
 from worker.gateways.signal_handler import SignalHandler
@@ -41,18 +43,19 @@ from worker.schemas.admin_schema import (
   AdminActionEnum,
   AdminFlatSchema,
   AdminMessageSchema,
+  PrivateAdminFlatSchema,
+  PrivateAdminSignalControlSchema,
+)
+from worker.schemas.inbox_schema import (
+  WorkerConnectedAckSchema,
+  WorkerConnectedErrorSchema,
+  WorkerConnectedSchema,
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
-from worker.schemas.system_schema import (
-  SystemActionEnum,
-  SystemRetrySignalsSchema,
-  SystemSchema,
-  SystemWorkerConnectedErrorSchema,
-  SystemWorkerConnectedSchema,
-)
+from worker.schemas.system_schema import SystemActionEnum, SystemSchema
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import (
   MAX_RETRY_TIMEOUT,
@@ -101,7 +104,7 @@ _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
 
 def _seconds_since(ts: Optional[datetime], now: datetime) -> Optional[float]:
   """Seconds between *ts* and *now*, treating a naive *ts* as UTC. Returns
-  None when *ts* is missing so the RETRY_SIGNALS handler can drop a payload
+  None when *ts* is missing so the signal-replay handler can drop a payload
   with no timestamp instead of guessing an age."""
   if ts is None:
     return None
@@ -130,8 +133,8 @@ def parse_strategy_subjects(raw: str) -> list[str]:
   Every entry in ``NATS_SUBJECTS`` that is not one of the control subjects
   (see :class:`NatsSubjectEnum`) is a strategy name (e.g. ``MT5_GOLD``). The
   WORKER_CONNECTED handshake ships this list to the broker so it knows which
-  strategies' recent signals to include in a RETRY_SIGNALS replay for this
-  worker."""
+  strategies to scope the ACK's ``strategy_magic_map`` and ``retry_signals``
+  replay to for this worker."""
   strategies: list[str] = []
   seen: set[str] = set()
   for s in raw.split(","):
@@ -165,6 +168,9 @@ class BaseSignalProcessor(ABC):
   #: bypass ``__init__`` in tests still resolve them).
   _footer_cache: Optional[str] = None
   _footer_cache_at: float = 0.0
+  #: Signal-execution gate (class-level default for the same reason). When True,
+  #: incoming SIGNALs are skipped — toggled by ADMIN BLOCK_SIGNAL/ALLOW_SIGNAL.
+  _signals_blocked: bool = False
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
     self.ctx = ctx
@@ -184,6 +190,11 @@ class BaseSignalProcessor(ABC):
     self.publisher: Optional[NATSPublisher] = None
     self._footer: str = ""
     self._market_type: str = self._market_type_value(settings_dict.get("market_type"))
+    # When True, incoming SIGNALs are skipped (not executed) — toggled by the
+    # private ADMIN actions BLOCK_SIGNAL / ALLOW_SIGNAL. In-memory only: a worker
+    # restart resets it to False (unblocked). Read/written on the single NATS
+    # listener thread, so no lock is needed.
+    self._signals_blocked: bool = False
 
   # ── Shared lifecycle ──────────────────────────────────────────────────── #
 
@@ -195,10 +206,21 @@ class BaseSignalProcessor(ABC):
     _tok = self.settings.get("nats_token")
     nats_token = _tok.get_secret_value() if _tok is not None else None
 
+    # Listen on the shared subjects plus this worker's own private ADMIN subject
+    # (ADMIN.<market>.<gateway>.<account_id>) so the broker can address a FLAT to
+    # exactly this account without fanning it out to every worker.
+    subjects = parse_nats_subjects(self.settings.get("nats_subjects", ""))
+    private_admin = self._private_admin_subject
+    if private_admin is not None and private_admin not in subjects:
+      subjects.append(private_admin)
+
     self.subscriber = NATSSubscriber(
       url=self.settings["nats_url"],
-      subjects=parse_nats_subjects(self.settings.get("nats_subjects", "")),
-      publish_subjects=[NatsSubjectEnum.TRADE, NatsSubjectEnum.SYSTEM], # purpose just only show on Notification
+      subjects=subjects,
+      publish_subjects=[
+        NatsSubjectEnum.TRADE,
+        NatsSubjectEnum.SYSTEM,
+      ],  # purpose just only show on Notification
       token=nats_token,
       account_id=self.settings.get("account_id"),
       account_footer_fn=self._account_footer,
@@ -219,7 +241,7 @@ class BaseSignalProcessor(ABC):
     self._footer = self._account_footer()
 
     # Handshake: tell the broker this worker is online so it can push any
-    # per-worker init (e.g. CRYPTO_LEVERAGE_INIT). The broker decides from
+    # per-worker init (magics, leverage, replay). The broker decides from
     # market/gateway whether anything applies — every market announces.
     self._announce_worker_connected()
     return True
@@ -248,6 +270,7 @@ class BaseSignalProcessor(ABC):
       publisher=self.publisher,
       db_service=self.ctx.db_service,
       market_type=self.settings.get("market_type"),
+      gateway=self._gateway_value,
       **self._position_cdc_kwargs(),
     ).start(stop_event=stop_event)
 
@@ -262,14 +285,19 @@ class BaseSignalProcessor(ABC):
         log.exception(
           "[%s Process] Unhandled error processing message — skipping. "
           "CRITICAL: manual reconciliation may be required. raw=%r",
-          self.name, raw,
+          self.name,
+          raw,
         )
 
   # ── Shared message processing ─────────────────────────────────────────── #
 
   def _process_message(self, subject, raw) -> None:
     if subject == NatsSubjectEnum.ADMIN:
-      self._handle_admin_message(raw)
+      self._handle_admin_message(raw, private=False)
+      return
+
+    if subject == self._private_admin_subject:
+      self._handle_admin_message(raw, private=True)
       return
 
     if subject == NatsSubjectEnum.SYSTEM:
@@ -306,6 +334,46 @@ class BaseSignalProcessor(ABC):
     MAX_OPEN_ORDERS exposure guard, run it through the handler, then persist and
     notify the outcome. Split out of :meth:`_process_message` so each NATS subject
     (ADMIN / SYSTEM / signal) has its own handler."""
+    # Signal-execution gate: an ADMIN BLOCK_SIGNAL suspends *all* signal
+    # execution for this worker until an ALLOW_SIGNAL clears it. This is the
+    # single funnel for both live signals and the ACK's replay, so blocking
+    # here covers both. Open positions are untouched — they can still be closed
+    # out-of-band via an ADMIN FLAT.
+    if self._signals_blocked:
+      log.warning(
+        "[%s Process] Signal SKIPPED — execution is BLOCKED (BLOCK_SIGNAL) | %s | %s",
+        self.name,
+        signal.symbol,
+        signal.action.value,
+      )
+      return
+
+    # Unknown-strategy guard: a signal whose strategy has no isolation handle
+    # (FOREX: no strategy_magic_map entry) can't be routed — every code path
+    # downstream calls _magic_for and would raise KeyError deep in the executor,
+    # bubbling up as an unhandled "manual reconciliation may be required" error.
+    # Skip cleanly with an operator alert so the misconfig (subscribed on NATS
+    # but not mapped) is visible and correctable. Crypto's _magic_for returns
+    # None, so this is a no-op there.
+    try:
+      self._magic_for(signal.strategy)
+    except (KeyError, ValueError) as exc:
+      reason = f"Unknown strategy '{signal.strategy}' — no strategy_magic_map entry."
+      log.error(
+        "[%s Process] Signal SKIPPED — %s (%s) | %s | %s. "
+        "Map it on the broker (WORKER_CONNECTED_ACK.strategy_magic_map) or "
+        "remove it from NATS_SUBJECTS.",
+        self.name,
+        reason,
+        exc,
+        signal.symbol,
+        signal.action.value,
+      )
+      self.ctx.notifier.send_message(
+        self.presenter.signal_rejected(reason, self._current_footer())
+      )
+      return
+
     # Scale-in (averaging): the broker has already scaled SL/TP1/TP2/quantity in
     # the payload, so every downstream step (SL/TP placement, persistence,
     # notifications) consumes them verbatim. The only re-derivation happens inside
@@ -315,21 +383,46 @@ class BaseSignalProcessor(ABC):
     if signal.is_scale_position:
       log.info(
         "[%s Process] Scale-in position | %s | scaling=%s | sl=%s tp1=%s tp2=%s qty=%s",
-        self.name, signal.symbol, signal.scaling,
-        signal.sl, signal.tp1, signal.tp2, signal.quantity,
+        self.name,
+        signal.symbol,
+        signal.scaling,
+        signal.sl,
+        signal.tp1,
+        signal.tp2,
+        signal.quantity,
       )
 
     log.info(
       "[%s Process] Processing Signal: %s | %s | TV Time: %s",
-      self.name, signal.symbol, signal.action.value, signal.timestamp,
+      self.name,
+      signal.symbol,
+      signal.action.value,
+      signal.timestamp,
     )
 
-    # Exposure guard: a new entry that would exceed MAX_OPEN_ORDERS is never sent
-    # to the broker. It is still recorded (status REJECTED), forwarded to the broker
-    # via CDC on the TRADE subject, and notified. Exits are never gated here so a
-    # position can always be closed even at the cap.
+    # Entry guards: a rejected entry is never sent to the broker. It is still
+    # recorded (status REJECTED), forwarded to the broker via CDC on the TRADE
+    # subject, and notified. Exits are never gated here so a position can always
+    # be closed. The single-position-per-symbol guard runs first (it is the
+    # stricter rule): while any order is open on the symbol, no new entry is
+    # placed — unless the market allows multiple strategies per symbol
+    # (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
+    # already held by *this* strategy still blocks.
     if signal.action in _ENTRY_ACTIONS:
-      reject_reason = self._max_open_orders_rejection(signal)
+      allow_multi_strategy = bool(
+        getattr(
+          getattr(self.handler, "strategy", None),
+          "allows_multi_strategy_per_symbol",
+          False,
+        )
+      )
+      reject_reason = guard.symbol_open_rejection(
+        self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
+      )
+      if reject_reason is None:
+        reject_reason = guard.max_open_orders_rejection(
+          self.ctx.db_service, self.settings, signal
+        )
       if reject_reason is not None:
         self._reject_signal(signal, reject_reason)
         return
@@ -374,8 +467,12 @@ class BaseSignalProcessor(ABC):
       else:
         risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
-          signal, result, result.get("source_ticket") or result.get("ticket"), footer,
-          risk_info=risk_info, settings_dict=self.settings,
+          signal,
+          result,
+          result.get("source_ticket") or result.get("ticket"),
+          footer,
+          risk_info=risk_info,
+          settings_dict=self.settings,
         )
     else:
       msg = self.presenter.order_failed(signal, result, footer)
@@ -428,37 +525,6 @@ class BaseSignalProcessor(ABC):
           message=signal_json,
         )
 
-  # ── Shared MAX_OPEN_ORDERS exposure guard ─────────────────────────────── #
-
-  def _max_open_orders_rejection(self, signal: SignalSchema) -> Optional[str]:
-    """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
-    because the worker is already at its MAX_OPEN_ORDERS cap, else ``None``.
-
-    The cap counts active (OPENED/TP1) positions across every strategy/symbol. A
-    re-entry or scale-in on a symbol this strategy already holds replaces the
-    existing position rather than opening a new slot, so it is never counted
-    against the cap. A value of 0 (or unset) disables the limit.
-    """
-    max_orders = self.settings.get("max_open_orders")
-    if not max_orders or max_orders <= 0:
-      return None
-
-    open_positions = self.ctx.db_service.get_open_positions_for_flat()
-    already_held = any(
-      p.get("strategy") == signal.strategy and p.get("symbol") == signal.symbol
-      for p in open_positions
-    )
-    if already_held:
-      return None
-
-    open_count = len(open_positions)
-    if open_count < max_orders:
-      return None
-    return (
-      f"Max open orders reached ({open_count}/{max_orders}); "
-      f"entry not placed (MAX_OPEN_ORDERS)."
-    )
-
   def _reject_signal(self, signal: SignalSchema, reason: str) -> None:
     """Handle a policy-rejected entry end-to-end without touching the broker.
 
@@ -468,14 +534,20 @@ class BaseSignalProcessor(ABC):
     """
     log.warning(
       "[%s Process] Entry REJECTED | %s %s | %s",
-      self.name, signal.symbol, signal.action.value, reason,
+      self.name,
+      signal.symbol,
+      signal.action.value,
+      reason,
     )
     footer = self._current_footer()
     signal_json = signal.model_dump_json()
     # No broker order exists, so there's no ticket to key on — echo the broker's
     # signal_id (falling back to a deterministic tag) so the rejection is still
     # correlatable end-to-end.
-    ref = signal.signal_id or f"REJECTED-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
+    ref = (
+      signal.signal_id
+      or f"REJECTED-{signal.strategy}-{signal.symbol}-{int(signal.timestamp.timestamp())}"
+    )
     volume = signal.quantity or 0.0
     price = signal.price or 0.0
 
@@ -518,17 +590,23 @@ class BaseSignalProcessor(ABC):
 
   # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
 
-  def _handle_admin_message(self, raw: str) -> None:
-    """Handle a NATS ADMIN ``FLAT``: parse, route by account, close live broker
-    positions, then reconcile the DB.
+  def _handle_admin_message(self, raw: str, *, private: bool = False) -> None:
+    """Parse a NATS ADMIN message and dispatch by ``action``.
 
-    The algorithm is identical for every market; only *how a live close maps to a
-    DB row* differs (MT5 matches by ticket, a CEX by resolved symbol). That single
-    variation point is the :meth:`_flat_match_key` / :meth:`_flat_db_match_keys`
-    pair, so the broker is always the source of truth: a row is marked ``FLATTED``
-    only when its close actually succeeded *or* the position was never live on the
-    broker. A row whose close was **attempted but failed** is left OPEN (it is
-    still live), so the DB never claims a position is flat while it is not.
+    A message arrives on one of two subjects, selected by ``private``:
+
+    * the **public** ``ADMIN`` subject — fanned out to every worker with optional
+      ``market``/``gateway`` filters and **no** ``account_id`` (not
+      account-scoped); or
+    * this worker's **private** ``ADMIN.<market>.<gateway>.<account_id>`` subject
+      — the full composite identity is required and must match this worker.
+
+    Supported actions:
+
+    * ``FLAT`` (both subjects) — close live positions, then reconcile the DB
+      (see :meth:`_handle_admin_flat`).
+    * ``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL`` (private only) — toggle whether this
+      worker executes incoming SIGNALs (see :meth:`_handle_signal_control`).
     """
     try:
       data = json.loads(raw)
@@ -537,24 +615,138 @@ class BaseSignalProcessor(ABC):
       log.error("[ADMIN] Parse error: %s", err)
       return
 
-    if not self._ensure_connected():
+    if admin.action == AdminActionEnum.FLAT:
+      # FLAT touches the broker (closes live positions), so it needs a live
+      # connection; the signal-control toggles below do not.
+      if not self._ensure_connected():
+        return
+      self._handle_admin_flat(data, raw, private=private)
       return
 
-    if admin.action == AdminActionEnum.FLAT:
-      admin_flat_schema = AdminFlatSchema(**data)
-      if admin_flat_schema.account_id and admin_flat_schema.account_id != self._account_id:
-        log.info(
-          "[ADMIN FLAT] Skipping: account_id=%s != worker account=%s",
-          admin_flat_schema.account_id, self._account_id,
-        )
-        return
-      # Close live broker positions first (source of truth), then reconcile the DB.
-      closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
-      self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+    if admin.action in (AdminActionEnum.BLOCK_SIGNAL, AdminActionEnum.ALLOW_SIGNAL):
+      self._handle_signal_control(admin.action, data, private=private)
       return
 
     log.warning("[ADMIN] Unknown action: %s", admin.action)
     return
+
+  def _handle_admin_flat(self, data: dict, raw: str, *, private: bool) -> None:
+    """Route + execute a FLAT: validate the subject-specific payload, confirm it
+    targets this worker, then close live positions and reconcile the DB.
+
+    The close-and-reconcile algorithm is identical for every market and both
+    subjects; only *how a live close maps to a DB row* differs (MT5 matches by
+    ticket, a CEX by resolved symbol) — the :meth:`_flat_match_key` /
+    :meth:`_flat_db_match_keys` pair. The broker is always the source of truth: a
+    row is marked ``FLATTED`` only when its close actually succeeded *or* the
+    position was never live on the broker. A row whose close was **attempted but
+    failed** is left OPEN (it is still live), so the DB never claims a position
+    is flat while it is not."""
+    schema_cls = PrivateAdminFlatSchema if private else AdminFlatSchema
+    try:
+      admin_flat_schema = schema_cls(**data)
+    except ValidationError as err:
+      log.error(
+        "[ADMIN FLAT] Invalid %s payload: %s",
+        "private" if private else "public",
+        err,
+      )
+      return
+    if not self._flat_targets_this_worker(admin_flat_schema, private=private):
+      log.info(
+        "[ADMIN FLAT] Skipping (%s): market=%s gateway=%s account_id=%s != "
+        "worker market=%s gateway=%s account=%s",
+        "private" if private else "public",
+        admin_flat_schema.market,
+        admin_flat_schema.gateway,
+        getattr(admin_flat_schema, "account_id", None),
+        self._market_type,
+        self._gateway_value,
+        self._account_id,
+      )
+      return
+    # Close live broker positions first (source of truth), then reconcile the DB.
+    closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
+    self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+
+  def _handle_signal_control(
+    self, action: AdminActionEnum, data: dict, *, private: bool
+  ) -> None:
+    """Handle a private ADMIN ``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL``: toggle whether
+    this worker executes incoming SIGNALs.
+
+    Signal control is account-scoped, so it is only accepted on the worker's
+    **private** subject (``ADMIN.<market>.<gateway>.<account_id>``); the same
+    action arriving on the public ``ADMIN`` subject is ignored. The composite
+    identity is required and re-validated against this worker before the toggle
+    is applied."""
+    if not private:
+      log.warning(
+        "[ADMIN %s] Ignored on the public ADMIN subject — signal control is "
+        "account-scoped and only accepted on the private subject.",
+        action.value,
+      )
+      return
+    try:
+      ctrl = PrivateAdminSignalControlSchema(**data)
+    except ValidationError as err:
+      log.error("[ADMIN %s] Invalid private payload: %s", action.value, err)
+      return
+    if not self._flat_targets_this_worker(ctrl, private=True):
+      log.info(
+        "[ADMIN %s] Skipping: market=%s gateway=%s account_id=%s != worker "
+        "market=%s gateway=%s account=%s",
+        action.value,
+        ctrl.market,
+        ctrl.gateway,
+        ctrl.account_id,
+        self._market_type,
+        self._gateway_value,
+        self._account_id,
+      )
+      return
+    self._set_signals_blocked(action == AdminActionEnum.BLOCK_SIGNAL)
+
+  def _set_signals_blocked(self, blocked: bool) -> None:
+    """Flip the signal-execution gate and notify the operator on a real change.
+    A repeat of the current state is a no-op (logged, no duplicate alert)."""
+    state = "BLOCKED" if blocked else "ALLOWED"
+    if self._signals_blocked == blocked:
+      log.info("[ADMIN] Signal execution already %s — no change.", state)
+      return
+    self._signals_blocked = blocked
+    log.warning("[ADMIN] Signal execution now %s for this worker.", state)
+    footer = self._current_footer()
+    msg = (
+      self.presenter.signals_blocked(footer)
+      if blocked
+      else self.presenter.signals_allowed(footer)
+    )
+    self.ctx.channel_notifier.send_message(msg)
+
+  def _flat_targets_this_worker(self, admin, *, private: bool = False) -> bool:
+    """Whether this worker should act on an ADMIN FLAT.
+
+    Private subject (``private=True``): ``market``/``gateway``/``account_id`` are
+    all required and must match this worker's identity exactly — the private
+    subject already addresses one worker, so this re-check is defence-in-depth
+    against a misrouted publish.
+
+    Public subject (``private=False``): ``market``/``gateway`` are optional
+    filters (unset matches every worker on that dimension; both unset broadcasts
+    to everyone matching strategy/symbol). The public FLAT carries no
+    ``account_id`` — account-scoped FLATs use the private subject instead."""
+    if private:
+      return (
+        admin.market == self._market_type
+        and admin.gateway == self._gateway_value
+        and admin.account_id == self._account_id
+      )
+    if admin.market and admin.market != self._market_type:
+      return False
+    if admin.gateway and admin.gateway != self._gateway_value:
+      return False
+    return True
 
   def _close_live_positions_for_flat(self, admin) -> tuple[Dict[Any, dict], set]:
     """Close every live broker position matching the FLAT filter.
@@ -565,19 +757,26 @@ class BaseSignalProcessor(ABC):
     never live).
     """
     if admin.symbol:
-      positions = self.executor.get_open_positions(admin.symbol, strategy=admin.strategy)
+      positions = self.executor.get_open_positions(
+        admin.symbol, strategy=admin.strategy
+      )
     else:
       positions = self.executor.get_all_open_positions(strategy=admin.strategy)
 
     if positions:
       log.info(
         "[ADMIN FLAT] Closing %d %s position(s) (strategy=%s, symbol=%s)",
-        len(positions), self.name, admin.strategy, admin.symbol,
+        len(positions),
+        self.name,
+        admin.strategy,
+        admin.symbol,
       )
     else:
       log.warning(
         "[ADMIN FLAT] No open %s positions (strategy=%s, symbol=%s)",
-        self.name, admin.strategy, admin.symbol,
+        self.name,
+        admin.strategy,
+        admin.symbol,
       )
 
     attempted: set = set()
@@ -588,12 +787,21 @@ class BaseSignalProcessor(ABC):
       result = self.executor.close_single_position(pos, reason="FLAT")
       if result.get("success"):
         closed[key] = result
-        log.info("[ADMIN FLAT] Closed %s key=%s vol=%s", self.name, key, result.get("volume"))
+        log.info(
+          "[ADMIN FLAT] Closed %s key=%s vol=%s", self.name, key, result.get("volume")
+        )
       else:
-        log.error("[ADMIN FLAT] Failed to close %s key=%s: %s", self.name, key, result.get("comment"))
+        log.error(
+          "[ADMIN FLAT] Failed to close %s key=%s: %s",
+          self.name,
+          key,
+          result.get("comment"),
+        )
     return closed, attempted
 
-  def _reconcile_flat_db(self, admin, closed: Dict[Any, dict], attempted: set, raw: str) -> None:
+  def _reconcile_flat_db(
+    self, admin, closed: Dict[Any, dict], attempted: set, raw: str
+  ) -> None:
     """Reconcile DB rows against what actually closed.
 
     A row is marked ``FLATTED`` only when its close succeeded, or when it was never
@@ -625,7 +833,8 @@ class BaseSignalProcessor(ABC):
         # Never seen live on the broker → already closed externally; sync the DB.
         log.warning(
           "[ADMIN FLAT] %s in DB but not found on %s — marking FLATTED",
-          db_pos.get("symbol"), self.name,
+          db_pos.get("symbol"),
+          self.name,
         )
         self.ctx.db_service.update_position_status(
           ref_source_id=db_pos.get("ref_source_id"),
@@ -639,21 +848,26 @@ class BaseSignalProcessor(ABC):
         log.error(
           "[ADMIN FLAT] %s close FAILED — DB row left OPEN (still live on %s, "
           "manual check required).",
-          db_pos.get("symbol"), self.name,
+          db_pos.get("symbol"),
+          self.name,
         )
 
   # ── Shared SYSTEM handling ────────────────────────────────────────────── #
 
   def _handle_system_message(self, raw: str) -> None:
-    """Handle a NATS ``SYSTEM`` message: parse the envelope, then dispatch the
-    action to the market-specific :meth:`_handle_system_action` hook.
+    """Handle a message received on the NATS ``SYSTEM`` subscription: validate the
+    common envelope (action + timestamp + account_id), route it by worker
+    identity, then dispatch to the market's :meth:`_handle_system_action` hook.
 
-    SYSTEM messages drive operational/maintenance actions (e.g. re-initialising
-    per-symbol leverage on a crypto exchange) that are not trade signals. The
-    base only validates the common envelope (action + timestamp + account_id); each market
-    decides which actions it understands — an unknown action is logged and
-    ignored rather than raising, so a SYSTEM action meant for another market type
-    is harmless here.
+    This is the **runtime** half of the broker→worker config flow: the worker
+    stays subscribed to ``SYSTEM`` for its whole lifetime, so a broadcast here
+    always lands — which is what a setting changed *after* the handshake needs
+    (e.g. ``CRYPTO_LEVERAGE_INIT`` when an admin edits an account's leverage cap).
+    Connect-time config takes the other half, the WORKER_CONNECTED_ACK, because a
+    request reply inbox delivers exactly one message.
+
+    An action a market does not understand is logged and ignored rather than
+    raising, so a SYSTEM message meant for another market type is harmless here.
     """
     try:
       data = json.loads(raw)
@@ -664,7 +878,9 @@ class BaseSignalProcessor(ABC):
 
     log.info(
       "[%s SYSTEM] Received action=%s account_id=%s",
-      self.name, getattr(system.action, "value", system.action), system.account_id,
+      self.name,
+      getattr(system.action, "value", system.action),
+      system.account_id,
     )
 
     if not self._ensure_connected():
@@ -676,12 +892,31 @@ class BaseSignalProcessor(ABC):
     if system.account_id and system.account_id != self._system_account_id:
       log.info(
         "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
-        self.name, getattr(system.action, "value", system.action),
-        system.account_id, self._system_account_id,
+        self.name,
+        getattr(system.action, "value", system.action),
+        system.account_id,
+        self._system_account_id,
       )
       return
 
     self._handle_system_action(system.action, data)
+
+  def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
+    """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
+
+    The base owns no runtime SYSTEM action of its own — the config it manages
+    (magic map, signal replay) is connect-time only and arrives in the
+    WORKER_CONNECTED_ACK. Markets that do have one override this hook and
+    delegate to ``super()`` for anything they don't recognise; CRYPTO handles
+    ``CRYPTO_LEVERAGE_INIT``. The base still sees the worker's own
+    ``WORKER_CONNECTED`` fanned back out on the shared subject, which lands here
+    and is ignored.
+    """
+    log.info(
+      "[%s SYSTEM] No handler for action=%s — ignoring.",
+      self.name,
+      getattr(action, "value", action),
+    )
 
   @property
   def _system_account_id(self) -> Optional[str]:
@@ -689,6 +924,21 @@ class BaseSignalProcessor(ABC):
     ``<market>-<gateway>-<account_id>`` (matches the NATS connection name; see
     Settings._validate_market_requirements)."""
     return self.settings.get("account_id") or None
+
+  @property
+  def _private_admin_subject(self) -> Optional[str]:
+    """This worker's private ADMIN subject: ``ADMIN.<market>.<gateway>.<account_id>``.
+
+    The broker publishes an account-scoped FLAT here (instead of fanning it out
+    on the public ``ADMIN`` subject) so only this worker receives it. Returns
+    None when the identity is incomplete — there is nothing unique to subscribe
+    to, so the worker relies on the public subject alone."""
+    if not (self._market_type and self._gateway_value and self._account_id):
+      return None
+    return (
+      f"{NatsSubjectEnum.ADMIN.value}."
+      f"{self._market_type}.{self._gateway_value}.{self._account_id}"
+    )
 
   # Settings key holding this market's gateway enum (exchange / platform).
   # Concrete processors set it so the WORKER_CONNECTED handshake can report the
@@ -704,8 +954,8 @@ class BaseSignalProcessor(ABC):
 
   def _subscribed_strategies(self) -> list[str]:
     """Strategy names this worker subscribes to (from ``NATS_SUBJECTS`` minus
-    the control subjects). Shipped in WORKER_CONNECTED so the broker knows
-    which strategies' recent signals belong in a RETRY_SIGNALS replay."""
+    the control subjects). Shipped in WORKER_CONNECTED so the broker knows which
+    strategies to scope the ACK's magic map and signal replay to."""
     return parse_strategy_subjects(self.settings.get("nats_subjects", "") or "")
 
   def _worker_connected_payload(self) -> Optional[str]:
@@ -714,7 +964,7 @@ class BaseSignalProcessor(ABC):
     account_id = self._system_account_id
     if not account_id:
       return None
-    return SystemWorkerConnectedSchema(
+    return WorkerConnectedSchema(
       account_id=account_id,
       market=self._market_type,
       gateway=self._gateway_value,
@@ -727,11 +977,16 @@ class BaseSignalProcessor(ABC):
     be live first — NATS core does not replay, so a reply arriving before we are
     subscribed would be lost.
 
-    The broker always replies now (``CRYPTO_LEVERAGE_INIT`` /
-    ``WORKER_CONNECTED_ACK`` / ``WORKER_CONNECTED_ERROR``), so a timeout means the
+    The broker always replies now (``WORKER_CONNECTED_ACK`` /
+    ``WORKER_CONNECTED_ERROR``), so a timeout means the
     broker genuinely didn't get it. The handshake is idempotent and mandatory
     before trading (crypto needs ``default_leverage``), so this blocks and
     retries with backoff until it succeeds rather than giving up.
+
+    The outbound payload is logged at DEBUG before the request is sent, mirroring
+    the reply-side logging in :meth:`_handle_worker_connected_response` — the INFO
+    line below only prints ``account_id``, so seeing ``market``/``gateway``/
+    ``strategies`` the worker actually announced requires ``LOG_LEVEL=DEBUG``.
     """
     payload = self._worker_connected_payload()
     if payload is None:
@@ -744,8 +999,11 @@ class BaseSignalProcessor(ABC):
     if self.subscriber is not None and not self.subscriber.wait_subscribed(timeout=10):
       log.warning(
         "[%s Process] SYSTEM subscription not confirmed within timeout — "
-        "announcing WORKER_CONNECTED anyway (reply may be missed).", self.name
+        "announcing WORKER_CONNECTED anyway (reply may be missed).",
+        self.name,
       )
+
+    log.debug("[%s Process] WORKER_CONNECTED request payload: %s", self.name, payload)
 
     # Desynchronise a reconnect storm (see _HANDSHAKE_JITTER_MAX) before the
     # very first attempt only — retries are already spaced out by the backoff.
@@ -763,25 +1021,42 @@ class BaseSignalProcessor(ABC):
         log_fn = log.error if attempt >= _HANDSHAKE_ALERT_THRESHOLD else log.warning
         log_fn(
           "[%s Process] WORKER_CONNECTED handshake failed (%s) — attempt %d, retrying in %ds.",
-          self.name, exc, attempt, delay,
+          self.name,
+          exc,
+          attempt,
+          delay,
         )
         time.sleep(delay)
         continue
 
       log.info(
         "[%s Process] Announced WORKER_CONNECTED account_id=%s",
-        self.name, self._system_account_id,
+        self.name,
+        self._system_account_id,
       )
       self._handle_worker_connected_response(raw_response)
       return
 
   def _handle_worker_connected_response(self, raw: str) -> None:
-    """Dispatch the broker's reply to WORKER_CONNECTED. ``CRYPTO_LEVERAGE_INIT``
-    is routed through the normal :meth:`_handle_system_action` hook (identical to
-    receiving it via the SYSTEM subscription); ``WORKER_CONNECTED_ACK`` needs no
-    further action; ``WORKER_CONNECTED_ERROR`` is logged for operator attention —
-    it signals a broker-side config problem (e.g. missing settings), which a
-    retry cannot fix."""
+    """Dispatch the broker's reply to WORKER_CONNECTED.
+
+    ``WORKER_CONNECTED_ACK`` is the normal reply and carries this worker's whole
+    connect-time config in one payload (see
+    :class:`~worker.schemas.inbox_schema.WorkerConnectedAckSchema`) — a NATS
+    request inbox delivers only the first message, so the broker cannot split it
+    across several sends.
+    ``WORKER_CONNECTED_ERROR`` is logged for operator attention — it signals a
+    broker-side config problem (e.g. missing settings), which a retry cannot fix.
+    Those two are the only valid replies; anything else means the broker answered
+    with something this worker has no contract for.
+
+    The raw reply is logged at DEBUG first, before anything is parsed. A reply
+    arrives on the request's private inbox, so it never passes through
+    ``NATSSubscriber.listen``'s "Received NATS message" DEBUG line the way a
+    subscribed message does — without this, the exact bytes the broker sent are
+    invisible, and that is precisely what you need when a section silently fails
+    to apply (or the payload doesn't parse at all)."""
+    log.debug("[%s Process] WORKER_CONNECTED reply payload: %s", self.name, raw)
     try:
       data = json.loads(raw)
       action = SystemActionEnum(data.get("action"))
@@ -790,53 +1065,185 @@ class BaseSignalProcessor(ABC):
       return
 
     if action == SystemActionEnum.WORKER_CONNECTED_ERROR:
-      error = SystemWorkerConnectedErrorSchema(**data)
+      error = WorkerConnectedErrorSchema(**data)
       log.error(
-        "[%s Process] WORKER_CONNECTED_ERROR: %s", self.name, error.reason or "(no reason given)"
+        "[%s Process] WORKER_CONNECTED_ERROR: %s",
+        self.name,
+        error.reason or "(no reason given)",
       )
       return
 
     if action == SystemActionEnum.WORKER_CONNECTED_ACK:
-      log.info("[%s Process] WORKER_CONNECTED_ACK — handshake complete, no init config needed.", self.name)
+      self._apply_worker_connected_ack(data)
       return
 
-    self._handle_system_action(action, data)
-
-  def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
-    """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
-
-    ``RETRY_SIGNALS`` is handled here for every market — the base owns the
-    dedup+timeout gate so both FOREX and CRYPTO get identical replay semantics.
-    Markets that add their own SYSTEM actions override this hook and delegate
-    to ``super()`` so the shared actions still fire.
-    """
-    if action == SystemActionEnum.RETRY_SIGNALS:
-      self._handle_retry_signals(data)
-      return
-    log.info(
-      "[%s SYSTEM] No handler for action=%s — ignoring.",
-      self.name, getattr(action, "value", action),
+    log.error(
+      "[%s Process] Unexpected WORKER_CONNECTED reply action=%s — ignoring.",
+      self.name,
+      getattr(action, "value", action),
     )
 
-  def _handle_retry_signals(self, data: dict) -> None:
-    """Execute a RETRY_SIGNALS replay: for each signal, drop it if already
+  def _apply_worker_connected_ack(self, data: dict) -> None:
+    """Apply the config carried by a ``WORKER_CONNECTED_ACK``.
+
+    Config sections land **before** the signal replay, which always runs last: a
+    replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO
+    entry is sized against the exchange's leverage, so replaying first would fire
+    orders against config that hadn't been applied yet. Every section is optional
+    — an ACK with none of them is just "handshake complete".
+
+    Ordering alone is not enough, because a section that never arrived is also
+    "applied" in order: an ACK that omits ``strategy_magic_map`` (or whose map is
+    wholly unparseable) leaves the worker's map untouched, which on a **first**
+    connect means empty — ``STRATEGY_MAGIC_MAP`` no longer ships a default. The
+    replay would then run against no magics at all and every entry would be
+    rejected one-by-one as an unknown strategy. So the replay is additionally
+    *gated* on the config it depends on actually being present — see
+    :meth:`_replay_blocked_reason`.
+
+    Each section (and each entry within it) is salvaged independently by
+    :meth:`~worker.schemas.inbox_schema.WorkerConnectedAckSchema._salvage_sections`,
+    so a broker-side payload fault costs only the part that is actually broken.
+    Whatever was discarded is logged at ERROR here, one line per entry, so the
+    operator sees exactly what the worker is missing. Only a broken *envelope*
+    (bad ``account_id``/``timestamp``) drops the ACK wholesale — that leaves
+    nothing addressable to apply.
+    """
+    try:
+      ack = WorkerConnectedAckSchema(**data)
+    except ValidationError as err:
+      log.error(
+        "[%s Process] WORKER_CONNECTED_ACK envelope invalid: %s", self.name, err
+      )
+      return
+
+    for reason in ack.dropped:
+      log.error("[%s Process] WORKER_CONNECTED_ACK dropped %s", self.name, reason)
+
+    has_config = (
+      ack.strategy_magic_map is not None
+      or ack.crypto_leverage_init is not None
+      or bool(ack.retry_signals)
+    )
+    if not has_config:
+      if not ack.dropped:
+        log.info(
+          "[%s Process] WORKER_CONNECTED_ACK — handshake complete, no init config needed.",
+          self.name,
+        )
+      return
+
+    log.info(
+      "[%s Process] WORKER_CONNECTED_ACK — handshake complete | magics=%s leverage=%s replay=%d",
+      self.name,
+      "-" if ack.strategy_magic_map is None else len(ack.strategy_magic_map),
+      "yes" if ack.crypto_leverage_init is not None else "-",
+      len(ack.retry_signals),
+    )
+    if ack.strategy_magic_map is not None:
+      self._apply_strategy_magic_map(ack.strategy_magic_map)
+    self._apply_market_init(ack)
+    if ack.retry_signals:
+      blocked = self._replay_blocked_reason()
+      if blocked is not None:
+        log.error(
+          "[%s Process] retry_signals: SKIPPING replay of %d signal(s) — %s. "
+          "Replaying now would reject every entry one-by-one; fix the broker-side "
+          "config and reconnect the worker to replay them.",
+          self.name,
+          len(ack.retry_signals),
+          blocked,
+        )
+        return
+      self._apply_retry_signals(ack.retry_signals)
+
+  def _replay_blocked_reason(self) -> Optional[str]:
+    """Why this worker must not run the ACK's signal replay, or None to proceed.
+
+    Checked *after* every config section has been applied, so it asks the only
+    question that matters at that point: did the config the replay depends on
+    actually land? Ordering the sections correctly is not sufficient on its own —
+    a section the broker omitted, or one that failed to parse, is skipped in
+    order and leaves the worker running on whatever it had before (on a first
+    connect: nothing).
+
+    Default: nothing blocks the replay. A market whose execution path *requires*
+    broker-pushed config overrides this and returns a reason (FOREX cannot route
+    an order without a magic map). Blocking the whole batch rather than letting
+    each signal fail individually is deliberate: the outcome is identical (none
+    of them can execute) but the operator gets one actionable line naming the
+    root cause instead of N per-signal rejections that each name a symptom.
+    """
+    return None
+
+  def _apply_market_init(  # noqa: B027 - optional hook
+    self, ack: WorkerConnectedAckSchema
+  ) -> None:
+    """Apply the ACK sections only one market understands. Default: no-op.
+
+    The base cannot run these itself — it imports no broker SDK — so a market
+    that owns a section overrides this hook and reads its own field off *ack*
+    (CRYPTO handles ``crypto_leverage_init``). Called after the shared config and
+    before the signal replay, so a replayed order is placed against fully
+    initialised market state.
+    """
+
+  def _apply_strategy_magic_map(self, pushed: dict[str, int]) -> None:
+    """Store the broker's per-strategy magic map (from the WORKER_CONNECTED_ACK)
+    into the live settings, replacing the legacy ``STRATEGY_MAGIC_MAP`` .env
+    value, so the executor and :class:`PositionCDC` resolve magics from it exactly
+    as before. An empty map clears the worker's magics.
+
+    Only entries for strategies this worker actually subscribes to (its
+    ``NATS_SUBJECTS`` minus the control subjects) are kept — the map is scoped to
+    this worker so it never claims a magic for a strategy it does not trade.
+
+    The ACK is answered during ``connect()``, before ``start_market_jobs()``
+    builds the CDC / close-detection jobs, so those jobs read the freshly-stored
+    map. The already-built executor is updated in place via
+    :meth:`_set_executor_magic_map` so magic resolution and ``owned_magics()``
+    reflect the push immediately.
+    """
+    subscribed = set(self._subscribed_strategies())
+    mapping = {
+      strategy: magic for strategy, magic in pushed.items() if strategy in subscribed
+    }
+    ignored = sorted(set(pushed) - subscribed)
+    if ignored:
+      log.warning(
+        "[%s SYSTEM] strategy_magic_map: ignoring %d entr%s for strategies this "
+        "worker does not subscribe to: %s",
+        self.name,
+        len(ignored),
+        "y" if len(ignored) == 1 else "ies",
+        ", ".join(ignored),
+      )
+
+    self.settings["strategy_magic_map"] = mapping
+    self._set_executor_magic_map(mapping)
+    log.info(
+      "[%s SYSTEM] strategy_magic_map applied | strategies=%d", self.name, len(mapping)
+    )
+
+  def _set_executor_magic_map(self, mapping: dict) -> None:  # noqa: B027 - optional hook
+    """Propagate an updated strategy→magic map to the already-built executor.
+
+    Default no-op: a market with no magic concept (e.g. CRYPTO) resolves nothing
+    on the executor and its :class:`PositionCDC` reads the map straight from
+    settings, so storing it there is enough. FOREX overrides this to refresh the
+    executor's in-memory map (magic resolution + ``owned_magics()``)."""
+
+  def _apply_retry_signals(self, signals: list[SignalSchema]) -> None:
+    """Execute the ACK's signal replay: for each signal, drop it if already
     processed (dedup by ``signal_id`` against ``position_logs``) or older than
     :data:`~worker.settings.MAX_RETRY_TIMEOUT` (against the signal's own
     ``timestamp``); otherwise run it through the normal signal pipeline.
 
-    A bad envelope is dropped (never crashes the SYSTEM listener) and a single
-    bad signal in an otherwise valid batch does not abort the rest — the goal
-    of a replay is to fill gaps, so each entry stands on its own.
+    A single failing signal in an otherwise valid batch does not abort the rest —
+    the goal of a replay is to fill gaps, so each entry stands on its own.
     """
-    try:
-      envelope = SystemRetrySignalsSchema(**data)
-    except ValidationError as err:
-      log.error("[%s SYSTEM] RETRY_SIGNALS envelope invalid: %s", self.name, err)
-      return
-
-    signals = envelope.signals
     if not signals:
-      log.info("[%s SYSTEM] RETRY_SIGNALS: empty batch — nothing to do.", self.name)
+      log.info("[%s SYSTEM] retry_signals: empty batch — nothing to do.", self.name)
       return
 
     now = datetime.now(timezone.utc)
@@ -848,8 +1255,9 @@ class BaseSignalProcessor(ABC):
       if signal.signal_id and self.ctx.db_service.signal_exists(signal.signal_id):
         skipped_dedup += 1
         log.info(
-          "[%s SYSTEM] RETRY_SIGNALS: skip signal_id=%s (already processed).",
-          self.name, signal.signal_id,
+          "[%s SYSTEM] retry_signals: skip signal_id=%s (already processed).",
+          self.name,
+          signal.signal_id,
         )
         continue
 
@@ -857,10 +1265,14 @@ class BaseSignalProcessor(ABC):
       if age is None or age > MAX_RETRY_TIMEOUT:
         skipped_stale += 1
         log.info(
-          "[%s SYSTEM] RETRY_SIGNALS: skip signal_id=%s symbol=%s action=%s — "
+          "[%s SYSTEM] retry_signals: skip signal_id=%s symbol=%s action=%s — "
           "age=%.1fs > MAX_RETRY_TIMEOUT=%ds.",
-          self.name, signal.signal_id, signal.symbol, signal.action.value,
-          age if age is not None else float("nan"), MAX_RETRY_TIMEOUT,
+          self.name,
+          signal.signal_id,
+          signal.symbol,
+          signal.action.value,
+          age if age is not None else float("nan"),
+          MAX_RETRY_TIMEOUT,
         )
         continue
 
@@ -870,13 +1282,19 @@ class BaseSignalProcessor(ABC):
       except Exception:
         failed += 1
         log.exception(
-          "[%s SYSTEM] RETRY_SIGNALS: signal_id=%s failed — continuing batch.",
-          self.name, signal.signal_id,
+          "[%s SYSTEM] retry_signals: signal_id=%s failed — continuing batch.",
+          self.name,
+          signal.signal_id,
         )
 
     log.info(
-      "[%s SYSTEM] RETRY_SIGNALS done | executed=%d dedup=%d stale=%d failed=%d total=%d",
-      self.name, executed, skipped_dedup, skipped_stale, failed, len(signals),
+      "[%s SYSTEM] retry_signals done | executed=%d dedup=%d stale=%d failed=%d total=%d",
+      self.name,
+      executed,
+      skipped_dedup,
+      skipped_stale,
+      failed,
+      len(signals),
     )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #
@@ -891,7 +1309,10 @@ class BaseSignalProcessor(ABC):
     ``is_custom`` is True when USE_CUSTOM_RISK_PERCENTAGE overrides the signal's
     own risk_percent (so the gear icon is shown in notifications).
     """
-    if signal.action.value not in ("LONG", "SHORT") or not self.config.volume_decision_enabled:
+    if (
+      signal.action.value not in ("LONG", "SHORT")
+      or not self.config.volume_decision_enabled
+    ):
       return None
     if self.config.use_custom_risk_percentage:
       return (self.config.risk_percentage, True)

@@ -14,13 +14,17 @@ def test_calculate_lot_size_uses_capital(config):
   sizer = LotSizer(config)
   # capital=1000, risk=2% -> risk_cash=20; SL distance = 10 / 0.01 = 1000 points;
   # point_value = (1/0.01)*0.01 = 1; lot = 20 / (1000*1) = 0.02
-  assert sizer.calculate_lot_size(make_symbol_spec(), 2000.0, 1990.0, 2.0, 1000.0) == 0.02
+  assert (
+    sizer.calculate_lot_size(make_symbol_spec(), 2000.0, 1990.0, 2.0, 1000.0) == 0.02
+  )
 
 
 def test_calculate_lot_size_scales_with_capital(config):
   sizer = LotSizer(config)
   # risk_cash = 10000 * 2% = 200; lot = 200 / 1000 = 0.2
-  assert sizer.calculate_lot_size(make_symbol_spec(), 2000.0, 1990.0, 2.0, 10000.0) == 0.2
+  assert (
+    sizer.calculate_lot_size(make_symbol_spec(), 2000.0, 1990.0, 2.0, 10000.0) == 0.2
+  )
 
 
 def test_calculate_lot_size_missing_spec_returns_floor(config):
@@ -31,12 +35,16 @@ def test_calculate_lot_size_missing_spec_returns_floor(config):
 def test_calculate_lot_size_invalid_sl_distance_returns_volume_min(config):
   sizer = LotSizer(config)
   # entry == sl -> zero distance -> volume_min
-  assert sizer.calculate_lot_size(make_symbol_spec(), 2000.0, 2000.0, 2.0, 1000.0) == 0.01
+  assert (
+    sizer.calculate_lot_size(make_symbol_spec(), 2000.0, 2000.0, 2.0, 1000.0) == 0.01
+  )
 
 
 def test_calculate_lot_size_clamps_to_volume_max(config):
   sizer = LotSizer(config)
-  lot = sizer.calculate_lot_size(make_symbol_spec(volume_max=0.05), 2000.0, 1990.0, 2.0, 1_000_000)
+  lot = sizer.calculate_lot_size(
+    make_symbol_spec(volume_max=0.05), 2000.0, 1990.0, 2.0, 1_000_000
+  )
   assert lot == 0.05
 
 

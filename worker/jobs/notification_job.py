@@ -93,7 +93,11 @@ class NotificationJob:
       success = notifier.send_message(row["message_text"])
       if success:
         self._db.delete_notification(row["id"])
-        log.debug("[NotificationJob] Sent and deleted notification id=%s category=%s", row["id"], row.get("category"))
+        log.debug(
+          "[NotificationJob] Sent and deleted notification id=%s category=%s",
+          row["id"],
+          row.get("category"),
+        )
       else:
         next_at = _next_attempt_at(row["attempts"])
         self._db.mark_notification_failed(

@@ -148,7 +148,9 @@ class CryptoExecutor:
 
     qty = self._enforce_min_notional(symbol, qty)
     if qty is None:
-      return TradeResult.fail("Computed quantity below MIN_NOTIONAL and cannot be bumped")
+      return TradeResult.fail(
+        "Computed quantity below MIN_NOTIONAL and cannot be bumped"
+      )
 
     conflict = self._netting_conflict(signal, symbol)
     if conflict is not None:
@@ -183,7 +185,8 @@ class CryptoExecutor:
         logger.warning(
           "[open_position] TP placement failed (%s) for %s — position remains "
           "SL-protected; continuing without a resting take-profit.",
-          tp_res.get("comment"), symbol,
+          tp_res.get("comment"),
+          symbol,
         )
 
     result.setdefault("volume", qty)
@@ -222,7 +225,12 @@ class CryptoExecutor:
       logger.info(
         "[open_position] RISK mode | price=%s sl=%s risk=%s%% capital=%s "
         "scale_factor=%s → qty=%s",
-        price, signal.sl, risk, capital, scale_factor, qty,
+        price,
+        signal.sl,
+        risk,
+        capital,
+        scale_factor,
+        qty,
       )
       return qty
     qty = self._min_qty(symbol)
@@ -266,7 +274,9 @@ class CryptoExecutor:
     try:
       price = self._gateway.get_mark_price(symbol)
     except Exception:
-      logger.exception("[open_position] Could not fetch mark price for notional check (%s)", symbol)
+      logger.exception(
+        "[open_position] Could not fetch mark price for notional check (%s)", symbol
+      )
       return None
     if price <= 0 or qty * price >= f.min_notional:
       return qty
@@ -277,11 +287,17 @@ class CryptoExecutor:
       bumped = self.normalize_volume(symbol, bumped + step) if step > 0 else bumped
     logger.warning(
       "[open_position] qty %.8f * price %.4f = %.4f below MIN_NOTIONAL %.4f — bumped to %.8f",
-      qty, price, qty * price, f.min_notional, bumped,
+      qty,
+      price,
+      qty * price,
+      f.min_notional,
+      bumped,
     )
     return bumped
 
-  def _netting_conflict(self, signal: SignalSchema, symbol: str) -> Optional[TradeResult]:
+  def _netting_conflict(
+    self, signal: SignalSchema, symbol: str
+  ) -> Optional[TradeResult]:
     """In netting mode, reject an entry that would merge with another strategy's
     position on the same symbol — unless the operator opted in. Returns a failed
     :class:`TradeResult` on conflict, else ``None``."""
@@ -291,7 +307,9 @@ class CryptoExecutor:
     if get_for_symbol is None:
       return None
     open_rows = get_for_symbol(symbol=signal.symbol)
-    other_strategies = {r["strategy"] for r in open_rows if r["strategy"] != signal.strategy}
+    other_strategies = {
+      r["strategy"] for r in open_rows if r["strategy"] != signal.strategy
+    }
     if other_strategies:
       return TradeResult.fail(
         f"Netting conflict: {symbol} already held by {other_strategies}. "
@@ -312,10 +330,16 @@ class CryptoExecutor:
     logger.error(
       "[open_position] SL placement failed (%s) — closing the just-opened %s %s "
       "(qty=%s) to avoid unprotected exposure.",
-      sl_res.get("comment"), action, symbol, close_qty,
+      sl_res.get("comment"),
+      action,
+      symbol,
+      close_qty,
     )
     close_res = self._gateway.place_market_order(
-      symbol, action, close_qty, reduce_only=True,
+      symbol,
+      action,
+      close_qty,
+      reduce_only=True,
       client_order_id=self._close_client_order_id(),
     )
     if close_res.get("success"):
@@ -328,7 +352,9 @@ class CryptoExecutor:
       logger.critical(
         "[open_position] ROLLBACK FAILED for %s %s: position is OPEN WITHOUT a "
         "stop and could not be closed (%s). Manual intervention required.",
-        action, symbol, close_res.get("comment"),
+        action,
+        symbol,
+        close_res.get("comment"),
       )
       fail = TradeResult.fail(
         f"UNPROTECTED POSITION: stop-loss failed ({sl_res.get('comment')}) and "
@@ -363,7 +389,10 @@ class CryptoExecutor:
       return TradeResult.fail("Close volume rounds to zero")
 
     result = self._gateway.place_market_order(
-      resolved, pos.side, safe_volume, reduce_only=True,
+      resolved,
+      pos.side,
+      safe_volume,
+      reduce_only=True,
       client_order_id=self._close_client_order_id(),
     )
     if result.get("success"):
@@ -404,7 +433,8 @@ class CryptoExecutor:
           logger.warning(
             "[update_position_sl] TP2 re-placement failed (%s) for %s — breakeven "
             "stop is set but the take-profit target is no longer resting.",
-            tp_res.get("comment"), resolved,
+            tp_res.get("comment"),
+            resolved,
           )
     return result
 
@@ -425,7 +455,9 @@ class CryptoExecutor:
     try:
       rows = getter(strategy, symbol)
     except Exception:
-      logger.exception("[update_position_sl] Could not read DB to recover TP2 (%s).", symbol)
+      logger.exception(
+        "[update_position_sl] Could not read DB to recover TP2 (%s).", symbol
+      )
       return None
     for row in rows:
       raw = row.get("gateway_message")
@@ -454,7 +486,10 @@ class CryptoExecutor:
     last_result: Optional[Any] = None
     for pos in positions:
       result = self._gateway.place_market_order(
-        resolved, pos.side, pos.volume, reduce_only=True,
+        resolved,
+        pos.side,
+        pos.volume,
+        reduce_only=True,
         client_order_id=self._close_client_order_id(),
       )
       if result.get("success"):
@@ -478,7 +513,10 @@ class CryptoExecutor:
   def close_single_position(self, pos: Any, reason: str = "FLAT") -> TradeResult:
     """Close one :class:`ExchangePosition` (its ``symbol`` is already resolved)."""
     result = self._gateway.place_market_order(
-      pos.symbol, pos.side, pos.volume, reduce_only=True,
+      pos.symbol,
+      pos.side,
+      pos.volume,
+      reduce_only=True,
       client_order_id=self._close_client_order_id(),
     )
     if result.get("success"):

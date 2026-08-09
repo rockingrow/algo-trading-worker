@@ -1,12 +1,14 @@
 import asyncio
 import queue
 import threading
+import time
 from typing import Callable, Generator, Optional
 
 from worker.icons import BROKER, DISCONNECTED, RETRYING
 from worker.logger import get_logger
 from worker.nats_client import NatsClient
 from worker.schemas.nats_schema import NatsSubjectEnum
+from worker.settings import settings
 from worker.utils.logging import get_footer
 
 logger = get_logger("worker.nats_service")
@@ -16,6 +18,28 @@ _Subject = str | NatsSubjectEnum
 
 def _subject_str(s: _Subject) -> str:
   return s if isinstance(s, str) else s.value
+
+
+class _CallbackDedup:
+  """Suppresses duplicate async NATS callbacks within a time window.
+
+  nats.py fires error_cb / disconnected_cb from multiple internal coroutines
+  (reader, flusher, pinger) for the same connection event, producing duplicate
+  log records that slip past the downstream TelegramLogHandler dedup."""
+
+  def __init__(self) -> None:
+    self._lock = threading.Lock()
+    self._recent: dict[str, float] = {}
+
+  def is_duplicate(self, key: str) -> bool:
+    window = settings.telegram.log_dedup_window
+    now = time.monotonic()
+    with self._lock:
+      self._recent = {k: ts for k, ts in self._recent.items() if now - ts < window}
+      if key in self._recent:
+        return True
+      self._recent[key] = now
+      return False
 
 
 def _connection_name(account_id: Optional[str]) -> Optional[str]:
@@ -52,6 +76,7 @@ class NATSSubscriber:
     self._subscribed = threading.Event()
     self._msg_queue: queue.Queue[tuple[_Subject, str]] = queue.Queue()
     self._footer = get_footer(account_footer_fn)
+    self._dedup = _CallbackDedup()
     self._client = NatsClient(
       url=url,
       token=token,
@@ -68,9 +93,13 @@ class NATSSubscriber:
       self._enqueue_fn(message_text)
 
   async def _on_error(self, e) -> None:
+    if self._dedup.is_duplicate(f"error:{e!r}"):
+      return
     logger.error("NATS error: %r", e)
 
   async def _on_disconnect(self) -> None:
+    if self._dedup.is_duplicate("disconnect"):
+      return
     logger.warning("NATS disconnected from %s. Retrying...", self.url)
     self._notify(
       f"<pre>{DISCONNECTED} [Disconnected] NATS Broker\nEndpoint: {self.url}\n{RETRYING} Retrying connection...{self._footer}</pre>"
@@ -136,9 +165,7 @@ class NATSSubscriber:
     logger.info("NATS subscriber stop requested. Closing...")
     self._client.stop()
 
-  def listen(
-    self, stop_event=None
-  ) -> Generator[tuple[_Subject, str], None, None]:
+  def listen(self, stop_event=None) -> Generator[tuple[_Subject, str], None, None]:
     logger.info(
       "Started listening for NATS messages on subjects: %s",
       ", ".join(_subject_str(s) for s in self.subjects),
@@ -173,6 +200,7 @@ class NATSPublisher:
     self.publish_subjects = publish_subjects
     self._on_reconnect_callback = on_reconnect
     self._send_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
+    self._dedup = _CallbackDedup()
     self._client = NatsClient(
       url=url,
       token=token,
@@ -183,15 +211,19 @@ class NATSPublisher:
     )
 
   async def _on_error(self, e) -> None:
+    if self._dedup.is_duplicate(f"error:{e!s}"):
+      return
     logger.error("NATS publisher error: %s", e)
 
   async def _on_disconnect(self) -> None:
+    if self._dedup.is_duplicate("disconnect"):
+      return
     logger.warning("NATS publisher disconnected from %s. Retrying...", self.url)
 
   async def _on_reconnect(self) -> None:
     logger.info("NATS publisher reconnected to %s", self.url)
     # Re-announce presence so the broker re-pushes any per-worker init config
-    # (e.g. CRYPTO_LEVERAGE_INIT) after a broker/NATS restart. The handshake is
+    # (magics, leverage, replay) after a broker/NATS restart. The handshake is
     # now a blocking request/reply with retries (see BaseSignalProcessor.
     # _announce_worker_connected), so it must run off this event loop's thread —
     # calling it here directly would deadlock the loop it needs to schedule its

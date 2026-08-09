@@ -71,6 +71,16 @@ class ForexExecutor:
     terminal-close detection)."""
     return set(self._strategy_magic_map.values())
 
+  def set_strategy_magic_map(self, mapping: Optional[Dict[str, int]]) -> None:
+    """Replace the per-strategy magic map at runtime.
+
+    The broker owns the mapping and pushes it in the ``WORKER_CONNECTED_ACK``
+    (``strategy_magic_map``, applied before trading starts), so
+    :meth:`_magic_for` and :meth:`owned_magics` resolve
+    against the broker-managed mapping rather than a static .env value. A copy is
+    stored so a later mutation of the caller's dict can't alter it underneath us."""
+    self._strategy_magic_map = dict(mapping or {})
+
   # ── Symbol / volume helpers (delegated to the agnostic math) ──────────── #
 
   def get_symbol(self, base_symbol: str) -> str:
@@ -139,7 +149,9 @@ class ForexExecutor:
     """Open a new market order (LONG → BUY, SHORT → SELL)."""
     side = _ACTION_SIDE.get(signal.action.value)
     if side is None:
-      logger.warning(f"open_position called with unsupported action: '{signal.action.value}'")
+      logger.warning(
+        f"open_position called with unsupported action: '{signal.action.value}'"
+      )
       return TradeResult.fail("Action Mapping Failed")
 
     symbol = self.get_symbol(signal.symbol)
@@ -151,7 +163,9 @@ class ForexExecutor:
 
     volume = self._resolve_entry_volume(signal, side, spec, price)
 
-    sl, tp = self._stop_validator.validate_stops(spec, side, tick, signal.sl, signal.tp2)
+    sl, tp = self._stop_validator.validate_stops(
+      spec, side, tick, signal.sl, signal.tp2
+    )
 
     comment = f"{signal.strategy} {(signal.signal_id or '')[-2:]}".strip()
     return self._gateway.place_order(
@@ -210,7 +224,11 @@ class ForexExecutor:
       return 0.01
 
     volume = self._lot_sizer.calculate_lot_size(spec, price, signal.sl, risk, capital)
-    capital_src = "account_equity" if self._config.use_account_equity else f"capital={self._config.capital}"
+    capital_src = (
+      "account_equity"
+      if self._config.use_account_equity
+      else f"capital={self._config.capital}"
+    )
     logger.info(
       f"[open_position] VOLUME_DECISION mode | {capital_src} "
       f"risk={risk}% (source={risk_source}, "
@@ -277,7 +295,9 @@ class ForexExecutor:
         success_count += 1
         last_result = result
       else:
-        logger.error(f"[close_all] Failed to close ticket {pos.ticket}: {result.get('comment')}")
+        logger.error(
+          f"[close_all] Failed to close ticket {pos.ticket}: {result.get('comment')}"
+        )
 
     if success_count > 0 and last_result is not None:
       return TradeResult.ok(

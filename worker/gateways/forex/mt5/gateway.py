@@ -79,7 +79,9 @@ class MT5Gateway(BasePlatformGateway):
     return self._bridge.is_connected()
 
   def reconnect(self, max_attempts: int = 0, delay_seconds: float = 10.0) -> bool:
-    return self._bridge.reconnect(max_attempts=max_attempts, delay_seconds=delay_seconds)
+    return self._bridge.reconnect(
+      max_attempts=max_attempts, delay_seconds=delay_seconds
+    )
 
   def restart_terminal(self, startup_wait: float = 15.0) -> bool:
     return self._bridge.restart_terminal(startup_wait=startup_wait)
@@ -234,11 +236,15 @@ class MT5Gateway(BasePlatformGateway):
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
 
-    logger.info(f"[close_position] Closing ticket {position.ticket}, vol={close_volume}")
+    logger.info(
+      f"[close_position] Closing ticket {position.ticket}, vol={close_volume}"
+    )
     result = self._mt5.order_send(request)
 
     if result is None:
-      logger.error(f"[close_position] order_send failed. error: {self._mt5.last_error()}")
+      logger.error(
+        f"[close_position] order_send failed. error: {self._mt5.last_error()}"
+      )
       return TradeResult.fail(
         "Close Failed", retcode=_mt5_error_code(self._mt5.last_error())
       )
@@ -297,4 +303,8 @@ class MT5Gateway(BasePlatformGateway):
       magic_numbers=magic_numbers,
       db_service=db_service,
       notifier=notifier,
+      # Poll only while the terminal is actually reachable — the job must keep
+      # scanning through the FOREX weekend for 24/7 symbols, so the connection
+      # (not the calendar) is what tells it there is nothing to read.
+      is_connected=self.is_connected,
     )

@@ -4,7 +4,7 @@ from worker.gateways.forex.message_presenter import (
   ForexMessagePresenter,
   format_volume,
 )
-from worker.icons import GEAR, REJECTED
+from worker.icons import GEAR, REJECTED, SYNC
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -15,7 +15,9 @@ def test_format_volume_plain():
 def test_order_rejected_contains_reason_and_fields():
   signal = make_signal(SignalActionEnum.LONG)
   msg = ForexMessagePresenter.order_rejected(
-    signal, "Max open orders reached (5/5); entry not placed (MAX_OPEN_ORDERS).", "FOOTER"
+    signal,
+    "Max open orders reached (5/5); entry not placed (MAX_OPEN_ORDERS).",
+    "FOOTER",
   )
   assert "Order Rejected" in msg and REJECTED in msg
   assert "XAUUSD" in msg and "strat-1" in msg and "LONG" in msg
@@ -33,6 +35,20 @@ def test_startup_banner_omits_max_open_orders_when_disabled():
   assert "MAX_OPEN_ORDERS" not in msg
 
 
+def test_startup_banner_shows_multi_strategy_when_enabled():
+  msg = ForexMessagePresenter.startup(
+    {"capital": 1000, "forex_allow_multi_strategy_per_symbol": True}, "FOOTER"
+  )
+  assert "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL: <b>ENABLED</b>" in msg
+
+
+def test_startup_banner_omits_multi_strategy_when_disabled():
+  msg = ForexMessagePresenter.startup(
+    {"capital": 1000, "forex_allow_multi_strategy_per_symbol": False}, "FOOTER"
+  )
+  assert "MULTI_STRATEGY" not in msg
+
+
 def test_format_volume_auto_calculated_has_icon():
   out = format_volume(0.5, auto_calculated=True)
   assert "0.5 lot" in out and GEAR in out
@@ -48,6 +64,27 @@ def test_order_filled_contains_key_fields():
   assert "strat-1" in msg
   assert "FOOTER" in msg
   assert msg.startswith("<pre>") and msg.endswith("</pre>")
+
+
+def test_order_filled_volume_gear_follows_volume_decision():
+  # The gear means "worker-sized"; with VOLUME_DECISION_ENABLED off the lot is
+  # the signal's own quantity, so no icon — and none either when the presenter
+  # is called without settings at all.
+  signal = make_signal(SignalActionEnum.LONG)
+  result = {"price": 2000.0, "volume": 0.1, "ticket": 5}
+
+  on = ForexMessagePresenter.order_filled(
+    signal, result, 5, "FOOTER", settings_dict={"volume_decision_enabled": True}
+  )
+  assert f"0.1 lot {GEAR}" in on
+
+  off = ForexMessagePresenter.order_filled(
+    signal, result, 5, "FOOTER", settings_dict={"volume_decision_enabled": False}
+  )
+  assert "0.1 lot" in off and GEAR not in off
+
+  no_settings = ForexMessagePresenter.order_filled(signal, result, 5, "FOOTER")
+  assert "0.1 lot" in no_settings and GEAR not in no_settings
 
 
 def test_order_filled_shows_scale_position_block():
@@ -176,10 +213,14 @@ def test_startup_message_tp1_be_line():
     "risk_percentage": 2.0,
     "use_account_equity": False,
   }
-  msg_on = ForexMessagePresenter.startup({**base, "tp1_move_sl_to_breakeven": True}, "F")
+  msg_on = ForexMessagePresenter.startup(
+    {**base, "tp1_move_sl_to_breakeven": True}, "F"
+  )
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (true)</b>" in msg_on
 
-  msg_off = ForexMessagePresenter.startup({**base, "tp1_move_sl_to_breakeven": False}, "F")
+  msg_off = ForexMessagePresenter.startup(
+    {**base, "tp1_move_sl_to_breakeven": False}, "F"
+  )
   assert "TP1_MOVE_SL_TO_BREAKEVEN: <b>ENABLED (false)</b>" in msg_off
 
 
@@ -196,4 +237,20 @@ def test_admin_flat_closed_contains_key_fields():
   assert "strat-A" in msg
   assert "2001.5" in msg
   assert "10" in msg
+  assert "FOOTER" in msg
+
+
+def test_position_reconciled_closed_contains_key_fields():
+  db_pos = {
+    "symbol": "XAUUSD",
+    "strategy": "strat-A",
+    "ref_source_id": "4587420656",
+    "volume": 0.01,
+  }
+  msg = ForexMessagePresenter.position_reconciled_closed(db_pos, 2000.0, "FOOTER")
+  assert "Position Reconciled" in msg and SYNC in msg
+  assert "XAUUSD" in msg and "strat-A" in msg
+  assert "0.01 lot" in msg
+  assert "2000.0" in msg
+  assert "4587420656" in msg
   assert "FOOTER" in msg

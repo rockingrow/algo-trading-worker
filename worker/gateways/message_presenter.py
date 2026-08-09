@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import html
 
-from worker.icons import ALARM, GEAR, REJECTED, SHIELD
+from worker.icons import ALARM, GEAR, REJECTED, SHIELD, STOP, SUCCESS
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 from worker.services.notification_service import _box
 
@@ -191,11 +191,47 @@ class BaseMessagePresenter:
     return f"MAX_OPEN_ORDERS: <b>{limit}</b>\n"
 
   @staticmethod
+  def _multi_strategy_line(settings_dict: dict, market: str) -> str:
+    """Render the ALLOW_MULTI_STRATEGY_PER_SYMBOL line, or '' when disabled.
+
+    *market* selects which env var is reported; only FOREX actually supports
+    parallel strategies on one symbol today (see ``CryptoMarket``), so only the
+    forex banner calls this. Omitted when off — the default
+    one-strategy-per-symbol behaviour needs no announcement; showing it only
+    when enabled makes the riskier mode stand out.
+    """
+    key = f"{market.lower()}_allow_multi_strategy_per_symbol"
+    if not settings_dict.get(key, False):
+      return ""
+    return f"{market.upper()}_ALLOW_MULTI_STRATEGY_PER_SYMBOL: <b>ENABLED</b>\n"
+
+  @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
       f"{REJECTED} <b>Signal Rejected</b>\n\n"
       f"A signal failed validation and was <b>NOT executed</b>.\n"
       f"Reason: <b>{html.escape(reason)}</b>\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def signals_blocked(footer: str) -> str:
+    """An ADMIN ``BLOCK_SIGNAL`` took effect: the worker will now skip executing
+    every incoming SIGNAL until an ``ALLOW_SIGNAL`` clears it. Market-agnostic."""
+    return _box(
+      f"{STOP} <b>Signals Blocked</b>\n\n"
+      f"Incoming signals will be <b>skipped</b> and <b>NOT executed</b>.\n"
+      f"Open positions are unaffected; send <b>ALLOW_SIGNAL</b> to resume.\n"
+      f"{_DIVIDER}\n{footer}"
+    )
+
+  @staticmethod
+  def signals_allowed(footer: str) -> str:
+    """An ADMIN ``ALLOW_SIGNAL`` took effect: the worker resumes executing
+    incoming SIGNALs. Market-agnostic."""
+    return _box(
+      f"{SUCCESS} <b>Signals Allowed</b>\n\n"
+      f"Incoming signals will be <b>executed</b> normally again.\n"
       f"{_DIVIDER}\n{footer}"
     )
 

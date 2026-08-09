@@ -26,6 +26,7 @@ from worker.icons import (
   GEAR,
   STOP,
   SUCCESS,
+  SYNC,
   WARNING,
 )
 from worker.schemas.signal_schema import SignalSchema
@@ -52,6 +53,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"{ForexMessagePresenter._tp1_percent_line(s)}"
       f"{ForexMessagePresenter._tp1_be_line(s)}"
       f"{ForexMessagePresenter._max_open_orders_line(s)}"
+      f"{ForexMessagePresenter._multi_strategy_line(s, 'FOREX')}"
     )
     return _box(
       f"{CONNECTED} <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"
@@ -77,10 +79,19 @@ class ForexMessagePresenter(BaseMessagePresenter):
 
   @staticmethod
   def order_filled(
-    signal: SignalSchema, result: dict, pos_ticket: Any, footer: str,
-    risk_info=None, settings_dict: dict | None = None,
+    signal: SignalSchema,
+    result: dict,
+    pos_ticket: Any,
+    footer: str,
+    risk_info=None,
+    settings_dict: dict | None = None,
   ) -> str:
-    volume = format_volume(result.get("volume"), auto_calculated=True)
+    # The gear marks a volume the worker sized itself. Under
+    # VOLUME_DECISION_ENABLED=false the lot comes straight from signal.quantity,
+    # so the icon must be dropped — mirrors _risk_line, which the processor
+    # likewise suppresses when volume decision is off.
+    auto_sized = bool((settings_dict or {}).get("volume_decision_enabled", False))
+    volume = format_volume(result.get("volume"), auto_calculated=auto_sized)
     qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)
     return _box(
       f"{SUCCESS} <b>Order Filled</b>\n\n"
@@ -127,6 +138,24 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Action: <b>{signal.action.value}</b>\n"
       f"Price: <b>{result.get('price')}</b>\n"
       f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
+      f"{_DIVIDER}\n"
+      f"{footer}"
+    )
+
+  @staticmethod
+  def position_reconciled_closed(db_pos: dict, close_price: Any, footer: str) -> str:
+    """The periodic reconciler found a DB-open position that no longer exists on
+    the platform (a close no terminal event reported — e.g. a TP1 partial that
+    closed the whole position) and synced the DB to live state."""
+    return _box(
+      f"{SYNC} <b>Position Reconciled — Closed on Broker</b>\n\n"
+      f"The position is <b>no longer open</b> on the platform; the DB was synced "
+      f"from live state.\n"
+      f"Symbol: <b>{db_pos.get('symbol')}</b>\n"
+      f"Strategy: <b>{db_pos.get('strategy')}</b>\n"
+      f"Volume: <b>{db_pos.get('volume')} lot</b>\n"
+      f"Approx Close: <b>{close_price}</b>\n"
+      f"Source Ticket: <b>{db_pos.get('ref_source_id')}</b>\n"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

@@ -1,4 +1,4 @@
-﻿"""
+"""
 worker/crypto/factory.py
 ────────────────────────
 Exchange factory — turns the configured ``CryptoExchangeEnum`` into a concrete

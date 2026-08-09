@@ -38,7 +38,9 @@ def run_worker(
   ``run(stop_event)``, ``shutdown()`` and ``send_shutdown_notification()`` — i.e.
   a :class:`~worker.gateways.processor.BaseSignalProcessor`.
   """
-  log.info("[%s Process] Started (PID=%d)", label, multiprocessing.current_process().pid)
+  log.info(
+    "[%s Process] Started (PID=%d)", label, multiprocessing.current_process().pid
+  )
 
   ctx = WorkerContext(settings_dict)
   ctx.start_notification_job(stop_event)
@@ -47,7 +49,7 @@ def run_worker(
   # a child process with no event loop, so the handler drains its queue on a
   # background thread; it is flushed in the finally block below so the crash
   # path's log.exception is delivered before the process exits.
-  if settings.telegram_enabled and settings.telegram_log_errors_enabled:
+  if settings.telegram.enabled and settings.telegram.log_errors_enabled:
     from worker.services.notification_service import telegram_log_handler
 
     telegram_log_handler.start()
@@ -85,7 +87,7 @@ def run_worker(
           processor.send_shutdown_notification()
         except Exception:
           log.exception("[%s Process] Error sending shutdown notification.", label)
-    if settings.telegram_enabled and settings.telegram_log_errors_enabled:
+    if settings.telegram.enabled and settings.telegram.log_errors_enabled:
       from worker.services.notification_service import telegram_log_handler
 
       telegram_log_handler.stop()

@@ -70,7 +70,7 @@ class WorkerContext:
       if channel == NotificationChannelEnum.INDIVIDUAL:
         mode = NotificationModeEnum.VERBOSE
       else:
-        mode = NotificationModeEnum(settings.notification_mode.upper())
+        mode = NotificationModeEnum(settings.logging.notification_mode.upper())
       self.db_service.enqueue_notification(
         platform=NotificationPlatformEnum.TELEGRAM,
         channel=channel,

@@ -41,7 +41,11 @@ class PositionEvent(BaseModel):
   event: PositionEventType
   account_id: str
   account_name: Optional[str] = None
-  market_type: MarketTypeEnum
+  market: MarketTypeEnum
+  # account_id alone is not a unique worker identity (can collide across
+  # markets/gateways) — gateway is sent alongside market so the broker can
+  # upsert by the full composite key (market, gateway, account_id).
+  gateway: str = ""
 
   id: int
   ref_source_id: str

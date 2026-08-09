@@ -26,19 +26,22 @@ def test_ignores_unfilled_orders():
 def test_ignores_worker_market_close():
   # A reduce-only MARKET fill the worker placed itself carries the worker marker
   # on its clientOrderId — it is already handled by the signal flow, so dropped.
-  assert parse_order_trade_update(
-    _frame(
-      {
-        "s": "BTCUSDT",
-        "X": "FILLED",
-        "ot": "MARKET",
-        "R": True,
-        "ap": "29000",
-        "z": "0.5",
-        "c": "awkr_deadbeefcafe0001",
-      }
+  assert (
+    parse_order_trade_update(
+      _frame(
+        {
+          "s": "BTCUSDT",
+          "X": "FILLED",
+          "ot": "MARKET",
+          "R": True,
+          "ap": "29000",
+          "z": "0.5",
+          "c": "awkr_deadbeefcafe0001",
+        }
+      )
     )
-  ) is None
+    is None
+  )
 
 
 def test_parses_external_manual_close():
@@ -69,9 +72,12 @@ def test_parses_external_manual_close():
 
 def test_non_reduce_only_market_is_ignored():
   # An opening MARKET fill (reduce-only false) is an entry, never a close.
-  assert parse_order_trade_update(
-    _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "ap": "29000", "z": "0.5"})
-  ) is None
+  assert (
+    parse_order_trade_update(
+      _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "ap": "29000", "z": "0.5"})
+    )
+    is None
+  )
 
 
 def test_market_autoclose_prefix_is_liquidation():
@@ -120,7 +126,15 @@ def test_parses_stop_loss():
 
 def test_parses_take_profit():
   event = parse_order_trade_update(
-    _frame({"s": "ETHUSDT", "X": "FILLED", "ot": "TAKE_PROFIT_MARKET", "ap": "2100", "z": "1"})
+    _frame(
+      {
+        "s": "ETHUSDT",
+        "X": "FILLED",
+        "ot": "TAKE_PROFIT_MARKET",
+        "ap": "2100",
+        "z": "1",
+      }
+    )
   )
   assert event is not None
   assert event.reason == ExchangeCloseReason.TP
@@ -135,21 +149,34 @@ def test_parses_liquidation():
 
 
 def test_ignores_fill_with_missing_symbol():
-  assert parse_order_trade_update(
-    _frame({"X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0.5"})
-  ) is None
+  assert (
+    parse_order_trade_update(
+      _frame({"X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0.5"})
+    )
+    is None
+  )
 
 
 def test_ignores_fill_with_zero_price():
-  assert parse_order_trade_update(
-    _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "0", "z": "0.5"})
-  ) is None
+  assert (
+    parse_order_trade_update(
+      _frame(
+        {"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "0", "z": "0.5"}
+      )
+    )
+    is None
+  )
 
 
 def test_ignores_fill_with_zero_volume():
-  assert parse_order_trade_update(
-    _frame({"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0"})
-  ) is None
+  assert (
+    parse_order_trade_update(
+      _frame(
+        {"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0"}
+      )
+    )
+    is None
+  )
 
 
 # ── SDK event adapter (typed event → raw dict → dispatch) ──────────────────── #
@@ -190,7 +217,17 @@ def test_on_message_dispatches_stop_loss():
   seen = []
   stream = _stream(seen.append)
   event = _FakeWrapper(
-    {"e": "ORDER_TRADE_UPDATE", "o": {"s": "BTCUSDT", "X": "FILLED", "ot": "STOP_MARKET", "ap": "29000", "z": "0.5", "i": 42}}
+    {
+      "e": "ORDER_TRADE_UPDATE",
+      "o": {
+        "s": "BTCUSDT",
+        "X": "FILLED",
+        "ot": "STOP_MARKET",
+        "ap": "29000",
+        "z": "0.5",
+        "i": 42,
+      },
+    }
   )
   stream._on_message(event)
   assert len(seen) == 1
@@ -206,8 +243,13 @@ def test_on_message_ignores_worker_market_close():
       {
         "e": "ORDER_TRADE_UPDATE",
         "o": {
-          "s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "R": True,
-          "ap": "29000", "z": "0.5", "c": "awkr_deadbeefcafe0001",
+          "s": "BTCUSDT",
+          "X": "FILLED",
+          "ot": "MARKET",
+          "R": True,
+          "ap": "29000",
+          "z": "0.5",
+          "c": "awkr_deadbeefcafe0001",
         },
       }
     )
@@ -223,8 +265,14 @@ def test_on_message_dispatches_external_manual_close():
       {
         "e": "ORDER_TRADE_UPDATE",
         "o": {
-          "s": "BTCUSDT", "X": "FILLED", "ot": "MARKET", "R": True,
-          "ap": "66153.99", "z": "0.5", "i": 7, "c": "web_x",
+          "s": "BTCUSDT",
+          "X": "FILLED",
+          "ot": "MARKET",
+          "R": True,
+          "ap": "66153.99",
+          "z": "0.5",
+          "i": 7,
+          "c": "web_x",
         },
       }
     )

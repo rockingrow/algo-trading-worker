@@ -92,6 +92,8 @@ class _FakeProc:
   _flat_db_match_keys = ForexSignalProcessor._flat_db_match_keys
   # Real broker-agnostic skeleton.
   _handle_admin_message = BaseSignalProcessor._handle_admin_message
+  _handle_admin_flat = BaseSignalProcessor._handle_admin_flat
+  _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
 
@@ -101,6 +103,8 @@ class _FakeProc:
       admin_flat_closed=lambda db_pos, result, footer: f"Admin FLAT {db_pos['symbol']}"
     )
     self._account_id = "100"
+    self._market_type = "FOREX"
+    self._gateway_value = "MT5"
     self.executor = _FakeExecutor(positions, close_result)
     self.db = _FakeDb(db_positions)
     self.notifications = []
@@ -129,14 +133,23 @@ def test_closed_int_ticket_reconciles_str_db_row():
   succeeded, so the row must be marked FLATTED with the close result — NOT routed
   to the 'position not found on MT5' branch."""
   proc = _FakeProc(
-    db_positions=[{
-      "ref_id": "4587420656", "ref_source_id": "4587420656",
-      "strategy": "MT5_BTC_M5_V1", "symbol": "BTCUSD", "status": "OPENED",
-    }],
+    db_positions=[
+      {
+        "ref_id": "4587420656",
+        "ref_source_id": "4587420656",
+        "strategy": "MT5_BTC_M5_V1",
+        "symbol": "BTCUSD",
+        "status": "OPENED",
+      }
+    ],
     positions=[SimpleNamespace(ticket=4587420656, symbol="BTCUSD", volume=0.01)],
     close_result={
-      "success": True, "retcode": 10009, "ticket": "4587420656",
-      "price": 64000.0, "volume": 0.01, "comment": "Closed [FLAT]",
+      "success": True,
+      "retcode": 10009,
+      "ticket": "4587420656",
+      "price": 64000.0,
+      "volume": 0.01,
+      "comment": "Closed [FLAT]",
     },
   )
 
@@ -146,6 +159,6 @@ def test_closed_int_ticket_reconciles_str_db_row():
   assert len(proc.db.status_updates) == 1
   upd = proc.db.status_updates[0]
   assert upd["status"] == PositionStatusEnum.FLATTED
-  assert upd["closed_price"] == 64000.0           # set only on the matched branch
-  assert upd["comment"] == "Closed [FLAT]"        # NOT "position not found on MT5"
-  assert len(proc.notifications) == 1             # close notification was sent
+  assert upd["closed_price"] == 64000.0  # set only on the matched branch
+  assert upd["comment"] == "Closed [FLAT]"  # NOT "position not found on MT5"
+  assert len(proc.notifications) == 1  # close notification was sent
