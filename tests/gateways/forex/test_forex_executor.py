@@ -82,8 +82,12 @@ def test_get_open_positions_scopes_to_the_requesting_strategy(config):
   pos_b = make_platform_position(ticket=202, magic=222, volume=2.0)
   ex = _multi_strategy_executor(config, positions=[pos_a, pos_b])
 
-  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="strat-A")] == [201]
-  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="strat-B")] == [202]
+  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="strat-A")] == [
+    201
+  ]
+  assert [p.ticket for p in ex.get_open_positions("XAUUSD", strategy="strat-B")] == [
+    202
+  ]
 
 
 def test_partial_close_only_touches_the_requesting_strategys_ticket(config):

@@ -11,7 +11,7 @@ to the broker.
 from __future__ import annotations
 
 import threading
-from typing import Set
+from typing import Callable, Optional, Set, Union
 
 from worker.gateways.forex.mt5.close_detector import (
   TerminalClosedEvent,
@@ -38,6 +38,22 @@ _REASON_ICON = {
   TerminalCloseReason.MANUAL: MANUAL,
 }
 
+#: Rendered in place of a price the platform did not give us.
+_NO_PRICE = "—"
+
+
+def _fmt_price(value: Optional[float]) -> str:
+  """A price for display: rounded, or :data:`_NO_PRICE` when it is missing.
+
+  ``sl``/``tp`` are read off the position's *opening order*, and
+  ``history_orders_get`` can legitimately return nothing for it — pruned broker
+  history, or a position opened outside the worker. They are ``Optional`` on
+  :class:`TerminalClosedEvent` for exactly that reason, and ``round(None, 2)``
+  raises, which used to abort the whole notification (and, before the per-event
+  guard in :meth:`MT5EventJob._run`, every remaining close in the batch).
+  """
+  return _NO_PRICE if value is None else str(round(value, 2))
+
 
 class MT5EventJob:
   """
@@ -53,16 +69,28 @@ class MT5EventJob:
 
   def __init__(
     self,
-    magic_numbers: Set[int],
+    magic_numbers: Union[Set[int], Callable[[], Set[int]]],
     db_service: TerminalCloseStoreProtocol,
     notifier: MessageSenderProtocol,
     poll_interval: int = _POLL_INTERVAL,
+    is_connected: Optional[Callable[[], bool]] = None,
   ) -> None:
-    self._magics = set(magic_numbers)
+    """*magic_numbers* should be a **callable** returning the magics this worker
+    currently owns (``ForexExecutor.owned_magics``); a plain set is accepted and
+    frozen for tests. *is_connected* reports the platform connection and gates
+    polling — without it the job assumes the terminal is always reachable.
+    """
+    self._magics_fn: Callable[[], Set[int]] = (
+      magic_numbers
+      if callable(magic_numbers)
+      else (lambda frozen=set(magic_numbers): frozen)
+    )
+    self._is_connected = is_connected
     self._db = db_service
     self._notifier = notifier
     self._poll_interval = poll_interval
     self._seen_tickets: Set[int] = set()
+    self._warned_no_magics = False
     self._stop_event = threading.Event()
     self._thread: threading.Thread | None = None
 
@@ -94,20 +122,79 @@ class MT5EventJob:
 
   def _run(self) -> None:
     while not self._stop_event.is_set():
-      # Over the weekend-closed window the health thread closes the MT5
-      # connection until the market reopens, so positions_get() would return None
-      # and every scan would log a "terminal offline" warning. Skip polling
-      # entirely and idle at the slow weekend cadence instead of flooding the logs.
-      if is_market_closed():
-        self._stop_event.wait(MT5_HEALTH_INTERVAL_WEEKEND)
+      if not self._platform_ready():
+        self._stop_event.wait(self._offline_interval())
         continue
       try:
-        events = scan_terminal_closed_positions(self._magics, self._seen_tickets)
-        for event in events:
-          self._handle(event)
+        events = scan_terminal_closed_positions(
+          self._current_magics(), self._seen_tickets
+        )
       except Exception as exc:
         log.exception("[MT5EventJob] Unexpected error during scan: %s", exc)
+        events = []
+      for event in events:
+        # Isolate each event. scan_terminal_closed_positions has already advanced
+        # seen_tickets past this whole batch, so an exception escaping the loop
+        # would silently drop every *remaining* close — and they never reappear,
+        # because their tickets are no longer "disappeared" on the next scan.
+        # (A failure inside _handle before the DB write leaves the row open, so
+        # ForexReconcileJob still picks it up as its backstop.)
+        try:
+          self._handle(event)
+        except Exception as exc:
+          log.exception(
+            "[MT5EventJob] Failed to handle terminal close | ticket=%s reason=%s: %s",
+            event.source_ticket,
+            event.close_reason.value,
+            exc,
+          )
       self._stop_event.wait(self._poll_interval)
+
+  # ── Scan gating ───────────────────────────────────────────────────────── #
+
+  def _platform_ready(self) -> bool:
+    """Whether the terminal is reachable enough to be polled.
+
+    Gated on the **live connection**, not on the FOREX weekend calendar. Once the
+    health thread parks the connection for the weekend, positions_get() returns
+    None and every scan would log a "terminal offline" warning — so skip quietly
+    then. But a broker's 24/7 instruments (crypto CFDs such as BTCUSD) trade
+    straight through that window with the terminal connected and orders filling;
+    gating on the calendar made this job sleep through them, so a manual close
+    over the weekend was never reported at all.
+    """
+    if self._is_connected is None or self._is_connected():
+      return True
+    log.debug("[MT5EventJob] Platform not connected — skipping scan.")
+    return False
+
+  def _offline_interval(self) -> int:
+    """Wait before re-checking a disconnected terminal: the slow weekend cadence
+    while the connection is parked for the market's weekly maintenance, otherwise
+    the normal cadence so polling resumes as soon as the health thread
+    reconnects."""
+    return MT5_HEALTH_INTERVAL_WEEKEND if is_market_closed() else self._poll_interval
+
+  def _current_magics(self) -> Set[int]:
+    """The magics this worker owns, resolved fresh on every scan.
+
+    The map is broker-owned and re-pushed on each WORKER_CONNECTED_ACK — including
+    after a NATS reconnect — so a snapshot taken when the job was built goes stale
+    and silently blinds close detection. An empty result means no ticket is ever
+    tracked and this job is a no-op, which is worth one warning (repeated only
+    after magics have come and gone again).
+    """
+    magics = set(self._magics_fn())
+    if not magics:
+      if not self._warned_no_magics:
+        self._warned_no_magics = True
+        log.warning(
+          "[MT5EventJob] No owned magics — terminal-close detection is INACTIVE "
+          "until the broker pushes a strategy_magic_map."
+        )
+    else:
+      self._warned_no_magics = False
+    return magics
 
   # ── per-event handler ─────────────────────────────────────────────────── #
 
@@ -172,13 +259,13 @@ class MT5EventJob:
       f"{icon} <b>Terminal Close [{event.close_reason.value}]</b>\n\n"
       f"Symbol: <b>{event.symbol}</b>\n"
       f"Reason: <b>{event.close_reason.value}</b>\n"
-      f"Close Price: <b>{round(event.close_price, 2)}</b>\n"
+      f"Close Price: <b>{_fmt_price(event.close_price)}</b>\n"
       f"Volume: <b>{event.close_volume}</b>\n"
       f"Position: <b>{event.source_ticket}</b>\n"
       f"Deal: <b>{event.deal_ticket}</b>\n"
-      f"Entry Price: <b>{round(event.entry_price, 2)}</b>\n"
-      f"SL: <b>{round(event.sl, 2)}</b>\n"
-      f"TP: <b>{round(event.tp, 2)}</b>\n"
+      f"Entry Price: <b>{_fmt_price(event.entry_price)}</b>\n"
+      f"SL: <b>{_fmt_price(event.sl)}</b>\n"
+      f"TP: <b>{_fmt_price(event.tp)}</b>\n"
       f"----------------------------------\n"
       f"{acct_footer}"
     )

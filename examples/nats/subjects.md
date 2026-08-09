@@ -41,9 +41,9 @@ strategy's traffic. Each payload is a `SignalSchema` and is handled by
   everything on this strategy".
 
 `signal_id` is the de-duplication key: a signal the worker sees live and then
-again inside a `SYSTEM.RETRY_SIGNALS` replay is dropped by id (checked against
-`position_logs.signal_id`). `action` is one of `SignalActionEnum`: `LONG`,
-`SHORT`, `TP1`, `TP2`, `R_SL`, `SL`, `FLAT`.
+again inside a `WORKER_CONNECTED_ACK.retry_signals` replay is dropped by id
+(checked against `position_logs.signal_id`). `action` is one of
+`SignalActionEnum`: `LONG`, `SHORT`, `TP1`, `TP2`, `R_SL`, `SL`, `FLAT`.
 
 | Action | Meaning | Example |
 | ------ | ------- | ------- |
@@ -89,7 +89,7 @@ SIGNALs**. They are account-scoped, so they are accepted on the **private
 subject only** (the same action on the public `ADMIN` subject is ignored);
 `market` / `gateway` / `account_id` are required and re-validated against the
 worker's identity. While blocked, every incoming SIGNAL is skipped (both live
-and `RETRY_SIGNALS` replays) — open positions are untouched and can still be
+and ACK replays) — open positions are untouched and can still be
 closed via an `ADMIN` `FLAT`. The state is in-memory only, so a worker restart
 resets it to allowed. Handled by `BaseSignalProcessor._handle_signal_control`
 (payload `PrivateAdminSignalControlSchema`).
@@ -105,17 +105,57 @@ The broker's outgoing half of the `SYSTEM` conversation, received by
 `BaseSignalProcessor._handle_system_message` (or as the direct reply to the
 worker's `WORKER_CONNECTED` request). Each payload is a `SystemSchema` subclass
 keyed by `action` (`SystemActionEnum`) and addressed to the worker by its worker
-id (`account_id` in `<market>-<gateway>-<account_id>` form). The three handshake
-replies below normally arrive on the request's **reply inbox** rather than the
-shared `SYSTEM` subject, so they reach only the worker that asked.
+id (`account_id` in `<market>-<gateway>-<account_id>` form).
+
+Config reaches the worker on **two** paths, and which one applies is decided by
+*when* the config exists, not by what it contains:
+
+- **Connect-time** — the broker's reply to the worker's `WORKER_CONNECTED`
+  request, delivered on the request's private **reply inbox**, so it reaches only
+  the worker that asked.
+- **Runtime** — a broadcast on the shared `SYSTEM` subject, for a setting an
+  admin changes *after* the worker is already connected. The worker stays
+  subscribed for its whole lifetime, so a broadcast always lands.
+
+> **One reply per request.** A NATS request inbox resolves on the **first**
+> message delivered and then unsubscribes, so a broker that publishes several
+> messages to it has all but the first dropped by the client library — never
+> received, never logged, on either side. Everything the broker pushes *on
+> connect* therefore rides inside the single `WORKER_CONNECTED_ACK` payload. The
+> shared `SYSTEM` subject has no such limit, which is exactly why runtime changes
+> go there instead.
 
 | Action | Sent | Meaning | Example |
 | ------ | ---- | ------- | ------- |
-| `WORKER_CONNECTED_ACK` | reply inbox | Handshake accepted; no extra config needed (e.g. a non-crypto worker) | [`system.worker_connected_ack.json`](system.worker_connected_ack.json) |
+| `WORKER_CONNECTED_ACK` | reply inbox | Handshake accepted, carrying all of this worker's connect-time config (see the sections below). Every section is optional — an ACK with none of them means "nothing to push" | [`system.worker_connected_ack.json`](system.worker_connected_ack.json) |
 | `WORKER_CONNECTED_ERROR` | reply inbox | Handshake received but the broker could not build the initial config (carries `reason`) | [`system.worker_connected_error.json`](system.worker_connected_error.json) |
-| `CRYPTO_LEVERAGE_INIT` | reply inbox or `SYSTEM` | Push allowed crypto `symbols` + `default_leverage` to a crypto worker (on connect, or when an admin changes the setting) | [`system.crypto_leverage_init.json`](system.crypto_leverage_init.json) |
-| `STRATEGY_MAGIC_MAP` | reply inbox or `SYSTEM` | Push the per-strategy MT5 magic-number map (`strategy_magic_map`) to a FOREX worker, scoped to the strategies it subscribes to. Replaces the static `STRATEGY_MAGIC_MAP` .env value; the worker keeps only entries for its own `NATS_SUBJECTS` strategies and stores them in settings | [`system.strategy_magic_map.json`](system.strategy_magic_map.json) |
-| `RETRY_SIGNALS` | reply inbox or `SYSTEM` | Replay of recent SIGNALs for the worker's subscribed strategies so a reconnecting worker catches up; each is deduped by `signal_id` and age-gated against `MAX_RETRY_TIMEOUT` | [`system.retry_signals.json`](system.retry_signals.json) |
+| `CRYPTO_LEVERAGE_INIT` | `SYSTEM` broadcast | Re-run the leverage-init pass on a **connected** crypto worker after an admin changes the account's leverage settings. Same `{symbols, default_leverage}` payload as the ACK section, flattened into the envelope | [`system.crypto_leverage_init.json`](system.crypto_leverage_init.json) |
+
+### `WORKER_CONNECTED_ACK` sections
+
+| Field | Market | Meaning |
+| ----- | ------ | ------- |
+| `strategy_magic_map` | both | The per-strategy MT5 magic-number map (`{strategy: magic}`), scoped to the strategies this worker subscribes to. Replaces the static `STRATEGY_MAGIC_MAP` .env value; the worker keeps only entries for its own `NATS_SUBJECTS` strategies and stores them in settings. **Omitted or `null` leaves the worker's current map untouched; an explicit `{}` clears it.** CRYPTO stores it too (its `PositionCDC` stamps `strategy_code` from it) but has no executor magic to refresh |
+| `crypto_leverage_init` | CRYPTO | Re-initialise per-symbol leverage on the exchange before trading: `{symbols, default_leverage}`, each field an optional override of `CRYPTO_LEVERAGE_INIT_SYMBOLS` / `MAX_LEVERAGE_CAP`. `default_leverage` is a **cap** — each symbol is set to `min(exchange_max, default_leverage)`. Omitting the section skips the connect-time pass (there is no startup pass); a change made later is broadcast as a standalone `CRYPTO_LEVERAGE_INIT` instead |
+| `retry_signals` | both | Replay of recent SIGNALs for the worker's subscribed strategies so a reconnecting worker catches up; each is deduped by `signal_id` and age-gated against `MAX_RETRY_TIMEOUT`. Omitted, `null` or `[]` all mean "nothing to replay" |
+
+The example file shows every section at once as a schema reference; a real ACK
+only carries the ones that apply to that worker.
+
+Config sections are applied **before** `retry_signals`, which always runs last: a
+replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO
+entry is sized against the exchange's leverage, so replaying first would fire
+orders against config that hadn't been applied yet.
+
+Each section — and each entry within it — is validated **independently**, so a
+fault costs only the part that is actually broken: one malformed signal is
+dropped while the rest of the batch still replays and the magic map still
+applies, and one bad magic costs only that strategy. Every discarded entry is
+logged at `ERROR` with its reason. Two exceptions: if *every* magic-map entry is
+unparseable the section is skipped rather than stored as `{}` (an empty map means
+"clear my magics", and a parse failure must not be mistaken for one), and a
+broken **envelope** — bad `account_id` / `timestamp` — drops the whole ACK, since
+it addresses nobody.
 
 ---
 
@@ -155,9 +195,9 @@ gateway — it never opened, and the reason rides in `comment`.
 The worker's outgoing half of the `SYSTEM` conversation. Right after it connects
 to NATS the worker publishes a single `WORKER_CONNECTED` (via NATS `request`)
 announcing itself and asking for initial configuration. The broker replies on
-the request's reply inbox with one of the `SYSTEM` messages in the
+the request's reply inbox with exactly one of the `SYSTEM` messages in the
 Broker → Worker section above.
 
 | Action | Meaning | Example |
 | ------ | ------- | ------- |
-| `WORKER_CONNECTED` | Worker announces its `account_id` (worker id), `market`, `gateway`, and the `strategies` it subscribes to; drives the `RETRY_SIGNALS` replay | [`system.worker_connected.json`](system.worker_connected.json) |
+| `WORKER_CONNECTED` | Worker announces its `account_id` (worker id), `market`, `gateway`, and the `strategies` it subscribes to; scopes the ACK's `strategy_magic_map` and `retry_signals` replay | [`system.worker_connected.json`](system.worker_connected.json) |

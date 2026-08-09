@@ -8,7 +8,7 @@ once, so nothing is duplicated and existing values are never silently lost.
 
 ``MARKET_TYPE`` decides which credential group you are prompted for:
 
-  * ``FOREX``  -> "MT5 Connection Configuration"
+  * ``FOREX``  -> "FOREX / MT5 Configuration"
   * ``CRYPTO`` -> "Crypto CEX Configuration"
 
 The group that does not match the chosen market keeps its current/default
@@ -37,9 +37,17 @@ ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_PATH = ROOT / ".env.example"
 ENV_PATH = ROOT / ".env"
 
-# Credential groups gated by MARKET_TYPE. Keys in the selected market's group
-# are prompted for; the other group is written with its existing/default value.
-MT5_KEYS = ("MT5_SERVER", "MT5_LOGIN", "MT5_PASSWORD", "MT5_PATH", "MT5_NAME")
+# Market-specific groups gated by MARKET_TYPE. Keys in the selected market's
+# group are prompted for; the other group is written with its existing/default
+# value.
+FOREX_KEYS = (
+  "MT5_SERVER",
+  "MT5_LOGIN",
+  "MT5_PASSWORD",
+  "MT5_PATH",
+  "MT5_NAME",
+  "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL",
+)
 CRYPTO_KEYS = (
   "CRYPTO_EXCHANGE",
   "CRYPTO_QUOTE_ASSET",
@@ -73,6 +81,10 @@ DESCRIPTIONS = {
   "MT5_PASSWORD": "MT5 account password",
   "MT5_PATH": "Path to terminal64.exe (blank -> auto-detect via registry)",
   "MT5_NAME": "Friendly label for this MT5 terminal/account",
+  "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL": (
+    "Let several strategies hold the same symbol (needs a HEDGING account "
+    "+ STRATEGY_MAGIC_MAP)"
+  ),
   "CRYPTO_EXCHANGE": "Crypto exchange gateway to use (currently BINANCE)",
   "CRYPTO_QUOTE_ASSET": "Quote asset appended to bare symbols (BTCUSD -> BTCUSDT)",
   "CRYPTO_API_KEY": "Exchange API key",
@@ -116,6 +128,7 @@ QUOTED_KEYS = {
   "TELEGRAM_CHAT_CHANNEL_ID",
   "CRYPTO_LEVERAGE_INIT_SYMBOLS",
 }
+
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 def split_value_comment(raw: str) -> tuple[str, str]:
@@ -288,7 +301,7 @@ def build_plan(updating: bool):
 def collect_values(ordered_keys, default_for):
   """Prompt for every value, gating the market-specific credential group."""
   result: dict = {}
-  group_keys = set(MT5_KEYS) | set(CRYPTO_KEYS)
+  group_keys = set(FOREX_KEYS) | set(CRYPTO_KEYS)
 
   # Phase 1 — everything outside the two market credential groups.
   section("General configuration")
@@ -303,11 +316,11 @@ def collect_values(ordered_keys, default_for):
   # Phase 2 — only the credential group the chosen market requires; the other
   # group keeps its current/default value untouched.
   if market_type == "FOREX":
-    section("MT5 Connection Configuration  (MARKET_TYPE=FOREX)")
-    prompt_keys, keep_keys = MT5_KEYS, CRYPTO_KEYS
+    section("FOREX / MT5 Configuration  (MARKET_TYPE=FOREX)")
+    prompt_keys, keep_keys = FOREX_KEYS, CRYPTO_KEYS
   else:
     section("Crypto CEX Configuration  (MARKET_TYPE=CRYPTO)")
-    prompt_keys, keep_keys = CRYPTO_KEYS, MT5_KEYS
+    prompt_keys, keep_keys = CRYPTO_KEYS, FOREX_KEYS
   for key in prompt_keys:
     result[key] = ask(key, default_for(key))
   for key in keep_keys:

@@ -3,7 +3,8 @@ worker/gateways/crypto/leverage_init_job.py
 ───────────────────────────────────────────
 One-shot leverage initialisation for crypto exchanges.
 
-Runs on demand, triggered by a SYSTEM ``CRYPTO_LEVERAGE_INIT`` message, to bring
+Runs on demand, triggered by the handshake ACK's ``crypto_leverage_init``
+section, to bring
 every configured symbol's leverage into a known state. Per-symbol leverage on
 USDⓈ-M futures is sticky on the exchange — whatever value was set the last
 time (manually or by a prior worker) is what the next order is sized against —

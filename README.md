@@ -206,12 +206,12 @@ capped at 5x can silently leave a symbol at its old 20x setting (or vice
 versa), and an order can fail with `-2019 Margin is insufficient` even when
 risk-sizing math is correct.
 
-`CryptoSignalProcessor` runs `LeverageInitJob` on demand, triggered by a `SYSTEM`
-`CRYPTO_LEVERAGE_INIT` message — normally returned by the broker as the direct
-reply to this worker's `WORKER_CONNECTED` handshake (see
-[SYSTEM Subject](#-system-subject)), so the pass still effectively happens right
-after connect without the worker needing to run it itself. For each symbol in
-`CRYPTO_LEVERAGE_INIT_SYMBOLS`:
+`CryptoSignalProcessor` runs `LeverageInitJob` on demand, never at startup. Two
+things trigger it, both from the broker (see
+[SYSTEM Subject](#-system-subject)): the `crypto_leverage_init` section of the
+`WORKER_CONNECTED_ACK` on connect, and a runtime `CRYPTO_LEVERAGE_INIT` broadcast
+when an admin changes the account's leverage settings later. Neither one arriving
+means no leverage is touched. For each symbol in `CRYPTO_LEVERAGE_INIT_SYMBOLS`:
 
 1. `gateway.get_max_leverage(symbol)` (Binance: `GET /fapi/v1/leverageBracket`)
    returns the account-side ceiling. Sub-account / VIP caps are reflected here
@@ -242,12 +242,13 @@ typo) skips that symbol with a warning and **never falls back to the cap**
 blindly — picking the cap for an account that is actually limited to 5x is
 the failure mode this job exists to prevent. Any uncaught crash inside the
 job is logged and swallowed so the worker keeps running; symbols are left at
-their current exchange-side leverage until the next `CRYPTO_LEVERAGE_INIT`
-trigger.
+their current exchange-side leverage until the next trigger.
 
-The pass can be re-triggered at any time — without restarting the worker — via
-another `SYSTEM` `CRYPTO_LEVERAGE_INIT` message, which may also override the
-symbol set and cap for that one run.
+The pass can be re-triggered at any time — without restarting the worker — via a
+[`CRYPTO_LEVERAGE_INIT`](#action-crypto_leverage_init-crypto-runtime) broadcast,
+which may also override the symbol set and cap for that one run. It also re-runs
+on every reconnect handshake whose ACK carries the section, since the worker
+re-announces `WORKER_CONNECTED` after a broker/NATS restart.
 
 ---
 
@@ -356,13 +357,15 @@ worker/
 │   └── notification_job.py       # NotificationJob — outbox dispatcher (Telegram retries)
 ├── schemas/             # Pydantic / dataclass data schemas
 │   ├── admin_schema.py           # AdminActionEnum + AdminMessageSchema + Specific action Schema (NATS ADMIN subject)
+│   ├── inbox_schema.py           # WorkerConnectedSchema / WorkerConnectedAckSchema / WorkerConnectedErrorSchema (WORKER_CONNECTED request/reply handshake)
 │   ├── job_schema.py             # LogAuthorEnum (broker / terminal / exchange)
 │   ├── trade_result.py           # TradeResult value object (ok()/fail() factories)
 │   ├── metatrader_schema.py      # Back-compat re-export of TradeResult
 │   ├── nats_schema.py            # NatsSubjectEnum (SIGNAL, ADMIN, SYSTEM, TRADE)
 │   ├── notification_schema.py    # NotificationPlatformEnum / NotificationChannelEnum / NotificationModeEnum
 │   ├── position_schema.py        # PositionStatusEnum + PositionEvent / PositionEventType
-│   └── signal_schema.py          # Signal validation schemas
+│   ├── signal_schema.py          # Signal validation schemas
+│   └── system_schema.py          # SystemActionEnum + SystemSchema envelope + CryptoLeverageInitSchema (NATS SYSTEM subject)
 ├── services/            # Infrastructure services
 │   ├── db_service.py             # Persistence facade (positions, logs, outbox)
 │   ├── nats_service.py           # NATSSubscriber & NATSPublisher (over the NatsClient lifecycle)
@@ -542,7 +545,7 @@ The broker/exchange is always the source of truth: live positions are closed **f
 
 Toggle whether the worker **executes incoming SIGNALs**. `BLOCK_SIGNAL` suspends signal execution; `ALLOW_SIGNAL` resumes it. Both are **account-scoped**, so they are accepted on the **private subject only** (`ADMIN.<market>.<gateway>.<account_id>`) — the same action arriving on the public `ADMIN` subject is ignored. The payload (`PrivateAdminSignalControlSchema`) requires `market` / `gateway` / `account_id`, and the worker re-validates all three against its own identity before applying the toggle.
 
-While blocked (`_signals_blocked = True`), every incoming SIGNAL is skipped at the single execution funnel `_process_signal` — this covers **both** live signals and `RETRY_SIGNALS` replays. Open positions are **untouched**: they can still be closed out-of-band via an `ADMIN` `FLAT`, which is the escape hatch even while signals are blocked. A real state change is logged and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` Telegram notification; repeating the current state is a no-op (no duplicate alert).
+While blocked (`_signals_blocked = True`), every incoming SIGNAL is skipped at the single execution funnel `_process_signal` — this covers **both** live signals and the ACK's `retry_signals` replay. Open positions are **untouched**: they can still be closed out-of-band via an `ADMIN` `FLAT`, which is the escape hatch even while signals are blocked. A real state change is logged and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` Telegram notification; repeating the current state is a no-op (no duplicate alert).
 
 The flag is **in-memory only** — a worker restart resets it to *allowed*. There is no DB/schema change; if a durable block is needed, the broker can re-issue `BLOCK_SIGNAL` after the worker re-announces `WORKER_CONNECTED`.
 
@@ -567,7 +570,16 @@ The flag is **in-memory only** — a worker restart resets it to *allowed*. Ther
 
 ## 🚦 SYSTEM Subject
 
-The `SYSTEM` NATS subject carries operational/maintenance commands that drive worker-side actions outside the trade-signal flow (no order is placed). Inbound messages are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp` + `account_id`) and dispatches the action to the market-specific `_handle_system_action` hook. Two actions are handled by the **base** for every market — `RETRY_SIGNALS` (signal replay) and `STRATEGY_MAGIC_MAP` (per-strategy magic map, see below) — while a market adds its own (CRYPTO handles `CRYPTO_LEVERAGE_INIT`). An action a market does not understand is logged and ignored — so a `SYSTEM` message meant for another market type is harmless.
+The `SYSTEM` NATS subject carries the connect handshake and the broker's config pushes. Which of **two paths** a push takes is decided by *when* the config exists, not by what it contains:
+
+| Path | Delivery | Used for |
+| --- | --- | --- |
+| **Connect-time** | Sections of the `WORKER_CONNECTED_ACK`, on the handshake's private reply inbox | Everything the worker needs before it trades: `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` |
+| **Runtime** | A standalone action broadcast on the shared `SYSTEM` subject | A setting an admin changes *after* the worker is connected — currently `CRYPTO_LEVERAGE_INIT` |
+
+The split exists because a request reply inbox delivers exactly **one** message (see the handshake section below), so it cannot carry a push that arrives later; the shared subject has no such limit and the worker stays subscribed to it for its whole lifetime, so a broadcast always lands.
+
+Broadcasts are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp` + `account_id`), routes by worker identity, then dispatches to the market's `_handle_system_action` hook — CRYPTO handles `CRYPTO_LEVERAGE_INIT`, the base handles none of its own. An action a market does not understand is logged and ignored, so a `SYSTEM` message meant for another market type is harmless (the worker's own `WORKER_CONNECTED`, fanned back out on the shared subject, lands here too and is ignored).
 
 ### WORKER_CONNECTED handshake (request/reply)
 
@@ -575,14 +587,14 @@ Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected`
 
 | Reply action | Meaning | Worker behaviour |
 | --- | --- | --- |
-| `CRYPTO_LEVERAGE_INIT` | Crypto worker, config attached | Routed through the normal `_handle_system_action` hook — applies `symbols` + `default_leverage` exactly as if received on the subscription (see below); handshake complete |
-| `STRATEGY_MAGIC_MAP` | FOREX worker, magic map attached | Routed through `_handle_system_action` — stores the per-strategy magic map into settings and refreshes the executor (see [Action: `STRATEGY_MAGIC_MAP`](#action-strategy_magic_map-forex)); handshake complete |
-| `WORKER_CONNECTED_ACK` | No init needed (e.g. a worker with no magics/leverage to push) | Handshake complete, nothing further to apply |
+| `WORKER_CONNECTED_ACK` | The normal reply — carries **all** of this worker's connect-time config in one payload (`strategy_magic_map` + `retry_signals`, both optional) | Applies each section that is present (see [WORKER_CONNECTED_ACK payload](#worker_connected_ack-payload-broker--worker-reply)); handshake complete |
 | `WORKER_CONNECTED_ERROR` | Broker received it but couldn't process it (missing settings, invalid leverage config, …) | Logged with `reason` for operator attention; not retried — a config problem on the broker side isn't fixed by resending the same request |
+
+> **One reply per request — why the ACK carries everything.** `nc.request` opens a temporary reply inbox, resolves on the **first** message delivered to it, and unsubscribes immediately. A broker that publishes several messages to that inbox has all but the first silently discarded *by the client library*, below the worker's message handler: nothing is logged on either side, and which message "wins" is decided purely by the broker's send order. Splitting connect-time config across several sends is therefore not a delivery race the worker can retry out of — it is guaranteed loss, so every section rides in the single ACK payload.
 
 If the broker doesn't reply within the request timeout (5s), the worker retries with backoff (5s → 10s → 20s, capped) **indefinitely** — the handshake is idempotent on the broker side and gates trading (crypto specifically needs `default_leverage` before it's safe to size an order), so the worker blocks here rather than falling back to running without config. A random 0–500ms jitter is added before the very first attempt only, to desynchronise a reconnect storm (every connected worker reconnects and re-announces at roughly the same instant after a NATS/broker restart). From the 3rd consecutive timeout onward, the retry log escalates from `WARNING` to `ERROR` so it's forwarded to Telegram (`TelegramLogHandler`), alerting an operator that the broker looks unreachable rather than just transiently slow.
 
-The worker still keeps its normal `SYSTEM` subscription for `CRYPTO_LEVERAGE_INIT` regardless of the reply above: an older broker that hasn't been updated yet falls back to a plain `publish` (no reply), and a pre-request-reply worker still receives `CRYPTO_LEVERAGE_INIT` the old way — so broker and worker upgrades can roll out independently, in either order.
+Any other reply action is logged as unexpected and ignored — `WORKER_CONNECTED_ACK` and `WORKER_CONNECTED_ERROR` are the only two this worker has a contract for on the reply inbox. In particular a standalone `CRYPTO_LEVERAGE_INIT` is **not** accepted as a reply: on connect it belongs in the ACK's section, and at runtime it belongs on the shared `SYSTEM` subject.
 
 #### WORKER_CONNECTED Payload (worker → broker, request)
 
@@ -596,6 +608,80 @@ The worker still keeps its normal `SYSTEM` subscription for `CRYPTO_LEVERAGE_INI
 }
 ```
 
+#### WORKER_CONNECTED_ACK Payload (broker → worker, reply)
+
+The single reply carrying this worker's whole connect-time config. Every section is optional; an ACK with none of them is just "handshake complete, nothing to apply".
+
+| Field | Market | Behaviour when present | Behaviour when omitted (or `null`) |
+| --- | --- | --- | --- |
+| `strategy_magic_map` | both | `{strategy_name: magic_number}` for the strategies this worker subscribes to. Entries for other strategies are ignored; an explicit `{}` **clears** the worker's magics | The worker's current map is left **untouched** — omitting the section means "nothing to push", so a reconnect ACK never wipes the magics the worker is already trading under |
+| `crypto_leverage_init` | CRYPTO | `{symbols, default_leverage}` — runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass before trading | The connect-time pass is skipped, so a worker that wasn't asked never touches exchange leverage. A change made later arrives instead as a runtime [`CRYPTO_LEVERAGE_INIT`](#action-crypto_leverage_init-crypto-runtime) broadcast |
+| `retry_signals` | both | A batch of full `SignalSchema` payloads to replay (deduped + age-gated, see below) | Nothing to replay (`[]` is equivalent) |
+
+Applied by `BaseSignalProcessor._apply_worker_connected_ack`, which runs the config sections first and the **replay last**. That ordering is load-bearing: a replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO entry is sized against the exchange's leverage, so replaying first would fire orders against config that hadn't been applied yet.
+
+Merging every section into one payload would normally mean one malformed entry takes the whole ACK down, so `WorkerConnectedAckSchema` (`worker/schemas/inbox_schema.py`) validates each section — and each entry within it — **independently**, and a fault costs only the part that is actually broken:
+
+| Fault | Effect |
+| --- | --- |
+| One malformed signal in `retry_signals` | That signal is dropped; the rest of the batch still replays and every config section still applies |
+| One non-integer magic in `strategy_magic_map` | That strategy is dropped; the other magics still apply (its own signals are then rejected loudly by the unknown-strategy guard) |
+| **Every** magic in `strategy_magic_map` unparseable | The section is skipped and the worker's current map is left alone — never stored as `{}`, because an empty map is the broker's explicit *clear my magics* instruction and a parse failure must not be mistaken for one |
+| Malformed `crypto_leverage_init` | The leverage pass is skipped; the magic map and replay in the same payload are unaffected |
+| Broken **envelope** (bad `account_id` / `timestamp`) | The whole ACK is dropped — it addresses nobody, so there is nothing to apply it to |
+
+Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK dropped retry_signals[0] — timestamp: Field required`), so an operator sees exactly what the worker is missing rather than a silent partial apply.
+
+```json
+{
+  "action": "WORKER_CONNECTED_ACK",
+  "account_id": "FOREX-MT5-1234567",
+  "timestamp": "2026-06-30T00:00:00+00:00",
+  "strategy_magic_map": {
+    "MT5_GOLD_M5_V1": 20260409,
+    "MT5_FX_M15_V2": 20260410
+  },
+  "crypto_leverage_init": { "symbols": ["BTC", "ETH"], "default_leverage": 10 },
+  "retry_signals": [
+    {
+      "strategy": "MT5_GOLD_M5_V1",
+      "signal_id": "be6aac4d-da0d-41a3-9798-14d0d23d3f63",
+      "timestamp": "2026-04-10T22:55:00Z",
+      "action": "LONG",
+      "symbol": "XAUUSD",
+      "price": 4858.50,
+      "quantity": 6.0000,
+      "sl": 4850.00,
+      "tp1": 4865.00,
+      "tp2": 4870.00
+    }
+  ]
+}
+```
+
+##### Section: `strategy_magic_map`
+
+The **per-strategy MT5 magic-number map**. The broker owns this mapping centrally, so it is **no longer configured per worker in `.env`** — `STRATEGY_MAGIC_MAP` in `.env` is now only an offline/legacy fallback default (empty by default), and a broker push always replaces it. It lands during `connect()`, before `start_market_jobs` builds the CDC and terminal-close jobs, so those jobs read the freshly-stored map.
+
+Handled generically by `BaseSignalProcessor._apply_strategy_magic_map` for every market (CRYPTO stores it too — its `PositionCDC` stamps `strategy_code` from it — but has no executor magic to refresh):
+
+1. **Scope to this worker:** keep only entries whose key is one of the strategies this worker subscribes to (its `NATS_SUBJECTS` minus the control subjects, via `_subscribed_strategies()`). Any entry for a strategy the worker does not trade is ignored with a warning, so the worker never claims a magic it shouldn't own.
+2. Store the filtered map into the live settings under `strategy_magic_map` — the exact key the old `.env` value populated, so `PositionCDC` and every other consumer read it unchanged.
+3. Refresh the already-built executor via the `_set_executor_magic_map` hook. FOREX calls `ForexExecutor.set_strategy_magic_map`, so `_magic_for` (order stamping) and `owned_magics()` (account-wide queries + `MT5EventJob` terminal-close detection) reflect the new map immediately; CRYPTO no-ops.
+
+##### Section: `crypto_leverage_init`
+
+Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass on connect. The base cannot execute it itself (it imports no exchange SDK), so it hands the parsed section to the `_apply_market_init` market hook, which `CryptoSignalProcessor` overrides to call `_run_leverage_init`. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are unchanged; an uncaught crash inside the job is logged and swallowed so it never takes the worker down. The example above shows every section at once as a schema reference — a real ACK carries only the ones that apply to that worker, so a FOREX worker never receives this one.
+
+| Field | Behaviour when present | Behaviour when omitted |
+| --- | --- | --- |
+| `symbols` | Initialise exactly this list of raw signal symbols | Falls back to `CRYPTO_LEVERAGE_INIT_SYMBOLS` |
+| `default_leverage` | Used as the cap — each symbol is set to `min(exchange_max, default_leverage)` | Falls back to `MAX_LEVERAGE_CAP` |
+
+##### Section: `retry_signals`
+
+A replay of recent SIGNALs for the worker's subscribed strategies, so a worker reconnecting after an outage catches up on what it missed. Handled by `BaseSignalProcessor._apply_retry_signals`, identically for FOREX and CRYPTO: each signal is (1) deduped against `position_logs.signal_id` — one we've already processed (successfully or as a REJECT) is skipped — and (2) age-gated against `MAX_RETRY_TIMEOUT` using the signal's own `timestamp`, so a stale entry/exit is dropped rather than fired hours after the market moved. Eligible signals go through the normal `_process_signal` pipeline, so a replayed entry is indistinguishable from a live one, and one failing signal never aborts the rest of the batch.
+
 #### WORKER_CONNECTED_ERROR Payload (broker → worker, reply)
 
 ```json
@@ -607,64 +693,28 @@ The worker still keeps its normal `SYSTEM` subscription for `CRYPTO_LEVERAGE_INI
 }
 ```
 
-### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO)
+### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO, runtime)
 
-Runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass — the only way it runs, since there is no longer a startup pass. Normally returned by the broker as the reply to this worker's `WORKER_CONNECTED` handshake (see above); can also be sent standalone (subscription fallback) after editing a sub-account's leverage cap or onboarding new symbols.
+The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same payload, flattened into a `SYSTEM` envelope and broadcast to an **already-connected** worker when an admin edits a sub-account's leverage cap or onboards new symbols. It cannot ride in the ACK because the handshake is long over by then, and the reply inbox it used is gone — the shared `SYSTEM` subject, which the worker stays subscribed to for its whole lifetime, is the path that still reaches it.
+
+`CryptoSignalProcessor._handle_system_action` parses `SystemCryptoLeverageInitSchema` and funnels it into the same `_leverage_init_from` → `_run_leverage_init` path the ACK section uses, so both deliveries behave identically; only the log line differs (`via SYSTEM` vs `via ACK`), which is what tells an operator whether a pass was a connect-time init or a runtime change.
 
 | Field | Behaviour when present | Behaviour when omitted |
 | --- | --- | --- |
 | `symbols` | Initialise exactly this list of raw signal symbols | Falls back to `CRYPTO_LEVERAGE_INIT_SYMBOLS` |
 | `default_leverage` | Used as the cap — each symbol is set to `min(exchange_max, default_leverage)` | Falls back to `MAX_LEVERAGE_CAP` |
 
-#### CRYPTO_LEVERAGE_INIT Payload
-
 ```json
 {
   "action": "CRYPTO_LEVERAGE_INIT",
+  "account_id": "CRYPTO-BINANCE-7654321",
   "timestamp": "2026-06-30T00:00:00+00:00",
   "symbols": ["BTC", "ETH"],
   "default_leverage": 10
 }
 ```
 
-`action`, `timestamp` and `account_id` are required; `symbols` and `default_leverage` are optional overrides.
-
-#### Execution flow (SYSTEM)
-
-1. Parse `SystemSchema`; drop silently on validation error.
-2. Ensure the broker/exchange connection; abort if unreachable.
-3. Dispatch to `CryptoSignalProcessor._handle_system_action`, which parses `SystemCryptoLeverageInitSchema` and calls `_run_leverage_init(symbols=…, max_leverage_cap=…)`. Per-symbol failure isolation and the "never fall back to the cap blindly" guarantee are unchanged; an uncaught crash inside the job is logged and swallowed so the message never takes the worker down.
-
-### Action: `STRATEGY_MAGIC_MAP` (FOREX)
-
-Pushes the **per-strategy MT5 magic-number map** to the worker. The broker owns this mapping centrally and pushes it here, so it is **no longer configured per worker in `.env`** — `STRATEGY_MAGIC_MAP` in `.env` is now only an offline/legacy fallback default (empty by default), and a broker push always replaces it. Normally returned as the reply to this worker's `WORKER_CONNECTED` handshake (so it applies during `connect()`, before `start_market_jobs` builds the CDC and terminal-close jobs); it can also be sent standalone on the `SYSTEM` subject when the mapping changes.
-
-Handled generically by `BaseSignalProcessor._handle_strategy_magic_map` for every market (CRYPTO stores it too — its `PositionCDC` stamps `strategy_code` from it — but has no executor magic to refresh):
-
-1. Parse `SystemStrategyMagicMapSchema`; drop on validation error.
-2. **Scope to this worker:** keep only entries whose key is one of the strategies this worker subscribes to (its `NATS_SUBJECTS` minus the control subjects, via `_subscribed_strategies()`). Any entry for a strategy the worker does not trade is ignored with a warning, so the worker never claims a magic it shouldn't own.
-3. Store the filtered map into the live settings under `strategy_magic_map` — the exact key the old `.env` value populated, so `PositionCDC` and every other consumer read it unchanged.
-4. Refresh the already-built executor via the `_set_executor_magic_map` hook. FOREX calls `ForexExecutor.set_strategy_magic_map`, so `_magic_for` (order stamping) and `owned_magics()` (account-wide queries + `MT5EventJob` terminal-close detection) reflect the new map immediately; CRYPTO no-ops.
-
-| Field | Behaviour |
-| --- | --- |
-| `strategy_magic_map` | `{strategy_name: magic_number}` for the strategies this worker subscribes to. Entries for other strategies are ignored; an empty map clears the worker's magics |
-
-#### STRATEGY_MAGIC_MAP Payload
-
-```json
-{
-  "action": "STRATEGY_MAGIC_MAP",
-  "account_id": "FOREX-MT5-1234567",
-  "timestamp": "2026-06-30T00:00:00+00:00",
-  "strategy_magic_map": {
-    "MT5_GOLD_M5_V1": 20260409,
-    "MT5_FX_M15_V2": 20260410
-  }
-}
-```
-
-`action`, `timestamp` and `account_id` are required; `strategy_magic_map` defaults to an empty object.
+`action`, `timestamp` and `account_id` are required; `symbols` and `default_leverage` are optional overrides. `account_id` scopes the broadcast to one worker — every other worker logs a skip and ignores it.
 
 ---
 
@@ -672,12 +722,12 @@ Handled generically by `BaseSignalProcessor._handle_strategy_magic_map` for ever
 
 - **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation differs per gateway:
 
-  - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number, supplied by the broker via the SYSTEM [`STRATEGY_MAGIC_MAP`](#action-strategy_magic_map-forex) push (stored in settings under `strategy_magic_map`). `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
+  - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number, supplied by the broker in the [`WORKER_CONNECTED_ACK`](#section-strategy_magic_map) (stored in settings under `strategy_magic_map`). `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
   - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol)` DB invariant and the `strategy` column.
 
 - **Multiple strategies on one symbol — FOREX only (`FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL`, default `false`):** By default a `LONG`/`SHORT` entry on a symbol **another strategy already holds** is rejected as a netting conflict (`SignalHandler._handle_entry`, before any cleanup runs). With the toggle on, a FOREX worker lets the entry through and the two strategies hold *parallel* positions on that symbol. The handler asks the market for the capability (`BaseMarketStrategy.allows_multi_strategy_per_symbol`) rather than reading config directly, and only `ForexMarket` ever reports it:
 
-  - **FOREX** can isolate the two: each strategy trades under its own magic number, `get_open_positions`/`close_all_positions` filter on it, and closes/SL edits target a specific ticket (`request["position"]`), so neither strategy can touch the other's orders. Requires a **hedging** account — on a netting account the broker merges both strategies into one position, and the second strategy would own nothing while its exits fail with "No open position". `ForexSignalProcessor._warn_if_multi_strategy_needs_hedging` checks `account_info().margin_mode` once at connect and escalates (log + Telegram) if the account is not hedging; it warns rather than refuses, so a mid-migration deployment still trades. The toggle also makes a **unique magic per strategy** load-bearing, so `Settings` rejects a `STRATEGY_MAGIC_MAP` with duplicate magics at startup when it is on.
+  - **FOREX** can isolate the two: each strategy trades under its own magic number, `get_open_positions`/`close_all_positions` filter on it, and closes/SL edits target a specific ticket (`request["position"]`), so neither strategy can touch the other's orders. Requires a **hedging** account — on a netting account the broker merges both strategies into one position, and the second strategy would own nothing while its exits fail with "No open position". `ForexSignalProcessor._warn_if_multi_strategy_needs_hedging` checks `account_info().margin_mode` once at connect and escalates (log + Telegram) if the account is not hedging; it warns rather than refuses, so a mid-migration deployment still trades. The toggle also makes a **unique magic per strategy** load-bearing, so `Settings` rejects a `STRATEGY_MAGIC_MAP` .env fallback with duplicate magics at startup when it is on.
   - **CRYPTO cannot**, so `CryptoMarket` never reports the capability and the rejection stands regardless of config: `CryptoExecutor.get_open_positions` ignores the `strategy` argument (there is no magic-number equivalent on a CEX) and `cancel_all_orders` is symbol-scoped, so a second strategy's entry would force-close the first strategy's position and wipe its resting SL/TP. `CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL` only relaxes the redundant `CryptoExecutor._netting_conflict` check behind that guard.
 
   What the toggle does **not** relax: **one open order per `(strategy, symbol)`**. A strategy re-entering (or scaling into) its own symbol still force-closes and *replaces* its existing position — enforced by the stale cleanup below and the `uidx_positions_one_active_per_strategy_symbol` unique index, which is unchanged. One extra safeguard rides along with the flag: when it is on, a `FLAT` that finds no strategy-scoped position **skips** the unscoped retry (`close_all_positions(strategy=None)`), which would otherwise flatten the other strategies' live positions while cleaning up this one.
@@ -724,9 +774,9 @@ Handled generically by `BaseSignalProcessor._handle_strategy_magic_map` for ever
 
 Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/gateways/forex/mt5/close_detector.py`), which:
 
-1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** (all `strategy_magic_map` values from the broker's `STRATEGY_MAGIC_MAP` push, via `ForexExecutor.owned_magics()`) → `current_tickets`
+1. Calls `mt5.positions_get()` filtered by **every magic number this worker owns** — resolved **per scan** via the `ForexExecutor.owned_magics` callable, not snapshotted when the job was built, because the broker re-pushes `strategy_magic_map` on every `WORKER_CONNECTED_ACK` (a NATS reconnect re-runs the handshake) → `current_tickets`. An empty result logs one `No owned magics — terminal-close detection is INACTIVE` warning, since it makes the job a silent no-op.
 2. Diffs against an internal `seen_tickets` set maintained across polls
-3. For each ticket that disappeared, calls `mt5.history_deals_get(position=ticket)` to find the closing deal
+3. For each ticket that disappeared, calls `mt5.history_deals_get(position=ticket)` and picks the **newest** closing deal (`DEAL_ENTRY_OUT` / `DEAL_ENTRY_OUT_BY`, by `deal.time`). A position can have several: taking the *first* let our own TP1 partial (`DEAL_REASON_EXPERT`, which maps to nothing) mask a later manual close, silently discarding the whole event.
 4. Reads `deal.reason` to classify the closure:
 
 | MT5 `deal.reason` | `TerminalCloseReason` | Action |
@@ -734,7 +784,7 @@ Every 5 seconds the job calls `scan_terminal_closed_positions()` (`worker/gatewa
 | `DEAL_REASON_SL` | `SL` | DB updated → `PositionCDC` publishes TRADE event |
 | `DEAL_REASON_TP` | `TP` | DB updated → `PositionCDC` publishes TRADE event |
 | `DEAL_REASON_SO` | `STOP_OUT` | DB updated → `PositionCDC` publishes TRADE event |
-| `DEAL_REASON_CLIENT` / `MOBILE` / `WEB` | `MANUAL` | Telegram only — no DB update (ambiguous intent) |
+| `DEAL_REASON_CLIENT` / `MOBILE` / `WEB` | `MANUAL` | DB updated → `PositionCDC` publishes TRADE event |
 | `DEAL_REASON_EXPERT` | *(skipped)* | none — closed by our own `order_send` (covered by [`ForexReconcileJob`](#forexreconcilejob--missed-close-reconciliation-workergatewaysforexreconcile_jobpy)) |
 
 1. For terminal-initiated closures, emits a `TerminalClosedEvent` dataclass carrying: `source_ticket`, `deal_ticket`, `symbol`, `close_reason`, `close_price`, `close_volume`, `close_time`, `entry_price`, `sl`, `tp`, and an `AccountSnapshot`.
@@ -754,7 +804,7 @@ On each event the job then:
 
 When `positions_get()` returns `None` (terminal offline), the scan is skipped and `seen_tickets` is left untouched. This prevents false-positive "position closed" events and ensures that once MT5 comes back online, any positions that were closed during the outage are detected on the next scan.
 
-Over the **weekend-closed window** (Fri 22:00 → Sun 22:00 UTC) the connection is deliberately closed by the health thread, so `MT5EventJob` skips polling entirely rather than logging a "terminal offline" warning every 5 s — see [FOREX weekend market-closed handling](#forex-weekend-market-closed-handling).
+Polling is gated on the **live connection** (`MT5Gateway.is_connected`), not on the FOREX calendar: once the health thread parks the connection for the weekend the job idles rather than logging a "terminal offline" warning every 5 s, but while the terminal is up it keeps scanning — including right through the weekend window, where 24/7 instruments still trade. See [FOREX weekend market-closed handling](#forex-weekend-market-closed-handling).
 
 The job shares the process-level `stop_event` (`multiprocessing.Event`) with the health-check thread and the NATS loop, so it shuts down cleanly as part of the normal worker lifecycle — no independent restart mechanism is needed.
 
@@ -795,14 +845,16 @@ A row is matched primarily by ticket (`ref_id` / `ref_source_id`, normalised to 
 | `ref_source_id` `111`, `ref_id` `222` | ticket `222` | live — either ref may match |
 | ticket `111`, slot `XAUUSDc:101` | ticket `999`, magic `101`, `XAUUSDc` (re-ticketed) | live — slot matched |
 | ticket `111`, slot `XAUUSDc:101` | ticket `999`, magic `202`, `XAUUSDc` (another strategy) | **stale** — magics isolate strategies |
-| strategy missing from `STRATEGY_MAGIC_MAP` | any position on the symbol | live — key degrades to symbol-only |
+| strategy missing from `strategy_magic_map` | any position on the symbol | live — key degrades to symbol-only |
 | any | *(none)* | **stale** → reconciled after the second scan |
 
 The slot key is deliberately conservative: it can only ever *prevent* a reconcile, never cause one — the right trade-off when the alternative is marking a live position closed and losing management of it.
 
 #### Connection guards
 
-`MT5Gateway.get_positions` maps `positions_get() → None` (terminal offline) to an empty list, which is indistinguishable from a genuinely flat account and would otherwise reconcile the entire book. Scans are therefore skipped while `is_market_closed()` (the weekend window, when the health thread deliberately closes the connection — the job then idles at `MT5_HEALTH_INTERVAL_WEEKEND`) and whenever the platform is not connected, **including a re-check before an empty position list is trusted**.
+`MT5Gateway.get_positions` maps `positions_get() → None` (terminal offline) to an empty list, which is indistinguishable from a genuinely flat account and would otherwise reconcile the entire book. Scans are therefore skipped whenever the platform is not connected, **including a re-check before an empty position list is trusted**.
+
+Connectivity — not `is_market_closed()` — is the gate. Scans used to be skipped for the whole weekend window on the assumption that nothing can trade then; 24/7 instruments break that assumption, and a close there went unreconciled all weekend. Only the *cadence* still consults the calendar: the job idles at `MT5_HEALTH_INTERVAL_WEEKEND` when the market is closed **and** the connection has actually been parked, and keeps the normal 60 s cadence otherwise (including a weekday disconnect, so it resumes the moment the health thread reconnects).
 
 #### Missed-close handling (`ForexSignalProcessor._on_missed_close`)
 
@@ -1042,9 +1094,9 @@ Daemon threads running alongside the NATS message loop:
 | Thread | Markets | Interval | Purpose |
 | --- | --- | --- | --- |
 | `forex-health` | FOREX | 15 s (`MT5_HEALTH_INTERVAL`); 15 min while market closed | Checks MT5 connection; sends Telegram alert on disconnect/reconnect, and relaunches/restarts the terminal when needed. Parks the connection over the weekend-closed window (see below) |
-| `MT5EventJob` | FOREX | 5 s; paused while market closed | Detects terminal-side position closes (SL/TP/Stop-Out) |
+| `MT5EventJob` | FOREX | 5 s; paused only while the terminal connection is parked | Detects terminal-side position closes (SL/TP/Stop-Out/manual) |
 | `binance-user-stream` | CRYPTO | push | Websocket user-data stream → exchange-side fills / SL / TP / liquidation |
-| `forex-reconcile` | FOREX | 60 s; paused while market closed | `ForexReconcileJob` — polls live platform positions; reconciles DB-open rows that match no live ticket/slot on two consecutive scans (missed-close safety net, incl. a TP1 partial that closed the whole position) |
+| `forex-reconcile` | FOREX | 60 s; paused only while the terminal connection is parked | `ForexReconcileJob` — polls live platform positions; reconciles DB-open rows that match no live ticket/slot on two consecutive scans (missed-close safety net, incl. a TP1 partial that closed the whole position) |
 | `crypto-reconcile` | CRYPTO | 45 s | `CryptoReconcileJob` — polls live positions; reconciles DB-open rows that are exchange-flat on two consecutive scans (missed-fill safety net) and imports exchange-open positions untracked in the DB (manual opens) on two consecutive scans |
 | `PositionCDC` | both | 2 s | Publishes `PENDING` position rows to NATS `TRADE` subject |
 | `NotificationJob` | both | 1 s | Drains the `notifications` outbox and dispatches Telegram messages (with exponential-backoff retries) |
@@ -1055,14 +1107,17 @@ All threads share the same `stop_event` — a `multiprocessing.Event` for FOREX,
 
 The FOREX market is closed from **Friday 22:00 UTC to Sunday 22:00 UTC**, when the broker's trade server is offline for its weekly maintenance. During this window MT5 legitimately reports "disconnected" — it is **not** a crash, and reconnecting cannot succeed until the market reopens. Left unchecked, the `forex-health` thread would treat it like a weekday outage and hammer the server every 15 s (up to 15 reconnect attempts, then `taskkill terminal64.exe` + relaunch + 15 more), flooding the logs and Telegram all weekend.
 
-Instead, both FOREX threads become market-hours-aware via `is_market_closed()` (`worker/settings.py`), which returns `True` inside the Fri 22:00 → Sun 22:00 UTC window:
+Only `forex-health` is driven by the calendar (`is_market_closed()` in `worker/settings.py`, `True` inside the Fri 22:00 → Sun 22:00 UTC window). The two close-detection jobs are driven by the **connection** instead:
 
 | Thread | While the market is closed |
 | --- | --- |
 | `forex-health` | Closes the MT5 connection **once** (`gateway.close()`), sends a single **"Market Closed"** Telegram notice, then idles at `MT5_HEALTH_INTERVAL_WEEKEND` (default 15 min) — no reconnect attempts, no terminal relaunch — until the market reopens. |
-| `MT5EventJob` | Pauses its 5 s polling (also at the 15-min cadence). A closed connection makes `positions_get()` return `None`, so without this it would log a "terminal offline" warning on every scan. |
+| `MT5EventJob` | Keeps its 5 s polling **while the terminal is still connected**, and only pauses (at the 15-min cadence) once `forex-health` has parked the connection — a closed connection makes `positions_get()` return `None`, so without that it would warn on every scan. |
+| `forex-reconcile` | Same rule: normal 60 s cadence while connected, 15-min idle once the connection is parked. |
 
-On **reopen** (Sunday 22:00 UTC = Monday 05:00 UTC+7) the first health check reconnects through the normal path and emits the usual *reconnecting → connected* Telegram pair; `MT5EventJob` resumes polling and catches up on any SL/TP that fired at the open. Open-market behaviour is otherwise unchanged — a genuine disconnect still triggers the full aggressive relaunch/reconnect path immediately.
+> **Why not gate the close detectors on the calendar too?** Because a broker's **24/7 instruments** — crypto CFDs such as `BTCUSD` — trade straight through the FOREX weekend window. The terminal stays up (the health thread parks it only at its *next* check, up to 15 min in), signals still fill, and positions can still be closed by hand in the terminal. Gating on `is_market_closed()` made both detectors sleep through exactly that: a manual weekend close was never reported, the row stayed `OPENED`, and it blocked every later signal on the symbol until an operator sent an ADMIN FLAT. Connectivity is the only state that actually makes `positions_get()` meaningless, so it is the only thing that gates a scan.
+
+On **reopen** (Sunday 22:00 UTC = Monday 05:00 UTC+7) the first health check reconnects through the normal path and emits the usual *reconnecting → connected* Telegram pair; both jobs resume their normal cadence and catch up on anything that fired while the connection was parked (`MT5EventJob` still holds the pre-park `seen_tickets`, so a close during the window surfaces on the first scan after reconnect). Open-market behaviour is otherwise unchanged — a genuine disconnect still triggers the full aggressive relaunch/reconnect path immediately.
 
 The window and cadence are module constants in `worker/settings.py`:
 

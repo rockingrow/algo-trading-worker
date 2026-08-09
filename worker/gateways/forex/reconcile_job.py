@@ -37,18 +37,25 @@ position occupies that strategy's slot on that symbol, the row is considered liv
 and is never reconciled. The slot key is deliberately conservative — it can only
 ever *prevent* a reconcile, never cause one, which is the right trade-off when
 the alternative is marking a live position closed and losing management of it.
-When the row's magic cannot be resolved (strategy missing from
-``STRATEGY_MAGIC_MAP``), the key degrades to symbol-only — more conservative
+When the row's magic cannot be resolved (strategy missing from the broker's
+``strategy_magic_map``), the key degrades to symbol-only — more conservative
 still.
 
 Connection safety
 ─────────────────
 ``MT5Gateway.get_positions`` maps ``positions_get() → None`` (terminal offline) to
 an empty list, which is indistinguishable from a genuinely flat account and would
-otherwise reconcile the entire book. Scans are therefore skipped while the market
-is closed for the weekend (the health thread deliberately closes the connection
-then) and whenever the platform is not connected — including a re-check before an
-empty position list is trusted.
+otherwise reconcile the entire book. Scans are therefore skipped whenever the
+platform is not connected — including a re-check before an empty position list is
+trusted.
+
+Connectivity, **not** the calendar, is the gate. Scans used to be skipped for the
+whole FOREX weekend window on the assumption that nothing can trade then, but a
+broker's 24/7 instruments (crypto CFDs such as BTCUSD) keep trading straight
+through it: the terminal stays connected, entries still fill, and a close there
+was silently never reconciled — the DB row stayed ``OPENED`` all weekend and
+blocked every later signal on that symbol. Only the *poll cadence* still knows
+about the weekend, and only once the connection has actually been parked.
 """
 
 from __future__ import annotations
@@ -101,19 +108,31 @@ class ForexReconcileJob(BasePositionReconcileJob):
   # ── Scan gating ─────────────────────────────────────────────────────────── #
 
   def _should_scan(self) -> bool:
-    if self._market_closed():
-      # Weekend maintenance window: the health thread has closed the connection,
-      # so positions_get() would report an empty (meaningless) book.
-      return False
-    if self._gateway is not None and not self._gateway.is_connected():
+    # An offline terminal is the only state that makes positions_get() a lie
+    # (None → empty book → "everything is flat"), so it is the only thing that
+    # gates a scan. Deliberately *not* gated on is_market_closed(): 24/7 symbols
+    # trade through the FOREX weekend with the terminal up — see the module
+    # docstring.
+    if self._is_parked():
       log.debug("[%s] Platform not connected — skipping scan.", self.name)
       return False
     return True
 
   def _next_interval(self) -> int:
-    # Idle at the slow weekend cadence instead of waking every poll interval to
-    # do nothing, mirroring MT5EventJob.
-    return MT5_HEALTH_INTERVAL_WEEKEND if self._market_closed() else self._poll_interval
+    # Back off to the slow weekend cadence only once the connection has actually
+    # been parked (the health thread closes it a few minutes into the window) —
+    # there is genuinely nothing to poll then. While the terminal is still up,
+    # keep the normal cadence even over the weekend so a close on a 24/7 symbol
+    # is still reconciled within two scans. A weekday disconnect also keeps the
+    # fast cadence, so the job resumes the moment the health thread reconnects.
+    if self._market_closed() and self._is_parked():
+      return MT5_HEALTH_INTERVAL_WEEKEND
+    return self._poll_interval
+
+  def _is_parked(self) -> bool:
+    """True when the platform connection is down — parked for the weekend by the
+    health thread, or mid-reconnect."""
+    return self._gateway is not None and not self._gateway.is_connected()
 
   # ── Market hooks ────────────────────────────────────────────────────────── #
 

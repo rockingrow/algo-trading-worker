@@ -210,14 +210,14 @@ def test_log_position_persists_generic_columns(repo):
   assert rows[0]["market_type"] == "FOREX"
 
 
-# ── signal_id dedup (used by RETRY_SIGNALS) ──────────────────────────────── #
+# ── signal_id dedup (used by the ACK replay) ──────────────────────────────── #
 
 
 def test_signal_exists_returns_true_only_after_signal_logged(repo):
   # A signal_id we've never seen is not present.
   assert repo.signal_exists("sig-abc") is False
 
-  # Once a position for that signal_id is logged, the RETRY_SIGNALS handler
+  # Once a position for that signal_id is logged, the ACK replay handler
   # can find it and dedup incoming replays.
   repo.log_position(
     strategy="strat-a",

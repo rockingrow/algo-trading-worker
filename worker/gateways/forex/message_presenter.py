@@ -86,7 +86,12 @@ class ForexMessagePresenter(BaseMessagePresenter):
     risk_info=None,
     settings_dict: dict | None = None,
   ) -> str:
-    volume = format_volume(result.get("volume"), auto_calculated=True)
+    # The gear marks a volume the worker sized itself. Under
+    # VOLUME_DECISION_ENABLED=false the lot comes straight from signal.quantity,
+    # so the icon must be dropped — mirrors _risk_line, which the processor
+    # likewise suppresses when volume decision is off.
+    auto_sized = bool((settings_dict or {}).get("volume_decision_enabled", False))
+    volume = format_volume(result.get("volume"), auto_calculated=auto_sized)
     qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)
     return _box(
       f"{SUCCESS} <b>Order Filled</b>\n\n"

@@ -109,7 +109,7 @@ _ONE_ACTIVE_INDEX = """
         WHERE status = 'OPENED' OR status = 'TP1'
 """
 
-# Fast dedup lookup for RETRY_SIGNALS: the base processor's replay handler
+# Fast dedup lookup for the ACK replay: the base processor's replay handler
 # checks each incoming signal_id against position_logs (every processed signal
 # is logged there, whether it succeeded or was rejected) and skips ones already
 # seen. The audit log is the single source of truth here — positions may or may

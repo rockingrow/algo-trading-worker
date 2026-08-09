@@ -223,7 +223,7 @@ class NATSPublisher:
   async def _on_reconnect(self) -> None:
     logger.info("NATS publisher reconnected to %s", self.url)
     # Re-announce presence so the broker re-pushes any per-worker init config
-    # (e.g. CRYPTO_LEVERAGE_INIT) after a broker/NATS restart. The handshake is
+    # (magics, leverage, replay) after a broker/NATS restart. The handshake is
     # now a blocking request/reply with retries (see BaseSignalProcessor.
     # _announce_worker_connected), so it must run off this event loop's thread —
     # calling it here directly would deadlock the loop it needs to schedule its

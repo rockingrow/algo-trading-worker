@@ -303,4 +303,8 @@ class MT5Gateway(BasePlatformGateway):
       magic_numbers=magic_numbers,
       db_service=db_service,
       notifier=notifier,
+      # Poll only while the terminal is actually reachable — the job must keep
+      # scanning through the FOREX weekend for 24/7 symbols, so the connection
+      # (not the calendar) is what tells it there is nothing to read.
+      is_connected=self.is_connected,
     )

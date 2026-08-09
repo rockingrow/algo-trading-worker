@@ -66,6 +66,27 @@ def test_order_filled_contains_key_fields():
   assert msg.startswith("<pre>") and msg.endswith("</pre>")
 
 
+def test_order_filled_volume_gear_follows_volume_decision():
+  # The gear means "worker-sized"; with VOLUME_DECISION_ENABLED off the lot is
+  # the signal's own quantity, so no icon — and none either when the presenter
+  # is called without settings at all.
+  signal = make_signal(SignalActionEnum.LONG)
+  result = {"price": 2000.0, "volume": 0.1, "ticket": 5}
+
+  on = ForexMessagePresenter.order_filled(
+    signal, result, 5, "FOOTER", settings_dict={"volume_decision_enabled": True}
+  )
+  assert f"0.1 lot {GEAR}" in on
+
+  off = ForexMessagePresenter.order_filled(
+    signal, result, 5, "FOOTER", settings_dict={"volume_decision_enabled": False}
+  )
+  assert "0.1 lot" in off and GEAR not in off
+
+  no_settings = ForexMessagePresenter.order_filled(signal, result, 5, "FOOTER")
+  assert "0.1 lot" in no_settings and GEAR not in no_settings
+
+
 def test_order_filled_shows_scale_position_block():
   # The broker pre-scales the signal, so tp1/tp2/sl here are already the final
   # values and are displayed verbatim; volume is the executed lot.
