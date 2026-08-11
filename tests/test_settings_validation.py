@@ -45,6 +45,8 @@ _LEGACY_FLAT_KEYS = {
   "min_leverage_cap",
   "use_custom_leverage",
   "slippage_deviation",
+  "max_entry_drift_r_percent",
+  "max_entry_drift_percent",
   "strategy_magic_map",
   "use_custom_position_tp1_percent",
   "position_tp1_percent",

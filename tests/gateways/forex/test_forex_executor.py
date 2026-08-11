@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 from helpers import FakePlatformGateway, make_platform_position, make_signal
 
+from worker.gateways.forex.base import Tick
 from worker.gateways.forex.executor import ForexExecutor
 from worker.schemas.signal_schema import SignalActionEnum
 
@@ -41,6 +42,43 @@ def test_open_position_signal_risk_does_not_crash(config):
     make_signal(SignalActionEnum.LONG, sl=1990.0, risk_percent=1.5)
   )
   assert res["success"] is True
+
+
+# ── Live entry quote (feeds the staleness guard) ───────────────────────────── #
+
+
+def test_get_entry_price_returns_ask_for_long(config):
+  # Must match the side open_position actually pays, so the guard judges the
+  # signal against the real fill price rather than a mid the broker never quotes.
+  ex = ForexExecutor(
+    gateway=FakePlatformGateway(tick=Tick(bid=1999.5, ask=2000.0)),
+    config=config,
+    strategy_magic_map={"strat-1": 12345},
+  )
+  assert ex.get_entry_price(make_signal(SignalActionEnum.LONG)) == 2000.0
+
+
+def test_get_entry_price_returns_bid_for_short(config):
+  ex = ForexExecutor(
+    gateway=FakePlatformGateway(tick=Tick(bid=1999.5, ask=2000.0)),
+    config=config,
+    strategy_magic_map={"strat-1": 12345},
+  )
+  assert ex.get_entry_price(make_signal(SignalActionEnum.SHORT)) == 1999.5
+
+
+def test_get_entry_price_is_none_without_a_tick(config):
+  gateway = FakePlatformGateway()
+  gateway.get_tick = lambda symbol: None
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+  assert ex.get_entry_price(make_signal(SignalActionEnum.LONG)) is None
+
+
+def test_get_entry_price_is_none_for_a_non_entry_action(config):
+  ex = _executor(config)
+  assert ex.get_entry_price(make_signal(SignalActionEnum.TP1)) is None
 
 
 # ── Multi-strategy-per-symbol isolation (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL) ── #

@@ -179,6 +179,22 @@ class ForexExecutor:
       comment=comment,
     )
 
+  def get_entry_price(self, signal: SignalSchema) -> Optional[float]:
+    """The price a market entry for *signal* would fill at right now, or ``None``
+    when no tick is available.
+
+    Same side convention as :meth:`open_position` (ask for a LONG, bid for a
+    SHORT), so the staleness guard judges the signal against the price the order
+    would really get rather than a mid-price the broker never quotes.
+    """
+    side = _ACTION_SIDE.get(signal.action.value)
+    if side is None:
+      return None
+    tick = self._gateway.get_tick(self.get_symbol(signal.symbol))
+    if tick is None:
+      return None
+    return tick.ask if side == SIDE_LONG else tick.bid
+
   def _resolve_entry_volume(
     self, signal: SignalSchema, side: str, spec: Optional[SymbolSpec], price: float
   ) -> float:

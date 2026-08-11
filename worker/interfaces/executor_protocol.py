@@ -20,6 +20,7 @@ class TradeExecutorProtocol(Protocol):
   """The order-execution surface a market strategy needs from any broker."""
 
   def open_position(self, signal: SignalSchema) -> TradeResult: ...
+  def get_entry_price(self, signal: SignalSchema) -> Optional[float]: ...
   def partial_close_position(
     self,
     symbol: str,

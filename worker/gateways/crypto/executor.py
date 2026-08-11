@@ -192,6 +192,23 @@ class CryptoExecutor:
     result.setdefault("volume", qty)
     return result
 
+  def get_entry_price(self, signal: SignalSchema) -> Optional[float]:
+    """The price a market entry for *signal* would fill at right now, or ``None``
+    when the mark price cannot be read.
+
+    A CEX quotes a single mark price rather than a bid/ask pair, so unlike the
+    forex executor there is no side to pick — the same price is used for a LONG
+    and a SHORT.
+    """
+    try:
+      price = self._gateway.get_mark_price(self.get_symbol(signal.symbol))
+    except Exception:
+      logger.exception(
+        "[get_entry_price] Could not fetch mark price for %s", signal.symbol
+      )
+      return None
+    return price if price and price > 0 else None
+
   def _resolve_entry_qty(self, signal: SignalSchema, symbol: str) -> float:
     """Entry quantity before final step-size normalization: risk-based when
     VOLUME_DECISION is on (min qty if the signal carries no SL), otherwise the

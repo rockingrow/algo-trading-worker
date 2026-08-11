@@ -264,6 +264,24 @@ class StrategySettings(BaseSettings):
   model_config = _GROUP_CONFIG
 
   slippage_deviation: int = _opt(100, "SLIPPAGE_DEVIATION", "slippage_deviation")
+  # Staleness guard (worker.gateways.guard.stale_signal_rejection). Entries are
+  # market orders, so they fill at the live quote, never at the price the signal
+  # was built on. These bound how far the market may have moved before the entry
+  # is rejected instead of placed. An entry whose live quote has already passed
+  # the signal's own tp2 or sl is always rejected, with no threshold to tune.
+  #
+  # Drift measured as a percentage of the signal's entry-to-SL distance ("R").
+  # Preferred over a raw price percentage because it is self-normalizing: 50%
+  # means the same thing on BTCUSDT at 100,000 as on EURUSD at 1.08, and it
+  # tightens automatically for a tight-stop signal. 0 disables the check.
+  max_entry_drift_r_percent: float = _opt(
+    50.0, "MAX_ENTRY_DRIFT_R_PERCENT", "max_entry_drift_r_percent"
+  )
+  # Fallback for a signal carrying no SL, where there is no risk distance to
+  # measure against: drift as a plain percentage of the signal price. 0 disables.
+  max_entry_drift_percent: float = _opt(
+    0.5, "MAX_ENTRY_DRIFT_PERCENT", "max_entry_drift_percent"
+  )
   # Per-strategy MT5 magic numbers. The broker now owns this mapping and pushes it
   # on connect in the WORKER_CONNECTED_ACK (``strategy_magic_map``), scoped to the
   # strategies this worker subscribes to — BaseSignalProcessor.
