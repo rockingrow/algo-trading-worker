@@ -196,13 +196,19 @@ class MT5Gateway(BasePlatformGateway):
       return TradeResult.fail(result.comment, retcode=result.retcode)
 
     logger.info(
-      f"[place_order] Filled! Ticket: {result.order}, Price: {result.price}, Vol: {result.volume}"
+      f"[place_order] Filled! Ticket: {result.order}, Price: {result.price}, "
+      f"Vol: {result.volume}, SL: {sl}, TP: {tp}"
     )
+    # Report the stops as *sent*, not as the signal asked for them: the caller
+    # already ran them through StopValidator, so these are what the position
+    # actually carries and what the DB/notification must record.
     return TradeResult.ok(
       retcode=result.retcode,
       ticket=str(result.order),
       price=result.price,
       volume=result.volume,
+      sl=sl,
+      tp=tp,
     )
 
   def close_position(

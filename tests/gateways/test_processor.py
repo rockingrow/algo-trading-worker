@@ -520,6 +520,69 @@ def test_max_open_orders_zero_disables_cap():
   assert len(proc.db.inserted) == 1
 
 
+# ── Audit trail records the stop actually placed ───────────────────────────── #
+
+
+def test_log_position_records_the_broker_side_stop():
+  # The broker widened the stop to satisfy its minimum distance. The audit row
+  # must hold what the position really carries, not what the signal asked for —
+  # it is the record of the risk actually taken.
+  proc = FakeProcessor(
+    {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.33,
+      "sl": 1999.39,
+      "tp": 2000.11,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, sl=1999.45, tp2=2000.05).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["sl"] == 1999.39
+
+
+def test_log_position_falls_back_to_the_signal_stop():
+  # Exits carry no stop of their own, so the signal's value still lands in the
+  # audit row rather than a null.
+  proc = FakeProcessor(
+    {"success": True, "ticket": 9, "source_ticket": 5, "price": 1990.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.SL, sl=1990.0).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["sl"] == 1990.0
+
+
+def test_log_position_keeps_tp1_as_the_signal_partial_target():
+  # tp1 is the partial-close level, a different concept from the full-exit TP
+  # resting at the broker — result["tp"] must not overwrite it.
+  proc = FakeProcessor(
+    {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.1,
+      "sl": 1990.0,
+      "tp": 2050.0,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, tp1=2020.0, tp2=2050.0).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["tp1"] == 2020.0
+
+
 # ── Stale-signal guard ─────────────────────────────────────────────────────── #
 
 

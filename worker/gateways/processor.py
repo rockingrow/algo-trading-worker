@@ -427,7 +427,15 @@ class BaseSignalProcessor(ABC):
       action=signal.action.value,
       volume=result.get("volume", signal.quantity),
       price=result.get("price", signal.price),
-      sl=getattr(signal, "sl", None),
+      # The stop the position really carries, not the one the signal asked for:
+      # an entry reports back the level it actually registered with the broker
+      # (FOREX widens it to the broker's minimum stop distance), and that is the
+      # number the audit trail must hold. Exits carry no stop of their own, so
+      # they fall back to the signal's.
+      sl=result.get("sl") or getattr(signal, "sl", None),
+      # tp1 is the signal's *partial-close* target and is deliberately not
+      # overwritten by result["tp"] — that is the full-exit level (tp2) resting
+      # on the broker, a different concept that this column does not track.
       tp1=getattr(signal, "tp1", None),
       gateway_return_code=result.get("retcode", -1),
       comment=result.get("comment", ""),

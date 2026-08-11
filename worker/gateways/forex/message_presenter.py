@@ -102,12 +102,40 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Volume: <b>{volume}{qty_suffix}</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
       f"Source Ticket: <b>{pos_ticket}</b>\n"
+      f"{ForexMessagePresenter._stops_lines(signal, result)}"
       f"{ForexMessagePresenter._scale_lines(signal)}"
       f"{ForexMessagePresenter._risk_line(risk_info)}"
       f"{ForexMessagePresenter._override_section(settings_dict)}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )
+
+  @staticmethod
+  def _stops_lines(signal: SignalSchema, result: dict) -> str:
+    """Render the SL/TP actually registered with the broker.
+
+    Reports what the position really carries, not what the signal asked for. The
+    broker's minimum stop distance can move either level (``StopValidator``), and
+    reading the signal's own numbers back out of a notification while the
+    terminal holds different ones is how an adjusted stop goes unnoticed — so a
+    level that was moved is shown with the signal's value beside it.
+    """
+    lines = ""
+    for label, placed, requested in (
+      ("SL", result.get("sl"), signal.sl),
+      ("TP", result.get("tp"), signal.tp2),
+    ):
+      if placed is None:
+        # No such stop on the position. Worth saying only when one was asked for
+        # — otherwise the signal simply did not carry that level.
+        if requested is not None:
+          lines += f"{label}: <b>none</b> {WARNING} (signal asked {requested})\n"
+        continue
+      if requested is not None and placed != requested:
+        lines += f"{label}: <b>{placed}</b> {WARNING} (signal asked {requested})\n"
+      else:
+        lines += f"{label}: <b>{placed}</b>\n"
+    return lines
 
   @staticmethod
   def _scale_lines(signal: SignalSchema) -> str:

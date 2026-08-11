@@ -87,6 +87,72 @@ def test_order_filled_volume_gear_follows_volume_decision():
   assert "0.1 lot" in no_settings and GEAR not in no_settings
 
 
+# ── Stops shown are the ones actually placed ───────────────────────────────── #
+#
+# The broker's minimum stop distance can move SL/TP, so reading the signal's own
+# numbers back out of the notification is how an adjusted stop goes unnoticed —
+# which is exactly how an entry can appear to sit beyond its own take-profit.
+
+
+def test_order_filled_shows_the_stops_actually_placed():
+  signal = make_signal(SignalActionEnum.LONG, sl=1990.0, tp2=2050.0)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2000.0, "volume": 0.1, "ticket": 5, "sl": 1990.0, "tp": 2050.0},
+    5,
+    "FOOTER",
+  )
+  assert "SL: <b>1990.0</b>" in msg
+  assert "TP: <b>2050.0</b>" in msg
+  # Nothing was moved, so no adjustment marker.
+  assert "signal asked" not in msg
+
+
+def test_order_filled_flags_a_stop_the_broker_moved():
+  signal = make_signal(SignalActionEnum.LONG, sl=1999.45, tp2=2000.05)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2000.0, "volume": 0.33, "ticket": 5, "sl": 1999.39, "tp": 2000.11},
+    5,
+    "FOOTER",
+  )
+  # The placed level leads; the signal's request is shown beside it so the gap
+  # is visible instead of silent.
+  assert "SL: <b>1999.39</b>" in msg and "signal asked 1999.45" in msg
+  assert "TP: <b>2000.11</b>" in msg and "signal asked 2000.05" in msg
+
+
+def test_order_filled_flags_a_take_profit_that_was_not_placed():
+  # Crypto path: the entry filled and the SL registered, but the resting TP
+  # failed — the position is running without a target and must say so.
+  signal = make_signal(SignalActionEnum.LONG, sl=1990.0, tp2=2050.0)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2000.0, "volume": 0.1, "ticket": 5, "sl": 1990.0, "tp": None},
+    5,
+    "FOOTER",
+  )
+  assert "TP: <b>none</b>" in msg and "signal asked 2050.0" in msg
+
+
+def test_order_filled_omits_stops_the_signal_never_carried():
+  signal = make_signal(SignalActionEnum.LONG, sl=None, tp2=None)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "SL:" not in msg
+  assert "TP:" not in msg
+
+
+def test_order_filled_stops_absent_for_a_result_without_them():
+  # A result predating the sl/tp fields (or an exit) must not render a bogus line.
+  signal = make_signal(SignalActionEnum.LONG, sl=None, tp2=None)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "Order Filled" in msg
+
+
 def test_order_filled_shows_scale_position_block():
   # The broker pre-scales the signal, so tp1/tp2/sl here are already the final
   # values and are displayed verbatim; volume is the executed lot.

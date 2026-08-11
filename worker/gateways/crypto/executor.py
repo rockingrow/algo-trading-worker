@@ -171,17 +171,28 @@ class CryptoExecutor:
   def _attach_entry_orders(
     self, symbol: str, action: str, qty: float, signal: SignalSchema, result: dict
   ) -> TradeResult:
-    """Place SL and TP2 resting orders after the entry market order succeeds."""
+    """Place SL and TP2 resting orders after the entry market order succeeds.
+
+    ``result["sl"]`` / ``result["tp"]`` report the stops the position actually
+    ends up carrying, matching the forex executor's contract. An exchange takes
+    the signal's levels verbatim (there is no minimum-stop-distance rewrite as on
+    MT5), so they differ from the signal only when a stop was not placed at all —
+    which is exactly the case worth recording: a failed TP leaves the position
+    running without a take-profit.
+    """
     if signal.sl:
       sl_res = self._gateway.set_stop_loss(symbol, action, signal.sl, qty)
       result["sl_update"] = sl_res
       if not sl_res.get("success"):
         return self._rollback_unprotected_entry(symbol, action, result, sl_res, qty)
+      result["sl"] = signal.sl
 
     if signal.tp2:
       tp_res = self._gateway.set_take_profit(symbol, action, signal.tp2, qty)
       result["tp_update"] = tp_res
-      if not tp_res.get("success"):
+      if tp_res.get("success"):
+        result["tp"] = signal.tp2
+      else:
         logger.warning(
           "[open_position] TP placement failed (%s) for %s — position remains "
           "SL-protected; continuing without a resting take-profit.",

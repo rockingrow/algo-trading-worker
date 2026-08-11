@@ -113,6 +113,47 @@ def test_calculate_quantity_risk_based(config):
   assert ex.calculate_quantity("BTCUSD", 30000, 29000, 2.0, 1000) == 0.02
 
 
+# ── Stops actually placed are reported back ────────────────────────────────── #
+
+
+def test_entry_reports_the_stops_it_registered(config):
+  # Same contract as the forex executor, so the DB and the notification read one
+  # field regardless of market. An exchange takes the signal's levels verbatim.
+  ex = CryptoExecutor(FakeGateway(), config)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0, tp2=32000.0)
+  )
+  assert res["success"] is True
+  assert res.get("sl") == 29000.0
+  assert res.get("tp") == 32000.0
+
+
+def test_entry_reports_no_tp_when_its_placement_failed(config):
+  # The entry and SL succeeded but the resting TP did not, so the position runs
+  # without a target — result["tp"] must stay None rather than claim the level.
+  gw = FakeGateway()
+  gw.set_take_profit = lambda *a: {"success": False, "comment": "TP rejected"}
+  ex = CryptoExecutor(gw, config)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0, tp2=32000.0)
+  )
+  assert res["success"] is True
+  assert res.get("sl") == 29000.0
+  # Read with .get(), as the processor and presenter do: a stop that was never
+  # registered is simply absent from the result.
+  assert res.get("tp") is None
+
+
+def test_entry_reports_no_stops_when_the_signal_carried_none(config):
+  ex = CryptoExecutor(FakeGateway(), config)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=None, tp2=None)
+  )
+  assert res["success"] is True
+  assert res.get("sl") is None
+  assert res.get("tp") is None
+
+
 # ── Live entry quote (feeds the staleness guard) ───────────────────────────── #
 
 
