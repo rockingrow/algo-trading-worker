@@ -290,7 +290,11 @@ class FakePlatformGateway:
     )
     if self._place_results:
       return self._place_results.pop(0)
-    return TradeResult.ok(retcode=10009, ticket="999", price=price, volume=volume)
+    # Echo the stops back like a real gateway: they are what the position ends
+    # up carrying, after the caller's StopValidator pass.
+    return TradeResult.ok(
+      retcode=10009, ticket="999", price=price, volume=volume, sl=sl, tp=tp
+    )
 
   def close_position(self, position, volume=None, comment="Close"):
     vol = position.volume if volume is None else volume

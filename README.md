@@ -399,7 +399,7 @@ Configuration is grouped into nested `<specific>Settings` sub-models on the main
 | `NatsSettings` | `settings.nats` | `url`, `token`, `subjects` |
 | `ForexSettings` | `settings.forex` | `platform`, MT5 `server`/`login`/`password`/`path`/`name` |
 | `CryptoSettings` | `settings.crypto` | `exchange`, API keys, `hedge_mode`, leverage caps, … |
-| `StrategySettings` | `settings.strategy` | `slippage_deviation`, `magic_map`, TP1 overrides |
+| `StrategySettings` | `settings.strategy` | `slippage_deviation`, entry-drift limits, `magic_map`, TP1 overrides |
 | `RiskSettings` | `settings.risk` | `capital`, `risk_percentage`, `max_open_orders`, … |
 | `TelegramSettings` | `settings.telegram` | `enabled`, tokens, chat ids, error-log hook |
 | `DatabaseSettings` | `settings.database` | `file` |
@@ -736,6 +736,17 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 
 - **Max-open-orders exposure cap (`MAX_OPEN_ORDERS`):** Before any new `LONG`/`SHORT` is sent to the broker, the shared `BaseSignalProcessor._max_open_orders_rejection` guard counts the active (`OPENED`/`TP1`) positions across **every** strategy and symbol. If the count is already at the cap, the entry is rejected: `_reject_signal` audit-logs it, inserts a `REJECTED` position row (via `PositionRepository.insert_rejected_position`), and sends an `Order Rejected` operator notification — but **no order is placed**. The `REJECTED` row is picked up by `PositionCDC` and forwarded to the broker on the `TRADE` subject with status `REJECTED`, so a blocked signal is visible end-to-end even though nothing was traded. A re-entry or scale-in on a symbol the strategy already holds **replaces** the existing position rather than opening a new slot, so it is never counted against the cap. Exits (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`) are never gated — a position can always be closed even at the cap. The guard is market-agnostic (identical for FOREX and CRYPTO); `MAX_OPEN_ORDERS=0` disables it.
 
+- **Stale-signal guard (`MAX_ENTRY_DRIFT_R_PERCENT` / `MAX_ENTRY_DRIFT_PERCENT`):** Entries are **market** orders (`TRADE_ACTION_DEAL` on MT5, `MARKET` on a CEX), so they fill at the live quote — never at the `price` the signal was built on. When the market has already run past the signal's own levels, filling it opens a position that is broken from the first tick, so `guard.stale_signal_rejection` rejects it before anything reaches the broker (same `REJECTED` path as `MAX_OPEN_ORDERS` above). Three rules, evaluated against the price the entry would *actually* pay (ask for a LONG, bid for a SHORT; mark price on a CEX — `BaseMarketStrategy.entry_price`):
+  - **Already through `tp2`** — the position would open beyond its own target: instantly in loss by at least the spread, with no profit left to capture. Always rejected, no threshold. (Without this, `StopValidator` would silently rewrite the now-unreachable TP to one point above the entry, hiding the problem instead of surfacing it.)
+  - **Already through `sl`** — the position would open at or past its stop and be stopped out on entry. Always rejected, no threshold.
+  - **Drifted too far** — no level passed yet, but the market has moved enough that the trade no longer resembles the one signalled. Measured as a percentage of the signal's own entry-to-SL distance ("R"), which is why one setting fits every market: `MAX_ENTRY_DRIFT_R_PERCENT=50` means the same thing on BTCUSDT at 100,000 as on EURUSD at 1.08, and tightens automatically for a tight-stop signal — no per-symbol tuning, and no MT5-only `point` unit that a CEX has no equivalent for. `MAX_ENTRY_DRIFT_PERCENT` (percent of price) is the fallback for a signal carrying no SL. Either set to `0` disables that rule; the two level checks above are unaffected.
+
+  Note this is **not** what `SLIPPAGE_DEVIATION` does: that is MT5's `deviation` field, a *maximum tolerance* passed to the broker (an order filling further than that from the requested price is rejected/requoted), and on a **Market Execution** account most brokers ignore it entirely. It cannot stop an entry that is already stale when the quote is read — this guard can. The guard runs last of the three entry guards because it needs a live quote (a tick read / REST round-trip), so an entry already rejected by the DB-only guards never pays for one; a quote that can't be read skips the guard rather than blocking the entry.
+
+- **Entry lot is sized on the stop that is actually placed (FOREX):** `StopValidator` widens an SL that violates the broker's minimum stop distance (`stops_level`), so the order can carry a wider stop than the signal asked for. Risk sizing spreads `risk_cash` over the SL distance, so `ForexExecutor.open_position` validates the stops **before** sizing and feeds the *effective* SL into `LotSizer` — sizing on the signal's narrower stop and then submitting the widened one would silently make the position risk more than `RISK_PERCENTAGE` of capital. When a stop is widened, the sizing log line records both levels.
+
+- **The stops actually placed are what gets recorded (`TradeResult.sl` / `.tp`):** an entry reports back the SL/TP it really registered with the broker, not the signal's requested levels — FOREX after any `StopValidator` adjustment, CRYPTO as the resting orders that were successfully placed (a `tp` of `None` means the take-profit did not register and the position is running without a target). The `position_logs.sl` column and the `Order Filled` notification both read this, and the notification flags a level the broker moved by showing the signal's request beside it. Reading the signal's own numbers back out of a notification while the terminal holds different ones is how an adjusted stop goes unnoticed. Note `position_logs.tp1` deliberately keeps the signal's *partial-close* target — a different concept from the full-exit TP (`tp2`) resting at the broker, which the column does not track.
+
 - **Data self-healing on inconsistency:** `SignalHandler._get_db_position` enforces the one-active-position-per-(strategy, symbol) invariant at read time. If more than one `OPENED`/`TP1` row is found (possible after a crash before the unique index existed), the oldest row is kept and all extras are immediately marked `FORCED_CLOSED` with an explanatory comment, so the DB self-heals on the next signal rather than silently producing split-brain state.
 
 - **SQLite as source of truth for exit signals:** Before executing any exit action (`TP1`, `TP2`, `SL`, `R_SL`), `SignalHandler` queries the local SQLite `positions` table for a tracked record matching the signal's `strategy + symbol`. If no record is found the signal is rejected — this prevents acting on untracked or already-closed positions. On success, `source_ticket` in the result is always taken from the DB record (not from the live broker ticket) so `_process_message` always updates the correct DB row, even in edge cases where the broker re-tickets a position after a partial close.
@@ -1013,7 +1024,8 @@ A partial unique index `uidx_positions_one_active_per_strategy_symbol` enforces 
 #### Position Status Lifecycle
 
 ```text
-(entry rejected) ──► REJECTED           (MAX_OPEN_ORDERS cap — never sent to broker)
+(entry rejected) ──► REJECTED           (entry guard: open-order cap / symbol already
+                                         held / stale signal — never sent to broker)
 
 OPENED ──► TP1 ──► TP2
        │         └──► SL
@@ -1033,7 +1045,7 @@ OPENED ──► TP1 ──► TP2
 | `TERMINAL_CLOSED` | `MT5EventJob` / exchange event / either market's reconcile job | Broker/exchange closed the position (SL/TP/Stop-Out/manual) before a NATS signal arrived, or the reconciler found the position gone from the broker while the row was still open |
 | `FORCED_CLOSED` | New entry signal / liquidation | Position was force-closed (opposing/same-direction entry, or a crypto liquidation) |
 | `FLATTED` | FLAT signal | Position was closed by an administrative flat command |
-| `REJECTED` | `MAX_OPEN_ORDERS` guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
+| `REJECTED` | `MAX_OPEN_ORDERS` / open-order-per-symbol / stale-signal guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
 
 ### `position_logs` — Immutable execution audit trail
 

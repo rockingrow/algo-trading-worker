@@ -60,6 +60,17 @@ class BaseMarketStrategy(ABC):
   def entry(self, signal: SignalSchema) -> TradeResult:
     """Open a new LONG (BUY) or SHORT (SELL) position — direction in signal.action."""
 
+  def entry_price(self, signal: SignalSchema) -> Optional[float]:
+    """The price :meth:`entry` would fill *signal* at right now, or ``None``.
+
+    Read by the staleness guard (``guard.stale_signal_rejection``) before an
+    entry is sent, so it can compare the signal's own levels against the price
+    the order would really get. Concrete (not abstract) with a ``None`` default
+    — the guard treats that as "no quote available" and skips, so a market
+    implementation or test double that predates the capability keeps working.
+    """
+    return None
+
   # ── Group 2: TP1 ─────────────────────────────────────────────────────── #
 
   @abstractmethod
@@ -132,6 +143,13 @@ class ExecutorBackedMarket(BaseMarketStrategy):
   def entry(self, signal: SignalSchema) -> TradeResult:
     """Open a BUY or SELL market order — direction encoded in signal.action."""
     return self._executor.open_position(signal)
+
+  def entry_price(self, signal: SignalSchema) -> Optional[float]:
+    """Delegate the live entry quote to the executor (see the base docstring)."""
+    getter = getattr(self._executor, "get_entry_price", None)
+    if getter is None:
+      return None
+    return getter(signal)
 
   # ── TP1 ──────────────────────────────────────────────────────────────── #
 

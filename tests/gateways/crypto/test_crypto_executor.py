@@ -113,6 +113,87 @@ def test_calculate_quantity_risk_based(config):
   assert ex.calculate_quantity("BTCUSD", 30000, 29000, 2.0, 1000) == 0.02
 
 
+# ── Stops actually placed are reported back ────────────────────────────────── #
+
+
+def test_entry_reports_the_stops_it_registered(config):
+  # Same contract as the forex executor, so the DB and the notification read one
+  # field regardless of market. An exchange takes the signal's levels verbatim.
+  ex = CryptoExecutor(FakeGateway(), config)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0, tp2=32000.0)
+  )
+  assert res["success"] is True
+  assert res.get("sl") == 29000.0
+  assert res.get("tp") == 32000.0
+
+
+def test_entry_reports_no_tp_when_its_placement_failed(config):
+  # The entry and SL succeeded but the resting TP did not, so the position runs
+  # without a target — result["tp"] must stay None rather than claim the level.
+  gw = FakeGateway()
+  gw.set_take_profit = lambda *a: {"success": False, "comment": "TP rejected"}
+  ex = CryptoExecutor(gw, config)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0, tp2=32000.0)
+  )
+  assert res["success"] is True
+  assert res.get("sl") == 29000.0
+  # Read with .get(), as the processor and presenter do: a stop that was never
+  # registered is simply absent from the result.
+  assert res.get("tp") is None
+
+
+def test_entry_reports_no_stops_when_the_signal_carried_none(config):
+  ex = CryptoExecutor(FakeGateway(), config)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=None, tp2=None)
+  )
+  assert res["success"] is True
+  assert res.get("sl") is None
+  assert res.get("tp") is None
+
+
+# ── Live entry quote (feeds the staleness guard) ───────────────────────────── #
+
+
+def test_get_entry_price_returns_mark_price(config):
+  ex = CryptoExecutor(FakeGateway(mark_price=30500.0), config)
+  # A CEX quotes one mark price, so both sides read the same number.
+  assert (
+    ex.get_entry_price(make_signal(SignalActionEnum.LONG, symbol="BTCUSD")) == 30500.0
+  )
+  assert (
+    ex.get_entry_price(make_signal(SignalActionEnum.SHORT, symbol="BTCUSD")) == 30500.0
+  )
+
+
+def test_get_entry_price_resolves_the_exchange_symbol(config):
+  gw = FakeGateway()
+  seen = []
+  gw.get_mark_price = lambda symbol: seen.append(symbol) or 30000.0
+  ex = CryptoExecutor(gw, config)
+  ex.get_entry_price(make_signal(SignalActionEnum.LONG, symbol="BINANCE:BTCUSD.P"))
+  assert seen == ["BTCUSDT"]
+
+
+def test_get_entry_price_is_none_when_the_exchange_raises(config):
+  gw = FakeGateway()
+
+  def _boom(symbol):
+    raise RuntimeError("exchange unreachable")
+
+  gw.get_mark_price = _boom
+  ex = CryptoExecutor(gw, config)
+  # Swallowed, not raised: a missing quote must not stop the entry path.
+  assert ex.get_entry_price(make_signal(SignalActionEnum.LONG, symbol="BTCUSD")) is None
+
+
+def test_get_entry_price_is_none_for_a_non_positive_price(config):
+  ex = CryptoExecutor(FakeGateway(mark_price=0.0), config)
+  assert ex.get_entry_price(make_signal(SignalActionEnum.LONG, symbol="BTCUSD")) is None
+
+
 def test_open_position_risk_mode_places_order_and_stop(config):
   gw = FakeGateway()
   ex = CryptoExecutor(gw, config)

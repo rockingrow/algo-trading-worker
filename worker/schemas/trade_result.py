@@ -32,6 +32,8 @@ _FIELDS = frozenset(
     "price",
     "volume",
     "source_ticket",
+    "sl",
+    "tp",
     "new_sl",
     "sl_update",
     "forced_closed",
@@ -50,6 +52,13 @@ class TradeResult:
   price: Optional[float] = None
   volume: Optional[float] = None
   source_ticket: Optional[str] = None
+  # Stops actually registered with the broker by an entry — the signal's levels
+  # after any broker-driven adjustment (FOREX: StopValidator widening them to the
+  # minimum stop distance). They are what the position really carries, so the DB
+  # and the operator notification report these rather than the signal's own
+  # numbers. ``None`` means no stop of that kind is resting on the position.
+  sl: Optional[float] = None
+  tp: Optional[float] = None
   new_sl: Optional[float] = None
   sl_update: Any = None  # nested TradeResult from the SL-update step (TP1)
   forced_closed: list = field(default_factory=list)

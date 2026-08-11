@@ -3,8 +3,14 @@
 from dataclasses import replace
 
 import pytest
-from helpers import FakePlatformGateway, make_platform_position, make_signal
+from helpers import (
+  FakePlatformGateway,
+  make_platform_position,
+  make_signal,
+  make_symbol_spec,
+)
 
+from worker.gateways.forex.base import Tick
 from worker.gateways.forex.executor import ForexExecutor
 from worker.schemas.signal_schema import SignalActionEnum
 
@@ -41,6 +47,144 @@ def test_open_position_signal_risk_does_not_crash(config):
     make_signal(SignalActionEnum.LONG, sl=1990.0, risk_percent=1.5)
   )
   assert res["success"] is True
+
+
+# ── Entry lot is sized on the stop that is actually placed ─────────────────── #
+#
+# StopValidator widens a stop that violates the broker's minimum stop distance,
+# so the order can carry a wider SL than the signal asked for. Risk sizing spreads
+# risk_cash over the SL distance, so sizing on the signal's narrower stop and then
+# submitting the widened one makes the position risk MORE than RISK_PERCENTAGE.
+
+
+def _sizing_executor(config, **spec_overrides):
+  """Executor whose broker enforces a 10-point (0.10) minimum stop distance,
+  quoting bid=1999.5 / ask=2000.0."""
+  return ForexExecutor(
+    gateway=FakePlatformGateway(
+      spec=make_symbol_spec(stops_level=10, point=0.01, digits=2, **spec_overrides),
+      tick=Tick(bid=1999.5, ask=2000.0),
+    ),
+    config=config,
+    strategy_magic_map={"strat-1": 12345},
+  )
+
+
+def test_entry_lot_is_sized_on_the_widened_stop(config):
+  """Regression: the lot used to be computed from ``signal.sl`` before
+  StopValidator ran, so a widened stop shipped a lot sized for a tighter one.
+
+  LONG at ask 2000.0 with sl=1999.45: the broker's 0.10 minimum stop distance
+  pushes the stop to 1999.39, widening the risk from 55 to 61 points. With
+  capital=1000 and risk=2% ($20) and a point value of 1.0, the correct lot is
+  20 / 61 = 0.33 — not the 0.36 that 20 / 55 would give.
+  """
+  ex = _sizing_executor(config)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=1999.45))
+
+  assert res["success"] is True
+  placed = ex._gateway.placed[0]
+  assert placed["sl"] == 1999.39, "order must carry the widened stop"
+  assert placed["volume"] == 0.33, "lot must be sized on the widened stop, not 0.36"
+
+
+def test_entry_lot_unchanged_when_the_stop_needs_no_adjustment(config):
+  # sl=1990.0 clears the minimum distance, so nothing is widened and the lot is
+  # sized on the signal's own stop: 20 / ((2000.0 - 1990.0) / 0.01) = 0.02.
+  ex = _sizing_executor(config)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=1990.0))
+
+  assert res["success"] is True
+  placed = ex._gateway.placed[0]
+  assert placed["sl"] == 1990.0
+  assert placed["volume"] == 0.02
+
+
+def test_short_entry_lot_is_sized_on_the_widened_stop(config):
+  # SHORT at bid 1999.5; min_sl = ask + 0.10 = 2000.1, so sl=2000.05 is pushed
+  # out to 2000.11. Risk distance from the 1999.5 entry: 61 points → 20/61 = 0.33.
+  ex = _sizing_executor(config)
+  res = ex.open_position(make_signal(SignalActionEnum.SHORT, sl=2000.05))
+
+  assert res["success"] is True
+  placed = ex._gateway.placed[0]
+  assert placed["sl"] == 2000.11
+  assert placed["volume"] == 0.33
+
+
+def test_payload_quantity_mode_is_unaffected_by_stop_adjustment(config):
+  # With VOLUME_DECISION off the lot comes from signal.quantity, so a widened
+  # stop must not change it: 100 units / 100 contract size = 1.0 lot.
+  cfg = replace(config, volume_decision_enabled=False)
+  ex = _sizing_executor(cfg)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=1999.45, quantity=100))
+
+  assert res["success"] is True
+  placed = ex._gateway.placed[0]
+  assert placed["sl"] == 1999.39
+  assert placed["volume"] == 1.0
+
+
+def test_entry_without_sl_still_falls_back_to_min_lot(config):
+  # No stop to widen and none to size from — the conservative min-lot path holds.
+  ex = _sizing_executor(config)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=None))
+
+  assert res["success"] is True
+  placed = ex._gateway.placed[0]
+  assert placed["sl"] is None
+  assert placed["volume"] == 0.01
+
+
+# ── Stops actually placed are reported back ────────────────────────────────── #
+
+
+def test_result_reports_the_stops_actually_placed(config):
+  # The caller (DB + notification) must see what the position really carries,
+  # not what the signal asked for.
+  ex = _sizing_executor(config)
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=1999.45, tp2=2000.05))
+
+  assert res["success"] is True
+  assert res["sl"] == 1999.39, "widened stop, not the signal's 1999.45"
+  assert res["tp"] == 2000.11, "widened target, not the signal's 2000.05"
+
+
+# ── Live entry quote (feeds the staleness guard) ───────────────────────────── #
+
+
+def test_get_entry_price_returns_ask_for_long(config):
+  # Must match the side open_position actually pays, so the guard judges the
+  # signal against the real fill price rather than a mid the broker never quotes.
+  ex = ForexExecutor(
+    gateway=FakePlatformGateway(tick=Tick(bid=1999.5, ask=2000.0)),
+    config=config,
+    strategy_magic_map={"strat-1": 12345},
+  )
+  assert ex.get_entry_price(make_signal(SignalActionEnum.LONG)) == 2000.0
+
+
+def test_get_entry_price_returns_bid_for_short(config):
+  ex = ForexExecutor(
+    gateway=FakePlatformGateway(tick=Tick(bid=1999.5, ask=2000.0)),
+    config=config,
+    strategy_magic_map={"strat-1": 12345},
+  )
+  assert ex.get_entry_price(make_signal(SignalActionEnum.SHORT)) == 1999.5
+
+
+def test_get_entry_price_is_none_without_a_tick(config):
+  gateway = FakePlatformGateway()
+  gateway.get_tick = lambda symbol: None
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+  assert ex.get_entry_price(make_signal(SignalActionEnum.LONG)) is None
+
+
+def test_get_entry_price_is_none_for_a_non_entry_action(config):
+  ex = _executor(config)
+  assert ex.get_entry_price(make_signal(SignalActionEnum.TP1)) is None
 
 
 # ── Multi-strategy-per-symbol isolation (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL) ── #
