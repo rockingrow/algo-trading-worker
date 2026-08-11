@@ -31,6 +31,45 @@ SIDE_SHORT = "SHORT"
 WORKER_ORDER_PREFIX = "awkr_"
 
 
+def linear_realized_pnl(
+  side: str,
+  entry_price: Optional[float],
+  close_price: Optional[float],
+  volume: Optional[float],
+) -> Optional[float]:
+  """Realized PnL of closing *volume* of a linear (USDⓈ-margined) position.
+
+  ``(exit - entry) x qty`` for a long, inverted for a short — which is not an
+  approximation of what the exchange reports but the definition it uses: a
+  linear contract settles in the quote asset, so Binance's own ``realizedPnl``
+  (the ``rp`` field the user-data stream delivers for exchange-side closes) is
+  this same product. Computing it here lets a *worker-placed* close report the
+  same figure without a second REST round-trip on the order path — the order
+  response carries no PnL, and the stream deliberately skips the worker's own
+  fills.
+
+  Excludes trading commission and funding, which the exchange books separately;
+  ``rp`` excludes them too, so both close paths report a consistent number.
+
+  Returns ``None`` when any input is missing or non-positive — an unfilled or
+  zero-priced order means the amount is unknown, and a PnL computed against a
+  zero price would be a fabrication rather than a break-even result. An
+  unrecognised *side* is unknown for the same reason: it decides the sign, so
+  guessing it would not merely lose precision, it would report a loss as a
+  profit.
+  """
+  if side not in (SIDE_LONG, SIDE_SHORT):
+    return None
+  if not entry_price or entry_price <= 0:
+    return None
+  if not close_price or close_price <= 0:
+    return None
+  if not volume or volume <= 0:
+    return None
+  direction = 1.0 if side == SIDE_LONG else -1.0
+  return (close_price - entry_price) * volume * direction
+
+
 @dataclass
 class SymbolFilter:
   """Trading rules for a symbol, used to round quantities/prices to valid steps."""

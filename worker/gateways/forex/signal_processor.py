@@ -412,9 +412,41 @@ class ForexSignalProcessor(BaseSignalProcessor):
     )
     self.ctx.channel_notifier.send_message(
       ForexMessagePresenter.position_reconciled_closed(
-        row, close_price, self._account_footer()
+        row,
+        close_price,
+        self._account_footer(),
+        profit=self._reconciled_pnl(row.get("ref_source_id")),
       )
     )
+
+  def _reconciled_pnl(self, position_ticket: Optional[Any]) -> Optional[float]:
+    """Total realized PnL of a reconciled position, read from deal history.
+
+    The reconciler never saw the close, so unlike every other close path there is
+    no :class:`TradeResult` to read a figure off — but the platform still holds
+    the deals, and they are exact. Summed over the position's whole life (entry
+    commission, any TP1 partial, the final exit), which is why the notification
+    labels it a position total rather than the result of one close.
+
+    Best-effort: a platform that cannot answer leaves the PnL unknown rather than
+    holding up the reconcile, whose real job is unsticking the DB row.
+    """
+    if not position_ticket:
+      return None
+    # getattr chain so a platform (or test double) without the capability is
+    # simply "PnL unknown" rather than an exception on the reconcile path.
+    reader = getattr(self.gateway, "get_position_realized_pnl", None)
+    if reader is None:
+      return None
+    try:
+      return reader(position_ticket)
+    except Exception as exc:  # pragma: no cover - best effort
+      log.warning(
+        "[FOREX Reconcile] realized PnL unavailable for ticket %s: %s",
+        position_ticket,
+        exc,
+      )
+      return None
 
   def _best_effort_price(self, symbol: Optional[str]) -> Optional[float]:
     """Current mid price as an approximate close price; ``None`` if unreadable."""

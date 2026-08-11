@@ -17,16 +17,72 @@ this base is purely for code reuse, not for polymorphic dispatch.
 from __future__ import annotations
 
 import html
+from typing import Optional
 
-from worker.icons import ALARM, GEAR, REJECTED, SHIELD, STOP, SUCCESS
+from worker.icons import ALARM, GEAR, LOSS, PROFIT, REJECTED, SHIELD, STOP, SUCCESS
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
 from worker.services.notification_service import _box
 
 _DIVIDER = "----------------------------------"
 
+# Signal actions that take volume *out* of a position — the ones whose
+# ``order_filled`` notification is really a close report and must carry a PnL
+# line. Everything else (LONG/SHORT) opens a position and books nothing yet.
+_EXIT_ACTIONS = frozenset(
+  {
+    SignalActionEnum.TP1,
+    SignalActionEnum.TP2,
+    SignalActionEnum.SL,
+    SignalActionEnum.R_SL,
+    SignalActionEnum.FLAT,
+  }
+)
+
+
+def pnl_line(profit: Optional[float], *, label: str = "PnL") -> str:
+  """Render the realized-PnL line carried by every close notification.
+
+  Shared by both markets' presenters *and* by the jobs that build a close
+  message themselves (``MT5EventJob``), so a partial or full close reports the
+  money it booked in one identical format wherever the close came from — a
+  signal, an ADMIN FLAT, the broker's own SL/TP, or the reconciler.
+
+  The line is always emitted, never dropped: an unknown amount reads ``n/a`` so
+  "the broker didn't tell us" is visible as such instead of looking like a
+  break-even trade (or, worse, silently vanishing and leaving the operator to
+  guess whether the close made money). *label* lets a caller qualify what the
+  number covers — the reconciler reports a position total, and an estimate says
+  so — while keeping the format identical.
+  """
+  if profit is None:
+    return f"{label}: <b>n/a</b>\n"
+  # Signed, so a profit is unmistakable at a glance even without the icon (some
+  # Telegram clients render emoji poorly), and 2dp because account currency is
+  # what this is denominated in.
+  icon = PROFIT if profit > 0 else LOSS if profit < 0 else ""
+  suffix = f" {icon}" if icon else ""
+  return f"{label}: <b>{profit:+.2f}</b>{suffix}\n"
+
 
 class BaseMessagePresenter:
   """Market-agnostic message fragments shared by every concrete presenter."""
+
+  #: Shared realized-PnL line (see :func:`pnl_line`), exposed on the presenters
+  #: so every concrete message renders it through one implementation.
+  _pnl_line = staticmethod(pnl_line)
+
+  @staticmethod
+  def _exit_pnl_line(signal: SignalSchema, result) -> str:
+    """Render the PnL line for an ``order_filled`` that was actually a *close*.
+
+    ``order_filled`` covers the whole signal lifecycle — an entry and an exit
+    render through it alike — so the PnL line is gated on the action: an entry
+    has booked nothing yet and must not claim a 0.00 result, while every exit
+    (TP1's partial close included) reports what it made or lost.
+    """
+    if getattr(signal, "action", None) not in _EXIT_ACTIONS:
+      return ""
+    return pnl_line(result.get("profit"))
 
   @staticmethod
   def _risk_line(risk_info) -> str:
@@ -259,13 +315,21 @@ class BaseMessagePresenter:
     sl_res = result.get("sl_update") or {}
     if failsafe.get("success"):
       head = f"{SHIELD} <b>Unprotected Position — Emergency Closed</b>"
+      # Two closes happened here: the TP1 partial that *result* describes, and
+      # the emergency close of the remainder. Both booked money, so both are
+      # reported rather than netted into one ambiguous figure.
       outcome = (
         f"Closed: <b>{failsafe.get('volume')}</b> @ <b>{failsafe.get('price')}</b>\n"
+        f"{pnl_line(result.get('profit'), label='PnL (TP1 partial)')}"
+        f"{pnl_line(failsafe.get('profit'), label='PnL (emergency close)')}"
       )
     else:
       head = f"{ALARM} <b>UNPROTECTED POSITION — STILL OPEN</b>"
+      # The emergency close never filled, so only the TP1 partial booked a
+      # result; the position is still live and its PnL is still unrealized.
       outcome = (
         f"Emergency close <b>FAILED</b>: {failsafe.get('comment')}\n"
+        f"{pnl_line(result.get('profit'), label='PnL (TP1 partial)')}"
         f"<b>Manual intervention required.</b>\n"
       )
     return _box(

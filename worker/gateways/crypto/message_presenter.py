@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter
+from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter, pnl_line
 from worker.icons import (
   ADMIN,
   CONNECTED,
@@ -72,6 +72,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Quantity: <b>{fc.get('volume')}</b>\n"
       f"Order: <b>{fc.get('ref_id')}</b>\n"
       f"Source: <b>{fc.get('ref_source_id')}</b>\n"
+      f"{pnl_line(fc.get('profit'))}"
       f"{_DIVIDER}\n{footer}"
     )
 
@@ -95,6 +96,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Quantity: <b>{qty}{qty_suffix}</b>\n"
       f"Order: <b>{result.get('ticket')}</b>\n"
       f"Source: <b>{pos_ticket}</b>\n"
+      f"{CryptoMessagePresenter._exit_pnl_line(signal, result)}"
       f"{CryptoMessagePresenter._scale_lines(signal)}"
       f"{CryptoMessagePresenter._sl_line(signal, result)}"
       f"{CryptoMessagePresenter._risk_line(risk_info)}"
@@ -147,9 +149,16 @@ class CryptoMessagePresenter(BaseMessagePresenter):
     )
 
   @staticmethod
-  def position_reconciled_closed(db_pos: dict, close_price: Any, footer: str) -> str:
+  def position_reconciled_closed(
+    db_pos: dict, close_price: Any, footer: str, profit: Any = None
+  ) -> str:
     """The periodic reconciler found a DB-open position that no longer exists on
-    the exchange (a missed fill event) and synced the DB to live state."""
+    the exchange (a missed fill event) and synced the DB to live state.
+
+    *profit* is an **estimate**: the fill the position really closed at was never
+    delivered, so it is measured against the same approximate close price shown
+    above. Labelled as such so it is read as an indication, not a booked amount.
+    """
     return _box(
       f"{SYNC} <b>Position Reconciled — Closed on Exchange</b>\n\n"
       f"A fill event was <b>missed</b>; the DB was synced from live exchange state.\n"
@@ -157,6 +166,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Strategy: <b>{db_pos.get('strategy')}</b>\n"
       f"Approx Close: <b>{close_price}</b>\n"
       f"Source: <b>{db_pos.get('ref_source_id')}</b>\n"
+      f"{pnl_line(profit, label='PnL (est.)')}"
       f"{_DIVIDER}\n{footer}"
     )
 
@@ -186,7 +196,10 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Symbol: <b>{event.symbol}</b>\n"
       f"Close Price: <b>{event.close_price}</b>\n"
       f"Quantity: <b>{event.close_volume}</b>\n"
-      f"Realized PnL: <b>{event.realized_pnl}</b>\n"
+      # Rendered through the shared line (rather than the raw stream value it
+      # used to print) so an exchange-side close reads identically to every
+      # other close notification — same label, sign and icon.
+      f"{pnl_line(event.realized_pnl)}"
       f"Order: <b>{event.order_id}</b>\n"
       f"{_DIVIDER}\n{footer}"
     )
@@ -201,5 +214,6 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"Quantity: <b>{result.get('volume')}</b>\n"
       f"Order: <b>{result.get('ticket')}</b>\n"
       f"Source: <b>{db_pos['ref_source_id']}</b>\n"
+      f"{pnl_line(result.get('profit'))}"
       f"{_DIVIDER}\n{footer}"
     )

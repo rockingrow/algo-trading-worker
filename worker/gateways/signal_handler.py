@@ -242,6 +242,7 @@ class SignalHandler:
     forced_closed: list[dict] = []
     cleanup_price: Optional[float] = None
     cleanup_retcode: Optional[int] = None
+    cleanup_profit: Optional[float] = None
     stale = self.strategy.get_open_positions(symbol, strategy=strategy)
     if stale:
       logger.warning(
@@ -263,6 +264,11 @@ class SignalHandler:
         )
       cleanup_price = cleanup.get("price")
       cleanup_retcode = cleanup.get("retcode")
+      # What flattening the stale position booked, so its "Force Closed"
+      # notification reports a result like any other close. Stays None when the
+      # broker held nothing (nothing was closed, so nothing was booked) — the
+      # same condition that leaves price/retcode unset below.
+      cleanup_profit = cleanup.get("profit")
 
     # Reconcile DB records for any active (OPENED/TP1) row on this (strategy,
     # symbol) — independently of whether the broker still had a live position.
@@ -293,6 +299,7 @@ class SignalHandler:
             "price": cleanup_price,
             "volume": pos.get("volume"),
             "retcode": cleanup_retcode,
+            "profit": cleanup_profit,
           }
         )
       logger.info(

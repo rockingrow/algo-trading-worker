@@ -32,7 +32,7 @@ from worker.gateways.forex.stop_validator import StopValidator
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeResult, total_profit
 
 logger = get_logger("worker.gateways.forex.executor")
 
@@ -339,11 +339,13 @@ class ForexExecutor:
 
     success_count = 0
     last_result: Optional[Any] = None
+    closed_results: List[Any] = []
     for pos in positions:
       result = self._gateway.close_position(pos, comment=f"Full Close {reason}")
       if result.get("success"):
         success_count += 1
         last_result = result
+        closed_results.append(result)
       else:
         logger.error(
           f"[close_all] Failed to close ticket {pos.ticket}: {result.get('comment')}"
@@ -357,6 +359,10 @@ class ForexExecutor:
         price=last_result.get("price"),
         volume=last_result.get("volume"),
         comment=f"Closed {success_count} position(s) [{reason}]",
+        # Unlike price/volume — which describe the last fill — the PnL is summed
+        # across every position closed here, because the notification reports one
+        # close event and the operator's question is what the whole exit booked.
+        profit=total_profit(closed_results),
       )
     return TradeResult.fail(f"Failed to close positions [{reason}]")
 

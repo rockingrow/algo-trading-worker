@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter
+from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter, pnl_line
 from worker.icons import (
   ADMIN,
   CONNECTED,
@@ -73,6 +73,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Volume: <b>{format_volume(fc.get('volume'), auto_calculated=False)}</b>\n"
       f"Ticket: <b>{fc.get('ref_id')}</b>\n"
       f"Source Ticket: <b>{fc.get('ref_source_id')}</b>\n"
+      f"{pnl_line(fc.get('profit'))}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )
@@ -102,6 +103,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Volume: <b>{volume}{qty_suffix}</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
       f"Source Ticket: <b>{pos_ticket}</b>\n"
+      f"{ForexMessagePresenter._exit_pnl_line(signal, result)}"
       f"{ForexMessagePresenter._stops_lines(signal, result)}"
       f"{ForexMessagePresenter._scale_lines(signal)}"
       f"{ForexMessagePresenter._risk_line(risk_info)}"
@@ -171,10 +173,18 @@ class ForexMessagePresenter(BaseMessagePresenter):
     )
 
   @staticmethod
-  def position_reconciled_closed(db_pos: dict, close_price: Any, footer: str) -> str:
+  def position_reconciled_closed(
+    db_pos: dict, close_price: Any, footer: str, profit: Any = None
+  ) -> str:
     """The periodic reconciler found a DB-open position that no longer exists on
     the platform (a close no terminal event reported — e.g. a TP1 partial that
-    closed the whole position) and synced the DB to live state."""
+    closed the whole position) and synced the DB to live state.
+
+    *profit* is the position's **total** realized PnL, read from the platform's
+    deal history rather than from a close the worker witnessed — so it spans the
+    position's whole life (entry costs and any earlier partial included), which
+    the label states outright.
+    """
     return _box(
       f"{SYNC} <b>Position Reconciled — Closed on Broker</b>\n\n"
       f"The position is <b>no longer open</b> on the platform; the DB was synced "
@@ -184,6 +194,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Volume: <b>{db_pos.get('volume')} lot</b>\n"
       f"Approx Close: <b>{close_price}</b>\n"
       f"Source Ticket: <b>{db_pos.get('ref_source_id')}</b>\n"
+      f"{pnl_line(profit, label='PnL (position total)')}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )
@@ -198,6 +209,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Volume: <b>{result.get('volume')} lot</b>\n"
       f"Ticket: <b>{result.get('ticket')}</b>\n"
       f"Source Ticket: <b>{db_pos['ref_source_id']}</b>\n"
+      f"{pnl_line(result.get('profit'))}"
       f"{_DIVIDER}\n"
       f"{footer}"
     )

@@ -13,6 +13,7 @@ from helpers import (
 from worker.gateways.forex.base import Tick
 from worker.gateways.forex.executor import ForexExecutor
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.schemas.trade_result import TradeResult
 
 
 def _executor(cfg):
@@ -344,3 +345,80 @@ def test_set_strategy_magic_map_copies_input(config):
   ex.set_strategy_magic_map(source)
   source["strat-9"] = 0
   assert ex._magic_for("strat-9") == 42
+
+
+# ── Realized PnL of a close ─────────────────────────────────────────────────── #
+
+
+def test_close_all_sums_the_pnl_of_every_ticket_it_closed(config):
+  # A symbol can be held as several tickets, and FLAT/TP2 closes them all in one
+  # logical exit. The notification reports one figure, so it must cover them all
+  # rather than the last fill's alone (which is what price/volume report).
+  gateway = FakePlatformGateway(
+    positions=[
+      make_platform_position(ticket=201, magic=12345, volume=0.5),
+      make_platform_position(ticket=202, magic=12345, volume=0.3),
+    ],
+    close_results=[
+      TradeResult.ok(retcode=10009, ticket="1", price=1999.5, volume=0.5, profit=11.5),
+      TradeResult.ok(retcode=10009, ticket="2", price=1999.5, volume=0.3, profit=-4.25),
+    ],
+  )
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+
+  res = ex.close_all_positions("XAUUSD", reason="TP2", strategy="strat-1")
+
+  assert res["profit"] == pytest.approx(7.25)
+
+
+def test_close_all_counts_only_the_tickets_that_actually_closed(config):
+  # A failed close booked nothing, so it must not drag the reported figure.
+  gateway = FakePlatformGateway(
+    positions=[
+      make_platform_position(ticket=201, magic=12345, volume=0.5),
+      make_platform_position(ticket=202, magic=12345, volume=0.3),
+    ],
+    close_results=[
+      TradeResult.ok(retcode=10009, ticket="1", price=1999.5, volume=0.5, profit=11.5),
+      TradeResult.fail("Close Failed", profit=None),
+    ],
+  )
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+
+  assert ex.close_all_positions("XAUUSD", reason="TP2", strategy="strat-1")[
+    "profit"
+  ] == pytest.approx(11.5)
+
+
+def test_close_all_pnl_is_unknown_when_no_close_reported_one(config):
+  # A gateway that cannot read the amount leaves it unknown rather than claiming
+  # the exit broke even.
+  gateway = FakePlatformGateway(
+    positions=[make_platform_position(ticket=201, magic=12345, volume=0.5)]
+  )
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+
+  assert (
+    ex.close_all_positions("XAUUSD", reason="SL", strategy="strat-1")["profit"] is None
+  )
+
+
+def test_partial_close_passes_the_gateway_pnl_through(config):
+  gateway = FakePlatformGateway(
+    positions=[make_platform_position(ticket=201, magic=12345, volume=0.5)],
+    close_results=[
+      TradeResult.ok(retcode=10009, ticket="1", price=1999.5, volume=0.15, profit=3.4)
+    ],
+  )
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+
+  res = ex.partial_close_position("XAUUSD", close_volume=0.15, strategy="strat-1")
+  assert res["profit"] == pytest.approx(3.4)

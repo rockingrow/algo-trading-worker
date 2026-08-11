@@ -33,11 +33,12 @@ from worker.gateways.crypto.base import (
   WORKER_ORDER_PREFIX,
   BaseExchangeGateway,
   ExchangePosition,
+  linear_realized_pnl,
 )
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeResult, total_profit
 
 logger = get_logger("worker.gateways.crypto.executor")
 
@@ -425,6 +426,7 @@ class CryptoExecutor:
     )
     if result.get("success"):
       result["source_ticket"] = str(pos.ticket)
+      self._attach_realized_pnl(result, pos)
     return result
 
   def update_position_sl(
@@ -512,6 +514,7 @@ class CryptoExecutor:
     self._gateway.cancel_all_orders(resolved)
     success_count = 0
     last_result: Optional[Any] = None
+    closed_results: List[Any] = []
     for pos in positions:
       result = self._gateway.place_market_order(
         resolved,
@@ -523,6 +526,8 @@ class CryptoExecutor:
       if result.get("success"):
         success_count += 1
         last_result = result
+        self._attach_realized_pnl(result, pos)
+        closed_results.append(result)
       else:
         logger.error(
           "[close_all] Failed to close %s: %s", resolved, result.get("comment")
@@ -535,6 +540,9 @@ class CryptoExecutor:
         price=last_result.get("price"),
         volume=last_result.get("volume"),
         comment=f"Closed {success_count} position(s) [{reason}]",
+        # Summed, not last-write-wins like price/volume: the notification reports
+        # one exit, so it needs what the whole exit booked.
+        profit=total_profit(closed_results),
       )
     return TradeResult.fail(f"Failed to close [{reason}]")
 
@@ -549,7 +557,34 @@ class CryptoExecutor:
     )
     if result.get("success"):
       result.setdefault("comment", f"Closed [{reason}]")
+      self._attach_realized_pnl(result, pos)
     return result
+
+  # ── Realized PnL ──────────────────────────────────────────────────────── #
+
+  @staticmethod
+  def _attach_realized_pnl(result: TradeResult, pos: Any) -> None:
+    """Record on *result* what closing *pos* booked, so the notification can
+    report it.
+
+    The exchange answers a close with the order's fill, not its money: Binance's
+    order response carries no ``realizedPnl``, and the user-data stream that does
+    carry one deliberately skips the worker's own reduce-only fills (they would
+    double-report the close the signal flow already handles). The figure is
+    therefore derived from the position's average entry against the fill —
+    :func:`linear_realized_pnl` documents why that equals what the exchange
+    itself would report.
+
+    Leaves ``profit`` at ``None`` when the fill price is unusable (some venues
+    answer a filled MARKET order with a 0 price), so the notification says the
+    amount is unknown rather than claiming a break-even close.
+    """
+    result["profit"] = linear_realized_pnl(
+      side=pos.side,
+      entry_price=getattr(pos, "price_open", None),
+      close_price=result.get("price"),
+      volume=result.get("volume"),
+    )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #
 

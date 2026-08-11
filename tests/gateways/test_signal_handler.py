@@ -11,13 +11,19 @@ from worker.schemas.signal_schema import SignalActionEnum
 
 class FakeStrategy(BaseMarketStrategy):
   def __init__(
-    self, open_positions=None, entry_ok=True, cleanup_ok=True, multi_strategy=False
+    self,
+    open_positions=None,
+    entry_ok=True,
+    cleanup_ok=True,
+    multi_strategy=False,
+    cleanup_profit=None,
   ):
     self.calls = []
     self._open = open_positions if open_positions is not None else []
     self._entry_ok = entry_ok
     self._cleanup_ok = cleanup_ok
     self._multi_strategy = multi_strategy
+    self._cleanup_profit = cleanup_profit
 
   @property
   def allows_multi_strategy_per_symbol(self):
@@ -47,7 +53,12 @@ class FakeStrategy(BaseMarketStrategy):
 
   def close_all_positions(self, symbol, reason="CLOSE", strategy=None):
     self.calls.append(f"close_all:{reason}:{strategy}")
-    return {"success": self._cleanup_ok, "retcode": 0, "price": 1999.0}
+    return {
+      "success": self._cleanup_ok,
+      "retcode": 0,
+      "price": 1999.0,
+      "profit": self._cleanup_profit,
+    }
 
 
 class FakeStore:
@@ -299,3 +310,25 @@ def test_get_db_position_heals_duplicate_active_rows():
     for u in store.status_updates
     if u["ref_source_id"] in {"11", "12"}
   )
+
+
+def test_force_closed_entry_carries_what_the_cleanup_booked():
+  # Flattening a stale position is a close like any other, and its "Force Closed"
+  # notification reads the amount from here.
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=9)], cleanup_profit=-4.5)
+  store = FakeStore(positions=[{"ref_source_id": "9", "ref_id": "9", "volume": 1.0}])
+
+  res = SignalHandler(strat, store).handle(make_signal(SignalActionEnum.LONG))
+
+  assert res["forced_closed"][0]["profit"] == -4.5
+
+
+def test_orphaned_db_row_reports_no_pnl():
+  # Nothing was live on the broker, so nothing was closed and nothing was booked —
+  # the row is only being cleared. "n/a" is the honest reading, not 0.00.
+  strat = FakeStrategy(open_positions=[], cleanup_profit=99.0)
+  store = FakeStore(positions=[{"ref_source_id": "9", "ref_id": "9", "volume": 1.0}])
+
+  res = SignalHandler(strat, store).handle(make_signal(SignalActionEnum.LONG))
+
+  assert res["forced_closed"][0]["profit"] is None

@@ -2,9 +2,15 @@
 
 from dataclasses import replace
 
+import pytest
 from helpers import make_signal
 
-from worker.gateways.crypto.base import SIDE_LONG, ExchangePosition, SymbolFilter
+from worker.gateways.crypto.base import (
+  SIDE_LONG,
+  SIDE_SHORT,
+  ExchangePosition,
+  SymbolFilter,
+)
 from worker.gateways.crypto.executor import CryptoExecutor
 from worker.schemas.signal_schema import SignalActionEnum
 
@@ -428,3 +434,74 @@ def test_close_all_no_positions(config):
 
 def test_owned_magics_empty(config):
   assert CryptoExecutor(FakeGateway(), config).owned_magics() == set()
+
+
+# ── Realized PnL of a close ─────────────────────────────────────────────────── #
+#
+# The order response carries no realizedPnl and the user-data stream skips the
+# worker's own reduce-only fills, so a close derives its result from the
+# position's average entry against the fill — the same product the exchange uses
+# to compute the ``rp`` it reports for exchange-side closes.
+
+
+def _short_pos(qty=0.02, entry=30000.0):
+  return ExchangePosition(
+    symbol="BTCUSDT", side=SIDE_SHORT, quantity=qty, entry_price=entry, ticket=7
+  )
+
+
+def test_partial_close_reports_what_it_booked(config):
+  gw = FakeGateway(positions=[_long_pos(qty=0.02, entry=30000.0)], mark_price=31000.0)
+  res = CryptoExecutor(gw, config).partial_close_position(
+    "BTCUSD", close_volume=0.006, position_ticket=7
+  )
+  # 0.006 BTC bought at 30,000 and sold at 31,000.
+  assert res["profit"] == pytest.approx(6.0)
+
+
+def test_full_close_reports_what_it_booked(config):
+  gw = FakeGateway(positions=[_long_pos(qty=0.02, entry=30000.0)], mark_price=32000.0)
+  res = CryptoExecutor(gw, config).close_all_positions("BTCUSD", reason="TP2")
+  assert res["profit"] == pytest.approx(40.0)
+
+
+def test_a_short_close_inverts_the_sign(config):
+  # A short that closes *below* its entry made money; getting this sign wrong
+  # would report a profitable trade as a loss.
+  gw = FakeGateway(positions=[_short_pos(qty=0.02, entry=30000.0)], mark_price=29000.0)
+  res = CryptoExecutor(gw, config).close_all_positions("BTCUSD", reason="TP2")
+  assert res["profit"] == pytest.approx(20.0)
+
+
+def test_a_long_closed_below_entry_reports_a_loss(config):
+  gw = FakeGateway(positions=[_long_pos(qty=0.02, entry=30000.0)], mark_price=29500.0)
+  res = CryptoExecutor(gw, config).close_all_positions("BTCUSD", reason="SL")
+  assert res["profit"] == pytest.approx(-10.0)
+
+
+def test_close_all_sums_the_pnl_of_every_position_it_closed(config):
+  # One logical exit, several broker closes: the notification reports one figure,
+  # so it must cover the whole exit rather than just the last fill.
+  gw = FakeGateway(
+    positions=[_long_pos(qty=0.02, entry=30000.0), _long_pos(qty=0.01, entry=31000.0)],
+    mark_price=32000.0,
+  )
+  res = CryptoExecutor(gw, config).close_all_positions("BTCUSD", reason="FLAT")
+  assert res["profit"] == pytest.approx(40.0 + 10.0)
+
+
+def test_close_single_position_reports_what_it_booked(config):
+  # The ADMIN FLAT path.
+  gw = FakeGateway(mark_price=31000.0)
+  res = CryptoExecutor(gw, config).close_single_position(
+    _long_pos(qty=0.02, entry=30000.0), reason="FLAT"
+  )
+  assert res["profit"] == pytest.approx(20.0)
+
+
+def test_pnl_is_unknown_when_the_venue_reports_no_fill_price(config):
+  # Binance testnet (and occasionally live) answers a filled MARKET order with a
+  # 0 price; PnL computed against that would be a fabrication.
+  gw = FakeGateway(positions=[_long_pos(qty=0.02, entry=30000.0)], mark_price=0.0)
+  res = CryptoExecutor(gw, config).close_all_positions("BTCUSD", reason="SL")
+  assert res["profit"] is None
