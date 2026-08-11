@@ -121,7 +121,20 @@ class MT5Gateway(BasePlatformGateway):
     t = self._mt5.symbol_info_tick(symbol)
     if not t:
       return None
-    return Tick(bid=t.bid, ask=t.ask)
+    bid, ask = t.bid, t.ask
+    # ``symbol_info_tick`` returns a namedtuple, which is truthy even when every
+    # field is zero — and that is exactly what the terminal reports for a symbol
+    # it holds no quote for (just added to Market Watch, or outside its trading
+    # session). Such a tick must not reach the pricing/stop math: an entry priced
+    # off 0.0 turns SL/TP into nonsense the broker rejects with retcode 10016
+    # (TRADE_RETCODE_INVALID_STOPS). Report "no data" so callers fail fast.
+    if bid <= 0 or ask <= 0:
+      logger.warning(
+        f"[get_tick] {symbol} has no live quote (bid={bid} ask={ask}) — "
+        "symbol not yet synced in Market Watch or market closed."
+      )
+      return None
+    return Tick(bid=bid, ask=ask)
 
   # ── Positions ─────────────────────────────────────────────────────────── #
 
