@@ -160,6 +160,15 @@ class ForexExecutor:
     if tick is None:
       return TradeResult.fail("No tick / market data unavailable")
     price = tick.ask if side == SIDE_LONG else tick.bid
+    # A non-positive quote is "no market data", whatever the gateway says: pricing
+    # an entry off zero would size the lot against a meaningless SL distance and
+    # push the stops to the wrong side of the market (broker retcode 10016).
+    if price <= 0:
+      logger.error(
+        f"[open_position] Unusable {symbol} quote (bid={tick.bid} ask={tick.ask}) — "
+        "refusing to price an entry off zero."
+      )
+      return TradeResult.fail("No tick / market data unavailable")
 
     # Stops are validated BEFORE the lot is sized. The broker's minimum stop
     # distance can push the SL further from the entry than the signal asked for,

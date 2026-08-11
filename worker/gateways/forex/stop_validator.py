@@ -24,20 +24,47 @@ logger = get_logger("worker.gateways.forex.stop_validator")
 class StopValidator:
   """Adjusts SL/TP by one point when they violate the broker stop distance."""
 
+  @staticmethod
+  def _resolve_stop(
+    candidate: float, original: float, label: str, anchor: str
+  ) -> float:
+    """Take the adjusted stop, unless it isn't a positive price.
+
+    Every adjustment is anchored on the live quote, so a zero or negative
+    candidate means the anchor itself was garbage (an unusable tick, or a
+    ``stops_level`` wider than the price). Sending such a level guarantees a
+    rejection *and* hides the real cause, so fall back to the signal's own level
+    and let the broker judge it on its own terms.
+    """
+    if candidate <= 0:
+      logger.error(
+        f"[validate_stops] {label} adjustment ({anchor}) computed {candidate}, "
+        f"which is not a valid price — keeping the signal's {original}."
+      )
+      return original
+    logger.warning(
+      f"[validate_stops] {label} too close ({anchor}). Adjusted → {candidate}"
+    )
+    return candidate
+
   def _validate_sell_stops(self, sl, tp, tick, stop_dist, point, digits) -> Tuple:
     if sl is not None:
       min_sl = tick.ask + stop_dist
       if sl <= min_sl:
-        sl = round(min_sl + point, digits)
-        logger.warning(
-          f"[validate_stops] SHORT SL too close (ask={tick.ask} stop_dist={stop_dist}). Adjusted → {sl}"
+        sl = self._resolve_stop(
+          round(min_sl + point, digits),
+          sl,
+          "SHORT SL",
+          f"ask={tick.ask} stop_dist={stop_dist}",
         )
     if tp is not None:
       max_tp = tick.bid - stop_dist
       if tp >= max_tp:
-        tp = round(max_tp - point, digits)
-        logger.warning(
-          f"[validate_stops] SHORT TP too close (bid={tick.bid} stop_dist={stop_dist}). Adjusted → {tp}"
+        tp = self._resolve_stop(
+          round(max_tp - point, digits),
+          tp,
+          "SHORT TP",
+          f"bid={tick.bid} stop_dist={stop_dist}",
         )
     return sl, tp
 
@@ -45,16 +72,20 @@ class StopValidator:
     if sl is not None:
       max_sl = tick.bid - stop_dist
       if sl >= max_sl:
-        sl = round(max_sl - point, digits)
-        logger.warning(
-          f"[validate_stops] LONG SL too close (bid={tick.bid} stop_dist={stop_dist}). Adjusted → {sl}"
+        sl = self._resolve_stop(
+          round(max_sl - point, digits),
+          sl,
+          "LONG SL",
+          f"bid={tick.bid} stop_dist={stop_dist}",
         )
     if tp is not None:
       min_tp = tick.ask + stop_dist
       if tp <= min_tp:
-        tp = round(min_tp + point, digits)
-        logger.warning(
-          f"[validate_stops] LONG TP too close (ask={tick.ask} stop_dist={stop_dist}). Adjusted → {tp}"
+        tp = self._resolve_stop(
+          round(min_tp + point, digits),
+          tp,
+          "LONG TP",
+          f"ask={tick.ask} stop_dist={stop_dist}",
         )
     return sl, tp
 
@@ -70,8 +101,20 @@ class StopValidator:
 
     For SHORT: SL must be >= ask + stop_dist; TP must be <= bid - stop_dist.
     For LONG:  SL must be <= bid - stop_dist; TP must be >= ask + stop_dist.
+
+    An unusable quote (bid/ask of zero, as the terminal reports for a symbol it
+    has no price for) leaves both levels untouched: adjusting against a zero
+    anchor would push every stop to the wrong side of the market.
     """
     if not spec:
+      return sl, tp
+
+    if tick is None or tick.bid <= 0 or tick.ask <= 0:
+      logger.error(
+        "[validate_stops] Unusable tick "
+        f"({'None' if tick is None else f'bid={tick.bid} ask={tick.ask}'}) — "
+        "leaving SL/TP untouched."
+      )
       return sl, tp
 
     stop_dist = spec.stops_level * spec.point

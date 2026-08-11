@@ -187,6 +187,48 @@ def test_get_entry_price_is_none_for_a_non_entry_action(config):
   assert ex.get_entry_price(make_signal(SignalActionEnum.TP1)) is None
 
 
+# ── Entry pricing guard ────────────────────────────────────────────────────── #
+
+
+def test_open_position_refuses_a_zeroed_quote(config):
+  """Regression (XPTUSD, retcode 10016): a gateway that hands back a bid=ask=0.0
+  tick must not get an order out of the executor.
+
+  Priced off zero, the SL distance became 172,686 points (flooring the lot to the
+  minimum) and the stop validator turned SL into -0.01, so the broker rejected
+  the entry with 'Invalid stops'."""
+  gw = FakePlatformGateway(tick=Tick(bid=0.0, ask=0.0))
+  ex = ForexExecutor(gateway=gw, config=config, strategy_magic_map={"strat-1": 12345})
+
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=1726.86528))
+
+  assert res["success"] is False
+  assert gw.placed == []
+
+
+def test_open_position_refuses_a_half_populated_quote(config):
+  """A SHORT prices off the bid, so a zero bid is just as unusable."""
+  gw = FakePlatformGateway(tick=Tick(bid=0.0, ask=1732.83))
+  ex = ForexExecutor(gateway=gw, config=config, strategy_magic_map={"strat-1": 12345})
+
+  res = ex.open_position(make_signal(SignalActionEnum.SHORT, sl=1745.38981))
+
+  assert res["success"] is False
+  assert gw.placed == []
+
+
+def test_open_position_prices_a_healthy_quote(config):
+  """The guard doesn't get in the way of a normal entry."""
+  gw = FakePlatformGateway(tick=Tick(bid=1999.5, ask=2000.0))
+  ex = ForexExecutor(gateway=gw, config=config, strategy_magic_map={"strat-1": 12345})
+
+  res = ex.open_position(make_signal(SignalActionEnum.LONG, sl=1990.0))
+
+  assert res["success"] is True
+  assert gw.placed[0]["price"] == 2000.0  # LONG fills at the ask
+  assert gw.placed[0]["sl"] == 1990.0
+
+
 # ── Multi-strategy-per-symbol isolation (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL) ── #
 #
 # The toggle relies entirely on native MT5 magic-number isolation inside
