@@ -338,6 +338,12 @@ class TelegramSettings(BaseSettings):
 
   enabled: bool = _req("TELEGRAM_ENABLED", "telegram_enabled")
   bot_token: SecretStr = _req("TELEGRAM_BOT_TOKEN", "telegram_bot_token")
+  # Every chat id in this group — chat_id, chat_channel_id and log_chat_id
+  # below — is resolved through ``notification_service.parse_chat_targets``, so
+  # each accepts a comma-separated list of chats, and any entry may address a
+  # topic inside a supergroup that has Topics enabled by suffixing the topic
+  # id: ``-1002173777783_924584`` sends with ``message_thread_id`` so the
+  # message lands in that topic instead of General.
   chat_id: str = _req(
     "TELEGRAM_CHAT_ID", "telegram_chat_id"
   )  # management: NATS events, service start/stop, MT5 health

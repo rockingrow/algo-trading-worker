@@ -1,9 +1,10 @@
 import logging
 import os
 import queue
+import re
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable, Iterable, NamedTuple
 
 import requests
 from pydantic import SecretStr
@@ -19,6 +20,77 @@ def _box(text: str) -> str:
   return f"<pre>{text.strip()}</pre>"
 
 
+# ── Chat targets ───────────────────────────────────────────────────────────
+
+# A chat id carrying a forum topic, e.g. "-1002173777783_924584". Only a
+# *numeric* chat id may be suffixed this way: a channel username can itself
+# contain underscores (``@my_group_2``), so splitting those would invent a
+# topic out of part of the name.
+_CHAT_TOPIC_RE = re.compile(r"(?P<chat>-?\d+)_(?P<topic>\d+)")
+
+
+class ChatTarget(NamedTuple):
+  """One Telegram destination: a chat, optionally a topic inside it.
+
+  ``message_thread_id`` is the Bot API's name for a forum topic — "unique
+  identifier for the target message thread (topic) of a forum; for forum
+  supergroups and private chats of bots with forum topic mode enabled only".
+  Sending without it lands the message in the group's *General* topic, which is
+  why a group with topics enabled needs the id carried all the way down to the
+  payload."""
+
+  chat_id: str
+  message_thread_id: int | None = None
+
+  @property
+  def label(self) -> str:
+    """Identify this target in a log line."""
+    if self.message_thread_id is None:
+      return self.chat_id
+    return f"{self.chat_id} (topic {self.message_thread_id})"
+
+
+def parse_chat_targets(raw: str | Iterable[Any] | None) -> list[ChatTarget]:
+  """Parse a chat-id setting into the chats (and topics) to deliver to.
+
+  Accepts either a raw string or an already-split list, because the settings
+  reach here both ways: ``TELEGRAM_CHAT_ID`` / ``TELEGRAM_LOG_CHAT_ID`` stay
+  plain strings while ``TELEGRAM_CHAT_CHANNEL_ID`` is split into a list by
+  ``TelegramSettings.parse_channel_ids``. Either way each entry is
+  comma-separated, so one setting can fan out to several groups:
+  ``"-1001111111111,-1002173777783_924584,@public_channel"``.
+
+  An entry of the form ``<chat id>_<topic id>`` addresses a *topic* inside a
+  supergroup that has the Topics feature switched on — the shape Telegram
+  itself shows in a topic link (``t.me/c/2173777783/924584``). It is split back
+  into the chat and its ``message_thread_id``; everything else is passed
+  through untouched, so plain ids (``-1001111111111``), user ids and
+  ``@username`` handles keep working exactly as before.
+
+  Blank entries are skipped and duplicates collapse, so a stray comma or a chat
+  listed twice costs nothing (and never double-posts).
+  """
+  if raw is None:
+    return []
+  specs: Iterable[Any] = [raw] if isinstance(raw, str) else raw
+
+  targets: list[ChatTarget] = []
+  for spec in specs:
+    if spec is None:
+      continue  # e.g. a missing telegram_chat_id fallback in the settings dict
+    for entry in str(spec).split(","):
+      entry = entry.strip()
+      if not entry:
+        continue
+      match = _CHAT_TOPIC_RE.fullmatch(entry)
+      target = (
+        ChatTarget(match["chat"], int(match["topic"])) if match else ChatTarget(entry)
+      )
+      if target not in targets:
+        targets.append(target)
+  return targets
+
+
 class Notification:
   """Abstract base class for notification senders.
 
@@ -32,43 +104,64 @@ class Notification:
 
 
 class TelegramNotification(Notification):
-  """Sends HTML-formatted messages to one or more Telegram chat IDs via the Bot API."""
+  """Sends HTML-formatted messages to one or more Telegram chats via the Bot API.
+
+  ``chat_ids`` is resolved through :func:`parse_chat_targets`, so every chat-id
+  setting may name several chats at once and may address a single topic inside
+  a supergroup that has the Topics feature enabled
+  (``-1002173777783_924584``)."""
 
   def __init__(
     self,
-    chat_ids: list[str] | None = None,
+    chat_ids: str | list[str] | None = None,
     bot_token: SecretStr | None = None,
   ):
     self.enabled = settings.telegram.enabled
     self.bot_token = bot_token if bot_token is not None else settings.telegram.bot_token
-    self.chat_ids = chat_ids if chat_ids is not None else [settings.telegram.chat_id]
+    self.targets = parse_chat_targets(
+      chat_ids if chat_ids is not None else settings.telegram.chat_id
+    )
 
   def send_message(self, message_text: str) -> bool:
+    """Deliver *message_text* (HTML) to every configured chat/topic.
+
+    Returns True only when all of them took the message — never raises, since
+    notifications are best-effort."""
     if not self.enabled:
       logger.debug("Telegram notifications are disabled in settings.")
       return True
 
-    if not self.bot_token or not self.chat_ids:
-      logger.warning(
-        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set for notifications."
-      )
+    if not self.bot_token:
+      logger.warning("TELEGRAM_BOT_TOKEN must be set for notifications.")
+      return False
+
+    if not self.targets:
+      logger.warning("No usable Telegram chat id configured — nothing to notify.")
       return False
 
     url = f"https://api.telegram.org/bot{self.bot_token.get_secret_value()}/sendMessage"
     success = True
-    for chat_id in self.chat_ids:
-      payload = {
-        "chat_id": chat_id,
+    # Each chat is sent on its own so one group the bot was kicked from (or one
+    # deleted topic) never stops the others from being notified.
+    for target in self.targets:
+      payload: dict[str, Any] = {
+        "chat_id": target.chat_id,
         "text": message_text,
         "parse_mode": "HTML",
       }
+      # Only for topic targets: the Bot API answers "400 Bad Request: message
+      # thread not found" when a group has no such thread.
+      if target.message_thread_id is not None:
+        payload["message_thread_id"] = target.message_thread_id
       try:
         response = requests.post(url, json=payload, timeout=5)
         if response.status_code != 200:
-          logger.error(f"Failed to send Telegram message to {chat_id}: {response.text}")
+          logger.error(
+            f"Failed to send Telegram message to {target.label}: {response.text}"
+          )
           success = False
       except Exception as e:
-        logger.exception(f"Exception sending Telegram message to {chat_id}: {e}")
+        logger.exception(f"Exception sending Telegram message to {target.label}: {e}")
         success = False
     return success
 
@@ -126,7 +219,9 @@ class TelegramLogNotification(TelegramNotification):
   """Telegram channel dedicated to forwarded error logs.
 
   Targets the private log chat/bot when ``TELEGRAM_LOG_*`` is configured, and
-  otherwise falls back to the shared management chat/bot."""
+  otherwise falls back to the shared management chat/bot. The list/topic syntax
+  of :func:`parse_chat_targets` applies here too — to ``TELEGRAM_LOG_CHAT_ID``
+  and to the ``TELEGRAM_CHAT_ID`` it falls back to."""
 
   def __init__(self) -> None:
     log_token = settings.telegram.log_bot_token
