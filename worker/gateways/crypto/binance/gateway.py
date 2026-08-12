@@ -84,6 +84,7 @@ class _API_Endpoints(Enum):
   ALGO_OPEN_ORDERS = ("DELETE", "/fapi/v1/algoOpenOrders")
   ALL_OPEN_ORDERS = ("DELETE", "/fapi/v1/allOpenOrders")
   ACCOUNT = ("GET", "/fapi/v2/account")
+  USER_TRADES = ("GET", "/fapi/v1/userTrades")
   LEVERAGE_BRACKET = ("GET", "/fapi/v1/leverageBracket")
   LEVERAGE = ("POST", "/fapi/v1/leverage")
   POSITION_MODE = ("POST", "/fapi/v1/positionSide/dual")
@@ -623,6 +624,47 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     return cap
 
   # ── Account ───────────────────────────────────────────────────────────── #
+
+  def get_order_realized_pnl(self, symbol: str, order_id: Any) -> Optional[float]:
+    """Sum the ``realizedPnl`` Binance booked for *order_id*'s fills.
+
+    The order response itself carries no PnL, so this reads the account's trade
+    record for that order — the same figure the user-data stream reports as
+    ``rp`` for an exchange-side close, and like it exclusive of commission and
+    funding, so both crypto close paths stay consistent.
+
+    Only reached when the close could not be priced locally, which is the case
+    this exists for: Binance can answer a filled MARKET order with
+    ``avgPrice=0`` *and* ``cumQuote=0``, leaving no fill price to measure the
+    position's entry against. One extra signed round-trip, paid only then.
+
+    Returns ``None`` when the lookup fails or the order has no trades yet — a
+    close still reports "unknown" rather than a fabricated zero.
+    """
+    if not order_id:
+      return None
+    try:
+      rows = self._send(
+        _API_Endpoints.USER_TRADES,
+        {"symbol": symbol, "order_id": order_id},
+        signed=True,
+      )
+    except Exception as exc:
+      logger.warning(
+        "[Binance] userTrades lookup failed for order %s on %s: %s",
+        order_id,
+        symbol,
+        exc,
+      )
+      return None
+    if not rows:
+      logger.warning(
+        "[Binance] No trades recorded yet for order %s on %s — PnL unknown.",
+        order_id,
+        symbol,
+      )
+      return None
+    return sum(float(row.get("realizedPnl", 0) or 0) for row in rows)
 
   def get_account(self) -> Optional[Dict[str, Any]]:
     try:

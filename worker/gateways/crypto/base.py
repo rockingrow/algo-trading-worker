@@ -210,6 +210,24 @@ class BaseExchangeGateway(ABC):
     Default no-op for exchanges where leverage is not API-configurable."""
     return None
 
+  # ── Realized PnL ──────────────────────────────────────────────────────── #
+
+  def get_order_realized_pnl(  # pragma: no cover - default no-op
+    self, symbol: str, order_id: Any
+  ) -> Optional[float]:
+    """Realized PnL the exchange booked for one order, or ``None`` if unavailable.
+
+    The fallback for when a close cannot be priced locally: a venue that answers
+    a filled MARKET order without a usable fill price leaves
+    :func:`linear_realized_pnl` nothing to work from, and the exchange's own
+    per-trade record is then the only source. Costs a round-trip, so callers use
+    it only after the local computation has failed.
+
+    Default ``None`` for exchanges with no such lookup — the close then reports
+    its PnL as unknown, which beats inventing one.
+    """
+    return None
+
   # ── Account ───────────────────────────────────────────────────────────── #
 
   @abstractmethod
