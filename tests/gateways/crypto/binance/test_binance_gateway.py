@@ -31,6 +31,44 @@ def _exchange_info():
   }
 
 
+# Canned body per endpoint. A table rather than an if-chain so adding an
+# endpoint is one entry; an unlisted path answers with an empty body.
+_CANNED_BODIES = {
+  "/fapi/v1/order": {
+    "orderId": 555,
+    "avgPrice": "30000",
+    "executedQty": "0.02",
+    "status": "FILLED",
+  },
+  "/fapi/v1/algoOrder": {"algoId": 777, "status": "NEW"},
+  "/fapi/v1/algoOpenOrders": {
+    "code": 200,
+    "msg": "The algo open order cancellation request is successfully sent.",
+  },
+  "/fapi/v2/positionRisk": [
+    {
+      "symbol": "BTCUSDT",
+      "positionAmt": "0.02",
+      "entryPrice": "30000",
+      "unRealizedProfit": "1.5",
+    },
+    {"symbol": "ETHUSDT", "positionAmt": "0", "entryPrice": "0"},
+  ],
+  "/fapi/v2/account": {
+    "totalWalletBalance": "1000",
+    "totalMarginBalance": "1010",
+    "availableBalance": "900",
+  },
+  "/fapi/v1/premiumIndex": {"markPrice": "30050"},
+  "/fapi/v1/time": {"serverTime": 1_700_000_000_000},
+  # Two fills of one close order; realizedPnl is per fill, commission separate.
+  "/fapi/v1/userTrades": [
+    {"realizedPnl": "12.5", "commission": "0.4"},
+    {"realizedPnl": "7.5", "commission": "0.2"},
+  ],
+}
+
+
 def make_gateway(monkeypatch, hedge_mode=False):
   calls = []
 
@@ -38,46 +76,9 @@ def make_gateway(monkeypatch, hedge_mode=False):
     calls.append(
       {"method": method, "path": str(path), "payload": payload, "signed": is_signed}
     )
-    if str(path) == "/fapi/v1/order":
-      return FakeResp(
-        {"orderId": 555, "avgPrice": "30000", "executedQty": "0.02", "status": "FILLED"}
-      )
-    if str(path) == "/fapi/v1/algoOrder":
-      return FakeResp({"algoId": 777, "status": "NEW"})
-    if str(path) == "/fapi/v1/algoOpenOrders":
-      return FakeResp(
-        {
-          "code": 200,
-          "msg": "The algo open order cancellation request is successfully sent.",
-        }
-      )
-    if str(path) == "/fapi/v2/positionRisk":
-      return FakeResp(
-        [
-          {
-            "symbol": "BTCUSDT",
-            "positionAmt": "0.02",
-            "entryPrice": "30000",
-            "unRealizedProfit": "1.5",
-          },
-          {"symbol": "ETHUSDT", "positionAmt": "0", "entryPrice": "0"},
-        ]
-      )
-    if str(path) == "/fapi/v2/account":
-      return FakeResp(
-        {
-          "totalWalletBalance": "1000",
-          "totalMarginBalance": "1010",
-          "availableBalance": "900",
-        }
-      )
     if str(path) == "/fapi/v1/exchangeInfo":
       return FakeResp(_exchange_info())
-    if str(path) == "/fapi/v1/premiumIndex":
-      return FakeResp({"markPrice": "30050"})
-    if str(path) == "/fapi/v1/time":
-      return FakeResp({"serverTime": 1_700_000_000_000})
-    return FakeResp({})
+    return FakeResp(_CANNED_BODIES.get(str(path), {}))
 
   monkeypatch.setattr(gw_mod, "send_request", fake_send)
   gw = gw_mod.BinanceFuturesGateway(
@@ -538,3 +539,50 @@ def test_set_position_mode_returns_false_on_reject(monkeypatch):
 
   monkeypatch.setattr(gw_mod, "send_request", boom)
   assert gw.set_position_mode(True) is False
+
+
+# ── Realized PnL lookup ─────────────────────────────────────────────────────── #
+#
+# The order response carries no realizedPnl, and Binance can report a filled
+# MARKET order with avgPrice=0 *and* cumQuote=0 — so when a close cannot be
+# priced locally, the account's trade record for that order is the only source.
+
+
+def test_order_realized_pnl_sums_the_orders_fills(monkeypatch):
+  gw, calls = make_gateway(monkeypatch)
+
+  pnl = gw.get_order_realized_pnl("BTCUSDT", 8811)
+
+  assert pnl == 20.0  # 12.5 + 7.5, commission excluded (as the stream's rp is)
+  sent = calls[-1]
+  assert sent["method"] == "GET" and sent["path"] == "/fapi/v1/userTrades"
+  assert sent["signed"] is True
+  assert sent["payload"]["symbol"] == "BTCUSDT"
+  assert sent["payload"]["order_id"] == 8811
+
+
+def test_order_realized_pnl_is_unknown_without_an_order_id(monkeypatch):
+  gw, calls = make_gateway(monkeypatch)
+  before = len(calls)
+
+  assert gw.get_order_realized_pnl("BTCUSDT", None) is None
+  assert len(calls) == before  # nothing to look up, so no round-trip
+
+
+def test_order_realized_pnl_is_unknown_when_no_trades_are_recorded(monkeypatch):
+  gw, _ = make_gateway(monkeypatch)
+  monkeypatch.setattr(gw, "_send", lambda *a, **k: [])
+
+  assert gw.get_order_realized_pnl("BTCUSDT", 8811) is None
+
+
+def test_order_realized_pnl_survives_a_failing_lookup(monkeypatch):
+  # The close already succeeded; a failed read costs the PnL line, not the trade.
+  gw, _ = make_gateway(monkeypatch)
+
+  def _boom(*_a, **_k):
+    raise RuntimeError("rate limited")
+
+  monkeypatch.setattr(gw, "_send", _boom)
+
+  assert gw.get_order_realized_pnl("BTCUSDT", 8811) is None

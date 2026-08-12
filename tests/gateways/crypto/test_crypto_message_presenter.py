@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from helpers import make_signal
 
 from worker.gateways.crypto.message_presenter import CryptoMessagePresenter
-from worker.icons import SUCCESS
+from worker.icons import LOSS, PROFIT, SUCCESS
 from worker.schemas.signal_schema import SignalActionEnum
 from worker.settings import CryptoExchangeEnum
 
@@ -225,3 +225,108 @@ def test_order_filled_no_override_section_without_settings():
   msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER")
   assert "RISK_PERCENTAGE" not in msg
   assert "Quantity: <b>0.02</b>" in msg
+
+
+# ── Every close reports its PnL ─────────────────────────────────────────────── #
+#
+# Same contract as the FOREX presenter: a partial or full close always carries the
+# line, whether the close came from a signal, a force close, an ADMIN FLAT, the
+# exchange itself, or the reconciler.
+
+
+def test_order_filled_shows_pnl_for_a_full_close():
+  signal = make_signal(SignalActionEnum.TP2, symbol="BTCUSD")
+  msg = CryptoMessagePresenter.order_filled(
+    signal,
+    {"price": 32000.0, "volume": 0.02, "ticket": 11, "profit": 40.0},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>+40.00</b>" in msg and PROFIT in msg
+
+
+def test_order_filled_shows_pnl_for_a_tp1_partial_close():
+  signal = make_signal(SignalActionEnum.TP1, symbol="BTCUSD")
+  result = {
+    "price": 31000.0,
+    "volume": 0.006,
+    "ticket": 9,
+    "profit": -6.0,
+    "sl_update": {"success": True},
+  }
+  msg = CryptoMessagePresenter.order_filled(signal, result, 5, "FOOTER")
+  assert "PnL: <b>-6.00</b>" in msg and LOSS in msg
+
+
+def test_order_filled_reports_an_unreadable_pnl_as_unknown():
+  # Some venues answer a filled MARKET order with a 0 price, leaving the amount
+  # unknown — which must read as unknown, not as a break-even close.
+  signal = make_signal(SignalActionEnum.FLAT, symbol="BTCUSD")
+  msg = CryptoMessagePresenter.order_filled(
+    signal, {"price": 32000.0, "volume": 0.02, "ticket": 11}, 5, "FOOTER"
+  )
+  assert "PnL: <b>n/a</b>" in msg
+
+
+def test_order_filled_has_no_pnl_line_for_an_entry():
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD")
+  msg = CryptoMessagePresenter.order_filled(
+    signal, {"price": 30000.0, "volume": 0.02, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "PnL" not in msg
+
+
+def test_force_closed_shows_pnl():
+  msg = CryptoMessagePresenter.force_closed(
+    "BTCUSD",
+    "strat-1",
+    {
+      "price": 29500.0,
+      "volume": 0.02,
+      "ref_id": 7,
+      "ref_source_id": 3,
+      "profit": -10.0,
+    },
+    "FOOTER",
+  )
+  assert "PnL: <b>-10.00</b>" in msg
+
+
+def test_admin_flat_closed_shows_pnl():
+  msg = CryptoMessagePresenter.admin_flat_closed(
+    {"symbol": "BTCUSD", "strategy": "strat-A", "ref_source_id": 10},
+    {"price": 30500.0, "volume": 0.02, "ticket": 999, "profit": 10.0},
+    "FOOTER",
+  )
+  assert "PnL: <b>+10.00</b>" in msg
+
+
+def test_exchange_close_renders_pnl_through_the_shared_line():
+  # The exchange delivers a realized figure of its own; it must still read like
+  # every other close notification rather than as a raw stream value.
+  event = SimpleNamespace(
+    reason=SimpleNamespace(value="SL"),
+    symbol="BTCUSDT",
+    close_price=29000.0,
+    close_volume=0.02,
+    realized_pnl=-20.0,
+    order_id="8811",
+  )
+  msg = CryptoMessagePresenter.exchange_close(event, "FOOTER")
+  assert "PnL: <b>-20.00</b>" in msg and LOSS in msg
+
+
+def test_position_reconciled_closed_labels_its_pnl_an_estimate():
+  # The real fill was never delivered, so the figure is measured against the same
+  # approximate close price shown above it.
+  db_pos = {"symbol": "BTCUSD", "strategy": "strat-A", "ref_source_id": "abc"}
+  msg = CryptoMessagePresenter.position_reconciled_closed(
+    db_pos, 31000.0, "FOOTER", profit=20.0
+  )
+  assert "PnL (est.): <b>+20.00</b>" in msg
+
+
+def test_position_reconciled_closed_without_a_pnl_says_unknown():
+  db_pos = {"symbol": "BTCUSD", "strategy": "strat-A", "ref_source_id": "abc"}
+  msg = CryptoMessagePresenter.position_reconciled_closed(db_pos, None, "FOOTER")
+  assert "PnL (est.): <b>n/a</b>" in msg

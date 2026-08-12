@@ -4,7 +4,7 @@ from worker.gateways.forex.message_presenter import (
   ForexMessagePresenter,
   format_volume,
 )
-from worker.icons import GEAR, REJECTED, SYNC
+from worker.icons import GEAR, LOSS, PROFIT, REJECTED, SYNC
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -320,3 +320,116 @@ def test_position_reconciled_closed_contains_key_fields():
   assert "2000.0" in msg
   assert "4587420656" in msg
   assert "FOOTER" in msg
+
+
+# ── Every close reports its PnL ─────────────────────────────────────────────── #
+#
+# A partial or full close is the moment a trade books money, so each of these
+# messages carries the line whatever triggered the close — a signal, a stale-entry
+# force close, an ADMIN FLAT, or the reconciler. An amount we could not read says
+# "n/a" rather than dropping the line (silence reads as break-even).
+
+
+def test_order_filled_shows_pnl_for_a_full_close():
+  signal = make_signal(SignalActionEnum.TP2)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2050.0, "volume": 0.1, "ticket": 5, "profit": 41.75},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>+41.75</b>" in msg and PROFIT in msg
+
+
+def test_order_filled_shows_pnl_for_a_tp1_partial_close():
+  # TP1 closes only part of the position, but that part booked a real result.
+  signal = make_signal(SignalActionEnum.TP1)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2020.0, "volume": 0.03, "ticket": 5, "profit": 5.4},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>+5.40</b>" in msg
+
+
+def test_order_filled_shows_a_losing_close_with_its_sign():
+  signal = make_signal(SignalActionEnum.SL)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 1990.0, "volume": 0.1, "ticket": 5, "profit": -18.2},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>-18.20</b>" in msg and LOSS in msg
+
+
+def test_order_filled_reports_an_unreadable_pnl_as_unknown():
+  signal = make_signal(SignalActionEnum.TP2)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2050.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "PnL: <b>n/a</b>" in msg
+
+
+def test_order_filled_has_no_pnl_line_for_an_entry():
+  # An entry has booked nothing yet; a 0.00 (or an "n/a") there would be noise.
+  signal = make_signal(SignalActionEnum.LONG)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "PnL" not in msg
+
+
+def test_force_closed_shows_pnl():
+  msg = ForexMessagePresenter.force_closed(
+    "XAUUSD",
+    "strat-1",
+    {"price": 1999.0, "volume": 0.2, "ref_id": 7, "ref_source_id": 3, "profit": -3.5},
+    "FOOTER",
+  )
+  assert "PnL: <b>-3.50</b>" in msg
+
+
+def test_admin_flat_closed_shows_pnl():
+  msg = ForexMessagePresenter.admin_flat_closed(
+    {"symbol": "XAUUSD", "strategy": "strat-A", "ref_source_id": 10},
+    {"price": 2001.5, "volume": 0.5, "ticket": 999, "profit": 7.25},
+    "FOOTER",
+  )
+  assert "PnL: <b>+7.25</b>" in msg
+
+
+def test_position_reconciled_closed_labels_its_pnl_a_position_total():
+  # The reconciler never saw the close, so the figure it reads from deal history
+  # spans the position's whole life — the label has to say so.
+  db_pos = {
+    "symbol": "XAUUSD",
+    "strategy": "strat-A",
+    "ref_source_id": "458",
+    "volume": 0.01,
+  }
+  msg = ForexMessagePresenter.position_reconciled_closed(
+    db_pos, 2000.0, "FOOTER", profit=13.85
+  )
+  assert "PnL (position total): <b>+13.85</b>" in msg
+
+
+def test_position_reconciled_closed_without_a_pnl_says_unknown():
+  db_pos = {
+    "symbol": "XAUUSD",
+    "strategy": "strat-A",
+    "ref_source_id": "458",
+    "volume": 0.01,
+  }
+  msg = ForexMessagePresenter.position_reconciled_closed(db_pos, 2000.0, "FOOTER")
+  assert "PnL (position total): <b>n/a</b>" in msg
+
+
+def test_break_even_close_is_shown_as_zero_not_unknown():
+  signal = make_signal(SignalActionEnum.FLAT)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5, "profit": 0.0}, 5, "FOOTER"
+  )
+  assert "PnL: <b>+0.00</b>" in msg
+  assert "n/a" not in msg

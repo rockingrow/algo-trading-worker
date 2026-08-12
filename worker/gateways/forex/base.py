@@ -173,6 +173,24 @@ class BasePlatformGateway(ABC):
   def modify_sl(self, position: PlatformPosition, new_sl: float) -> TradeResult:
     """Move the stop-loss of *position* to *new_sl* (preserving its TP)."""
 
+  # ── Realized PnL ──────────────────────────────────────────────────────── #
+
+  def get_position_realized_pnl(  # pragma: no cover - default no-op
+    self, position_ticket: Any
+  ) -> Optional[float]:
+    """Total realized PnL of a closed position, or ``None`` when unavailable.
+
+    Asked by the reconciler, which finds out a position is gone without ever
+    seeing the close, so it has no :class:`TradeResult` to read a figure off —
+    only the ticket. A platform that cannot look up a historical position keeps
+    the default and its reconcile notification reports the PnL as unknown, which
+    is the honest answer rather than a number derived from a stale quote.
+
+    Closes the worker performs itself do **not** go through here: they report
+    their PnL on the ``TradeResult`` returned by :meth:`close_position`.
+    """
+    return None
+
   # ── Event ingestion ───────────────────────────────────────────────────── #
 
   def create_close_detection_job(
