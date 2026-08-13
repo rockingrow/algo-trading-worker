@@ -122,28 +122,57 @@ def test_positions_are_mapped_to_platform_positions():
 # ── Realized PnL of a close ─────────────────────────────────────────────────── #
 #
 # ``order_send`` reports what happened to the *order* and carries no money
-# figure, so the amount a close booked is read back off the deal it produced.
+# figure, so the amount a close booked is read back out of deal history.
 # Without it every worker-initiated FOREX close reports its PnL as "n/a".
 
 
 def test_close_position_reports_what_the_deal_booked():
   mt5 = FakeMt5(
-    order_results=[make_order_result(deal=777)],
-    deals=[make_deal(ticket=777, profit=12.5, commission=-0.7, swap=-0.3)],
+    order_results=[make_order_result(order=999, deal=777)],
+    deals=[make_deal(ticket=777, order=999, profit=12.5, commission=-0.7, swap=-0.3)],
   )
   result = _gateway(mt5).close_position(make_platform_position())
 
   assert result["success"] is True
   assert result["profit"] == 11.5
-  # Looked up by the deal the close created, not by position — a position can
-  # hold several closes and only this one's result belongs on this notification.
-  assert mt5.deal_lookups == [{"ticket": 777, "position": None}]
+
+
+def test_close_position_looks_the_deal_up_by_its_order_not_its_own_ticket():
+  """Regression: ``history_deals_get(ticket=…)`` filters on ``DEAL_ORDER``.
+
+  The lookup used to pass ``OrderSendResult.deal`` — the deal's *own* ticket,
+  which that filter never matches — so the read came back empty and every
+  worker-placed close (signal exit, ADMIN FLAT, force close) reported "n/a".
+  """
+  mt5 = FakeMt5(
+    order_results=[make_order_result(order=999, deal=777)],
+    deals=[make_deal(ticket=777, order=999, profit=12.5)],
+  )
+  assert _gateway(mt5).close_position(make_platform_position())["profit"] == 12.5
+  # By order, and never by position: a position can hold several closes and only
+  # this one's result belongs on this notification.
+  assert mt5.deal_lookups == [{"ticket": 999, "position": None}]
+
+
+def test_close_position_sums_a_close_the_broker_filled_in_several_deals():
+  # One close order can be filled against several counter-orders. The
+  # notification reports one close, so it reports their sum.
+  mt5 = FakeMt5(
+    order_results=[make_order_result(order=999, deal=777)],
+    deals=[
+      make_deal(ticket=777, order=999, profit=4.0, commission=-0.2),
+      make_deal(ticket=778, order=999, profit=6.0, commission=-0.3),
+      make_deal(ticket=900, order=1000, profit=99.0),  # a different order's deal
+    ],
+  )
+  result = _gateway(mt5).close_position(make_platform_position())
+  assert result["profit"] == pytest.approx(9.5)
 
 
 def test_close_position_pnl_is_unknown_when_history_has_nothing():
   # Reported as unknown rather than 0.0: a close whose amount we could not read
   # must not be shown as a break-even trade.
-  mt5 = FakeMt5(order_results=[make_order_result(deal=777)], deals=[])
+  mt5 = FakeMt5(order_results=[make_order_result(order=999, deal=777)], deals=[])
   assert _gateway(mt5).close_position(make_platform_position())["profit"] is None
 
 
@@ -151,16 +180,16 @@ def test_close_position_retries_a_history_read_that_has_not_landed_yet(monkeypat
   # The deal is registered server-side before order_send returns its ticket, but
   # the terminal's local history can trail by a few milliseconds.
   monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
-  mt5 = FakeMt5(order_results=[make_order_result(deal=777)], deals=[])
-  responses = [[], [], [make_deal(ticket=777, profit=4.0)]]
+  mt5 = FakeMt5(order_results=[make_order_result(order=999, deal=777)], deals=[])
+  responses = [[], [], [make_deal(ticket=777, order=999, profit=4.0)]]
   mt5.history_deals_get = lambda ticket=None, position=None: responses.pop(0)
 
   assert _gateway(mt5).close_position(make_platform_position())["profit"] == 4.0
 
 
-def test_close_position_pnl_is_unknown_without_a_deal_ticket():
+def test_close_position_pnl_is_unknown_without_an_order_ticket():
   mt5 = FakeMt5(
-    order_results=[make_order_result(deal=0)], deals=[make_deal(profit=9.0)]
+    order_results=[make_order_result(order=0)], deals=[make_deal(profit=9.0)]
   )
   result = _gateway(mt5).close_position(make_platform_position())
 
@@ -171,7 +200,7 @@ def test_close_position_pnl_is_unknown_without_a_deal_ticket():
 def test_close_position_survives_a_failing_history_read():
   # The close already succeeded; a terminal that cannot answer costs the PnL
   # line, never the trade result.
-  mt5 = FakeMt5(order_results=[make_order_result(deal=777)])
+  mt5 = FakeMt5(order_results=[make_order_result(order=999, deal=777)])
 
   def _boom(ticket=None, position=None):
     raise RuntimeError("terminal busy")
@@ -187,13 +216,38 @@ def test_position_realized_pnl_sums_every_deal_of_the_position():
   # figure spans the position's whole life.
   mt5 = FakeMt5(
     deals=[
-      make_deal(ticket=1, profit=0.0, commission=-0.35),  # entry
-      make_deal(ticket=2, profit=6.0, commission=-0.35),  # TP1 partial
-      make_deal(ticket=3, profit=9.0, commission=-0.35, swap=-0.1),  # exit
+      make_deal(ticket=1, position_id=4587420656, profit=0.0, commission=-0.35),
+      make_deal(ticket=2, position_id=4587420656, profit=6.0, commission=-0.35),
+      make_deal(
+        ticket=3, position_id=4587420656, profit=9.0, commission=-0.35, swap=-0.1
+      ),
+      make_deal(ticket=4, position_id=999, profit=50.0),  # another position
     ]
   )
   assert _gateway(mt5).get_position_realized_pnl(4587420656) == pytest.approx(13.85)
   assert mt5.deal_lookups == [{"ticket": None, "position": 4587420656}]
+
+
+def test_position_realized_pnl_accepts_the_tickets_text_form():
+  """Regression: the reconciler's ticket comes out of the DB, where it is TEXT.
+
+  ``history_deals_get`` is a native extension whose ``position`` argument must be
+  an integer — a string raised inside the lookup, so every ``Position
+  Reconciled`` notification reported ``PnL (position total): n/a``.
+  """
+  mt5 = FakeMt5(
+    deals=[make_deal(ticket=1, position_id=798267992, profit=2.4, commission=-0.1)]
+  )
+  assert _gateway(mt5).get_position_realized_pnl("798267992") == pytest.approx(2.3)
+  assert mt5.deal_lookups == [{"ticket": None, "position": 798267992}]
+
+
+def test_position_realized_pnl_is_unknown_for_a_ticket_that_is_not_a_number():
+  # A row whose reference is not a ticket at all (never seen in practice) must
+  # leave the PnL unknown, not raise on the reconcile path.
+  mt5 = FakeMt5(deals=[make_deal(position_id=111, profit=5.0)])
+  assert _gateway(mt5).get_position_realized_pnl("not-a-ticket") is None
+  assert mt5.deal_lookups == []  # never reached the terminal
 
 
 def test_position_realized_pnl_is_unknown_when_history_is_empty():

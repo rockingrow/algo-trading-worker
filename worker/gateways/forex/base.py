@@ -182,9 +182,12 @@ class BasePlatformGateway(ABC):
 
     Asked by the reconciler, which finds out a position is gone without ever
     seeing the close, so it has no :class:`TradeResult` to read a figure off —
-    only the ticket. A platform that cannot look up a historical position keeps
-    the default and its reconcile notification reports the PnL as unknown, which
-    is the honest answer rather than a number derived from a stale quote.
+    only the ticket, and that ticket comes straight out of the DB row, where
+    every reference is TEXT. An implementation talking to a typed platform API
+    must therefore coerce it rather than forward it as it arrives. A platform
+    that cannot look up a historical position keeps the default and its reconcile
+    notification reports the PnL as unknown, which is the honest answer rather
+    than a number derived from a stale quote.
 
     Closes the worker performs itself do **not** go through here: they report
     their PnL on the ``TradeResult`` returned by :meth:`close_position`.
