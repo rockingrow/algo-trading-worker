@@ -42,12 +42,15 @@ logger = get_logger("worker.gateways.forex.mt5.gateway")
 _MT5_COMMENT_MAX = 31
 
 # A deal is registered on the server before ``order_send`` returns its ticket,
-# but the terminal's local history can trail that by a few milliseconds. Retry
-# the lookup a couple of times before giving up, so a close reports its PnL
-# instead of "n/a" for want of a moment's patience — bounded tightly because the
-# close itself has already succeeded and nothing downstream waits on this.
-_DEAL_LOOKUP_ATTEMPTS = 3
-_DEAL_LOOKUP_DELAY = 0.15  # seconds between attempts
+# but the terminal's own history trails that — by measurably more than the few
+# milliseconds first assumed. A live close that read 0.3 s later still found
+# nothing, while the reconciler reading the *same position* a minute on returned
+# its full history, so the window is widened to ~1.25 s before giving up. It stays
+# bounded because the close has already succeeded: everything after it (the DB
+# status write, the notification) waits on this read, so the budget buys a PnL
+# line at the cost of delaying them, and must never grow into a stall.
+_DEAL_LOOKUP_ATTEMPTS = 6
+_DEAL_LOOKUP_DELAY = 0.25  # seconds between attempts
 
 
 def _mt5_error_code(err) -> int:
@@ -310,7 +313,7 @@ class MT5Gateway(BasePlatformGateway):
       ticket=str(result.order),
       price=result.price,
       volume=result.volume,
-      profit=self._closing_deal_pnl(result),
+      profit=self._closing_deal_pnl(result, position.ticket),
     )
 
   def modify_sl(self, position: PlatformPosition, new_sl: float) -> TradeResult:
@@ -346,39 +349,64 @@ class MT5Gateway(BasePlatformGateway):
 
   # ── Realized PnL ──────────────────────────────────────────────────────── #
 
-  def _closing_deal_pnl(self, order_result: Any) -> Optional[float]:
+  def _closing_deal_pnl(
+    self, order_result: Any, position_ticket: Any
+  ) -> Optional[float]:
     """Realized PnL of the deals a successful close just produced, or ``None``.
 
     ``order_send`` reports *what happened to the order* — it carries no money
-    figure — so the amount is read back off the deals it created. Those deals are
-    the single authority on what the close booked: MT5 has already netted the
+    figure — so the amount is read back out of deal history. Those deals are the
+    single authority on what the close booked: MT5 has already netted the
     position's entry price against the fill and charged the account's
     commission/swap, none of which the worker can derive itself from lots and
     prices (it would need the symbol's contract size and the account-currency
     conversion, and would still miss the costs).
 
-    The lookup goes through the **order** ticket, not ``OrderSendResult.deal``:
-    ``history_deals_get(ticket=…)`` filters on ``DEAL_ORDER`` — the order a deal
-    came *from* — and never on a deal's own ticket, so passing the deal ticket
-    matched no deal at all and every worker-placed close reported ``PnL: n/a``.
-    Going through the order is also what makes a close that the broker filled in
-    several deals report their sum rather than one slice of itself.
+    The read goes through the **position** (``DEAL_POSITION_ID``) and the deals it
+    returns are narrowed *here* to the ones this close's order produced
+    (``DEAL_ORDER``). Asking the terminal to do that narrowing — the more direct
+    ``history_deals_get(ticket=<order>)`` — returned nothing on a live account,
+    for a position whose history the reconciler read in full a minute later
+    through the position filter. So the query uses the filter with evidence behind
+    it and the narrowing is done in Python, which also keeps a partial close from
+    reporting the position's running total: an entry deal (and any earlier TP1)
+    sits in the same result and belongs to a different order.
 
     Best-effort throughout: the close has already succeeded by the time this
     runs, so a terminal that cannot answer costs a missing PnL line, never the
     trade result.
     """
-    order_ticket = getattr(order_result, "order", None)
-    if not order_ticket:
+    order_id = _as_ticket_id(getattr(order_result, "order", None))
+    if not order_id:
       logger.debug(
         "[close_position] order_send reported no order ticket — PnL unknown."
       )
       return None
-    return self.get_order_realized_pnl(order_ticket)
 
-  def get_order_realized_pnl(self, order_ticket: Any) -> Optional[float]:
-    """Net realized PnL of every deal *order_ticket* produced, or ``None``."""
-    return self._history_pnl("ticket", order_ticket, retry=True)
+    deals: List[Any] = []
+    for attempt in range(_DEAL_LOOKUP_ATTEMPTS):
+      found = self._history_deals("position", position_ticket)
+      if found is None:
+        return None  # the terminal refused the read outright; it already logged
+      deals = found
+      mine = [d for d in deals if getattr(d, "order", None) == order_id]
+      if mine:
+        return deals_realized_pnl(mine)
+      if attempt < _DEAL_LOOKUP_ATTEMPTS - 1:
+        time.sleep(_DEAL_LOOKUP_DELAY)
+
+    # Deliberately detailed: it separates "history is unreadable" from "history
+    # is readable but this close is not in it yet", which is the one thing a
+    # missing PnL line cannot tell an operator by itself.
+    logger.warning(
+      "[pnl] Position %s holds %d deal(s), none from close order %s after %.2fs "
+      "— PnL unknown for this close.",
+      position_ticket,
+      len(deals),
+      order_id,
+      (_DEAL_LOOKUP_ATTEMPTS - 1) * _DEAL_LOOKUP_DELAY,
+    )
+    return None
 
   def get_position_realized_pnl(self, position_ticket: Any) -> Optional[float]:
     """Net realized PnL of a whole position, summed over all of its deals.
@@ -388,18 +416,27 @@ class MT5Gateway(BasePlatformGateway):
     ever produced is summed, so the figure covers the entry's commission and any
     earlier partial close as well as the final exit: a *position total* rather
     than the result of one close, which is why the caller labels it as such.
+
+    No retry: by the time the reconciler notices, the close is at least a poll
+    interval old, so an empty history means unreadable rather than not-yet-landed.
     """
-    return self._history_pnl("position", position_ticket, retry=False)
+    pnl = deals_realized_pnl(self._history_deals("position", position_ticket))
+    if pnl is None:
+      logger.warning(
+        "[pnl] No deal history for position=%s — PnL unknown.", position_ticket
+      )
+    return pnl
 
-  def _history_pnl(self, key: str, ticket: Any, *, retry: bool) -> Optional[float]:
-    """Sum the realized PnL of the deals matching ``{key}=ticket`` in history.
+  def _history_deals(self, key: str, ticket: Any) -> Optional[List[Any]]:
+    """Deals matching ``{key}=ticket``, or ``None`` when the read itself failed.
 
-    *key* selects the ``history_deals_get`` filter — ``ticket`` for every deal one
-    *order* produced (``DEAL_ORDER``), ``position`` for every deal of one position
-    (``DEAL_POSITION_ID``). Neither filter matches a deal's own ticket. *retry*
-    re-reads a moment later when the history came back empty, which is worth it
-    for a deal that was created milliseconds ago and pointless for a position
-    that closed long enough ago for the reconciler to notice.
+    *key* selects the ``history_deals_get`` filter — ``position`` for every deal
+    of one position (``DEAL_POSITION_ID``), ``ticket`` for the deals of one order
+    (``DEAL_ORDER``). Neither matches a deal by its own ticket.
+
+    An empty list and ``None`` are kept apart: the first means the terminal
+    answered and holds nothing yet (worth retrying), the second that it could not
+    answer at all (retrying is pointless).
     """
     reader = getattr(self._mt5, "history_deals_get", None)
     if reader is None:  # pragma: no cover - the real module always has it
@@ -411,23 +448,11 @@ class MT5Gateway(BasePlatformGateway):
       logger.warning("[pnl] %s=%r is not a numeric ticket — PnL unknown.", key, ticket)
       return None
 
-    attempts = _DEAL_LOOKUP_ATTEMPTS if retry else 1
-    for attempt in range(attempts):
-      try:
-        deals = reader(**{key: ticket_id})
-      except Exception as exc:
-        logger.warning("[pnl] history_deals_get(%s=%s) failed: %s", key, ticket, exc)
-        return None
-      pnl = deals_realized_pnl(deals)
-      if pnl is not None:
-        return pnl
-      if attempt < attempts - 1:
-        time.sleep(_DEAL_LOOKUP_DELAY)
-
-    logger.warning(
-      "[pnl] No deal history for %s=%s — PnL unknown for this close.", key, ticket
-    )
-    return None
+    try:
+      return list(reader(**{key: ticket_id}) or [])
+    except Exception as exc:
+      logger.warning("[pnl] history_deals_get(%s=%s) failed: %s", key, ticket, exc)
+      return None
 
   # ── Event ingestion ───────────────────────────────────────────────────── #
 

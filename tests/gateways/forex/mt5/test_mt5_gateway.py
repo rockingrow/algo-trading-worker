@@ -129,39 +129,52 @@ def test_positions_are_mapped_to_platform_positions():
 def test_close_position_reports_what_the_deal_booked():
   mt5 = FakeMt5(
     order_results=[make_order_result(order=999, deal=777)],
-    deals=[make_deal(ticket=777, order=999, profit=12.5, commission=-0.7, swap=-0.3)],
+    deals=[
+      make_deal(
+        ticket=777,
+        order=999,
+        position_id=111,
+        profit=12.5,
+        commission=-0.7,
+        swap=-0.3,
+      )
+    ],
   )
-  result = _gateway(mt5).close_position(make_platform_position())
+  result = _gateway(mt5).close_position(make_platform_position(ticket=111))
 
   assert result["success"] is True
   assert result["profit"] == 11.5
 
 
-def test_close_position_looks_the_deal_up_by_its_order_not_its_own_ticket():
-  """Regression: ``history_deals_get(ticket=…)`` filters on ``DEAL_ORDER``.
+def test_close_position_reads_history_by_position_and_narrows_to_its_own_order():
+  """Regression, in two layers, for a close that reported ``PnL: n/a``.
 
-  The lookup used to pass ``OrderSendResult.deal`` — the deal's *own* ticket,
-  which that filter never matches — so the read came back empty and every
-  worker-placed close (signal exit, ADMIN FLAT, force close) reported "n/a".
+  ``history_deals_get(ticket=…)`` filters on ``DEAL_ORDER``, never on a deal's own
+  ticket, so the original lookup by ``OrderSendResult.deal`` matched nothing. But
+  asking the terminal by order did not answer either on a live account, for a
+  position the reconciler then read in full through ``position=``. So the query
+  uses the position filter — the one with evidence behind it — and picks this
+  close's own deals out of the result here.
   """
   mt5 = FakeMt5(
     order_results=[make_order_result(order=999, deal=777)],
-    deals=[make_deal(ticket=777, order=999, profit=12.5)],
+    deals=[make_deal(ticket=777, order=999, position_id=111, profit=12.5)],
   )
-  assert _gateway(mt5).close_position(make_platform_position())["profit"] == 12.5
-  # By order, and never by position: a position can hold several closes and only
-  # this one's result belongs on this notification.
-  assert mt5.deal_lookups == [{"ticket": 999, "position": None}]
+  assert (
+    _gateway(mt5).close_position(make_platform_position(ticket=111))["profit"] == 12.5
+  )
+  assert mt5.deal_lookups == [{"ticket": None, "position": 111}]
 
 
 def test_tp1_partial_that_takes_the_whole_position_reports_its_pnl():
-  """The exact shape an operator reported as ``PnL: n/a``.
+  """The exact shape an operator reported as ``PnL: n/a``, tickets and all.
 
   A TP1 whose close volume equals the position's whole volume — routine when the
-  entry was already at the broker's minimum lot — is still an ordinary partial
-  close as far as the gateway is concerned (``ForexExecutor.partial_close_position``
-  passes it straight through), so it went through the same broken deal-ticket
-  lookup as every other worker-placed close and reported nothing.
+  entry was already at the broker's minimum lot — is an ordinary partial close as
+  far as the gateway is concerned (``ForexExecutor.partial_close_position`` passes
+  it straight through), so it took the same broken lookup as every other
+  worker-placed close. The reconciler that later picked the position up reported
+  its total fine, which is what pointed at the lookup rather than the history.
   """
   mt5 = FakeMt5(
     order_results=[make_order_result(order=4911373684, deal=4911373999)],
@@ -184,18 +197,38 @@ def test_tp1_partial_that_takes_the_whole_position_reports_its_pnl():
   assert result["profit"] == pytest.approx(7.5)
 
 
+def test_close_position_reports_this_close_not_the_positions_running_total():
+  """The position's other deals share the result the position filter returns.
+
+  Reading by position is what makes the lookup work at all, so the narrowing that
+  keeps an entry's commission — and any earlier TP1 — off *this* close's PnL line
+  is done in Python. Without it a partial close would report the position total
+  under a plain ``PnL:`` label, which is a different (and wrong) number.
+  """
+  mt5 = FakeMt5(
+    order_results=[make_order_result(order=999, deal=777)],
+    deals=[
+      make_deal(ticket=1, order=500, position_id=111, commission=-0.35),  # entry
+      make_deal(ticket=2, order=600, position_id=111, profit=6.0),  # earlier TP1
+      make_deal(ticket=777, order=999, position_id=111, profit=3.0, commission=-0.2),
+    ],
+  )
+  result = _gateway(mt5).close_position(make_platform_position(ticket=111))
+  assert result["profit"] == pytest.approx(2.8)
+
+
 def test_close_position_sums_a_close_the_broker_filled_in_several_deals():
   # One close order can be filled against several counter-orders. The
   # notification reports one close, so it reports their sum.
   mt5 = FakeMt5(
     order_results=[make_order_result(order=999, deal=777)],
     deals=[
-      make_deal(ticket=777, order=999, profit=4.0, commission=-0.2),
-      make_deal(ticket=778, order=999, profit=6.0, commission=-0.3),
-      make_deal(ticket=900, order=1000, profit=99.0),  # a different order's deal
+      make_deal(ticket=777, order=999, position_id=111, profit=4.0, commission=-0.2),
+      make_deal(ticket=778, order=999, position_id=111, profit=6.0, commission=-0.3),
+      make_deal(ticket=900, order=1000, position_id=111, profit=99.0),  # not ours
     ],
   )
-  result = _gateway(mt5).close_position(make_platform_position())
+  result = _gateway(mt5).close_position(make_platform_position(ticket=111))
   assert result["profit"] == pytest.approx(9.5)
 
 
@@ -208,13 +241,36 @@ def test_close_position_pnl_is_unknown_when_history_has_nothing():
 
 def test_close_position_retries_a_history_read_that_has_not_landed_yet(monkeypatch):
   # The deal is registered server-side before order_send returns its ticket, but
-  # the terminal's local history can trail by a few milliseconds.
+  # the terminal's own history trails it — by long enough that a live close read
+  # 0.3s later still found nothing, which is why the window is now ~1.25s.
   monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
   mt5 = FakeMt5(order_results=[make_order_result(order=999, deal=777)], deals=[])
-  responses = [[], [], [make_deal(ticket=777, order=999, profit=4.0)]]
+  landed = make_deal(ticket=777, order=999, position_id=111, profit=4.0)
+  responses = [[], [], [], [], [landed]]
   mt5.history_deals_get = lambda ticket=None, position=None: responses.pop(0)
 
-  assert _gateway(mt5).close_position(make_platform_position())["profit"] == 4.0
+  result = _gateway(mt5).close_position(make_platform_position(ticket=111))
+  assert result["profit"] == 4.0
+
+
+def test_close_position_keeps_retrying_while_only_the_entry_deal_is_there(monkeypatch):
+  """History holding the position's *older* deals is not this close having landed.
+
+  Stopping at the first non-empty read would report the entry's commission as the
+  close's result — a plausible-looking wrong number, which is worse than n/a.
+  """
+  waits = []
+  monkeypatch.setattr(gateway_module.time, "sleep", waits.append)
+  mt5 = FakeMt5(order_results=[make_order_result(order=999, deal=777)])
+  entry = make_deal(ticket=1, order=500, position_id=111, commission=-0.35)
+  closed = make_deal(ticket=777, order=999, position_id=111, profit=7.0)
+  responses = [[entry], [entry], [entry, closed]]
+  mt5.history_deals_get = lambda ticket=None, position=None: responses.pop(0)
+
+  result = _gateway(mt5).close_position(make_platform_position(ticket=111))
+
+  assert result["profit"] == pytest.approx(7.0)
+  assert len(waits) == 2  # waited past both entry-only reads
 
 
 def test_close_position_pnl_is_unknown_without_an_order_ticket():

@@ -779,7 +779,7 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 
   | Path | Source | Label |
   | --- | --- | --- |
-  | FOREX, worker-placed close (signal / FLAT / force close) | the deals MT5 created for it (`OrderSendResult.order` → `history_deals_get(ticket=…)`), net of commission/swap/fee | `PnL` |
+  | FOREX, worker-placed close (signal / FLAT / force close) | the position's deals (`history_deals_get(position=…)`) narrowed to this close's own order, net of commission/swap/fee | `PnL` |
   | FOREX, terminal close (SL / TP / stop-out / manual) | the closing deal the detector already read | `PnL` |
   | FOREX, reconciled close | every deal of the position, summed | `PnL (position total)` |
   | CRYPTO, worker-placed close | `(exit − entry) × qty`, signed by side — or the exchange's `realizedPnl` for the order when there is no usable fill price | `PnL` |
@@ -790,7 +790,12 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 
   An amount that could not be read renders `PnL: n/a` rather than disappearing: a dropped line reads as break-even, and `0.00` would be a fabrication. `0.00` is reserved for a close that genuinely broke even. Where one logical exit fans out into several broker closes (a symbol held as multiple tickets, a netted FLAT), the reported figure is their **sum** — unlike `price`/`volume` on the same message, which describe the last fill.
 
-  Both FOREX reads go through `history_deals_get`, whose two filters are easy to reach for wrongly and answer with silence rather than an error when you do — each mistake costs a permanent `n/a`, so both are pinned by tests against a fake that filters and type-checks exactly as the terminal does. `ticket=` selects the deals of one **order** (`DEAL_ORDER`) and never a deal by its own ticket, which is why a worker-placed close is looked up through `OrderSendResult.order`; `position=` selects them by `DEAL_POSITION_ID`. Both arguments must be **integers** — the reconciler's ticket comes out of the DB, where every reference is TEXT, so `MT5Gateway._as_ticket_id` normalises at the one place that talks to the extension.
+  Both FOREX reads go through `history_deals_get`, which answers a filter that matches nothing with an empty result rather than an error — so every way of reaching for it wrongly costs a permanent `n/a` and nothing else. Both are therefore pinned by tests against a fake that filters and type-checks exactly as the terminal does. Two rules came out of getting it wrong on a live account:
+
+  - **Query by position, narrow in Python.** `ticket=` selects the deals of one **order** (`DEAL_ORDER`) and never a deal by its own ticket — but even asked by order it returned nothing on a live close, for a position the reconciler then read in full through `position=` (`DEAL_POSITION_ID`). So a close reads the position's deals and picks out its own order's here. That narrowing is not optional: the entry deal and any earlier TP1 sit in the same result, and summing them would report the position's running total under a plain `PnL:` label.
+  - **Both arguments must be integers.** The reconciler's ticket comes out of the DB, where every reference is TEXT, so `MT5Gateway._as_ticket_id` normalises at the one place that talks to the extension.
+
+  A close reads its PnL *before* the DB status write and the notification, so the retry that absorbs the terminal's history lag is bounded (~1.25 s) and gives up rather than stalling the pipeline. Giving up logs how many deals the position held and which order was missing from them, which is what separates "history unreadable" from "this close has not landed yet" — a distinction a missing `PnL` line cannot make on its own.
 
 - **Data self-healing on inconsistency:** `SignalHandler._get_db_position` enforces the one-active-position-per-(strategy, symbol) invariant at read time. If more than one `OPENED`/`TP1` row is found (possible after a crash before the unique index existed), the oldest row is kept and all extras are immediately marked `FORCED_CLOSED` with an explanatory comment, so the DB self-heals on the next signal rather than silently producing split-brain state.
 
