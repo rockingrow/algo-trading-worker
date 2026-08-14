@@ -154,6 +154,36 @@ def test_close_position_looks_the_deal_up_by_its_order_not_its_own_ticket():
   assert mt5.deal_lookups == [{"ticket": 999, "position": None}]
 
 
+def test_tp1_partial_that_takes_the_whole_position_reports_its_pnl():
+  """The exact shape an operator reported as ``PnL: n/a``.
+
+  A TP1 whose close volume equals the position's whole volume — routine when the
+  entry was already at the broker's minimum lot — is still an ordinary partial
+  close as far as the gateway is concerned (``ForexExecutor.partial_close_position``
+  passes it straight through), so it went through the same broken deal-ticket
+  lookup as every other worker-placed close and reported nothing.
+  """
+  mt5 = FakeMt5(
+    order_results=[make_order_result(order=4911373684, deal=4911373999)],
+    deals=[
+      make_deal(
+        ticket=4911373999,
+        order=4911373684,
+        position_id=4911373104,
+        profit=8.4,
+        commission=-0.9,
+      )
+    ],
+  )
+  position = make_platform_position(ticket=4911373104, volume=0.1, symbol="BTCUSD")
+  result = _gateway(mt5).close_position(
+    position, volume=0.1, comment="Partial Close TP1"
+  )
+
+  assert result["success"] is True
+  assert result["profit"] == pytest.approx(7.5)
+
+
 def test_close_position_sums_a_close_the_broker_filled_in_several_deals():
   # One close order can be filled against several counter-orders. The
   # notification reports one close, so it reports their sum.
