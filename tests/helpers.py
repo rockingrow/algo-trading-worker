@@ -94,10 +94,31 @@ def make_order_result(
   )
 
 
-def make_deal(ticket=555, profit=0.0, commission=0.0, swap=0.0, fee=0.0):
-  """One MT5 history deal, carrying the four fields that sum to its net result."""
+def make_deal(
+  ticket=555,
+  profit=0.0,
+  commission=0.0,
+  swap=0.0,
+  fee=0.0,
+  order=None,
+  position_id=None,
+):
+  """One MT5 history deal, carrying the four fields that sum to its net result.
+
+  *order* (``DEAL_ORDER``, the order that produced the deal) and *position_id*
+  (``DEAL_POSITION_ID``) are the two fields ``history_deals_get`` filters on — a
+  deal's own ``ticket`` is not a filter at all. Set whichever one the lookup
+  under test is supposed to find the deal by; a deal that carries neither is
+  reachable only through an unfiltered read.
+  """
   return SimpleNamespace(
-    ticket=ticket, profit=profit, commission=commission, swap=swap, fee=fee
+    ticket=ticket,
+    profit=profit,
+    commission=commission,
+    swap=swap,
+    fee=fee,
+    order=order,
+    position_id=position_id,
   )
 
 
@@ -182,7 +203,26 @@ class FakeMt5:
     return make_order_result(volume=request.get("volume", 1.0))
 
   def history_deals_get(self, ticket=None, position=None):
+    """Deal history, filtered the way the real terminal filters it.
+
+    Faithful on the two points a lenient fake used to hide, each of which cost a
+    live ``PnL: n/a``:
+
+    * the arguments are **integers** — the native extension raises on a string,
+      which is exactly what the reconciler handed it after reading the ticket out
+      of the DB's TEXT column;
+    * ``ticket`` selects the deals of one *order* (``DEAL_ORDER``) and
+      ``position`` the deals of one position (``DEAL_POSITION_ID``) — returning
+      every deal whatever was asked for let a lookup by the wrong ticket pass.
+    """
     self.deal_lookups.append({"ticket": ticket, "position": position})
+    for name, value in (("ticket", ticket), ("position", position)):
+      if value is not None and not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    if ticket is not None:
+      return [d for d in self._deals if getattr(d, "order", None) == ticket]
+    if position is not None:
+      return [d for d in self._deals if getattr(d, "position_id", None) == position]
     return list(self._deals)
 
   def last_error(self):

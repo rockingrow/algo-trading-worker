@@ -453,6 +453,27 @@ def test_missed_close_reports_the_positions_realized_pnl():
   assert "PnL (position total): <b>+13.85</b>" in proc.notifications[0]
 
 
+def test_missed_close_asks_for_the_pnl_by_the_rows_own_ticket():
+  """The ticket handed to the platform is the DB row's, unchanged — and the DB
+  stores every reference as TEXT.
+
+  That is the seam the reconciled PnL was lost at: MT5's ``history_deals_get``
+  takes an integer, so ``"798267992"`` raised inside the lookup and every
+  ``Position Reconciled`` message read ``n/a``. Normalising is the gateway's job
+  (``MT5Gateway._as_ticket_id``) since only it knows its platform's types, so
+  what is pinned here is that the reconciler hands over the reference as stored
+  rather than a re-derived one.
+  """
+  asked = []
+  proc = _FakeProc(position_pnl=2.3)
+  proc.gateway.get_position_realized_pnl = lambda ticket: asked.append(ticket) or 2.3
+
+  proc._on_missed_close(_row("798267992"))
+
+  assert asked == ["798267992"]
+  assert "PnL (position total): <b>+2.30</b>" in proc.notifications[0]
+
+
 def test_missed_close_reports_an_unreadable_pnl_as_unknown():
   proc = _FakeProc(position_pnl=None)
 
