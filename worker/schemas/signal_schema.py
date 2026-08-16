@@ -62,6 +62,11 @@ class SignalSchema(BaseModel):
   action: SignalActionEnum
   symbol: str
   signal_id: Optional[str] = None
+  # Trade-cycle correlation id: the entry and every close (TP1/TP2/SL/R_SL/FLAT)
+  # of one trade share the same value. Passed through untouched — never used for
+  # dedup (that is signal_id's job); forwarded on outbound TRADE events so the
+  # broker can match executions back to a single cycle.
+  signal_uxid: Optional[str] = None
   price: Optional[float] = None
   quantity: Optional[float] = None
   sl: Optional[float] = None
