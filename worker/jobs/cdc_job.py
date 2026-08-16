@@ -184,7 +184,7 @@ class PositionCDC:
     except (json.JSONDecodeError, TypeError):
       return {}
     extracted: Dict[str, Any] = {}
-    for key in ("signal_id", "sl", "tp1", "tp2"):
+    for key in ("signal_id", "signal_uxid", "sl", "tp1", "tp2"):
       if data.get(key) is not None:
         extracted[key] = data[key]
     if data.get("risk_percent") is not None:

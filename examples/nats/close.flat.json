@@ -1,5 +1,7 @@
 {
   "strategy": "MT5_GOLD_M5_V1",
+  "signal_id": "df6aac4d-da0d-41a3-9798-14d0d23d3f74",
+  "signal_uxid": "3f2e1d0c9b8a7654",
   "timestamp": "2026-04-18T21:55:00Z",
   "action": "FLAT",
   "symbol": "XAUUSD"
