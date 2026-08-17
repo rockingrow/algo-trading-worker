@@ -58,6 +58,7 @@ def test_db_keys_drops_none():
 class _FakeDb:
   def __init__(self, flat_positions):
     self.status_updates = []
+    self.logs = []
     self._flat = list(flat_positions)
 
   def get_open_positions_for_flat(self, strategy=None, symbol=None):
@@ -65,6 +66,9 @@ class _FakeDb:
 
   def update_position_status(self, **kwargs):
     self.status_updates.append(kwargs)
+
+  def log_position(self, **kwargs):
+    self.logs.append(kwargs)
 
 
 class _FakeExecutor:
@@ -96,6 +100,7 @@ class _FakeProc:
   _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
+  _log_flat_event = BaseSignalProcessor._log_flat_event
 
   def __init__(self, db_positions, positions, close_result):
     self.name = "FOREX"

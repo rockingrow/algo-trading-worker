@@ -593,6 +593,7 @@ The flag is **in-memory only** — a worker restart resets it to *allowed*. Ther
 - **Per-market match key, not symbol-only:** The admin FLAT correlates each live position with its DB row via `_flat_match_key` / `_flat_db_match_keys` — FOREX matches by ticket (checking both `ref_id` and `ref_source_id` so re-ticketed positions still match), CRYPTO by resolved exchange symbol. Two FOREX strategies running the same symbol are therefore handled independently.
 - **Graceful handling of already-closed positions:** If a position is tracked in SQLite but no longer live on the broker, it is marked `FLATTED` without sending a close order, so the DB stays consistent even after a connectivity gap.
 - **`PositionCDC` propagation:** After status updates, the CDC job picks up the `PENDING` rows and publishes `PositionEvent(event=UPDATED, status=FLATTED, …)` to the Broker via the NATS `TRADE` subject — no special handling required.
+- **The FLAT never overwrites the stored entry signal:** `positions.gateway_message` holds the *entry* signal JSON, which `PositionCDC` parses for the `signal_id` / `sl` / `tp1` / `tp2` the broker matches a `TRADE` event back to its own order. The ADMIN payload carries none of those, so it is written to the `position_logs` audit trail instead — where per-event history belongs — and the row's entry signal is left intact. (Overwriting it published an update with `signal_id: null` on both the public and the private subject, which the broker could not correlate, so the order was never updated there.)
 
 ---
 
