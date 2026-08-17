@@ -18,6 +18,7 @@ from worker.gateways.forex.mt5.close_detector import (
   TerminalCloseReason,
   scan_terminal_closed_positions,
 )
+from worker.gateways.message_presenter import pnl_line
 from worker.icons import MANUAL, STOP, SUCCESS, UNKNOWN, WARNING
 from worker.interfaces.db_protocol import TerminalCloseStoreProtocol
 from worker.interfaces.message_sender_protocol import MessageSenderProtocol
@@ -266,6 +267,7 @@ class MT5EventJob:
       f"Entry Price: <b>{_fmt_price(event.entry_price)}</b>\n"
       f"SL: <b>{_fmt_price(event.sl)}</b>\n"
       f"TP: <b>{_fmt_price(event.tp)}</b>\n"
+      f"{pnl_line(event.profit)}"
       f"----------------------------------\n"
       f"{acct_footer}"
     )

@@ -32,7 +32,7 @@ from worker.gateways.forex.stop_validator import StopValidator
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeResult, total_profit
 
 logger = get_logger("worker.gateways.forex.executor")
 
@@ -160,12 +160,27 @@ class ForexExecutor:
     if tick is None:
       return TradeResult.fail("No tick / market data unavailable")
     price = tick.ask if side == SIDE_LONG else tick.bid
+    # A non-positive quote is "no market data", whatever the gateway says: pricing
+    # an entry off zero would size the lot against a meaningless SL distance and
+    # push the stops to the wrong side of the market (broker retcode 10016).
+    if price <= 0:
+      logger.error(
+        f"[open_position] Unusable {symbol} quote (bid={tick.bid} ask={tick.ask}) — "
+        "refusing to price an entry off zero."
+      )
+      return TradeResult.fail("No tick / market data unavailable")
 
-    volume = self._resolve_entry_volume(signal, side, spec, price)
-
+    # Stops are validated BEFORE the lot is sized. The broker's minimum stop
+    # distance can push the SL further from the entry than the signal asked for,
+    # and the lot must be sized on the stop that will actually be placed:
+    # risk_cash is spread over the real SL distance, so sizing on the signal's
+    # (narrower) stop and then submitting the widened one silently makes the
+    # position risk more than RISK_PERCENTAGE of capital.
     sl, tp = self._stop_validator.validate_stops(
       spec, side, tick, signal.sl, signal.tp2
     )
+
+    volume = self._resolve_entry_volume(signal, spec, price, sl)
 
     comment = f"{signal.strategy} {(signal.signal_id or '')[-2:]}".strip()
     return self._gateway.place_order(
@@ -179,11 +194,38 @@ class ForexExecutor:
       comment=comment,
     )
 
+  def get_entry_price(self, signal: SignalSchema) -> Optional[float]:
+    """The price a market entry for *signal* would fill at right now, or ``None``
+    when no tick is available.
+
+    Same side convention as :meth:`open_position` (ask for a LONG, bid for a
+    SHORT), so the staleness guard judges the signal against the price the order
+    would really get rather than a mid-price the broker never quotes.
+    """
+    side = _ACTION_SIDE.get(signal.action.value)
+    if side is None:
+      return None
+    tick = self._gateway.get_tick(self.get_symbol(signal.symbol))
+    if tick is None:
+      return None
+    return tick.ask if side == SIDE_LONG else tick.bid
+
   def _resolve_entry_volume(
-    self, signal: SignalSchema, side: str, spec: Optional[SymbolSpec], price: float
+    self,
+    signal: SignalSchema,
+    spec: Optional[SymbolSpec],
+    price: float,
+    sl: Optional[float],
   ) -> float:
     """Entry lot: risk-based when VOLUME_DECISION is on (min lot if no SL or
-    equity unavailable), otherwise the signal's own quantity converted to lots."""
+    equity unavailable), otherwise the signal's own quantity converted to lots.
+
+    *sl* is the **effective** stop — the signal's, after ``StopValidator`` has
+    widened it to satisfy the broker's minimum stop distance — not ``signal.sl``.
+    Risk sizing divides risk_cash by the SL distance, so it must use the stop the
+    order will really carry or the position's true risk drifts from the
+    configured percentage.
+    """
     if not self._config.volume_decision_enabled:
       volume = self.convert_quantity_to_lots(signal.symbol, signal.quantity)
       logger.info(
@@ -191,7 +233,7 @@ class ForexExecutor:
       )
       return volume
 
-    if not signal.sl:
+    if not sl:
       volume = spec.volume_min if spec else 0.01
       logger.warning(
         "[open_position] VOLUME_DECISION_ENABLED but no SL in signal. "
@@ -223,16 +265,24 @@ class ForexExecutor:
       )
       return 0.01
 
-    volume = self._lot_sizer.calculate_lot_size(spec, price, signal.sl, risk, capital)
+    volume = self._lot_sizer.calculate_lot_size(spec, price, sl, risk, capital)
     capital_src = (
       "account_equity"
       if self._config.use_account_equity
       else f"capital={self._config.capital}"
     )
+    # Surface the widened stop explicitly: the lot below is smaller than the
+    # signal's own SL would have produced, and that difference is what keeps the
+    # position inside its risk budget.
+    sl_note = (
+      f" (broker stop distance widened SL {signal.sl} → {sl})"
+      if signal.sl and sl != signal.sl
+      else ""
+    )
     logger.info(
       f"[open_position] VOLUME_DECISION mode | {capital_src} "
       f"risk={risk}% (source={risk_source}, "
-      f"scale_factor={scale_factor}) → lot={volume}"
+      f"scale_factor={scale_factor}) sl={sl}{sl_note} → lot={volume}"
     )
     return volume
 
@@ -289,11 +339,13 @@ class ForexExecutor:
 
     success_count = 0
     last_result: Optional[Any] = None
+    closed_results: List[Any] = []
     for pos in positions:
       result = self._gateway.close_position(pos, comment=f"Full Close {reason}")
       if result.get("success"):
         success_count += 1
         last_result = result
+        closed_results.append(result)
       else:
         logger.error(
           f"[close_all] Failed to close ticket {pos.ticket}: {result.get('comment')}"
@@ -307,6 +359,10 @@ class ForexExecutor:
         price=last_result.get("price"),
         volume=last_result.get("volume"),
         comment=f"Closed {success_count} position(s) [{reason}]",
+        # Unlike price/volume — which describe the last fill — the PnL is summed
+        # across every position closed here, because the notification reports one
+        # close event and the operator's question is what the whole exit booked.
+        profit=total_profit(closed_results),
       )
     return TradeResult.fail(f"Failed to close positions [{reason}]")
 

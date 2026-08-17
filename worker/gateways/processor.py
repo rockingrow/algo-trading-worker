@@ -331,9 +331,9 @@ class BaseSignalProcessor(ABC):
 
   def _process_signal(self, signal: SignalSchema) -> None:
     """Execute one validated, connection-checked signal end-to-end: apply the
-    MAX_OPEN_ORDERS exposure guard, run it through the handler, then persist and
-    notify the outcome. Split out of :meth:`_process_message` so each NATS subject
-    (ADMIN / SYSTEM / signal) has its own handler."""
+    entry guards (:meth:`_entry_rejection`), run it through the handler, then
+    persist and notify the outcome. Split out of :meth:`_process_message` so each
+    NATS subject (ADMIN / SYSTEM / signal) has its own handler."""
     # Signal-execution gate: an ADMIN BLOCK_SIGNAL suspends *all* signal
     # execution for this worker until an ALLOW_SIGNAL clears it. This is the
     # single funnel for both live signals and the ACK's replay, so blocking
@@ -400,29 +400,9 @@ class BaseSignalProcessor(ABC):
       signal.timestamp,
     )
 
-    # Entry guards: a rejected entry is never sent to the broker. It is still
-    # recorded (status REJECTED), forwarded to the broker via CDC on the TRADE
-    # subject, and notified. Exits are never gated here so a position can always
-    # be closed. The single-position-per-symbol guard runs first (it is the
-    # stricter rule): while any order is open on the symbol, no new entry is
-    # placed — unless the market allows multiple strategies per symbol
-    # (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
-    # already held by *this* strategy still blocks.
+    # Exits are never gated so a position can always be closed.
     if signal.action in _ENTRY_ACTIONS:
-      allow_multi_strategy = bool(
-        getattr(
-          getattr(self.handler, "strategy", None),
-          "allows_multi_strategy_per_symbol",
-          False,
-        )
-      )
-      reject_reason = guard.symbol_open_rejection(
-        self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
-      )
-      if reject_reason is None:
-        reject_reason = guard.max_open_orders_rejection(
-          self.ctx.db_service, self.settings, signal
-        )
+      reject_reason = self._entry_rejection(signal)
       if reject_reason is not None:
         self._reject_signal(signal, reject_reason)
         return
@@ -447,7 +427,15 @@ class BaseSignalProcessor(ABC):
       action=signal.action.value,
       volume=result.get("volume", signal.quantity),
       price=result.get("price", signal.price),
-      sl=getattr(signal, "sl", None),
+      # The stop the position really carries, not the one the signal asked for:
+      # an entry reports back the level it actually registered with the broker
+      # (FOREX widens it to the broker's minimum stop distance), and that is the
+      # number the audit trail must hold. Exits carry no stop of their own, so
+      # they fall back to the signal's.
+      sl=result.get("sl") or getattr(signal, "sl", None),
+      # tp1 is the signal's *partial-close* target and is deliberately not
+      # overwritten by result["tp"] — that is the full-exit level (tp2) resting
+      # on the broker, a different concept that this column does not track.
       tp1=getattr(signal, "tp1", None),
       gateway_return_code=result.get("retcode", -1),
       comment=result.get("comment", ""),
@@ -524,6 +512,69 @@ class BaseSignalProcessor(ABC):
           comment=result.get("comment", ""),
           message=signal_json,
         )
+
+  def _entry_rejection(self, signal: SignalSchema) -> Optional[str]:
+    """Run the entry guards against *signal*, returning the first rejection
+    reason or ``None`` when it may be sent to the broker.
+
+    A rejected entry is never sent: it is recorded (status REJECTED), forwarded
+    to the broker via CDC on the TRADE subject, and notified.
+
+    Ordered cheapest-first, and by how strict the rule is:
+
+    1. **One open order per symbol** — the strictest rule, so it answers first.
+       While any order is live on the symbol no new entry is placed, unless the
+       market allows several strategies per symbol
+       (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
+       already held by *this* strategy blocks.
+    2. **MAX_OPEN_ORDERS** — the worker's exposure cap.
+    3. **Staleness** — needs a live quote from the broker (a tick read / REST
+       round-trip), so it runs last: no reason to pay for one on an entry the
+       two DB-only guards above already rejected.
+    """
+    allow_multi_strategy = bool(
+      getattr(
+        getattr(self.handler, "strategy", None),
+        "allows_multi_strategy_per_symbol",
+        False,
+      )
+    )
+    reason = guard.symbol_open_rejection(
+      self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
+    )
+    if reason is not None:
+      return reason
+
+    reason = guard.max_open_orders_rejection(self.ctx.db_service, self.settings, signal)
+    if reason is not None:
+      return reason
+
+    return guard.stale_signal_rejection(
+      signal, self._entry_quote(signal), self.settings
+    )
+
+  def _entry_quote(self, signal: SignalSchema) -> Optional[float]:
+    """Live price the entry would fill at, or ``None`` when it can't be read.
+
+    ``getattr`` chain so a market strategy (or a test double) without the
+    capability is treated as "no quote": the staleness guard then skips rather
+    than blocking the entry. A broker error is swallowed for the same reason —
+    failing to fetch a quote must not stop trading, it just means this guard has
+    nothing to judge on.
+    """
+    strategy = getattr(self.handler, "strategy", None)
+    getter = getattr(strategy, "entry_price", None)
+    if getter is None:
+      return None
+    try:
+      return getter(signal)
+    except Exception:
+      log.exception(
+        "[%s Process] Could not read a live quote for %s — staleness guard skipped.",
+        self.name,
+        signal.symbol,
+      )
+      return None
 
   def _reject_signal(self, signal: SignalSchema, reason: str) -> None:
     """Handle a policy-rejected entry end-to-end without touching the broker.

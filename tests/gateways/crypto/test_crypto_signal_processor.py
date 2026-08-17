@@ -70,6 +70,80 @@ def test_missed_close_tolerates_missing_mark_price():
   assert len(notes) == 1
 
 
+def test_missed_close_estimates_the_pnl_from_the_row_and_mark_price():
+  # The real fill was never delivered (that is why the reconciler is involved),
+  # so the figure is measured against the same approximate close price the
+  # message already shows — and is labelled an estimate for exactly that reason.
+  proc, _, _, notes = _reconcile_proc()
+
+  proc._on_missed_close(
+    {
+      "ref_source_id": "55",
+      "symbol": "BTCUSD",
+      "strategy": "s",
+      "action": "long",
+      "volume": 0.02,
+      "opened_price": 63000.0,
+    }
+  )
+
+  # 0.02 BTC from 63,000 to a 64,000 mark.
+  assert "PnL (est.): <b>+20.00</b>" in notes[0]
+
+
+def test_missed_close_estimate_inverts_for_a_short():
+  proc, _, _, notes = _reconcile_proc()
+
+  proc._on_missed_close(
+    {
+      "ref_source_id": "55",
+      "symbol": "BTCUSD",
+      "strategy": "s",
+      "action": "short",
+      "volume": 0.02,
+      "opened_price": 63000.0,
+    }
+  )
+
+  assert "PnL (est.): <b>-20.00</b>" in notes[0]
+
+
+def test_missed_close_pnl_is_unknown_without_a_mark_price():
+  # No price to measure against — the line still appears, saying so.
+  proc, _, _, notes = _reconcile_proc()
+  proc.gateway.get_mark_price = lambda sym: (_ for _ in ()).throw(RuntimeError("down"))
+
+  proc._on_missed_close(
+    {
+      "ref_source_id": "55",
+      "symbol": "BTCUSD",
+      "strategy": "s",
+      "action": "long",
+      "volume": 0.02,
+      "opened_price": 63000.0,
+    }
+  )
+
+  assert "PnL (est.): <b>n/a</b>" in notes[0]
+
+
+def test_missed_close_pnl_is_unknown_when_the_row_has_no_usable_side():
+  # The side decides the sign, so guessing it would report a loss as a profit.
+  proc, _, _, notes = _reconcile_proc()
+
+  proc._on_missed_close(
+    {
+      "ref_source_id": "55",
+      "symbol": "BTCUSD",
+      "strategy": "s",
+      "volume": 0.02,
+      "opened_price": 63000.0,
+    }
+  )
+
+  assert "PnL (est.): <b>n/a</b>" in notes[0]
+
+
 # ── manual-position import handler ──────────────────────────────────────────── #
 
 

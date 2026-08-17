@@ -520,6 +520,238 @@ def test_max_open_orders_zero_disables_cap():
   assert len(proc.db.inserted) == 1
 
 
+# ── Audit trail records the stop actually placed ───────────────────────────── #
+
+
+def test_log_position_records_the_broker_side_stop():
+  # The broker widened the stop to satisfy its minimum distance. The audit row
+  # must hold what the position really carries, not what the signal asked for —
+  # it is the record of the risk actually taken.
+  proc = FakeProcessor(
+    {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.33,
+      "sl": 1999.39,
+      "tp": 2000.11,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, sl=1999.45, tp2=2000.05).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["sl"] == 1999.39
+
+
+def test_log_position_falls_back_to_the_signal_stop():
+  # Exits carry no stop of their own, so the signal's value still lands in the
+  # audit row rather than a null.
+  proc = FakeProcessor(
+    {"success": True, "ticket": 9, "source_ticket": 5, "price": 1990.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.SL, sl=1990.0).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["sl"] == 1990.0
+
+
+def test_log_position_keeps_tp1_as_the_signal_partial_target():
+  # tp1 is the partial-close level, a different concept from the full-exit TP
+  # resting at the broker — result["tp"] must not overwrite it.
+  proc = FakeProcessor(
+    {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.1,
+      "sl": 1990.0,
+      "tp": 2050.0,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, tp1=2020.0, tp2=2050.0).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["tp1"] == 2020.0
+
+
+# ── Stale-signal guard ─────────────────────────────────────────────────────── #
+
+
+def _quoting_handler(proc, quote, result):
+  """Give the processor a handler whose market strategy reports *quote* as the
+  live entry price, and record the signals it was asked to execute."""
+  seen = []
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: seen.append(sig) or result,
+    strategy=SimpleNamespace(entry_price=lambda sig: quote),
+  )
+  return seen
+
+
+def test_entry_rejected_when_market_already_past_tp():
+  # The XPDUSD failure: signal planned at 1375 with TP 1377, but the ask has
+  # already run to 1388. The entry must never reach the broker.
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  seen = _quoting_handler(proc, 1388.0, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="XPDUSD", price=1375.0, sl=1370.0, tp2=1377.0
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert proc.db.inserted == []
+  assert len(proc.db.rejected) == 1
+  rej = proc.db.rejected[0]
+  assert rej["symbol"] == "XPDUSD"
+  assert "already reached its take-profit" in rej["comment"]
+  assert proc.notifications == ["order_rejected:LONG:" + rej["comment"]]
+
+
+def test_entry_rejected_when_market_already_past_sl():
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  seen = _quoting_handler(proc, 1985.0, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "already reached its stop-loss" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_rejected_when_drift_exceeds_limit():
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_entry_drift_r_percent": 50}
+  seen = _quoting_handler(proc, 2006.0, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "price moved too far" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_allowed_when_quote_is_close_to_the_signal():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2002.0, "volume": 0.1})
+  _quoting_handler(
+    proc, 2002.0, {"success": True, "ticket": 1, "price": 2002.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_exit_signal_not_gated_by_stale_guard():
+  # An exit must always be executable, however far the market has run — a TP2
+  # exit is *expected* to arrive with the price through the target.
+  proc = FakeProcessor(
+    {"success": True, "ticket": 9, "source_ticket": 5, "price": 2050.0, "volume": 0.1}
+  )
+  _quoting_handler(
+    proc,
+    2060.0,
+    {
+      "success": True,
+      "ticket": 9,
+      "source_ticket": 5,
+      "price": 2050.0,
+      "volume": 0.1,
+    },
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.TP2).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert proc.notifications == ["filled:TP2:5"]
+
+
+def test_entry_proceeds_when_no_live_quote_is_available():
+  # A missing quote must not block trading — the guard simply has nothing to
+  # judge on and defers to the broker.
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  _quoting_handler(
+    proc, None, {"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+
+
+def test_entry_proceeds_when_quote_lookup_raises():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+
+  def _boom(_sig):
+    raise RuntimeError("broker unreachable")
+
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.1,
+    },
+    strategy=SimpleNamespace(entry_price=_boom),
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+
+
+def test_cheaper_db_guards_run_before_the_quote_lookup():
+  # The staleness guard needs a broker round-trip, so an entry already rejected
+  # by a DB-only guard must not pay for one.
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+  quote_calls = []
+
+  def _quote(_sig):
+    quote_calls.append(_sig)
+    return 2000.0
+
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: {"success": True},
+    strategy=SimpleNamespace(entry_price=_quote),
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert quote_calls == []
+  assert len(proc.db.rejected) == 1
+  assert "already has an open order" in proc.db.rejected[0]["comment"]
+
+
 def test_unknown_strategy_signal_is_skipped_with_alert():
   # A FOREX signal for a strategy that isn't in STRATEGY_MAGIC_MAP used to bubble
   # a KeyError out of the executor as an unhandled "manual reconciliation may be

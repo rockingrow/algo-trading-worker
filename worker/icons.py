@@ -23,3 +23,5 @@ GEAR = _e.emojize(":gear:")  # ⚙️
 MANUAL = _e.emojize(":hand_with_fingers_splayed:")  # 🖐
 BROKER = _e.emojize(":electric_plug:")  # 🔌
 RETRYING = _e.emojize(":hourglass_not_done:")  # ⏳
+PROFIT = _e.emojize(":chart_increasing:")  # 📈 (a close booked in profit)
+LOSS = _e.emojize(":chart_decreasing:")  # 📉 (a close booked at a loss)

@@ -19,6 +19,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, Optional
 
+from worker.gateways.crypto.base import linear_realized_pnl
 from worker.gateways.crypto.binance.user_data_stream import (
   ExchangeCloseEvent,
   ExchangeCloseReason,
@@ -339,8 +340,35 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     )
     self.ctx.channel_notifier.send_message(
       CryptoMessagePresenter.position_reconciled_closed(
-        row, close_price, self.gateway.get_account_footer()
+        row,
+        close_price,
+        self.gateway.get_account_footer(),
+        profit=self._reconciled_pnl(row, close_price),
       )
+    )
+
+  @staticmethod
+  def _reconciled_pnl(
+    row: Dict[str, Any], close_price: Optional[float]
+  ) -> Optional[float]:
+    """Estimated PnL of a reconciled close, from the DB row against *close_price*.
+
+    The fill this position really closed at is gone — the event that carried it
+    was missed, which is why the reconciler is involved at all — so the figure is
+    only ever as good as the mark price standing in for it, exactly like the
+    "Approx Close" the same message already shows. That is why the notification
+    labels it an estimate: it is worth reading (an operator wants to know roughly
+    what a vanished position cost) but must not be mistaken for a booked amount.
+
+    ``None`` whenever the row or the price cannot support the arithmetic, so an
+    unknown result stays unknown.
+    """
+    side = str(row.get("action") or "").upper()
+    return linear_realized_pnl(
+      side=side,
+      entry_price=row.get("opened_price"),
+      close_price=close_price,
+      volume=row.get("volume"),
     )
 
   # ── Manual-position import (from CryptoReconcileJob) ──────────────────── #

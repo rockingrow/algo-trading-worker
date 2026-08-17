@@ -20,7 +20,7 @@ incrementally.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 # Declared fields exposed via mapping access (everything except the `extra` bag).
 _FIELDS = frozenset(
@@ -32,9 +32,12 @@ _FIELDS = frozenset(
     "price",
     "volume",
     "source_ticket",
+    "sl",
+    "tp",
     "new_sl",
     "sl_update",
     "forced_closed",
+    "profit",
   }
 )
 
@@ -50,9 +53,23 @@ class TradeResult:
   price: Optional[float] = None
   volume: Optional[float] = None
   source_ticket: Optional[str] = None
+  # Stops actually registered with the broker by an entry — the signal's levels
+  # after any broker-driven adjustment (FOREX: StopValidator widening them to the
+  # minimum stop distance). They are what the position really carries, so the DB
+  # and the operator notification report these rather than the signal's own
+  # numbers. ``None`` means no stop of that kind is resting on the position.
+  sl: Optional[float] = None
+  tp: Optional[float] = None
   new_sl: Optional[float] = None
   sl_update: Any = None  # nested TradeResult from the SL-update step (TP1)
   forced_closed: list = field(default_factory=list)
+  # Realized PnL booked by a *closing* operation, in account currency. Set on
+  # every close (partial or full) the worker performs, so the notification for it
+  # can report the money the trade actually made or lost. ``None`` means either
+  # "not a close" (an entry books nothing) or "the broker did not tell us" — the
+  # two are distinguished by context, and a close that renders ``None`` shows
+  # ``n/a`` rather than a fabricated 0.0.
+  profit: Optional[float] = None
   # Catch-all for any ad-hoc keys a caller may still set via mapping access.
   extra: dict = field(default_factory=dict)
 
@@ -104,3 +121,19 @@ class TradeResult:
       return self[key]
     self[key] = default
     return default
+
+
+def total_profit(results: Iterable[Any]) -> Optional[float]:
+  """Sum the realized PnL of several closes, or ``None`` when none reported one.
+
+  Used where one logical exit fans out into several broker closes (a symbol held
+  as multiple tickets, an ADMIN FLAT over a netted position): the notification
+  reports a single close, so it needs a single figure.
+
+  A result that reports no PnL contributes nothing rather than zero, and an exit
+  where *nothing* was reported stays ``None`` — so a partially-known total is
+  still shown (it is closer to the truth than nothing) while a wholly unknown one
+  never masquerades as a break-even close.
+  """
+  known = [r.get("profit") for r in results if r.get("profit") is not None]
+  return sum(known) if known else None

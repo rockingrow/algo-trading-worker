@@ -79,9 +79,46 @@ def make_position(
   )
 
 
-def make_order_result(retcode=10009, order=999, price=2000.0, volume=1.0, comment="ok"):
+def make_order_result(
+  retcode=10009, order=999, price=2000.0, volume=1.0, comment="ok", deal=555
+):
   return SimpleNamespace(
-    retcode=retcode, order=order, price=price, volume=volume, comment=comment
+    retcode=retcode,
+    order=order,
+    price=price,
+    volume=volume,
+    comment=comment,
+    # The deal a filled order produced. MT5 books the realized PnL of a close on
+    # it, so the gateway reads the amount back from deal history using this.
+    deal=deal,
+  )
+
+
+def make_deal(
+  ticket=555,
+  profit=0.0,
+  commission=0.0,
+  swap=0.0,
+  fee=0.0,
+  order=None,
+  position_id=None,
+):
+  """One MT5 history deal, carrying the four fields that sum to its net result.
+
+  *order* (``DEAL_ORDER``, the order that produced the deal) and *position_id*
+  (``DEAL_POSITION_ID``) are the two fields ``history_deals_get`` filters on — a
+  deal's own ``ticket`` is not a filter at all. Set whichever one the lookup
+  under test is supposed to find the deal by; a deal that carries neither is
+  reachable only through an unfiltered read.
+  """
+  return SimpleNamespace(
+    ticket=ticket,
+    profit=profit,
+    commission=commission,
+    swap=swap,
+    fee=fee,
+    order=order,
+    position_id=position_id,
   )
 
 
@@ -121,12 +158,16 @@ class FakeMt5:
     account=None,
     order_results: Optional[List] = None,
     symbols=None,
+    deals: Optional[List] = None,
   ):
     self._symbol_info = symbol_info if symbol_info is not None else make_symbol_info()
     self._tick = tick if tick is not None else make_tick()
     self._positions = list(positions or [])
     self._account = account if account is not None else SimpleNamespace(equity=10000.0)
     self._order_results = list(order_results or [])
+    # Deal history returned by history_deals_get. Left empty by default so the
+    # PnL lookup reports "unknown" unless a test supplies deals.
+    self._deals = list(deals) if deals is not None else []
     self._symbols = (
       symbols
       if symbols is not None
@@ -134,6 +175,7 @@ class FakeMt5:
     )
     self.sent_requests: List[dict] = []
     self.selected: List[tuple] = []
+    self.deal_lookups: List[dict] = []
 
   def symbols_get(self, group=None):
     return self._symbols
@@ -159,6 +201,29 @@ class FakeMt5:
     if self._order_results:
       return self._order_results.pop(0)
     return make_order_result(volume=request.get("volume", 1.0))
+
+  def history_deals_get(self, ticket=None, position=None):
+    """Deal history, filtered the way the real terminal filters it.
+
+    Faithful on the two points a lenient fake used to hide, each of which cost a
+    live ``PnL: n/a``:
+
+    * the arguments are **integers** — the native extension raises on a string,
+      which is exactly what the reconciler handed it after reading the ticket out
+      of the DB's TEXT column;
+    * ``ticket`` selects the deals of one *order* (``DEAL_ORDER``) and
+      ``position`` the deals of one position (``DEAL_POSITION_ID``) — returning
+      every deal whatever was asked for let a lookup by the wrong ticket pass.
+    """
+    self.deal_lookups.append({"ticket": ticket, "position": position})
+    for name, value in (("ticket", ticket), ("position", position)):
+      if value is not None and not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    if ticket is not None:
+      return [d for d in self._deals if getattr(d, "order", None) == ticket]
+    if position is not None:
+      return [d for d in self._deals if getattr(d, "position_id", None) == position]
+    return list(self._deals)
 
   def last_error(self):
     return (1, "fake error")
@@ -222,7 +287,9 @@ class FakePlatformGateway:
     place_results=None,
     close_results=None,
     modify_results=None,
+    position_pnl=None,
   ):
+    self._position_pnl = position_pnl
     self._spec = spec if spec is not None else make_symbol_spec()
     self._tick = tick if tick is not None else Tick(bid=1999.5, ask=2000.0)
     self._positions = list(positions or [])
@@ -274,6 +341,10 @@ class FakePlatformGateway:
   def get_positions(self, symbol=None):
     return list(self._positions)
 
+  def get_position_realized_pnl(self, position_ticket):
+    """Total realized PnL the reconciler reads for a closed position."""
+    return self._position_pnl
+
   # ── Orders ────────────────────────────────────────────────────────────── #
   def place_order(self, symbol, side, volume, price, sl, tp, magic, comment):
     self.placed.append(
@@ -290,7 +361,11 @@ class FakePlatformGateway:
     )
     if self._place_results:
       return self._place_results.pop(0)
-    return TradeResult.ok(retcode=10009, ticket="999", price=price, volume=volume)
+    # Echo the stops back like a real gateway: they are what the position ends
+    # up carrying, after the caller's StopValidator pass.
+    return TradeResult.ok(
+      retcode=10009, ticket="999", price=price, volume=volume, sl=sl, tp=tp
+    )
 
   def close_position(self, position, volume=None, comment="Close"):
     vol = position.volume if volume is None else volume

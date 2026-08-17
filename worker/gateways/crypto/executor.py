@@ -33,11 +33,12 @@ from worker.gateways.crypto.base import (
   WORKER_ORDER_PREFIX,
   BaseExchangeGateway,
   ExchangePosition,
+  linear_realized_pnl,
 )
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeResult, total_profit
 
 logger = get_logger("worker.gateways.crypto.executor")
 
@@ -171,17 +172,28 @@ class CryptoExecutor:
   def _attach_entry_orders(
     self, symbol: str, action: str, qty: float, signal: SignalSchema, result: dict
   ) -> TradeResult:
-    """Place SL and TP2 resting orders after the entry market order succeeds."""
+    """Place SL and TP2 resting orders after the entry market order succeeds.
+
+    ``result["sl"]`` / ``result["tp"]`` report the stops the position actually
+    ends up carrying, matching the forex executor's contract. An exchange takes
+    the signal's levels verbatim (there is no minimum-stop-distance rewrite as on
+    MT5), so they differ from the signal only when a stop was not placed at all —
+    which is exactly the case worth recording: a failed TP leaves the position
+    running without a take-profit.
+    """
     if signal.sl:
       sl_res = self._gateway.set_stop_loss(symbol, action, signal.sl, qty)
       result["sl_update"] = sl_res
       if not sl_res.get("success"):
         return self._rollback_unprotected_entry(symbol, action, result, sl_res, qty)
+      result["sl"] = signal.sl
 
     if signal.tp2:
       tp_res = self._gateway.set_take_profit(symbol, action, signal.tp2, qty)
       result["tp_update"] = tp_res
-      if not tp_res.get("success"):
+      if tp_res.get("success"):
+        result["tp"] = signal.tp2
+      else:
         logger.warning(
           "[open_position] TP placement failed (%s) for %s — position remains "
           "SL-protected; continuing without a resting take-profit.",
@@ -191,6 +203,23 @@ class CryptoExecutor:
 
     result.setdefault("volume", qty)
     return result
+
+  def get_entry_price(self, signal: SignalSchema) -> Optional[float]:
+    """The price a market entry for *signal* would fill at right now, or ``None``
+    when the mark price cannot be read.
+
+    A CEX quotes a single mark price rather than a bid/ask pair, so unlike the
+    forex executor there is no side to pick — the same price is used for a LONG
+    and a SHORT.
+    """
+    try:
+      price = self._gateway.get_mark_price(self.get_symbol(signal.symbol))
+    except Exception:
+      logger.exception(
+        "[get_entry_price] Could not fetch mark price for %s", signal.symbol
+      )
+      return None
+    return price if price and price > 0 else None
 
   def _resolve_entry_qty(self, signal: SignalSchema, symbol: str) -> float:
     """Entry quantity before final step-size normalization: risk-based when
@@ -397,6 +426,7 @@ class CryptoExecutor:
     )
     if result.get("success"):
       result["source_ticket"] = str(pos.ticket)
+      self._attach_realized_pnl(result, pos)
     return result
 
   def update_position_sl(
@@ -484,6 +514,7 @@ class CryptoExecutor:
     self._gateway.cancel_all_orders(resolved)
     success_count = 0
     last_result: Optional[Any] = None
+    closed_results: List[Any] = []
     for pos in positions:
       result = self._gateway.place_market_order(
         resolved,
@@ -495,6 +526,8 @@ class CryptoExecutor:
       if result.get("success"):
         success_count += 1
         last_result = result
+        self._attach_realized_pnl(result, pos)
+        closed_results.append(result)
       else:
         logger.error(
           "[close_all] Failed to close %s: %s", resolved, result.get("comment")
@@ -507,6 +540,9 @@ class CryptoExecutor:
         price=last_result.get("price"),
         volume=last_result.get("volume"),
         comment=f"Closed {success_count} position(s) [{reason}]",
+        # Summed, not last-write-wins like price/volume: the notification reports
+        # one exit, so it needs what the whole exit booked.
+        profit=total_profit(closed_results),
       )
     return TradeResult.fail(f"Failed to close [{reason}]")
 
@@ -521,7 +557,65 @@ class CryptoExecutor:
     )
     if result.get("success"):
       result.setdefault("comment", f"Closed [{reason}]")
+      self._attach_realized_pnl(result, pos)
     return result
+
+  # ── Realized PnL ──────────────────────────────────────────────────────── #
+
+  def _attach_realized_pnl(self, result: TradeResult, pos: Any) -> None:
+    """Record on *result* what closing *pos* booked, so the notification can
+    report it.
+
+    The exchange answers a close with the order's fill, not its money: Binance's
+    order response carries no ``realizedPnl``, and the user-data stream that does
+    carry one deliberately skips the worker's own reduce-only fills (they would
+    double-report the close the signal flow already handles). So the figure is
+    derived from the position's average entry against the fill —
+    :func:`linear_realized_pnl` documents why that equals what the exchange
+    itself would report — and costs nothing beyond the close already made.
+
+    That leaves one gap, and it is not rare: Binance can report a filled MARKET
+    order with ``avgPrice=0`` *and* ``cumQuote=0`` (routinely on testnet, and
+    occasionally live — the same quirk ``_order_result`` and
+    ``BaseSignalProcessor._process_signal`` already work around), and with no
+    fill price there is nothing to measure the entry against. The displayed
+    *price* recovers, because the processor substitutes the signal's price one
+    layer up, but that repair lands after this point — so without a fallback the
+    PnL is stuck reporting "n/a" on every close while the price beside it looks
+    fine. When the local computation cannot be made, the exchange is therefore
+    asked for the order's own realized figure: exact, consistent with the
+    stream's, and a round-trip paid only in that case.
+    """
+    profit = linear_realized_pnl(
+      side=pos.side,
+      entry_price=getattr(pos, "price_open", None),
+      close_price=result.get("price"),
+      volume=result.get("volume"),
+    )
+    if profit is None:
+      profit = self._exchange_realized_pnl(pos, result.get("ticket"))
+    result["profit"] = profit
+
+  def _exchange_realized_pnl(self, pos: Any, order_id: Any) -> Optional[float]:
+    """Ask the exchange what it booked for *order_id*, or ``None``.
+
+    ``getattr`` chain so an exchange (or test double) without the lookup is
+    simply "PnL unknown", and never raises: the close has already succeeded by
+    the time this runs, so a failed read costs the notification's PnL line, not
+    the trade.
+    """
+    reader = getattr(self._gateway, "get_order_realized_pnl", None)
+    if reader is None:
+      return None
+    try:
+      return reader(pos.symbol, order_id)
+    except Exception as exc:  # pragma: no cover - best effort
+      logger.warning(
+        "[close] Realized PnL unavailable from the exchange for order %s: %s",
+        order_id,
+        exc,
+      )
+      return None
 
   # ── Helpers ───────────────────────────────────────────────────────────── #
 

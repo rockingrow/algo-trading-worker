@@ -4,7 +4,7 @@ from worker.gateways.forex.message_presenter import (
   ForexMessagePresenter,
   format_volume,
 )
-from worker.icons import GEAR, REJECTED, SYNC
+from worker.icons import GEAR, LOSS, PROFIT, REJECTED, SYNC
 from worker.schemas.signal_schema import SignalActionEnum
 
 
@@ -85,6 +85,72 @@ def test_order_filled_volume_gear_follows_volume_decision():
 
   no_settings = ForexMessagePresenter.order_filled(signal, result, 5, "FOOTER")
   assert "0.1 lot" in no_settings and GEAR not in no_settings
+
+
+# ── Stops shown are the ones actually placed ───────────────────────────────── #
+#
+# The broker's minimum stop distance can move SL/TP, so reading the signal's own
+# numbers back out of the notification is how an adjusted stop goes unnoticed —
+# which is exactly how an entry can appear to sit beyond its own take-profit.
+
+
+def test_order_filled_shows_the_stops_actually_placed():
+  signal = make_signal(SignalActionEnum.LONG, sl=1990.0, tp2=2050.0)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2000.0, "volume": 0.1, "ticket": 5, "sl": 1990.0, "tp": 2050.0},
+    5,
+    "FOOTER",
+  )
+  assert "SL: <b>1990.0</b>" in msg
+  assert "TP: <b>2050.0</b>" in msg
+  # Nothing was moved, so no adjustment marker.
+  assert "signal asked" not in msg
+
+
+def test_order_filled_flags_a_stop_the_broker_moved():
+  signal = make_signal(SignalActionEnum.LONG, sl=1999.45, tp2=2000.05)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2000.0, "volume": 0.33, "ticket": 5, "sl": 1999.39, "tp": 2000.11},
+    5,
+    "FOOTER",
+  )
+  # The placed level leads; the signal's request is shown beside it so the gap
+  # is visible instead of silent.
+  assert "SL: <b>1999.39</b>" in msg and "signal asked 1999.45" in msg
+  assert "TP: <b>2000.11</b>" in msg and "signal asked 2000.05" in msg
+
+
+def test_order_filled_flags_a_take_profit_that_was_not_placed():
+  # Crypto path: the entry filled and the SL registered, but the resting TP
+  # failed — the position is running without a target and must say so.
+  signal = make_signal(SignalActionEnum.LONG, sl=1990.0, tp2=2050.0)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2000.0, "volume": 0.1, "ticket": 5, "sl": 1990.0, "tp": None},
+    5,
+    "FOOTER",
+  )
+  assert "TP: <b>none</b>" in msg and "signal asked 2050.0" in msg
+
+
+def test_order_filled_omits_stops_the_signal_never_carried():
+  signal = make_signal(SignalActionEnum.LONG, sl=None, tp2=None)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "SL:" not in msg
+  assert "TP:" not in msg
+
+
+def test_order_filled_stops_absent_for_a_result_without_them():
+  # A result predating the sl/tp fields (or an exit) must not render a bogus line.
+  signal = make_signal(SignalActionEnum.LONG, sl=None, tp2=None)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "Order Filled" in msg
 
 
 def test_order_filled_shows_scale_position_block():
@@ -254,3 +320,116 @@ def test_position_reconciled_closed_contains_key_fields():
   assert "2000.0" in msg
   assert "4587420656" in msg
   assert "FOOTER" in msg
+
+
+# ── Every close reports its PnL ─────────────────────────────────────────────── #
+#
+# A partial or full close is the moment a trade books money, so each of these
+# messages carries the line whatever triggered the close — a signal, a stale-entry
+# force close, an ADMIN FLAT, or the reconciler. An amount we could not read says
+# "n/a" rather than dropping the line (silence reads as break-even).
+
+
+def test_order_filled_shows_pnl_for_a_full_close():
+  signal = make_signal(SignalActionEnum.TP2)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2050.0, "volume": 0.1, "ticket": 5, "profit": 41.75},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>+41.75</b>" in msg and PROFIT in msg
+
+
+def test_order_filled_shows_pnl_for_a_tp1_partial_close():
+  # TP1 closes only part of the position, but that part booked a real result.
+  signal = make_signal(SignalActionEnum.TP1)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 2020.0, "volume": 0.03, "ticket": 5, "profit": 5.4},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>+5.40</b>" in msg
+
+
+def test_order_filled_shows_a_losing_close_with_its_sign():
+  signal = make_signal(SignalActionEnum.SL)
+  msg = ForexMessagePresenter.order_filled(
+    signal,
+    {"price": 1990.0, "volume": 0.1, "ticket": 5, "profit": -18.2},
+    5,
+    "FOOTER",
+  )
+  assert "PnL: <b>-18.20</b>" in msg and LOSS in msg
+
+
+def test_order_filled_reports_an_unreadable_pnl_as_unknown():
+  signal = make_signal(SignalActionEnum.TP2)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2050.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "PnL: <b>n/a</b>" in msg
+
+
+def test_order_filled_has_no_pnl_line_for_an_entry():
+  # An entry has booked nothing yet; a 0.00 (or an "n/a") there would be noise.
+  signal = make_signal(SignalActionEnum.LONG)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5}, 5, "FOOTER"
+  )
+  assert "PnL" not in msg
+
+
+def test_force_closed_shows_pnl():
+  msg = ForexMessagePresenter.force_closed(
+    "XAUUSD",
+    "strat-1",
+    {"price": 1999.0, "volume": 0.2, "ref_id": 7, "ref_source_id": 3, "profit": -3.5},
+    "FOOTER",
+  )
+  assert "PnL: <b>-3.50</b>" in msg
+
+
+def test_admin_flat_closed_shows_pnl():
+  msg = ForexMessagePresenter.admin_flat_closed(
+    {"symbol": "XAUUSD", "strategy": "strat-A", "ref_source_id": 10},
+    {"price": 2001.5, "volume": 0.5, "ticket": 999, "profit": 7.25},
+    "FOOTER",
+  )
+  assert "PnL: <b>+7.25</b>" in msg
+
+
+def test_position_reconciled_closed_labels_its_pnl_a_position_total():
+  # The reconciler never saw the close, so the figure it reads from deal history
+  # spans the position's whole life — the label has to say so.
+  db_pos = {
+    "symbol": "XAUUSD",
+    "strategy": "strat-A",
+    "ref_source_id": "458",
+    "volume": 0.01,
+  }
+  msg = ForexMessagePresenter.position_reconciled_closed(
+    db_pos, 2000.0, "FOOTER", profit=13.85
+  )
+  assert "PnL (position total): <b>+13.85</b>" in msg
+
+
+def test_position_reconciled_closed_without_a_pnl_says_unknown():
+  db_pos = {
+    "symbol": "XAUUSD",
+    "strategy": "strat-A",
+    "ref_source_id": "458",
+    "volume": 0.01,
+  }
+  msg = ForexMessagePresenter.position_reconciled_closed(db_pos, 2000.0, "FOOTER")
+  assert "PnL (position total): <b>n/a</b>" in msg
+
+
+def test_break_even_close_is_shown_as_zero_not_unknown():
+  signal = make_signal(SignalActionEnum.FLAT)
+  msg = ForexMessagePresenter.order_filled(
+    signal, {"price": 2000.0, "volume": 0.1, "ticket": 5, "profit": 0.0}, 5, "FOOTER"
+  )
+  assert "PnL: <b>+0.00</b>" in msg
+  assert "n/a" not in msg

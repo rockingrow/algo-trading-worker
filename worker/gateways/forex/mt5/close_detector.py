@@ -18,6 +18,7 @@ from typing import List, Optional, Set
 
 import MetaTrader5 as mt5
 
+from worker.gateways.forex.mt5.deal_pnl import deal_realized_pnl
 from worker.logger import get_logger
 
 log = get_logger("worker.gateways.forex.mt5.close_detector")
@@ -101,6 +102,9 @@ class TerminalClosedEvent:
   tp: Optional[float]  # server-side TP (= tp1 price level in our system)
   # Account snapshot at detection time
   account: Optional[AccountSnapshot]
+  # Net realized PnL of the closing deal (price result minus commission/swap/fee),
+  # as MT5 booked it. ``None`` only when the deal carried no such fields at all.
+  profit: Optional[float] = None
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────── #
@@ -188,6 +192,11 @@ def _build_event(position_ticket: int) -> Optional[TerminalClosedEvent]:
     sl=opening_order.sl if opening_order else None,
     tp=opening_order.tp if opening_order else None,
     account=_account_snapshot(),
+    # The deal that flattened the position is also where MT5 booked the money it
+    # made or lost, so the PnL comes free with the history read that detected the
+    # close — no second query, and it covers exactly this close (an earlier TP1
+    # partial booked its own result on its own deal, reported at the time).
+    profit=deal_realized_pnl(closing_deal),
   )
 
 
