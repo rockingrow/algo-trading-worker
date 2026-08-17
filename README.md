@@ -413,13 +413,13 @@ Configuration is grouped into nested `<specific>Settings` sub-models on the main
 
 ### Telegram chat ids: many chats, and group topics
 
-`TELEGRAM_CHAT_ID`, `TELEGRAM_CHAT_CHANNEL_ID` and `TELEGRAM_LOG_CHAT_ID` all run through the same `notification_service.parse_chat_targets()` — none of them is special — so each can reach several chats and can address a **topic** inside a group that has the Topics feature switched on:
+`TELEGRAM_WORKER_LOG_CHAT_IDS`, `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS` and `TELEGRAM_LOG_CHAT_ID` all run through the same `notification_service.parse_chat_targets()` — none of them is special — so each can reach several chats and can address a **topic** inside a group that has the Topics feature switched on:
 
 ```bash
 # Two groups + one topic inside a third, all from one setting
-TELEGRAM_CHAT_CHANNEL_ID="-1001111111111,@public_channel,-1002173777783_924584"
+TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS="-1001111111111,@public_channel,-1002173777783_924584"
 # The same syntax works for the management chat and the error-log chat
-TELEGRAM_CHAT_ID="-1001111111111,-1002173777783_100"
+TELEGRAM_WORKER_LOG_CHAT_IDS="-1001111111111,-1002173777783_100"
 TELEGRAM_LOG_CHAT_ID="-1002173777783_555"
 ```
 
@@ -437,7 +437,7 @@ Notes:
 - The suffix is sent *only* when configured: Telegram answers `400 Bad Request: message thread not found` if a `message_thread_id` is passed for a chat that has no such topic.
 - Each chat gets its own Bot API call, and one failing chat (bot kicked, topic deleted) is logged without stopping the others; `send_message()` returns `False` if any of them failed.
 - Whitespace and empty entries are ignored, and a chat listed twice is only notified once.
-- An empty `TELEGRAM_LOG_CHAT_ID` still falls back to `TELEGRAM_CHAT_ID`, list and topics included.
+- An empty `TELEGRAM_LOG_CHAT_ID` still falls back to `TELEGRAM_WORKER_LOG_CHAT_IDS`, list and topics included.
 
 ---
 
@@ -825,7 +825,7 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 
 - **Notification outbox (store-and-forward):** In-process notification calls (`ctx.notifier` and `ctx.channel_notifier`) do **not** hit the Telegram API directly — they enqueue a row in the SQLite `notifications` table via `OutboxNotifier`. A separate `NotificationJob` daemon thread drains the table every 1 s and performs the actual HTTP send, retrying failed messages with exponential backoff (`5s → 30s → 2m → 10m`) up to `max_attempts` (default `5`). This decouples signal handling from Telegram's availability/latency and prevents Telegram outages from blocking the NATS event loop. **Startup/shutdown banners** are sent **directly** via `ctx.direct_notifier` (bypassing the outbox) so the user sees them immediately — even before the DB/notification dispatcher is ready or after they are torn down.
 
-- **Error-log forwarding (opt-in):** With `TELEGRAM_ENABLED` and `TELEGRAM_LOG_ERRORS_ENABLED` set, `get_logger` attaches a shared `TelegramLogHandler` that forwards every `ERROR`-level (or above) log record to Telegram. `emit` only formats the record and pushes it onto a bounded queue; a background **thread** performs the blocking `send_message`, so logging never stalls the NATS loop and works even inside the FOREX child process (which has no event loop). The handler is process-aware — a forked child (re)starts its own worker thread — and self-limits: a filter drops records from the send path itself (no feedback loop), identical messages are deduplicated within `TELEGRAM_LOG_DEDUP_WINDOW` seconds, and the queue drops records under saturation. `TELEGRAM_LOG_BOT_TOKEN` / `TELEGRAM_LOG_CHAT_ID` route these alerts through a dedicated bot/chat (falling back to `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`), and the log chat id takes the same list/topic syntax as every other chat id — see [Telegram chat ids](#telegram-chat-ids-many-chats-and-group-topics).
+- **Error-log forwarding (opt-in):** With `TELEGRAM_ENABLED` and `TELEGRAM_LOG_ERRORS_ENABLED` set, `get_logger` attaches a shared `TelegramLogHandler` that forwards every `ERROR`-level (or above) log record to Telegram. `emit` only formats the record and pushes it onto a bounded queue; a background **thread** performs the blocking `send_message`, so logging never stalls the NATS loop and works even inside the FOREX child process (which has no event loop). The handler is process-aware — a forked child (re)starts its own worker thread — and self-limits: a filter drops records from the send path itself (no feedback loop), identical messages are deduplicated within `TELEGRAM_LOG_DEDUP_WINDOW` seconds, and the queue drops records under saturation. `TELEGRAM_LOG_BOT_TOKEN` / `TELEGRAM_LOG_CHAT_ID` route these alerts through a dedicated bot/chat (falling back to `TELEGRAM_BOT_TOKEN` / `TELEGRAM_WORKER_LOG_CHAT_IDS`), and the log chat id takes the same list/topic syntax as every other chat id — see [Telegram chat ids](#telegram-chat-ids-many-chats-and-group-topics).
 
 ### MT5EventJob — Terminal-Close Polling (`worker/jobs/mt5_event_job.py`)
 
@@ -986,8 +986,8 @@ The job is constructed with a `{channel → TelegramNotification}` map built by 
 
 | `channel` value | Maps to | Backing chat IDs |
 | --- | --- | --- |
-| `INDIVIDUAL` | `ctx.direct_notifier` | `TELEGRAM_CHAT_ID` (management) |
-| `COMMUNITY` | `ctx.direct_channel_notifier` | `TELEGRAM_CHAT_CHANNEL_ID` (signal channels), falling back to `TELEGRAM_CHAT_ID` when unset |
+| `INDIVIDUAL` | `ctx.direct_notifier` | `TELEGRAM_WORKER_LOG_CHAT_IDS` (management) |
+| `COMMUNITY` | `ctx.direct_channel_notifier` | `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS` (signal channels), falling back to `TELEGRAM_WORKER_LOG_CHAT_IDS` when unset |
 
 Both are comma-separated lists and both accept a `-<chat id>_<topic id>` entry to post into one topic of a group — see [Telegram chat ids](#telegram-chat-ids-many-chats-and-group-topics).
 

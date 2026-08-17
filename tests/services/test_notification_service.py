@@ -66,7 +66,7 @@ def test_parse_chat_targets_reads_a_comma_separated_list():
 
 
 def test_parse_chat_targets_accepts_an_already_split_list():
-  # TELEGRAM_CHAT_CHANNEL_ID arrives pre-split by TelegramSettings, and each
+  # TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS arrives pre-split by TelegramSettings, and each
   # entry still has to be parsed for a topic suffix.
   assert parse_chat_targets(["-100111", "-1002173777783_924584"]) == [
     ChatTarget("-100111"),
@@ -181,7 +181,7 @@ def test_chat_id_that_parses_to_nothing_is_a_noop(monkeypatch):
 
 
 def test_management_chat_id_setting_takes_a_list(monkeypatch):
-  """TELEGRAM_CHAT_ID — service lifecycle, NATS events, MT5 health."""
+  """TELEGRAM_WORKER_LOG_CHAT_IDS — service lifecycle, NATS events, MT5 health."""
   monkeypatch.setattr(
     notification_service.settings.telegram,
     "chat_id",
@@ -202,11 +202,11 @@ def test_management_chat_id_setting_takes_a_list(monkeypatch):
 
 
 def test_channel_id_setting_keeps_topics_through_settings_parsing(monkeypatch):
-  """TELEGRAM_CHAT_CHANNEL_ID — split by the settings validator, topics intact."""
+  """TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS — split by the settings validator, topics intact."""
   monkeypatch.setenv("TELEGRAM_ENABLED", "true")
   monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-  monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100999")
-  monkeypatch.setenv("TELEGRAM_CHAT_CHANNEL_ID", "-100111, -1002173777783_924584")
+  monkeypatch.setenv("TELEGRAM_WORKER_LOG_CHAT_IDS", "-100999")
+  monkeypatch.setenv("TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "-100111, -1002173777783_924584")
 
   telegram = TelegramSettings()
 

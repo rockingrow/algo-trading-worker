@@ -45,6 +45,11 @@ again inside a `WORKER_CONNECTED_ACK.retry_signals` replay is dropped by id
 (checked against `position_logs.signal_id`). `action` is one of
 `SignalActionEnum`: `LONG`, `SHORT`, `TP1`, `TP2`, `R_SL`, `SL`, `FLAT`.
 
+`signal_uxid` is the **trade-cycle** id: the entry and every follow-up close
+(TP1 / TP2 / SL / R_SL / FLAT) of one trade share the same value, so the broker
+can gather this worker's executions under one cycle. It is passed through
+untouched and never used for dedup — dedup is strictly by `signal_id`.
+
 | Action | Meaning | Example |
 | ------ | ------- | ------- |
 | `LONG` | Open a long entry | [`entry.long.json`](entry.long.json) |
@@ -171,8 +176,11 @@ whenever a row in the worker's local `positions` table is inserted
 `gateway`, `account_leverage`, `account_balance`) the broker needs to
 create/upsert the trade and address the worker later. `ref_id` is the gateway's
 own order/ticket reference; `signal_id` ties the event back to the originating
-signal. Delivery is at-least-once (publish-then-mark), so the broker upserts
-idempotently by the composite key `(market, gateway, account_id, ticket)`.
+signal (echoed on every event — the entry's id on `CREATED`, the close
+signal's id on `UPDATED`); `signal_uxid` is the trade-cycle id shared by every
+event of one trade. Delivery is at-least-once (publish-then-mark), so the
+broker upserts idempotently by the composite key
+`(market, gateway, account_id, ticket)`.
 
 `status` is `PositionStatusEnum`. A `REJECTED` event is a `CREATED` position a
 worker-side policy (e.g. `MAX_OPEN_ORDERS`) blocked before it reached the

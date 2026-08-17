@@ -107,16 +107,16 @@ DESCRIPTIONS = {
   "NOTIFICATION_MODE": "How much the worker notifies",
   "TELEGRAM_ENABLED": "Enable Telegram notifications",
   "TELEGRAM_BOT_TOKEN": "Telegram bot token",
-  "TELEGRAM_CHAT_ID": (
+  "TELEGRAM_WORKER_LOG_CHAT_IDS": (
     "Chat IDs for management/service notifications, comma-separated "
     "(-100123_456 targets topic 456 of a group with Topics enabled)"
   ),
-  "TELEGRAM_CHAT_CHANNEL_ID": (
+  "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS": (
     "Broadcast channel IDs, comma-separated (same _<topic id> syntax)"
   ),
   "TELEGRAM_LOG_CHAT_ID": (
     "Chat IDs for forwarded ERROR logs, comma-separated "
-    "(blank -> falls back to TELEGRAM_CHAT_ID)"
+    "(blank -> falls back to TELEGRAM_WORKER_LOG_CHAT_IDS)"
   ),
 }
 
@@ -133,8 +133,8 @@ QUOTED_KEYS = {
   "CRYPTO_API_SECRET",
   "CRYPTO_ACCOUNT_ID",
   "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_CHAT_ID",
-  "TELEGRAM_CHAT_CHANNEL_ID",
+  "TELEGRAM_WORKER_LOG_CHAT_IDS",
+  "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS",
   "TELEGRAM_LOG_BOT_TOKEN",
   "TELEGRAM_LOG_CHAT_ID",
   "CRYPTO_LEVERAGE_INIT_SYMBOLS",

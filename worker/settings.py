@@ -345,13 +345,13 @@ class TelegramSettings(BaseSettings):
   # id: ``-1002173777783_924584`` sends with ``message_thread_id`` so the
   # message lands in that topic instead of General.
   chat_id: str = _req(
-    "TELEGRAM_CHAT_ID", "telegram_chat_id"
+    "TELEGRAM_WORKER_LOG_CHAT_IDS", "telegram_chat_id"
   )  # management: NATS events, service start/stop, MT5 health
   # NoDecode (see crypto leverage_init_symbols): the documented unquoted
   # comma-separated form (-100123,-100987) is not valid JSON, so let
   # parse_channel_ids split the raw string instead of pydantic JSON-decoding it.
   chat_channel_id: Annotated[list[str], NoDecode] = _opt(
-    [], "TELEGRAM_CHAT_CHANNEL_ID", "telegram_chat_channel_id"
+    [], "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "telegram_chat_channel_id"
   )  # signals: order fills/failures, terminal closes
 
   # ── Telegram error-log hook ──────────────────────────────────────
