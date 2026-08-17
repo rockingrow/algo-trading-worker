@@ -14,6 +14,7 @@ from helpers import make_signal
 from worker.gateways import processor as processor_module
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor, parse_strategy_subjects
+from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
 from worker.schemas.system_schema import SystemActionEnum
@@ -63,6 +64,10 @@ class FakePresenter:
   def signals_allowed(footer):
     return "signals_allowed"
 
+  @staticmethod
+  def position_unprotected_closed(signal, result, footer):
+    return f"unprotected:{signal.action.value}"
+
 
 class FakeDb:
   def __init__(self):
@@ -97,6 +102,24 @@ class FakeDb:
     return signal_id in self.known_signal_ids
 
 
+class FakeCycleNotifier:
+  """Stand-in for CycleNotifier: owns an action only when it has a uxid.
+
+  Mirrors the real contract — ``record`` returns True when the cycle has taken
+  over reporting the action, and the processor must then NOT send its own
+  message."""
+
+  def __init__(self, accept: bool = True):
+    self.accept = accept
+    self.recorded = []
+
+  def record(self, *, signal_uxid, strategy, symbol, event, status=None):
+    if not signal_uxid or not self.accept:
+      return False
+    self.recorded.append((signal_uxid, strategy, symbol, event, status))
+    return True
+
+
 class FakeProcessor(BaseSignalProcessor):
   """Concrete processor wired entirely with fakes (bypasses the real __init__)."""
 
@@ -109,6 +132,7 @@ class FakeProcessor(BaseSignalProcessor):
     self.db = FakeDb()
     self.notifications = []
     self.mgmt_notifications = []
+    self.cycle = FakeCycleNotifier()
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
@@ -118,6 +142,7 @@ class FakeProcessor(BaseSignalProcessor):
         send_message=lambda m: self.mgmt_notifications.append(m)
       ),
       direct_notifier=SimpleNamespace(send_message=lambda m: None),
+      cycle_notifier=self.cycle,
     )
     self.handler = SimpleNamespace(handle=lambda sig: handle_result)
     self.settings = {}
@@ -1996,3 +2021,146 @@ def test_leverage_init_reaches_the_same_pass_from_both_delivery_paths():
   )
 
   assert runs == [(["BTC"], 10), (["BTC"], 10)]
+
+
+# ── Signal-cycle notifications ────────────────────────────────────────────── #
+#
+# Every action of one trade folds into a single channel message keyed by
+# signal_uxid. The per-action message stays the fallback for anything the cycle
+# cannot own, so exactly one of the two fires — never both, never neither.
+
+
+def _cycle_proc(handle_result, **kwargs):
+  proc = FakeProcessor(handle_result, **kwargs)
+  proc.settings = {"volume_decision_enabled": True, "position_tp1_percent": 50.0}
+  return proc
+
+
+def _uxid_signal(action=SignalActionEnum.LONG, **overrides):
+  overrides.setdefault("signal_uxid", "9f2c4b7e18a3d605")
+  return make_signal(action=action, **overrides)
+
+
+def test_a_fill_is_recorded_on_the_cycle_instead_of_its_own_message():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal())
+  assert proc.notifications == []  # no standalone message
+  (uxid, strategy, symbol, event, status) = proc.cycle.recorded[0]
+  assert uxid == "9f2c4b7e18a3d605"
+  assert (strategy, symbol) == ("strat-1", "XAUUSD")
+  assert event.action == "LONG"
+  assert event.outcome == CycleOutcomeEnum.FILLED
+  assert status is CycleStatusEnum.OPENED
+
+
+def test_a_signal_without_a_uxid_still_sends_its_own_message():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(make_signal())
+  assert proc.cycle.recorded == []
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_a_declined_cycle_falls_back_to_the_standalone_message():
+  # A failed cycle write must not swallow the action.
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc.cycle.accept = False
+  proc._process_signal(_uxid_signal())
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_a_failed_order_joins_the_cycle_without_closing_the_position():
+  proc = _cycle_proc({"success": False, "comment": "Market closed", "retcode": 10018})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  (_, _, _, event, status) = proc.cycle.recorded[0]
+  assert event.outcome == CycleOutcomeEnum.FAILED
+  assert event.reason == "Market closed"
+  # FAILED describes the action; merge_status keeps it off an open position.
+  assert status is CycleStatusEnum.FAILED
+
+
+def test_a_policy_rejection_joins_the_cycle():
+  proc = _cycle_proc({"success": True})
+  proc._reject_signal(_uxid_signal(), "MAX_OPEN_ORDERS reached")
+  assert proc.notifications == []
+  (_, _, _, event, status) = proc.cycle.recorded[0]
+  assert event.outcome == CycleOutcomeEnum.REJECTED
+  assert event.reason == "MAX_OPEN_ORDERS reached"
+  assert status is CycleStatusEnum.REJECTED
+
+
+def test_an_exit_carries_the_status_its_action_implies():
+  proc = _cycle_proc({"success": True, "ticket": "2", "price": 2050.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP2))
+  assert proc.cycle.recorded[0][4] is CycleStatusEnum.TP2
+
+
+def test_a_force_closed_position_is_its_own_action_on_the_cycle():
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "forced_closed": [{"price": 1995.0, "volume": 0.3, "ref_id": "9"}],
+    }
+  )
+  proc._process_signal(_uxid_signal())
+  outcomes = [event.outcome for (_, _, _, event, _) in proc.cycle.recorded]
+  assert outcomes == [CycleOutcomeEnum.FORCE_CLOSED, CycleOutcomeEnum.FILLED]
+  assert proc.notifications == []
+
+
+def test_an_unprotected_position_closed_after_a_failed_breakeven_sl():
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "sl_failsafe_close": {"success": True, "price": 1999.0, "volume": 0.5},
+    }
+  )
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  (_, _, _, event, status) = proc.cycle.recorded[0]
+  assert event.outcome == CycleOutcomeEnum.UNPROTECTED_CLOSED
+  assert status is CycleStatusEnum.FORCED_CLOSED
+
+
+def test_a_failed_failsafe_close_leaves_the_position_at_its_action_status():
+  # The emergency close itself failed, so the position is still live at TP1.
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "sl_failsafe_close": {"success": False, "comment": "close failed"},
+    }
+  )
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  assert proc.cycle.recorded[0][4] is CycleStatusEnum.TP1
+
+
+def test_tp1_records_the_percent_the_executor_actually_used():
+  proc = _cycle_proc({"success": True, "ticket": "2", "price": 2020.0, "volume": 0.25})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1, tp1_percent=30.0))
+  assert proc.cycle.recorded[0][3].tp1_percent == 30.0
+
+
+def test_tp1_falls_back_to_the_configured_percent_when_the_signal_has_none():
+  proc = _cycle_proc({"success": True, "ticket": "2", "price": 2020.0, "volume": 0.25})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  assert proc.cycle.recorded[0][3].tp1_percent == 50.0
+
+
+def test_only_tp1_carries_a_close_percent():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal())
+  assert proc.cycle.recorded[0][3].tp1_percent is None
+
+
+def test_the_uxid_is_persisted_alongside_the_position():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal())
+  assert proc.db.inserted[0]["signal_uxid"] == "9f2c4b7e18a3d605"
+  assert proc.db.logged[0]["signal_uxid"] == "9f2c4b7e18a3d605"

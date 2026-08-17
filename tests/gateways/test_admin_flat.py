@@ -13,16 +13,20 @@ import json
 from types import SimpleNamespace
 
 from worker.gateways.processor import BaseSignalProcessor
+from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
 from worker.schemas.position_schema import PositionStatusEnum
 
 
-def _db_pos(ref_id=1, ref_source_id=1, strategy="strat-A", symbol="XAUUSD"):
+def _db_pos(
+  ref_id=1, ref_source_id=1, strategy="strat-A", symbol="XAUUSD", signal_uxid=None
+):
   return {
     "ref_id": ref_id,
     "ref_source_id": ref_source_id,
     "strategy": strategy,
     "symbol": symbol,
     "status": "OPENED",
+    "signal_uxid": signal_uxid,
   }
 
 
@@ -94,6 +98,19 @@ class FakePresenter:
     return "Signals Allowed"
 
 
+class FakeCycleNotifier:
+  """Stand-in for CycleNotifier — owns an action only when it has a uxid."""
+
+  def __init__(self):
+    self.recorded = []
+
+  def record(self, *, signal_uxid, strategy, symbol, event, status=None):
+    if not signal_uxid:
+      return False
+    self.recorded.append((signal_uxid, strategy, symbol, event, status))
+    return True
+
+
 class FakeProc:
   """Minimal stand-in providing exactly the hooks the base FLAT handler touches."""
 
@@ -126,11 +143,13 @@ class FakeProc:
     self.db = FakeDbService(flat_positions=db_positions)
     self.notifications = []
     self._signals_blocked = False
+    self.cycle = FakeCycleNotifier()
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
         send_message=lambda m: self.notifications.append(m)
       ),
+      cycle_notifier=self.cycle,
     )
 
   def _ensure_connected(self):
@@ -158,6 +177,8 @@ class FakeProc:
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
   _log_flat_event = BaseSignalProcessor._log_flat_event
+
+  _notify_cycle_or_send = BaseSignalProcessor._notify_cycle_or_send
   _private_admin_subject = BaseSignalProcessor._private_admin_subject
 
 
@@ -590,3 +611,33 @@ def test_db_only_position_also_logs_the_flat_payload():
   proc = FakeProc(db_positions=[_db_pos(ref_id=1, ref_source_id=1)], positions=[])
   proc._handle_admin_message(raw)
   assert [log["message"] for log in proc.db.logs] == [raw]
+
+# ── Admin FLAT on a signal cycle ─────────────────────────────────────────── #
+#
+# A FLAT is the last action of the position's own trade, so it closes out that
+# trade's message instead of arriving as an unrelated one. The cycle key comes
+# off the position row — no signal is involved in an admin directive.
+
+
+def test_admin_flat_closes_out_the_positions_cycle():
+  proc = FakeProc(
+    db_positions=[_db_pos(ref_id=1, signal_uxid="9f2c4b7e18a3d605")],
+    positions=[_pos(ticket=1)],
+  )
+  proc._handle_admin_message(_payload())
+  assert proc.notifications == []  # no standalone message
+  (uxid, strategy, symbol, event, status) = proc.cycle.recorded[0]
+  assert uxid == "9f2c4b7e18a3d605"
+  assert (strategy, symbol) == ("strat-A", "XAUUSD")
+  assert event.action == "FLAT"
+  assert event.outcome == CycleOutcomeEnum.ADMIN_FLAT
+  assert status is CycleStatusEnum.FLATTED
+
+
+def test_admin_flat_on_a_position_with_no_cycle_still_notifies():
+  # A position opened before signal_uxid existed has no cycle to join.
+  proc = FakeProc(db_positions=[_db_pos(ref_id=1)], positions=[_pos(ticket=1)])
+  proc._handle_admin_message(_payload())
+  assert proc.cycle.recorded == []
+  assert len(proc.notifications) == 1
+  assert "Admin FLAT" in proc.notifications[0]

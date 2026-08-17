@@ -12,13 +12,20 @@ generic names, so there is no name translation here.
 The one boundary concern this repository owns is id representation: ``ref_id`` /
 ``ref_source_id`` are stored as TEXT (so any gateway's id format fits) and
 returned as strings; callers cast to their preferred numeric type as needed.
+
+Three repositories live here, one per lifecycle:
+:class:`PositionRepository` (trade state), :class:`NotificationOutboxRepository`
+(send-once messages) and :class:`NotificationCycleRepository` (the one message
+per trade that is edited in place as the trade progresses).
 """
 
+import json
 import sqlite3
-from typing import Optional
+from typing import Iterable, Optional
 
 from worker.db.connection import _get_conn
 from worker.logger import get_logger
+from worker.schemas.cycle_schema import CycleStatusEnum, merge_status
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationModeEnum,
@@ -53,6 +60,7 @@ class PositionRepository:
     author: str = "broker",
     market_type: Optional[str] = None,
     signal_id: Optional[str] = None,
+    signal_uxid: Optional[str] = None,
   ):
     conn = None
     try:
@@ -60,8 +68,8 @@ class PositionRepository:
       cursor = conn.cursor()
       cursor.execute(
         """
-              INSERT INTO position_logs (strategy, ref_id, ref_source_id, signal_id, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              INSERT INTO position_logs (strategy, ref_id, ref_source_id, signal_id, signal_uxid, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
         # Store the broker-native price as-is. Rounding to 2 decimals (a forex-era
         # assumption) corrupts low-priced crypto (e.g. SHIB → 0.00) and is
@@ -72,6 +80,7 @@ class PositionRepository:
           ref_id,
           ref_source_id,
           signal_id,
+          signal_uxid,
           symbol,
           action,
           volume,
@@ -117,6 +126,7 @@ class PositionRepository:
     strategy_code: Optional[int],
     market_type: Optional[str],
     signal_id: Optional[str] = None,
+    signal_uxid: Optional[str] = None,
   ) -> None:
     """Insert a single positions row at ``status``. ref_source_id is seeded from
     ref_id (they diverge later only when a partial close re-tickets the order).
@@ -128,14 +138,15 @@ class PositionRepository:
       cursor = conn.cursor()
       cursor.execute(
         """
-              INSERT INTO positions (ref_source_id, ref_id, signal_id, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              INSERT INTO positions (ref_source_id, ref_id, signal_id, signal_uxid, strategy, symbol, action, volume, opened_price, status, gateway_return_code, comment, gateway_message, strategy_code, market_type)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """,
         # Broker-native price, no rounding — see log_position for the rationale.
         (
           ref_id,
           ref_id,
           signal_id,
+          signal_uxid,
           strategy,
           symbol,
           action,
@@ -168,6 +179,7 @@ class PositionRepository:
     strategy_code: Optional[int] = None,
     market_type: Optional[str] = None,
     signal_id: Optional[str] = None,
+    signal_uxid: Optional[str] = None,
   ):
     try:
       self._insert_position_row(
@@ -184,6 +196,7 @@ class PositionRepository:
         strategy_code=strategy_code,
         market_type=market_type,
         signal_id=signal_id,
+        signal_uxid=signal_uxid,
       )
       logger.debug(
         f"Position inserted: ref_source_id={ref_id}, symbol={symbol}, action={action}"
@@ -213,6 +226,7 @@ class PositionRepository:
     strategy_code: Optional[int] = None,
     market_type: Optional[str] = None,
     signal_id: Optional[str] = None,
+    signal_uxid: Optional[str] = None,
   ):
     """Record an entry that a worker-side policy rejected (e.g. MAX_OPEN_ORDERS)
     as a REJECTED row, so it is auditable and picked up by :class:`PositionCDC` and
@@ -236,6 +250,7 @@ class PositionRepository:
         strategy_code=strategy_code,
         market_type=market_type,
         signal_id=signal_id,
+        signal_uxid=signal_uxid,
       )
       logger.debug(
         f"Rejected entry recorded: ref_source_id={ref_id}, symbol={symbol}, action={action}"
@@ -542,6 +557,281 @@ class NotificationOutboxRepository:
       conn.commit()
     except Exception as exc:
       logger.error("mark_notification_failed failed (id=%s): %s", notification_id, exc)
+    finally:
+      if conn:
+        conn.close()
+
+
+class NotificationCycleRepository:
+  """Stores one signal cycle per (strategy, signal_uxid) and its per-chat state.
+
+  Split from :class:`NotificationOutboxRepository` because the two have opposite
+  lifecycles: an outbox row is a *message* that is sent once and deleted, while a
+  cycle row is a *conversation* that keeps growing and whose one Telegram message
+  is rewritten in place. Sharing the outbox table would have meant either
+  re-sending the whole trade on every action or teaching the outbox to update
+  rows it is meant to hard-delete.
+
+  Ordering safety comes from ``revision``: appending an action bumps it, and each
+  chat records the highest revision it has actually been shown
+  (``delivered_revision``), so a slow edit can never overwrite a newer body with
+  an older one.
+  """
+
+  @staticmethod
+  def _decode_events(raw: Optional[str]) -> list:
+    """Parse the ``events`` JSON column, tolerating a corrupt value.
+
+    A cycle whose JSON cannot be read is worth restarting from empty rather than
+    aborting the trade notification: the message is a report, never the record.
+    """
+    if not raw:
+      return []
+    try:
+      events = json.loads(raw)
+    except (TypeError, ValueError):
+      logger.warning("notification_cycles.events is not valid JSON — starting fresh")
+      return []
+    return events if isinstance(events, list) else []
+
+  def append_event(
+    self,
+    *,
+    strategy: str,
+    signal_uxid: str,
+    symbol: str,
+    event: dict,
+    status: Optional[CycleStatusEnum] = None,
+  ) -> Optional[dict]:
+    """Add *event* to the cycle's timeline, creating the cycle on first sight.
+
+    Returns the cycle as the caller must render it — ``id``, ``revision``, the
+    full ``events`` list and the merged ``status`` — or ``None`` when the write
+    failed. The read-modify-write runs inside one IMMEDIATE transaction so two
+    actions arriving back to back cannot lose each other's event.
+    """
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.row_factory = sqlite3.Row
+      conn.isolation_level = None  # explicit transaction control below
+      cursor = conn.cursor()
+      cursor.execute("BEGIN IMMEDIATE")
+      cursor.execute(
+        "SELECT id, status, events, revision FROM notification_cycles "
+        "WHERE strategy = ? AND signal_uxid = ?",
+        (strategy, signal_uxid),
+      )
+      row = cursor.fetchone()
+
+      events = self._decode_events(row["events"]) if row else []
+      events.append(event)
+      current = CycleStatusEnum(row["status"]) if row and row["status"] else None
+      merged = merge_status(current, status)
+      merged_value = merged.value if merged is not None else None
+
+      if row is None:
+        cursor.execute(
+          "INSERT INTO notification_cycles (signal_uxid, strategy, symbol, status, events, revision) "
+          "VALUES (?, ?, ?, ?, ?, 1)",
+          (signal_uxid, strategy, symbol, merged_value, json.dumps(events)),
+        )
+        cycle_id = cursor.lastrowid
+        revision = 1
+      else:
+        cycle_id = row["id"]
+        revision = row["revision"] + 1
+        cursor.execute(
+          "UPDATE notification_cycles "
+          "SET status = ?, events = ?, revision = ?, updated_at = CURRENT_TIMESTAMP "
+          "WHERE id = ?",
+          (merged_value, json.dumps(events), revision, cycle_id),
+        )
+      cursor.execute("COMMIT")
+      return {
+        "id": cycle_id,
+        "signal_uxid": signal_uxid,
+        "strategy": strategy,
+        "symbol": symbol,
+        "status": merged_value,
+        "events": events,
+        "revision": revision,
+      }
+    except Exception as exc:
+      logger.error(
+        "append_event failed (strategy=%s signal_uxid=%s): %s",
+        strategy,
+        signal_uxid,
+        exc,
+      )
+      if conn is not None:
+        try:
+          conn.execute("ROLLBACK")
+        except Exception:  # pragma: no cover — nothing left to roll back
+          pass
+      return None
+    finally:
+      if conn:
+        conn.close()
+
+  def set_message_text(self, cycle_id: int, message_text: str, revision: int) -> None:
+    """Store the body rendered for *revision*.
+
+    The ``revision <= ?`` guard makes a late render harmless: if a newer action
+    has already re-rendered the cycle, the older text is dropped instead of
+    replacing it.
+    """
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.execute(
+        "UPDATE notification_cycles SET message_text = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ? AND revision <= ?",
+        (message_text, cycle_id, revision),
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("set_message_text failed (cycle_id=%s): %s", cycle_id, exc)
+    finally:
+      if conn:
+        conn.close()
+
+  def ensure_cycle_chats(self, cycle_id: int, chat_ids: Iterable[str]) -> None:
+    """Make sure the cycle has a delivery row per chat.
+
+    Called on every recorded action rather than only at creation, so a chat id
+    added to the configuration mid-trade still picks the cycle up (it receives
+    the whole story in its first message, since the body is always rendered in
+    full).
+    """
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.executemany(
+        "INSERT OR IGNORE INTO notification_cycle_chats (cycle_id, chat_id) VALUES (?, ?)",
+        [(cycle_id, str(chat_id)) for chat_id in chat_ids if chat_id],
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("ensure_cycle_chats failed (cycle_id=%s): %s", cycle_id, exc)
+    finally:
+      if conn:
+        conn.close()
+
+  def get_due_cycle_deliveries(self, limit: int = 20) -> list:
+    """Chat rows whose message is behind the cycle's current body.
+
+    A row is due when its ``delivered_revision`` trails the cycle's ``revision``,
+    its backoff has elapsed and it has attempts left. Rows that exhausted
+    ``max_attempts`` stay in place as dead letters, exactly like the outbox.
+    """
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.row_factory = sqlite3.Row
+      cursor = conn.cursor()
+      cursor.execute(
+        """
+                SELECT c.id           AS chat_row_id,
+                       c.chat_id      AS chat_id,
+                       c.message_id   AS message_id,
+                       c.attempts     AS attempts,
+                       m.id           AS cycle_id,
+                       m.revision     AS revision,
+                       m.message_text AS message_text,
+                       m.signal_uxid  AS signal_uxid,
+                       m.strategy     AS strategy
+                FROM notification_cycle_chats c
+                JOIN notification_cycles m ON m.id = c.cycle_id
+                WHERE c.delivered_revision < m.revision
+                  AND m.message_text IS NOT NULL
+                  AND c.attempts < c.max_attempts
+                  AND (c.next_attempt_at IS NULL OR c.next_attempt_at <= CURRENT_TIMESTAMP)
+                ORDER BY m.id ASC, c.id ASC
+                LIMIT ?
+            """,
+        (limit,),
+      )
+      return [dict(row) for row in cursor.fetchall()]
+    except Exception as exc:
+      logger.exception("get_due_cycle_deliveries failed: %s", exc)
+      return []
+    finally:
+      if conn:
+        conn.close()
+
+  def mark_cycle_delivered(
+    self, chat_row_id: int, message_id: Optional[str], revision: int
+  ) -> None:
+    """Record that *chat_row_id* now shows the body rendered for *revision*.
+
+    ``delivered_revision`` only ever moves forward (``MAX``), so a delivery that
+    overtook a newer one is not undone by the slower of the two finishing last.
+    """
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.execute(
+        """
+              UPDATE notification_cycle_chats
+              SET message_id = COALESCE(?, message_id),
+                  delivered_revision = MAX(delivered_revision, ?),
+                  attempts = 0,
+                  last_error = NULL,
+                  next_attempt_at = NULL,
+                  updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?
+          """,
+        (message_id, revision, chat_row_id),
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("mark_cycle_delivered failed (id=%s): %s", chat_row_id, exc)
+    finally:
+      if conn:
+        conn.close()
+
+  def mark_cycle_delivery_failed(
+    self, chat_row_id: int, error: str, next_attempt_at: str
+  ) -> None:
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.execute(
+        """
+              UPDATE notification_cycle_chats
+              SET attempts = attempts + 1,
+                  last_error = ?,
+                  next_attempt_at = ?,
+                  updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?
+          """,
+        (error, next_attempt_at, chat_row_id),
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("mark_cycle_delivery_failed failed (id=%s): %s", chat_row_id, exc)
+    finally:
+      if conn:
+        conn.close()
+
+  def clear_cycle_message_id(self, chat_row_id: int) -> None:
+    """Forget the Telegram message id after an edit found it gone.
+
+    The row stays due, so the next pass posts a fresh message for the cycle
+    instead of editing one the chat no longer has.
+    """
+    conn = None
+    try:
+      conn = _get_conn()
+      conn.execute(
+        "UPDATE notification_cycle_chats "
+        "SET message_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (chat_row_id,),
+      )
+      conn.commit()
+    except Exception as exc:
+      logger.error("clear_cycle_message_id failed (id=%s): %s", chat_row_id, exc)
     finally:
       if conn:
         conn.close()

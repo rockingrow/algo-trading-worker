@@ -30,20 +30,31 @@ strategy's traffic. Each payload is a `SignalSchema` and is handled by
 `BaseSignalProcessor._process_message` → `_process_signal`.
 
 - **Entry / target / stop payloads** carry the full signal: `strategy`,
-  `timestamp`, `action`, `symbol`, `signal_id`, `price`, `quantity`, plus the
-  optional `sl` / `tp1` / `tp2` / `risk_percent` / `is_running` fields. A
-  **scale-in** additionally sets `is_scale_position: true` and a `scaling` block
-  (`tp` / `sl` / `quantity`) — the broker has already baked those multipliers
-  into the payload's SL/TP/quantity; the worker only re-applies `scaling.quantity`
-  when it sizes the entry itself under `VOLUME_DECISION_ENABLED`.
+  `timestamp`, `action`, `symbol`, `signal_id`, `signal_uxid`, `price`,
+  `quantity`, plus the optional `sl` / `tp1` / `tp2` / `risk_percent` /
+  `is_running` fields. A **scale-in** additionally sets
+  `is_scale_position: true` and a `scaling` block (`tp` / `sl` / `quantity`) —
+  the broker has already baked those multipliers into the payload's
+  SL/TP/quantity; the worker only re-applies `scaling.quantity` when it sizes
+  the entry itself under `VOLUME_DECISION_ENABLED`.
 - **The FLAT directive** is a lighter payload carrying only `strategy`,
-  `timestamp`, `action`, `symbol` — no price/quantity, because it means "close
-  everything on this strategy".
+  `signal_uxid`, `timestamp`, `action`, `symbol` — no price/quantity, because it
+  means "close everything on this strategy".
 
-`signal_id` is the de-duplication key: a signal the worker sees live and then
-again inside a `WORKER_CONNECTED_ACK.retry_signals` replay is dropped by id
-(checked against `position_logs.signal_id`). `action` is one of
-`SignalActionEnum`: `LONG`, `SHORT`, `TP1`, `TP2`, `R_SL`, `SL`, `FLAT`.
+The two ids answer different questions and neither replaces the other:
+
+- `signal_id` identifies **one signal** and is the de-duplication key: a signal
+  the worker sees live and then again inside a
+  `WORKER_CONNECTED_ACK.retry_signals` replay is dropped by id (checked against
+  `position_logs.signal_id`).
+- `signal_uxid` identifies **one trade** — the entry and every TP/SL/FLAT that
+  follows it share the same value — and is used only for correlation: it is what
+  folds every action of a trade into the single Telegram message that reports
+  it. Optional, so a broker that predates the field still works; those signals
+  fall back to one message per action.
+
+`action` is one of `SignalActionEnum`: `LONG`, `SHORT`, `TP1`, `TP2`, `R_SL`,
+`SL`, `FLAT`.
 
 `signal_uxid` is the **trade-cycle** id: the entry and every follow-up close
 (TP1 / TP2 / SL / R_SL / FLAT) of one trade share the same value, so the broker
