@@ -16,7 +16,7 @@ os.environ.setdefault("MT5_LOGIN", "1000")
 os.environ.setdefault("MT5_PASSWORD", "pw")
 os.environ.setdefault("TELEGRAM_ENABLED", "false")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
-os.environ.setdefault("TELEGRAM_CHAT_ID", "123")
+os.environ.setdefault("TELEGRAM_WORKER_LOG_CHAT_IDS", "123")
 os.environ.setdefault("BROKER_API_URL", "http://localhost")
 os.environ.setdefault("BROKER_API_KEY", "key")
 

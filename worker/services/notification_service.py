@@ -54,8 +54,8 @@ def parse_chat_targets(raw: str | Iterable[Any] | None) -> list[ChatTarget]:
   """Parse a chat-id setting into the chats (and topics) to deliver to.
 
   Accepts either a raw string or an already-split list, because the settings
-  reach here both ways: ``TELEGRAM_CHAT_ID`` / ``TELEGRAM_LOG_CHAT_ID`` stay
-  plain strings while ``TELEGRAM_CHAT_CHANNEL_ID`` is split into a list by
+  reach here both ways: ``TELEGRAM_WORKER_LOG_CHAT_IDS`` / ``TELEGRAM_LOG_CHAT_ID`` stay
+  plain strings while ``TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`` is split into a list by
   ``TelegramSettings.parse_channel_ids``. Either way each entry is
   comma-separated, so one setting can fan out to several groups:
   ``"-1001111111111,-1002173777783_924584,@public_channel"``.
@@ -221,7 +221,7 @@ class TelegramLogNotification(TelegramNotification):
   Targets the private log chat/bot when ``TELEGRAM_LOG_*`` is configured, and
   otherwise falls back to the shared management chat/bot. The list/topic syntax
   of :func:`parse_chat_targets` applies here too — to ``TELEGRAM_LOG_CHAT_ID``
-  and to the ``TELEGRAM_CHAT_ID`` it falls back to."""
+  and to the ``TELEGRAM_WORKER_LOG_CHAT_IDS`` it falls back to."""
 
   def __init__(self) -> None:
     log_token = settings.telegram.log_bot_token
