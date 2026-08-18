@@ -402,6 +402,7 @@ class CryptoExecutor:
     close_volume: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
@@ -426,7 +427,12 @@ class CryptoExecutor:
     )
     if result.get("success"):
       result["source_ticket"] = str(pos.ticket)
-      self._attach_realized_pnl(result, pos)
+      self._attach_realized_pnl(
+        result,
+        pos,
+        fallback_close_price,
+        self._entry_price_from_db(symbol, strategy),
+      )
     return result
 
   def update_position_sl(
@@ -468,6 +474,31 @@ class CryptoExecutor:
           )
     return result
 
+  def _entry_price_from_db(
+    self, symbol: str, strategy: Optional[str]
+  ) -> Optional[float]:
+    """The stored ``opened_price`` of the active row for *symbol*/*strategy*.
+
+    The reliable, notification-visible entry used to value a close whose exchange
+    fill price came back 0 (see :meth:`_attach_realized_pnl`). *symbol* is the raw
+    signal symbol the DB stores, not the resolved exchange one. ``None`` when the
+    DB is absent or holds no priced row."""
+    if self._db is None or not strategy:
+      return None
+    getter = getattr(self._db, "get_open_positions_by_strategy", None)
+    if getter is None:
+      return None
+    try:
+      rows = getter(strategy, symbol)
+    except Exception:
+      logger.exception("[close] Could not read DB for entry price (%s).", symbol)
+      return None
+    for row in rows:
+      opened = row.get("opened_price")
+      if opened:
+        return float(opened)
+    return None
+
   def _recover_entry_tp2(self, symbol: str, strategy: Optional[str]) -> Optional[float]:
     """Recover the original TP2 target from the persisted entry signal.
 
@@ -504,7 +535,11 @@ class CryptoExecutor:
   # ── Full close ────────────────────────────────────────────────────────── #
 
   def close_all_positions(
-    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+    self,
+    symbol: str,
+    reason: str = "CLOSE",
+    strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
@@ -512,6 +547,7 @@ class CryptoExecutor:
       return TradeResult.fail("No Positions Found")
 
     self._gateway.cancel_all_orders(resolved)
+    fallback_entry_price = self._entry_price_from_db(symbol, strategy)
     success_count = 0
     last_result: Optional[Any] = None
     closed_results: List[Any] = []
@@ -526,7 +562,9 @@ class CryptoExecutor:
       if result.get("success"):
         success_count += 1
         last_result = result
-        self._attach_realized_pnl(result, pos)
+        self._attach_realized_pnl(
+          result, pos, fallback_close_price, fallback_entry_price
+        )
         closed_results.append(result)
       else:
         logger.error(
@@ -562,7 +600,13 @@ class CryptoExecutor:
 
   # ── Realized PnL ──────────────────────────────────────────────────────── #
 
-  def _attach_realized_pnl(self, result: TradeResult, pos: Any) -> None:
+  def _attach_realized_pnl(
+    self,
+    result: TradeResult,
+    pos: Any,
+    fallback_close_price: Optional[float] = None,
+    fallback_entry_price: Optional[float] = None,
+  ) -> None:
     """Record on *result* what closing *pos* booked, so the notification can
     report it.
 
@@ -592,6 +636,27 @@ class CryptoExecutor:
       close_price=result.get("price"),
       volume=result.get("volume"),
     )
+    if profit is None and fallback_close_price:
+      # The exchange gave no usable fill price (Binance can answer a filled
+      # MARKET order with avgPrice=0, routinely on testnet). Value the close at
+      # the price the signal carried — the very price the processor repairs
+      # ``closed_price`` to for the notification — so the PnL stays consistent
+      # with the closed price shown beside it, and no REST round-trip is paid.
+      #
+      # The entry is taken from the *stored* row (``fallback_entry_price``, the
+      # DB ``opened_price`` that the notification's ``opened_price`` also shows),
+      # not the live position's ``price_open``: when the entry fill was itself
+      # priced 0 the exchange's average entry is the real market price, which on
+      # a testnet fed synthetic signals bears no relation to the signal prices on
+      # the message — pairing it with a signal close price would print a figure
+      # that matches neither the message nor reality. Falls back to the live
+      # entry only when the row has none.
+      profit = linear_realized_pnl(
+        side=pos.side,
+        entry_price=fallback_entry_price or getattr(pos, "price_open", None),
+        close_price=fallback_close_price,
+        volume=result.get("volume"),
+      )
     if profit is None:
       profit = self._exchange_realized_pnl(pos, result.get("ticket"))
     result["profit"] = profit

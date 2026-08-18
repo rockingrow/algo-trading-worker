@@ -554,3 +554,43 @@ def test_partial_close_also_falls_back_to_the_exchange(config):
     "BTCUSD", close_volume=0.006, position_ticket=7
   )
   assert res["profit"] == pytest.approx(5.5)
+
+
+class _FakeDbEntry:
+  """Minimal DB double exposing the one row a close values its entry against."""
+
+  def __init__(self, opened_price):
+    self._opened_price = opened_price
+
+  def get_open_positions_by_strategy(self, strategy, symbol):
+    return [{"opened_price": self._opened_price, "symbol": symbol}]
+
+
+def test_pnl_uses_the_signal_price_and_stored_entry_when_fill_price_is_zero(config):
+  # avgPrice=0 close (mark_price=0), but the caller passes the signal's price and
+  # the DB holds the entry the notification also shows. PnL is valued off those —
+  # (close - entry) x qty — so it matches the open/close prices on the message,
+  # and the exchange is never asked (order_pnl would be a different number).
+  gw = FakeGateway(
+    positions=[_long_pos(qty=0.1, entry=95000.0)], mark_price=0.0, order_pnl=123.0
+  )
+  ex = CryptoExecutor(gw, config, _FakeDbEntry(opened_price=64100.5))
+  res = ex.close_all_positions(
+    "BTCUSD", reason="TP2", strategy="strat-1", fallback_close_price=60100.0
+  )
+
+  # (60100.0 - 64100.5) * 0.1, from the stored entry — not the live 95000 entry.
+  assert res["profit"] == pytest.approx(-400.05)
+  assert gw.pnl_lookups == []
+
+
+def test_signal_price_fallback_is_skipped_when_the_fill_price_is_real(config):
+  # A usable fill price is exact; the signal-price estimate must not override it.
+  gw = FakeGateway(positions=[_long_pos(qty=0.1, entry=64000.0)], mark_price=64500.0)
+  ex = CryptoExecutor(gw, config, _FakeDbEntry(opened_price=64100.5))
+  res = ex.close_all_positions(
+    "BTCUSD", reason="TP2", strategy="strat-1", fallback_close_price=60100.0
+  )
+
+  # (64500 - 64000) * 0.1 from the real fill, not the signal's 60100.
+  assert res["profit"] == pytest.approx(50.0)

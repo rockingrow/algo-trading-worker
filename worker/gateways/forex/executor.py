@@ -294,7 +294,11 @@ class ForexExecutor:
     close_volume: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult:
+    # ``fallback_close_price`` is accepted for a uniform executor contract but
+    # unused here: MT5 reports the deal's own realized PnL, so a close never has
+    # to be valued at the signal's price the way an avgPrice=0 crypto fill does.
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
       logger.warning(f"[partial_close] No open positions found for {symbol}")
@@ -329,9 +333,18 @@ class ForexExecutor:
   # ── TP2 / SL / R_SL: full close ───────────────────────────────────────── #
 
   def close_all_positions(
-    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+    self,
+    symbol: str,
+    reason: str = "CLOSE",
+    strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult:
-    """Close ALL open positions for the symbol at actual broker volume."""
+    """Close ALL open positions for the symbol at actual broker volume.
+
+    ``fallback_close_price`` is part of the shared executor contract but unused
+    here — MT5 reads each close's realized PnL from its own deal, so it never
+    needs to value the close at the signal's price (see ``partial_close_position``).
+    """
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
       logger.warning(f"[close_all] No open positions found for {symbol}")
