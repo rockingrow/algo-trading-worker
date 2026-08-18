@@ -858,6 +858,15 @@ class BaseSignalProcessor(ABC):
     A row is marked ``FLATTED`` only when its close succeeded, or when it was never
     live on the broker (already closed externally). A row whose close was
     *attempted but failed* is left OPEN — it is still live — and flagged loudly.
+
+    The ADMIN payload is **not** written over the row's ``gateway_message``. That
+    column holds the original *entry signal* JSON, and :class:`PositionCDC` parses
+    it for the ``signal_id`` / ``sl`` / ``tp1`` / ``tp2`` the broker needs to match
+    the TRADE event back to its own order. Overwriting it with the FLAT payload —
+    which carries none of those fields, on the public and private subject alike —
+    published an update with ``signal_id=null``, so the broker could not correlate
+    it and the order was never updated there. The payload is preserved instead as
+    an append-only ``position_logs`` row, which is where per-event audit belongs.
     """
     db_positions = self.ctx.db_service.get_open_positions_for_flat(
       strategy=admin.strategy, symbol=admin.symbol
@@ -868,6 +877,7 @@ class BaseSignalProcessor(ABC):
       matched_key = next((k for k in db_keys if k in closed), None)
       if matched_key is not None:
         result = closed[matched_key]
+        self._log_flat_event(db_pos, result, raw)
         self.ctx.db_service.update_position_status(
           ref_source_id=db_pos.get("ref_source_id"),
           status=PositionStatusEnum.FLATTED,
@@ -875,7 +885,6 @@ class BaseSignalProcessor(ABC):
           closed_price=result.get("price"),
           gateway_return_code=result.get("retcode", 0),
           comment=result.get("comment", ""),
-          message=raw,
         )
         self.ctx.channel_notifier.send_message(
           self.presenter.admin_flat_closed(db_pos, result, footer)
@@ -887,11 +896,11 @@ class BaseSignalProcessor(ABC):
           db_pos.get("symbol"),
           self.name,
         )
+        self._log_flat_event(db_pos, None, raw)
         self.ctx.db_service.update_position_status(
           ref_source_id=db_pos.get("ref_source_id"),
           status=PositionStatusEnum.FLATTED,
           comment=f"Admin FLAT (position not found on {self.name})",
-          message=raw,
         )
       else:
         # Attempted but the close FAILED → still live on the broker. Leave the DB
@@ -902,6 +911,33 @@ class BaseSignalProcessor(ABC):
           db_pos.get("symbol"),
           self.name,
         )
+
+  def _log_flat_event(self, db_pos: dict, result: Optional[dict], raw: str) -> None:
+    """Record one ADMIN FLAT outcome in the append-only ``position_logs`` audit
+    trail, carrying the raw ADMIN payload.
+
+    This is where the payload lives now that it no longer overwrites the position
+    row's stored entry signal. *result* is the successful close, or ``None`` when
+    the row was already flat on the broker and is only being synced."""
+    self.ctx.db_service.log_position(
+      strategy=db_pos.get("strategy"),
+      ref_id=(result or {}).get("ticket") or db_pos.get("ref_id"),
+      ref_source_id=db_pos.get("ref_source_id"),
+      symbol=db_pos.get("symbol"),
+      action=PositionStatusEnum.FLATTED.value,
+      volume=(result or {}).get("volume") or db_pos.get("volume"),
+      price=(result or {}).get("price"),
+      sl=None,
+      tp1=None,
+      gateway_return_code=(result or {}).get("retcode", 0),
+      comment=(result or {}).get(
+        "comment", f"Admin FLAT (position not found on {self.name})"
+      ),
+      message=raw,
+      author=LogAuthorEnum.BROKER.value,
+      market_type=self._market_type,
+      signal_id=db_pos.get("signal_id"),
+    )
 
   # ── Shared SYSTEM handling ────────────────────────────────────────────── #
 

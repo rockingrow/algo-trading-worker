@@ -236,6 +236,9 @@ class ExecutorBackedMarket(BaseMarketStrategy):
       close_volume=close_volume,
       position_ticket=pos.ticket,
       strategy=signal.strategy,
+      # Value the close at the signal's price if the exchange returns no fill
+      # price (Binance avgPrice=0) — the same price the notification shows.
+      fallback_close_price=signal.price,
     )
 
     if not close_result.get("success"):
@@ -269,7 +272,10 @@ class ExecutorBackedMarket(BaseMarketStrategy):
         symbol,
       )
       failsafe = self._executor.close_all_positions(
-        symbol, reason="SL_FAILSAFE", strategy=signal.strategy
+        symbol,
+        reason="SL_FAILSAFE",
+        strategy=signal.strategy,
+        fallback_close_price=signal.price,
       )
       close_result["sl_failsafe_close"] = failsafe
       if failsafe.get("success"):
@@ -297,7 +303,12 @@ class ExecutorBackedMarket(BaseMarketStrategy):
   def handle_full_close(self, signal: SignalSchema) -> TradeResult:
     """Full close using actual broker volume; reason derived from signal.action."""
     return self._executor.close_all_positions(
-      signal.symbol, reason=signal.action.value, strategy=signal.strategy
+      signal.symbol,
+      reason=signal.action.value,
+      strategy=signal.strategy,
+      # Value the close at the signal's price if the exchange returns no fill
+      # price (Binance avgPrice=0) — matches the notification's closed_price.
+      fallback_close_price=signal.price,
     )
 
   # ── Helpers ──────────────────────────────────────────────────────────── #

@@ -27,6 +27,7 @@ class TradeExecutorProtocol(Protocol):
     close_volume: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult: ...
   def update_position_sl(
     self,
@@ -36,7 +37,11 @@ class TradeExecutorProtocol(Protocol):
     strategy: Optional[str] = None,
   ) -> TradeResult: ...
   def close_all_positions(
-    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+    self,
+    symbol: str,
+    reason: str = "CLOSE",
+    strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult: ...
   def get_open_positions(
     self, symbol: str, strategy: Optional[str] = None

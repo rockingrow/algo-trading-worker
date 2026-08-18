@@ -34,6 +34,7 @@ class FakeDbService:
   def __init__(self, flat_positions=None):
     self.flat_calls = []
     self.status_updates = []
+    self.logs = []
     self._flat = list(flat_positions or [])
 
   def get_open_positions_for_flat(self, strategy=None, symbol=None):
@@ -42,6 +43,9 @@ class FakeDbService:
 
   def update_position_status(self, **kwargs):
     self.status_updates.append(kwargs)
+
+  def log_position(self, **kwargs):
+    self.logs.append(kwargs)
 
 
 class FakeExecutor:
@@ -153,6 +157,7 @@ class FakeProc:
   _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
+  _log_flat_event = BaseSignalProcessor._log_flat_event
   _private_admin_subject = BaseSignalProcessor._private_admin_subject
 
 
@@ -533,3 +538,55 @@ def test_not_connected_short_circuits():
   proc._handle_admin_message(_payload())
   assert proc.executor.closed == []
   assert proc.db.flat_calls == []
+
+
+# ── the stored entry signal survives a FLAT (so the broker can still match) ───
+#
+# Regression: the FLAT wrote its own ADMIN payload over the row's
+# gateway_message, which is where the *entry signal* JSON lives. PositionCDC
+# parses that column for the signal_id / sl / tp1 / tp2 the broker matches the
+# TRADE event on, so the published update carried signal_id=null and the order
+# was never updated on the broker side — on the private and the public
+# (broadcast) subject alike. The payload now goes to the position_logs audit
+# trail instead.
+
+
+def test_flat_does_not_overwrite_the_stored_entry_signal():
+  proc = FakeProc(
+    db_positions=[_db_pos(ref_id=1, ref_source_id=1)], positions=[_pos(ticket=1)]
+  )
+  proc._handle_admin_message(_payload())
+  assert "message" not in proc.db.status_updates[0]
+
+
+def test_private_flat_does_not_overwrite_the_stored_entry_signal():
+  proc = FakeProc(
+    account_id="100",
+    db_positions=[_db_pos(ref_id=1, ref_source_id=1)],
+    positions=[_pos(ticket=1)],
+  )
+  proc._handle_admin_message(
+    _payload(market="FOREX", gateway="MT5", account_id="100"), private=True
+  )
+  assert len(proc.db.status_updates) == 1
+  assert "message" not in proc.db.status_updates[0]
+
+
+def test_flat_payload_is_kept_in_the_audit_log():
+  raw = _payload()
+  proc = FakeProc(
+    db_positions=[_db_pos(ref_id=1, ref_source_id=1)], positions=[_pos(ticket=1)]
+  )
+  proc._handle_admin_message(raw)
+  assert len(proc.db.logs) == 1
+  log = proc.db.logs[0]
+  assert log["message"] == raw
+  assert log["ref_source_id"] == 1
+  assert log["action"] == PositionStatusEnum.FLATTED.value
+
+
+def test_db_only_position_also_logs_the_flat_payload():
+  raw = _payload()
+  proc = FakeProc(db_positions=[_db_pos(ref_id=1, ref_source_id=1)], positions=[])
+  proc._handle_admin_message(raw)
+  assert [log["message"] for log in proc.db.logs] == [raw]
