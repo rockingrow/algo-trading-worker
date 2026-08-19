@@ -504,26 +504,28 @@ Two ids travel on every signal and they answer different questions:
 | Field | Scope | Used for |
 | --- | --- | --- |
 | `signal_id` | This one signal — unique per action | **De-duplication**: a signal seen live and again in the ACK replay is recognised by this id |
-| `signal_uxid` | The whole trade — the entry and every TP/SL/FLAT that follows share one | **Correlation**: ties every action of one trade to the single Telegram message that reports it |
+| `signal_uxid` | The whole trade — the entry and every TP/SL/FLAT that follows share one | **Correlation**: echoed on outbound `TRADE` events so the broker can gather this worker's executions under one cycle, and used locally to fold every action of a trade into a single Telegram message |
 
-`signal_uxid` is optional, so a broker that predates the field keeps working — those signals simply fall back to one message per action. When it is present, the worker reports the whole trade in **one channel message that it edits in place**, laid out as three boxes:
+`signal_uxid` is optional, so a broker that predates the field keeps working — those signals simply fall back to one message per action. When it is present, the worker reports the whole trade in **one broadcast message that it edits in place**, laid out as three boxes:
 
 ```
-[⏳ OPENED]                       ← headline: icon + the position's latest status
+[⏳ OPENED]                        ← headline: icon + the position's latest status
 📈 LONG XAUUSD                     ┐
-----------------------------------  │ Box 1 — position: what the trade is,
-Price: 2340.15 | Volume: 0.5 lot ⚙️ │ at what price/size, with which levels
-SL: 2330 | TP1: 2350 | TP2: 2360   │
-Risk: 3% ⚙️ | Ticket: 778899        ┘
+----------------------------------  │ Box 1 — position: what the trade is, at
+Price: 2340.15 | Volume: 0.5 lot ⚙️ │ what price/size, with which levels, and
+SL: 2330 | TP1: 2350 | TP2: 2360    │ what the trade has booked so far
+Risk: 3% ⚙️ | Ticket: 778899        │ (summed over every close — omitted while
+Realized: +154.65 📈                ┘ nothing has closed yet).
 ----------------------------------
 📡 Actions                         ┐
 ----------------------------------  │ Box 2 — the timeline, one entry per
 ✅ LONG — Filled                    │ action, appended as the trade moves.
 Price: 2340.15 | Volume: 0.5 lot ⚙️ │ The icon is the *outcome*, so a TP1
 2026-04-10 22:55:00                 │ the broker refused never looks like a
-                                    │ TP1 that hit.
-🎯 TP1 — Filled                     │
+                                    │ TP1 that hit. A close also reports the
+🎯 TP1 — Filled                     │ PnL it booked, in the same format the
 Price: 2350.4 | Volume: 0.25 lot (TP1 50%)
+PnL: +51.25 📈                      │ standalone close message used.
 2026-04-11 15:05:00                ┘
 ----------------------------------
 ⚙️ Settings                        ┐
@@ -537,6 +539,8 @@ Signal: 9f2c4b7e18a3d605            ┘
 ```
 
 The headline status is **the position's**, not the action's: a TP1 the broker refused leaves an `OPENED` position `OPENED`, and once a position is closed (`TP2`/`SL`/`R_SL`/`FLATTED`/…) a late or replayed action can never advertise it as live again. An admin `FLAT` closes out the position's own cycle rather than opening a new message.
+
+Each chat entry keeps its `_<topic id>` suffix, so a cycle lands in the same forum topic as every other notification, and two topics of the same group each own their own message.
 
 Delivery, retries and the `TELEGRAM_CYCLE_ENABLED` toggle are covered in [CycleNotificationJob](#cyclenotificationjob--one-telegram-message-per-trade-workerjobscycle_notification_jobpy).
 
@@ -1073,7 +1077,7 @@ Two notification paths intentionally bypass the outbox:
 
 ### CycleNotificationJob — One Telegram message per trade (`worker/jobs/cycle_notification_job.py`)
 
-Every action of one trade folds into a **single** channel message that is **rewritten in place** as the trade progresses, instead of an entry, a TP1, a TP2 and a FLAT arriving as four unrelated boxes a reader has to stitch together by eye. A trade is identified by the broker's `signal_uxid` (see [Signal-cycle notifications](#signal-cycle-notifications)); the write and the send are split across two halves that never call each other:
+Every action of one trade folds into a **single** broadcast message that is **rewritten in place** as the trade progresses, instead of an entry, a TP1, a TP2 and a FLAT arriving as four unrelated boxes a reader has to stitch together by eye. A trade is identified by the broker's `signal_uxid` (see [Signal-cycle notifications](#signal-cycle-notifications)); the write and the send are split across two halves that never call each other:
 
 | Half | Class | Responsibility |
 | --- | --- | --- |
@@ -1088,8 +1092,8 @@ Unlike the outbox — where a row is sent once and deleted — nothing here is e
 
 | Chat state | Action |
 | --- | --- |
-| No `message_id` yet | `sendMessage`, store the id Telegram returns |
-| `message_id` present | `editMessageText` on that same message |
+| No `message_id` yet | `sendMessage` (with `message_thread_id` when the entry names a topic), store the id Telegram returns |
+| `message_id` present | `editMessageText` on that same message — no thread id, the topic was fixed when it was posted |
 | Edit → `message is not modified` | Counted as delivered (a no-op edit; re-posting would duplicate the trade) |
 | Edit → message deleted / too old | Forget the `message_id`; the next pass posts a fresh message |
 | Anything else failed | `attempts += 1`, back off **5s → 30s → 2m → 10m**, dead-letter at `max_attempts` |
@@ -1101,8 +1105,8 @@ Ordering is guarded by a `revision` counter: recording an action bumps the cycle
 The cycle takes over reporting only when it can. `CycleNotifier.record()` returns `False` — and the caller sends the standalone message it always sent — when:
 
 - the signal carries **no `signal_uxid`** (a broker that predates the field: there is nothing to group actions by);
-- `TELEGRAM_CYCLE_ENABLED=false`, `TELEGRAM_ENABLED=false`, or no channel chat resolves (the same list `ctx.channel_notifier` posts to: `TELEGRAM_CHAT_CHANNEL_ID`, falling back to `TELEGRAM_CHAT_ID`);
-- `NOTIFICATION_MODE` is not `VERBOSE` (SILENT suppresses the community channel, exactly as for the outbox);
+- `TELEGRAM_CYCLE_ENABLED=false`, `TELEGRAM_ENABLED=false`, or no broadcast chat resolves (the same list `ctx.channel_notifier` posts to: `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`, falling back to `TELEGRAM_WORKER_LOG_CHAT_IDS`);
+- `NOTIFICATION_MODE` is not `VERBOSE` (SILENT suppresses the broadcast channel, exactly as for the outbox);
 - the cycle write itself failed.
 
 Exactly one of the two fires — never both, never neither.
@@ -1257,7 +1261,7 @@ Unique on `(strategy, signal_uxid)`.
 | --- | --- | --- |
 | `id` | INTEGER PK | Auto-increment row ID |
 | `cycle_id` | INTEGER | The cycle this delivery belongs to |
-| `chat_id` | TEXT | One entry of `TELEGRAM_CHAT_CHANNEL_ID` |
+| `chat_id` | TEXT | One entry of `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`, kept raw so a `_<topic id>` suffix survives and two topics of one group get their own message |
 | `message_id` | TEXT | Telegram's id for the message being edited; `NULL` = nothing posted yet |
 | `delivered_revision` | INTEGER | Highest cycle revision this chat has been shown; only ever moves forward |
 | `attempts` / `max_attempts` | INTEGER | Retry bookkeeping, dead-letter at the cap (default `5`) |

@@ -699,6 +699,9 @@ class NotificationCycleRepository:
   def ensure_cycle_chats(self, cycle_id: int, chat_ids: Iterable[str]) -> None:
     """Make sure the cycle has a delivery row per chat.
 
+    ``chat_ids`` are the raw setting entries (topic suffix included), which is
+    what makes two topics of one group two separate deliveries.
+
     Called on every recorded action rather than only at creation, so a chat id
     added to the configuration mid-trade still picks the cycle up (it receives
     the whole story in its first message, since the body is always rendered in

@@ -201,6 +201,12 @@ class TelegramCycleNotification:
   message per chat and rewrites each of them. Sharing the base class would have
   meant widening ``send_message`` for every sender that never edits anything.
 
+  Each call names **one** chat, as the raw setting entry the cycle stored
+  (``-1002173777783_924584``), and resolves it through :func:`parse_chat_targets`
+  like every other sender — so a cycle lands in the same forum topic as the rest
+  of the worker's notifications. Keeping the raw entry as the stored key is what
+  gives two topics of one group their own message.
+
   Bodies arrive already boxed by the presenter, so nothing is wrapped here.
   """
 
@@ -211,62 +217,86 @@ class TelegramCycleNotification:
   def _api_url(self, method: str) -> str:
     return f"https://api.telegram.org/bot{self.bot_token.get_secret_value()}/{method}"
 
-  def _ready(self, chat_id: str) -> bool:
+  def _target(self, chat: str) -> ChatTarget | None:
+    """Resolve one stored chat entry into the chat (and topic) to deliver to.
+
+    ``None`` means nothing can be sent — Telegram is off, the token is missing,
+    or the entry parses to no chat at all.
+    """
     if not self.enabled:
       logger.debug("Telegram notifications are disabled in settings.")
-      return False
-    if not self.bot_token or not chat_id:
-      logger.warning("TELEGRAM_BOT_TOKEN and a chat id must be set for cycle messages.")
-      return False
-    return True
+      return None
+    if not self.bot_token:
+      logger.warning("TELEGRAM_BOT_TOKEN must be set for cycle messages.")
+      return None
+    targets = parse_chat_targets(chat)
+    if not targets:
+      logger.warning("Unusable Telegram chat id for a cycle message: %r", chat)
+      return None
+    # One entry addresses one chat; parse_chat_targets returns a list because
+    # the *settings* it usually parses are comma-separated lists.
+    return targets[0]
 
   @staticmethod
-  def _payload(chat_id: str, message_text: str) -> dict:
-    return {
-      "chat_id": chat_id,
+  def _payload(target: ChatTarget, message_text: str) -> dict:
+    payload: dict[str, Any] = {
+      "chat_id": target.chat_id,
       "text": message_text,
       "parse_mode": "HTML",
       "disable_web_page_preview": True,
     }
+    if target.message_thread_id is not None:
+      payload["message_thread_id"] = target.message_thread_id
+    return payload
 
-  def send(self, chat_id: str, message_text: str) -> str | None:
-    """Post *message_text* to *chat_id* and return Telegram's ``message_id``.
+  def send(self, chat: str, message_text: str) -> str | None:
+    """Post *message_text* to *chat* and return Telegram's ``message_id``.
 
     ``None`` means there is no message to edit later — the send was skipped
     (disabled/misconfigured), failed, or succeeded with a response the id could
     not be read from. The caller must treat all three the same: nothing in this
     chat represents the cycle yet.
     """
-    if not self._ready(chat_id):
+    target = self._target(chat)
+    if target is None:
       return None
     try:
       response = requests.post(
         self._api_url("sendMessage"),
-        json=self._payload(chat_id, message_text),
+        json=self._payload(target, message_text),
         timeout=5,
       )
       if response.status_code != 200:
-        logger.error("Telegram sendMessage failed for %s: %s", chat_id, response.text)
+        logger.error(
+          "Telegram sendMessage failed for %s: %s", target.label, response.text
+        )
         return None
       message_id = _result_field(response, "message_id")
       if message_id is None:
-        logger.warning("Telegram sendMessage to %s returned no message_id", chat_id)
+        logger.warning(
+          "Telegram sendMessage to %s returned no message_id", target.label
+        )
         return None
       return str(message_id)
     except Exception as exc:
-      logger.exception("Exception on Telegram sendMessage to %s: %s", chat_id, exc)
+      logger.exception("Exception on Telegram sendMessage to %s: %s", target.label, exc)
       return None
 
-  def edit(self, chat_id: str, message_id: str, message_text: str) -> EditOutcome:
-    """Rewrite the cycle's message in *chat_id* with *message_text*.
+  def edit(self, chat: str, message_id: str, message_text: str) -> EditOutcome:
+    """Rewrite the cycle's message in *chat* with *message_text*.
 
     An edit Telegram rejects because the body is byte-identical (``message is
     not modified``) counts as ``OK``: it is a no-op, and calling it a failure
     would make a redelivered signal re-post the whole cycle.
     """
-    if not self._ready(chat_id):
+    target = self._target(chat)
+    if target is None:
       return EditOutcome.FAILED
-    payload = self._payload(chat_id, message_text)
+    payload = self._payload(target, message_text)
+    # editMessageText identifies the message by chat + message_id; the topic it
+    # sits in was fixed when it was posted, and the Bot API takes no
+    # message_thread_id here.
+    payload.pop("message_thread_id", None)
     payload["message_id"] = message_id
     try:
       response = requests.post(
@@ -279,7 +309,7 @@ class TelegramCycleNotification:
         return EditOutcome.OK
       logger.error(
         "Telegram editMessageText failed for %s message_id=%s: %s",
-        chat_id,
+        target.label,
         message_id,
         response.text,
       )
@@ -288,7 +318,10 @@ class TelegramCycleNotification:
       return EditOutcome.FAILED
     except Exception as exc:
       logger.exception(
-        "Exception editing Telegram message %s in %s: %s", message_id, chat_id, exc
+        "Exception editing Telegram message %s in %s: %s",
+        message_id,
+        target.label,
+        exc,
       )
       return EditOutcome.FAILED
 

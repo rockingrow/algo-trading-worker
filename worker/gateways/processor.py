@@ -98,6 +98,18 @@ _HANDSHAKE_ALERT_THRESHOLD = 3
 # cap applies to (exits must always be allowed so positions can be closed).
 _ENTRY_ACTIONS = (SignalActionEnum.LONG, SignalActionEnum.SHORT)
 
+# Actions that close (part of) a position, and are therefore the only ones that
+# can book a realized PnL onto the cycle.
+_CYCLE_EXIT_ACTIONS = frozenset(
+  {
+    SignalActionEnum.TP1,
+    SignalActionEnum.TP2,
+    SignalActionEnum.SL,
+    SignalActionEnum.R_SL,
+    SignalActionEnum.FLAT,
+  }
+)
+
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
   "TP1": PositionStatusEnum.TP1,
@@ -510,6 +522,7 @@ class BaseSignalProcessor(ABC):
           timestamp=signal.timestamp,
           price=fc.get("price"),
           volume=fc.get("volume"),
+          profit=fc.get("profit"),
           ref_id=_as_text(fc.get("ref_id")),
           ref_source_id=_as_text(fc.get("ref_source_id")),
           reason="Closed to make room for a new entry",
@@ -956,6 +969,7 @@ class BaseSignalProcessor(ABC):
             outcome=CycleOutcomeEnum.ADMIN_FLAT,
             price=result.get("price"),
             volume=result.get("volume"),
+            profit=result.get("profit"),
             ref_id=_as_text(result.get("ticket")),
             ref_source_id=_as_text(db_pos.get("ref_source_id")),
             gateway_return_code=result.get("retcode"),
@@ -1569,6 +1583,10 @@ class BaseSignalProcessor(ABC):
       auto_volume=bool(self.settings.get("volume_decision_enabled", False)),
       tp1_percent=self._cycle_tp1_percent(signal),
       is_scale_position=bool(getattr(signal, "is_scale_position", False)),
+      # Only a close books money. An entry carries no PnL at all, so it stays
+      # None and the timeline omits the line rather than claiming a 0.00 result
+      # — the same rule BaseMessagePresenter._exit_pnl_line applies.
+      profit=result.get("profit") if signal.action in _CYCLE_EXIT_ACTIONS else None,
       ref_id=_as_text(result.get("ticket")),
       ref_source_id=_as_text(result.get("source_ticket") or result.get("ticket")),
       gateway_return_code=result.get("retcode"),

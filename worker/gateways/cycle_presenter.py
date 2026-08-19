@@ -30,9 +30,10 @@ from datetime import datetime
 from typing import Any, Optional
 
 from worker import icons
-from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter
+from worker.gateways.message_presenter import _DIVIDER, BaseMessagePresenter, pnl_line
 from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.schemas.trade_result import total_profit
 from worker.settings import MarketTypeEnum
 
 #: Headline icon per cycle status. ⏳ while the position is live, 🏁 once it is
@@ -92,6 +93,28 @@ _OUTCOME_LABELS = {
 _BOX_BREAK = "\n</pre><pre>"
 
 _ENTRY_ACTIONS = (SignalActionEnum.LONG.value, SignalActionEnum.SHORT.value)
+
+#: Signal actions that close (part of) a position.
+_EXIT_ACTIONS = frozenset(
+  {
+    SignalActionEnum.TP1,
+    SignalActionEnum.TP2,
+    SignalActionEnum.SL,
+    SignalActionEnum.R_SL,
+    SignalActionEnum.FLAT,
+  }
+)
+
+#: Outcomes that are a close whatever action label they carry.
+_CLOSING_OUTCOMES = frozenset(
+  {
+    CycleOutcomeEnum.ADMIN_FLAT,
+    CycleOutcomeEnum.FORCE_CLOSED,
+    CycleOutcomeEnum.UNPROTECTED_CLOSED,
+    CycleOutcomeEnum.RECONCILED,
+    CycleOutcomeEnum.PLATFORM_CLOSED,
+  }
+)
 
 
 def _num(value: Any) -> str:
@@ -156,6 +179,20 @@ def _joined(parts: list[str]) -> str:
   return " | ".join(p for p in parts if p)
 
 
+def _is_close(event: dict) -> bool:
+  """True when this action (partly) closed the position, so it booked money.
+
+  Read off the *outcome* rather than the action, because the non-signal closes
+  (an admin FLAT, a force-close, a reconciled close) carry actions that are not
+  ``SignalActionEnum`` members at all.
+  """
+  outcome = _enum(event.get("outcome"), CycleOutcomeEnum)
+  if outcome in _CLOSING_OUTCOMES:
+    return True
+  action = _enum(event.get("action"), SignalActionEnum)
+  return outcome is CycleOutcomeEnum.FILLED and action in _EXIT_ACTIONS
+
+
 def _entry_event(events: list[dict]) -> dict:
   """The event describing the position itself.
 
@@ -172,7 +209,9 @@ def _entry_event(events: list[dict]) -> dict:
 # ── Box 1: position ─────────────────────────────────────────────────────────
 
 
-def _position_box(cycle: dict, entry: dict, *, unit: str, symbol: str) -> str:
+def _position_box(
+  cycle: dict, entry: dict, events: list[dict], *, unit: str, symbol: str
+) -> str:
   """Headline status, what the trade is, and the levels it was opened with."""
   status = _enum(cycle.get("status"), CycleStatusEnum)
   status_label = status.value if status is not None else "PENDING"
@@ -208,6 +247,15 @@ def _position_box(cycle: dict, entry: dict, *, unit: str, symbol: str) -> str:
     extras.append(f"Ticket: {html.escape(str(entry.get('ref_source_id')))}")
   if extras:
     lines.append(_joined(extras))
+
+  # What the trade has booked so far, summed over every close in the timeline —
+  # the question a one-message-per-trade view exists to answer, and one a reader
+  # would otherwise have to add up by hand from the actions box. Shown only once
+  # something has actually closed: an open position has booked nothing, and the
+  # partially-known total after a TP1 is still the honest figure.
+  closes = [event for event in events if _is_close(event)]
+  if closes:
+    lines.append(pnl_line(total_profit(closes), label="Realized").rstrip("\n"))
 
   lines.append(_DIVIDER)
   return "\n".join(lines)
@@ -250,6 +298,16 @@ def _action_block(event: dict, *, unit: str) -> str:
     if code is not None and code not in (0, -1):
       reason += f" (Code {code})"
     lines.append(f"Reason: {reason}")
+
+  # A close reports what it booked, through the shared renderer so a cycle's
+  # exit reads identically to the standalone message it replaced. Absent on an
+  # entry, which has booked nothing.
+  if event.get("profit") is not None or _is_close(event):
+    lines.append(
+      pnl_line(
+        event.get("profit"), label=str(event.get("profit_label") or "PnL")
+      ).rstrip("\n")
+    )
 
   stamp = _timestamp(event.get("timestamp"))
   if stamp:
@@ -317,7 +375,7 @@ def format_cycle_message(
   )
   entry = _entry_event(events)
 
-  boxes = [_position_box(cycle, entry, unit=unit, symbol=symbol)]
+  boxes = [_position_box(cycle, entry, events, unit=unit, symbol=symbol)]
   if events:
     boxes.append(_actions_box(events, unit=unit))
   boxes.append(

@@ -2164,3 +2164,36 @@ def test_the_uxid_is_persisted_alongside_the_position():
   proc._process_signal(_uxid_signal())
   assert proc.db.inserted[0]["signal_uxid"] == "9f2c4b7e18a3d605"
   assert proc.db.logged[0]["signal_uxid"] == "9f2c4b7e18a3d605"
+
+
+def test_an_exit_carries_the_pnl_it_booked_onto_the_cycle():
+  proc = _cycle_proc(
+    {"success": True, "ticket": "2", "price": 2050.0, "volume": 0.5, "profit": 87.5}
+  )
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP2))
+  assert proc.cycle.recorded[0][3].profit == 87.5
+
+
+def test_an_entry_records_no_pnl_even_when_the_broker_reports_one():
+  # An entry has booked nothing; a figure here would read as a closed result.
+  proc = _cycle_proc(
+    {"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5, "profit": 0.0}
+  )
+  proc._process_signal(_uxid_signal())
+  assert proc.cycle.recorded[0][3].profit is None
+
+
+def test_a_force_close_carries_its_own_pnl():
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "forced_closed": [
+        {"price": 1995.0, "volume": 0.3, "ref_id": "9", "profit": -12.0}
+      ],
+    }
+  )
+  proc._process_signal(_uxid_signal())
+  assert proc.cycle.recorded[0][3].profit == -12.0

@@ -276,3 +276,92 @@ def test_small_crypto_prices_keep_their_precision():
 def test_a_missing_value_renders_as_a_dash():
   msg = _render(_cycle([_event()]))
   assert "Price: —" in msg
+
+
+# ── Realized PnL ──────────────────────────────────────────────────────────── #
+#
+# The cycle message replaces the standalone close notifications, so it has to
+# carry the figure they report — per close, and as the trade's running total.
+
+
+def test_a_close_reports_what_it_booked():
+  msg = _render(_cycle([_event(action="TP1", profit=51.25)]))
+  assert "PnL: <b>+51.25</b>" in msg
+
+
+def test_a_loss_is_signed_and_marked():
+  msg = _render(_cycle([_event(action="SL", profit=-32.0)], status=CycleStatusEnum.SL))
+  assert "PnL: <b>-32.00</b>" in msg
+
+
+def test_a_close_whose_pnl_is_unknown_says_so_rather_than_zero():
+  # Silence would read as break-even; 0.00 would be a fabrication.
+  msg = _render(_cycle([_event(action="TP2", profit=None)], status=CycleStatusEnum.TP2))
+  assert "PnL: <b>n/a</b>" in msg
+
+
+def test_an_entry_reports_no_pnl():
+  # It has booked nothing yet.
+  actions = _render(_cycle([_event(action="LONG")])).split("</pre><pre>")[1]
+  assert "PnL" not in actions
+
+
+def test_a_failed_exit_reports_no_pnl():
+  # Nothing was closed, so there is nothing to report.
+  actions = _render(
+    _cycle([_event(action="TP2", outcome=CycleOutcomeEnum.FAILED, reason="closed")])
+  ).split("</pre><pre>")[1]
+  assert "PnL" not in actions
+
+
+def test_a_close_label_can_qualify_what_the_figure_covers():
+  msg = _render(
+    _cycle(
+      [_event(action="TP2", profit=12.0, profit_label="PnL (position total)")],
+      status=CycleStatusEnum.TP2,
+    )
+  )
+  assert "PnL (position total): <b>+12.00</b>" in msg
+
+
+def test_position_box_totals_the_trade():
+  position = _render(
+    _cycle(
+      [
+        _event(action="LONG"),
+        _event(action="TP1", profit=51.25),
+        _event(action="TP2", profit=103.40),
+      ],
+      status=CycleStatusEnum.TP2,
+    )
+  ).split("</pre><pre>")[0]
+  assert "Realized: <b>+154.65</b>" in position
+
+
+def test_an_open_trade_shows_no_total_yet():
+  position = _render(_cycle([_event(action="LONG")])).split("</pre><pre>")[0]
+  assert "Realized" not in position
+
+
+def test_a_partly_known_total_is_still_shown():
+  # Closer to the truth than nothing; a wholly unknown one reads n/a.
+  position = _render(
+    _cycle(
+      [_event(action="TP1", profit=51.25), _event(action="TP2", profit=None)],
+      status=CycleStatusEnum.TP2,
+    )
+  ).split("</pre><pre>")[0]
+  assert "Realized: <b>+51.25</b>" in position
+
+
+def test_an_admin_flat_counts_toward_the_total():
+  position = _render(
+    _cycle(
+      [
+        _event(action="LONG"),
+        _event(action="FLAT", outcome=CycleOutcomeEnum.ADMIN_FLAT, profit=-8.5),
+      ],
+      status=CycleStatusEnum.FLATTED,
+    )
+  ).split("</pre><pre>")[0]
+  assert "Realized: <b>-8.50</b>" in position

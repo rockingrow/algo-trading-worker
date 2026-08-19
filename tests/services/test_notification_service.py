@@ -3,9 +3,6 @@ from pydantic import SecretStr
 import worker.services.notification_service as notification_service
 from worker.services.notification_service import (
   ChatTarget,
-
-from worker.services import notification_service
-from worker.services.notification_service import (
   EditOutcome,
   Notification,
   OutboxNotifier,
@@ -211,7 +208,9 @@ def test_channel_id_setting_keeps_topics_through_settings_parsing(monkeypatch):
   monkeypatch.setenv("TELEGRAM_ENABLED", "true")
   monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
   monkeypatch.setenv("TELEGRAM_WORKER_LOG_CHAT_IDS", "-100999")
-  monkeypatch.setenv("TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "-100111, -1002173777783_924584")
+  monkeypatch.setenv(
+    "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "-100111, -1002173777783_924584"
+  )
 
   telegram = TelegramSettings()
 
@@ -248,6 +247,7 @@ def test_log_chat_id_setting_takes_a_list(monkeypatch):
     ("-100111", None),
     ("-1002173777783", 924584),
   ]
+
 
 # ── TelegramCycleNotification (send once, then edit in place) ─────────────── #
 
@@ -305,6 +305,44 @@ def test_cycle_send_is_skipped_when_telegram_is_disabled(monkeypatch):
   sender, calls = _cycle_sender(monkeypatch, _Response())
   sender.enabled = False
   assert sender.send("-1001", "body") is None
+  assert calls == []
+
+
+def test_cycle_send_lands_in_the_configured_topic(monkeypatch):
+  # A cycle must reach the same forum topic as every other notification, so the
+  # stored entry keeps the "<chat>_<topic>" shape and is parsed at send time.
+  sender, calls = _cycle_sender(
+    monkeypatch, _Response(payload={"ok": True, "result": {"message_id": 7}})
+  )
+  assert sender.send("-1002173777783_924584", "body") == "7"
+  _, payload = calls[0]
+  assert payload["chat_id"] == "-1002173777783"
+  assert payload["message_thread_id"] == 924584
+
+
+def test_cycle_send_omits_the_thread_id_for_a_plain_chat(monkeypatch):
+  # Telegram rejects the field on a group without that thread.
+  sender, calls = _cycle_sender(
+    monkeypatch, _Response(payload={"ok": True, "result": {"message_id": 7}})
+  )
+  sender.send("-1001111111111", "body")
+  assert "message_thread_id" not in calls[0][1]
+
+
+def test_cycle_edit_identifies_the_message_without_a_thread_id(monkeypatch):
+  # The topic was fixed when the message was posted; editMessageText takes the
+  # chat and message id only.
+  sender, calls = _cycle_sender(monkeypatch, _Response(payload={"ok": True}))
+  assert sender.edit("-1002173777783_924584", "7", "body") is EditOutcome.OK
+  _, payload = calls[0]
+  assert payload["chat_id"] == "-1002173777783"
+  assert "message_thread_id" not in payload
+  assert payload["message_id"] == "7"
+
+
+def test_cycle_send_with_an_unusable_chat_id_is_a_noop(monkeypatch):
+  sender, calls = _cycle_sender(monkeypatch, _Response())
+  assert sender.send(" ", "body") is None
   assert calls == []
 
 

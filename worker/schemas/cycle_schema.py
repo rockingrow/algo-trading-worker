@@ -172,6 +172,15 @@ class CycleEventSchema(BaseModel):
   tp1_percent: Optional[float] = None
   is_scale_position: bool = False
 
+  #: Realized PnL this action booked, in account currency. Only a close ever
+  #: carries one — an entry has booked nothing yet, and a 0.00 there would read
+  #: as a break-even trade. ``None`` on a close means the broker did not tell
+  #: us, which the message shows as ``n/a`` rather than hiding.
+  profit: Optional[float] = None
+  #: Qualifies what *profit* covers when it is not this close alone (the
+  #: reconciler reports a position total, a crypto estimate says so).
+  profit_label: str = "PnL"
+
   ref_id: Optional[str] = None
   ref_source_id: Optional[str] = None
   gateway_return_code: Optional[int] = None

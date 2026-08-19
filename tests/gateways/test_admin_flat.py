@@ -612,6 +612,7 @@ def test_db_only_position_also_logs_the_flat_payload():
   proc._handle_admin_message(raw)
   assert [log["message"] for log in proc.db.logs] == [raw]
 
+
 # ── Admin FLAT on a signal cycle ─────────────────────────────────────────── #
 #
 # A FLAT is the last action of the position's own trade, so it closes out that

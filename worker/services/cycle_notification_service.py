@@ -54,6 +54,9 @@ class CycleNotifier:
     footer_fn: Optional[Callable[[], str]] = None,
   ) -> None:
     self._db = db_service
+    # Raw setting entries, not parsed chats: an entry keeps any ``_<topic id>``
+    # suffix so two topics of the same group get their own message, and the
+    # sender resolves it through ``parse_chat_targets`` at delivery time.
     self._chat_ids = [str(chat_id) for chat_id in chat_ids if chat_id]
     self._settings = settings_dict or {}
     self._footer_fn = footer_fn
