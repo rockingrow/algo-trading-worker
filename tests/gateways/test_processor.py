@@ -55,6 +55,14 @@ class FakePresenter:
   def admin_flat_closed(db_pos, result, footer):
     return "admin_flat"
 
+  @staticmethod
+  def signals_blocked(footer):
+    return "signals_blocked"
+
+  @staticmethod
+  def signals_allowed(footer):
+    return "signals_allowed"
+
 
 class FakeDb:
   def __init__(self):
@@ -1190,6 +1198,7 @@ def test_worker_connected_payload_strategies_defaults_to_empty_when_unset():
 def _ack_payload(
   *,
   account_id="FAKE_MKT-FAKE_GW-acct-1",
+  settings=None,
   strategy_magic_map=None,
   crypto_leverage_init=None,
   retry_signals=None,
@@ -1203,6 +1212,8 @@ def _ack_payload(
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "account_id": account_id,
   }
+  if settings is not None:
+    payload["settings"] = settings
   if strategy_magic_map is not None:
     payload["strategy_magic_map"] = strategy_magic_map
   if crypto_leverage_init is not None:
@@ -1529,6 +1540,138 @@ def test_ack_applies_every_config_section_before_replaying_signals():
   ]
   assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
   assert proc.db.inserted[0]["symbol"] == "AAA"
+
+
+# ── ACK: the settings section restores runtime toggles ─────────────────────── #
+
+
+def _settings_proc():
+  """A connected FakeProcessor with the signal gate at its post-restart default
+  (unblocked) — the state a worker always boots into, since the toggles the ADMIN
+  actions flip live in memory only."""
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  proc._signals_blocked = False
+  return proc
+
+
+def test_ack_settings_restore_the_signal_block_set_before_the_restart():
+  """A worker restarting under an ADMIN BLOCK_SIGNAL comes back unblocked — the
+  gate is in-memory only. The broker owns that state and re-pushes it in the ACK,
+  so the worker must land back in the blocked state it was left in rather than
+  quietly resuming trading on an account an operator had stopped."""
+  proc = _settings_proc()
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": True})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  # Restoring goes through the ADMIN setter, so the operator gets the same alert
+  # they would have for a live BLOCK_SIGNAL.
+  assert proc.notifications == ["signals_blocked"]
+
+
+def test_ack_settings_signal_blocked_false_leaves_a_fresh_worker_alone():
+  """``false`` matches the state a fresh worker already boots into, so the shared
+  ADMIN setter treats it as the no-op it is: no flip, no duplicate alert."""
+  proc = _settings_proc()
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": False})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is False
+  assert proc.notifications == []
+
+
+def test_ack_settings_signal_blocked_false_clears_a_block_still_in_effect():
+  """A reconnect (not a restart) keeps the in-memory gate, so an explicit
+  ``false`` from the broker is a real change and must lift the block — same path,
+  same alert, as an ADMIN ALLOW_SIGNAL."""
+  proc = _settings_proc()
+  proc._signals_blocked = True
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": False})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is False
+  assert proc.notifications == ["signals_allowed"]
+
+
+def test_ack_without_settings_section_leaves_the_toggles_untouched():
+  """Omitting the section says nothing about the toggles — a worker mid-session
+  keeps whatever ADMIN last set rather than being reset to the defaults."""
+  proc = _settings_proc()
+  proc._signals_blocked = True
+  proc.publisher = FakePublisher([_ack_payload(strategy_magic_map={})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  assert proc.notifications == []
+
+
+def test_ack_settings_restore_the_block_before_the_replay_runs():
+  """The replay shares ``_process_signal`` with live traffic, so a restored block
+  has to land first: applying it afterwards would let the batch fire the very
+  orders the block exists to prevent."""
+  proc = _settings_proc()
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="blocked-replay", symbol="AAA")
+  proc.publisher = FakePublisher(
+    [_ack_payload(settings={"signal_blocked": True}, retry_signals=[sig])]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  assert proc.db.inserted == []
+  assert proc.notifications == ["signals_blocked"]
+
+
+def test_ack_unparseable_setting_does_not_cost_the_other_sections():
+  """Settings are salvaged like every other section — a malformed value is
+  dropped on its own while the rest of the payload still applies."""
+  proc = _magic_map_proc()
+  proc._signals_blocked = False
+  proc.publisher = FakePublisher(
+    [
+      _ack_payload(
+        settings={"signal_blocked": "not-a-bool"},
+        strategy_magic_map={"MT5_GOLD": 20260409},
+      )
+    ]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is False
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+
+
+def test_ack_unknown_setting_is_reported_but_costs_nothing():
+  """A newer broker pushing a toggle this worker has no field for keeps the known
+  ones working; the unknown key is recorded so the version skew is visible."""
+  proc = _settings_proc()
+  proc.publisher = FakePublisher(
+    [_ack_payload(settings={"signal_blocked": True, "future_toggle": 1})]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  from worker.schemas.inbox_schema import WorkerConnectedAckSchema
+
+  ack = WorkerConnectedAckSchema(
+    **{
+      "action": SystemActionEnum.WORKER_CONNECTED_ACK.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+      "settings": {"signal_blocked": True, "future_toggle": 1},
+    }
+  )
+  assert ack.settings.signal_blocked is True
+  assert any("future_toggle" in reason for reason in ack.dropped)
 
 
 # ── ACK: the replay is gated on the config it depends on ───────────────────── #
