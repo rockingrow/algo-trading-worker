@@ -354,6 +354,13 @@ class TelegramSettings(BaseSettings):
     [], "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "telegram_chat_channel_id"
   )  # signals: order fills/failures, terminal closes
 
+  # One message per trade cycle in the channel above, edited in place as the
+  # trade progresses, instead of one message per action. Turn off to go back to
+  # a separate message per fill/failure/close. Signals that carry no
+  # ``signal_uxid`` fall back to per-action messages either way — there is no
+  # cycle to group them by.
+  cycle_enabled: bool = _opt(True, "TELEGRAM_CYCLE_ENABLED", "telegram_cycle_enabled")
+
   # ── Telegram error-log hook ──────────────────────────────────────
   # When enabled (and enabled is true), log records at ERROR level or above are
   # forwarded to Telegram. The dedicated log bot/chat is kept separate from the

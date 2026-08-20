@@ -490,11 +490,59 @@ With the payload above, the worker executes against the SL/TP/quantity exactly a
 ```json
 {
   "strategy": "MT5_GOLD_M5_V1",
+  "signal_uxid": "9f2c4b7e18a3d605",
   "timestamp": "2026-04-18T21:55:00Z",
   "action": "FLAT",
   "symbol": "XAUUSD"
 }
 ```
+
+### Signal-cycle notifications
+
+Two ids travel on every signal and they answer different questions:
+
+| Field | Scope | Used for |
+| --- | --- | --- |
+| `signal_id` | This one signal — unique per action | **De-duplication**: a signal seen live and again in the ACK replay is recognised by this id |
+| `signal_uxid` | The whole trade — the entry and every TP/SL/FLAT that follows share one | **Correlation**: echoed on outbound `TRADE` events so the broker can gather this worker's executions under one cycle, and used locally to fold every action of a trade into a single Telegram message |
+
+`signal_uxid` is optional, so a broker that predates the field keeps working — those signals simply fall back to one message per action. When it is present, the worker reports the whole trade in **one broadcast message that it edits in place**, laid out as three boxes:
+
+```
+[⏳ OPENED]                        ← headline: icon + the position's latest status
+📈 LONG XAUUSD                     ┐
+----------------------------------  │ Box 1 — position: what the trade is, at
+Price: 2340.15 | Volume: 0.5 lot ⚙️ │ what price/size, with which levels, and
+SL: 2330 | TP1: 2350 | TP2: 2360    │ what the trade has booked so far
+Risk: 3% ⚙️ | Ticket: 778899        │ (summed over every close — omitted while
+Realized: +154.65 📈                ┘ nothing has closed yet).
+----------------------------------
+📡 Actions                         ┐
+----------------------------------  │ Box 2 — the timeline, one entry per
+✅ LONG — Filled                    │ action, appended as the trade moves.
+Price: 2340.15 | Volume: 0.5 lot ⚙️ │ The icon is the *outcome*, so a TP1
+2026-04-10 22:55:00                 │ the broker refused never looks like a
+                                    │ TP1 that hit. A close also reports the
+🎯 TP1 — Filled                     │ PnL it booked, in the same format the
+Price: 2350.4 | Volume: 0.25 lot (TP1 50%)
+PnL: +51.25 📈                      │ standalone close message used.
+2026-04-11 15:05:00                ┘
+----------------------------------
+⚙️ Settings                        ┐
+----------------------------------  │ Box 3 — the worker configuration this
+VOLUME_DECISION_ENABLED: ENABLED    │ trade ran under (same wording as the
+RISK_PERCENTAGE: ENABLED (3.0%)     │ startup banner), which cycle it is,
+...                                 │ and the live account footer.
+----------------------------------  │
+Strategy: MT5_GOLD_M5_V1            │
+Signal: 9f2c4b7e18a3d605            ┘
+```
+
+The headline status is **the position's**, not the action's: a TP1 the broker refused leaves an `OPENED` position `OPENED`, and once a position is closed (`TP2`/`SL`/`R_SL`/`FLATTED`/…) a late or replayed action can never advertise it as live again. An admin `FLAT` closes out the position's own cycle rather than opening a new message.
+
+Each chat entry keeps its `_<topic id>` suffix, so a cycle lands in the same forum topic as every other notification, and two topics of the same group each own their own message.
+
+Delivery, retries and the `TELEGRAM_CYCLE_ENABLED` toggle are covered in [CycleNotificationJob](#cyclenotificationjob--one-telegram-message-per-trade-workerjobscycle_notification_jobpy).
 
 ---
 
@@ -1027,6 +1075,42 @@ Two notification paths intentionally bypass the outbox:
 1. **Startup / shutdown banners** sent via `ctx.direct_notifier` — must surface even before `NotificationJob` is running or after it has been torn down.
 2. **NATS connection events** still go through the outbox via `ctx.nats_enqueue`, but they use the `NATS_EVENT` category so they can be filtered out of analytics if desired.
 
+### CycleNotificationJob — One Telegram message per trade (`worker/jobs/cycle_notification_job.py`)
+
+Every action of one trade folds into a **single** broadcast message that is **rewritten in place** as the trade progresses, instead of an entry, a TP1, a TP2 and a FLAT arriving as four unrelated boxes a reader has to stitch together by eye. A trade is identified by the broker's `signal_uxid` (see [Signal-cycle notifications](#signal-cycle-notifications)); the write and the send are split across two halves that never call each other:
+
+| Half | Class | Responsibility |
+| --- | --- | --- |
+| Writer | `CycleNotifier` (`worker/services/cycle_notification_service.py`) | Appends the action to the cycle's timeline, re-renders the whole body, stores it. Never touches Telegram. |
+| Reader | `CycleNotificationJob` | Polls every 1 s for chats whose message is behind the cycle, and posts or edits. |
+
+Splitting them is what makes delivery recoverable: the timeline is durable the moment the signal is executed, so a Telegram outage can neither delay a signal nor lose an action.
+
+#### Delivery semantics
+
+Unlike the outbox — where a row is sent once and deleted — nothing here is ever deleted, and "delivered" means *this chat has been shown revision N*:
+
+| Chat state | Action |
+| --- | --- |
+| No `message_id` yet | `sendMessage` (with `message_thread_id` when the entry names a topic), store the id Telegram returns |
+| `message_id` present | `editMessageText` on that same message — no thread id, the topic was fixed when it was posted |
+| Edit → `message is not modified` | Counted as delivered (a no-op edit; re-posting would duplicate the trade) |
+| Edit → message deleted / too old | Forget the `message_id`; the next pass posts a fresh message |
+| Anything else failed | `attempts += 1`, back off **5s → 30s → 2m → 10m**, dead-letter at `max_attempts` |
+
+Ordering is guarded by a `revision` counter: recording an action bumps the cycle's `revision`, each chat records the highest `delivered_revision` it has been shown, and `delivered_revision` only ever moves forward. A slow edit therefore can never overwrite a newer body with an older one — a burst of signals on one trade always renders in order.
+
+#### Falling back to per-action messages
+
+The cycle takes over reporting only when it can. `CycleNotifier.record()` returns `False` — and the caller sends the standalone message it always sent — when:
+
+- the signal carries **no `signal_uxid`** (a broker that predates the field: there is nothing to group actions by);
+- `TELEGRAM_CYCLE_ENABLED=false`, `TELEGRAM_ENABLED=false`, or no broadcast chat resolves (the same list `ctx.channel_notifier` posts to: `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`, falling back to `TELEGRAM_WORKER_LOG_CHAT_IDS`);
+- `NOTIFICATION_MODE` is not `VERBOSE` (SILENT suppresses the broadcast channel, exactly as for the outbox);
+- the cycle write itself failed.
+
+Exactly one of the two fires — never both, never neither.
+
 ### ForexExecutor Primitives (`worker/gateways/forex/executor.py`)
 
 `ForexExecutor` implements the broker-neutral `TradeExecutorProtocol` (the same surface `CryptoExecutor` provides), delegating every platform call to its injected `BasePlatformGateway`:
@@ -1150,6 +1234,42 @@ A durable queue of pending Telegram messages. `NotificationJob` polls this table
 | `created_at` / `updated_at` | DATETIME | Row timestamps |
 
 Indexed on `(next_attempt_at, id)` to make the dispatcher's poll query O(log n).
+
+### `notification_cycles` / `notification_cycle_chats` — One message per trade
+
+Notification state, not trade state: dropping these tables loses chat formatting, never a position. A cycle holds the whole timeline of one trade plus the body last rendered from it; a chat row holds the id of the message being edited in that chat.
+
+**`notification_cycles`**
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INTEGER PK | Auto-increment row ID |
+| `signal_uxid` | TEXT | The broker's trade-cycle id, shared by the entry and every close that follows |
+| `strategy` | TEXT | Part of the cycle key — a uxid is only unique within the strategy that minted it |
+| `symbol` | TEXT | Instrument the trade is on |
+| `status` | TEXT | Latest position status (`OPENED`/`TP1`/…/`FLATTED`, plus `FAILED`/`REJECTED` when nothing opened) — the message's headline |
+| `events` | TEXT | JSON array: the full timeline, one entry per action the worker executed |
+| `message_text` | TEXT | The body rendered from `events`, ready to send or edit |
+| `revision` | INTEGER | Bumped on every recorded action; drives what each chat still owes |
+| `created_at` / `updated_at` | DATETIME | Row timestamps |
+
+Unique on `(strategy, signal_uxid)`.
+
+**`notification_cycle_chats`**
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INTEGER PK | Auto-increment row ID |
+| `cycle_id` | INTEGER | The cycle this delivery belongs to |
+| `chat_id` | TEXT | One entry of `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`, kept raw so a `_<topic id>` suffix survives and two topics of one group get their own message |
+| `message_id` | TEXT | Telegram's id for the message being edited; `NULL` = nothing posted yet |
+| `delivered_revision` | INTEGER | Highest cycle revision this chat has been shown; only ever moves forward |
+| `attempts` / `max_attempts` | INTEGER | Retry bookkeeping, dead-letter at the cap (default `5`) |
+| `last_error` | TEXT | Error string from the last failed attempt |
+| `next_attempt_at` | DATETIME | Earliest retry time; `NULL` = ready immediately |
+| `created_at` / `updated_at` | DATETIME | Row timestamps |
+
+Unique on `(cycle_id, chat_id)`, and indexed on `(delivered_revision, next_attempt_at, id)` for the dispatcher's poll.
 
 ---
 

@@ -62,6 +62,7 @@ _LEGACY_FLAT_KEYS = {
   "telegram_bot_token",
   "telegram_chat_id",
   "telegram_chat_channel_id",
+  "telegram_cycle_enabled",
   "telegram_log_errors_enabled",
   "telegram_log_dedup_window",
   "telegram_log_chat_id",

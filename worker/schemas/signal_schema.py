@@ -61,11 +61,15 @@ class SignalSchema(BaseModel):
   timestamp: datetime
   action: SignalActionEnum
   symbol: str
+  # Identity of THIS signal — unique per action, and therefore the de-duplication
+  # key: a signal seen live and again in the ACK replay is recognised by this id.
   signal_id: Optional[str] = None
   # Trade-cycle correlation id: the entry and every close (TP1/TP2/SL/R_SL/FLAT)
   # of one trade share the same value. Passed through untouched — never used for
   # dedup (that is signal_id's job); forwarded on outbound TRADE events so the
-  # broker can match executions back to a single cycle.
+  # broker can match executions back to a single cycle, and used locally to fold
+  # every action of one trade into a single Telegram message (see
+  # :mod:`worker.services.cycle_notification_service`).
   signal_uxid: Optional[str] = None
   price: Optional[float] = None
   quantity: Optional[float] = None

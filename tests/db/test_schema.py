@@ -142,3 +142,71 @@ def test_unique_index_allows_different_strategies_on_same_symbol():
   assert (
     len(conn.execute("SELECT 1 FROM positions WHERE status='OPENED'").fetchall()) == 2
   )
+
+
+# ── Signal-cycle tables ───────────────────────────────────────────────────── #
+
+
+def test_cycle_tables_exist():
+  conn = _make_db()
+  tables = {
+    row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+  }
+  assert {"notification_cycles", "notification_cycle_chats"} <= tables
+
+
+def test_positions_carry_the_cycle_key():
+  for table in ("positions", "position_logs"):
+    assert "signal_uxid" in _cols(_make_db(), table)
+
+
+def test_one_cycle_per_strategy_and_uxid():
+  conn = _make_db()
+  conn.execute(
+    "INSERT INTO notification_cycles (signal_uxid, strategy, symbol) VALUES (?,?,?)",
+    ("9f2c4b7e18a3d605", "strat-a", "XAUUSD"),
+  )
+  with pytest.raises(sqlite3.IntegrityError):
+    conn.execute(
+      "INSERT INTO notification_cycles (signal_uxid, strategy, symbol) VALUES (?,?,?)",
+      ("9f2c4b7e18a3d605", "strat-a", "XAUUSD"),
+    )
+
+
+def test_the_same_uxid_under_another_strategy_is_its_own_cycle():
+  conn = _make_db()
+  for strategy in ("strat-a", "strat-b"):
+    conn.execute(
+      "INSERT INTO notification_cycles (signal_uxid, strategy, symbol) VALUES (?,?,?)",
+      ("9f2c4b7e18a3d605", strategy, "XAUUSD"),
+    )
+  assert len(conn.execute("SELECT 1 FROM notification_cycles").fetchall()) == 2
+
+
+def test_one_delivery_row_per_cycle_and_chat():
+  conn = _make_db()
+  conn.execute(
+    "INSERT INTO notification_cycle_chats (cycle_id, chat_id) VALUES (1, '-1001')"
+  )
+  with pytest.raises(sqlite3.IntegrityError):
+    conn.execute(
+      "INSERT INTO notification_cycle_chats (cycle_id, chat_id) VALUES (1, '-1001')"
+    )
+
+
+def test_missing_columns_are_retrofitted_onto_an_older_database():
+  # A DB created before signal_uxid shipped has the tables but not the column;
+  # CREATE TABLE IF NOT EXISTS would silently leave it missing.
+  conn = sqlite3.connect(":memory:")
+  conn.execute(
+    "CREATE TABLE positions (id INTEGER PRIMARY KEY, ref_source_id TEXT, ref_id TEXT, "
+    "strategy TEXT, symbol TEXT, action TEXT, volume REAL, opened_price REAL, "
+    "status TEXT DEFAULT 'OPENED')"
+  )
+  conn.execute(
+    "CREATE TABLE position_logs (id INTEGER PRIMARY KEY, strategy TEXT, symbol TEXT, "
+    "action TEXT)"
+  )
+  _create_tables(conn)
+  for table in ("positions", "position_logs"):
+    assert {"signal_id", "signal_uxid"} <= _cols(conn, table)

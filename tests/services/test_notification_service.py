@@ -3,8 +3,10 @@ from pydantic import SecretStr
 import worker.services.notification_service as notification_service
 from worker.services.notification_service import (
   ChatTarget,
+  EditOutcome,
   Notification,
   OutboxNotifier,
+  TelegramCycleNotification,
   TelegramNotification,
   _box,
   parse_chat_targets,
@@ -206,7 +208,9 @@ def test_channel_id_setting_keeps_topics_through_settings_parsing(monkeypatch):
   monkeypatch.setenv("TELEGRAM_ENABLED", "true")
   monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
   monkeypatch.setenv("TELEGRAM_WORKER_LOG_CHAT_IDS", "-100999")
-  monkeypatch.setenv("TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "-100111, -1002173777783_924584")
+  monkeypatch.setenv(
+    "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS", "-100111, -1002173777783_924584"
+  )
 
   telegram = TelegramSettings()
 
@@ -243,3 +247,143 @@ def test_log_chat_id_setting_takes_a_list(monkeypatch):
     ("-100111", None),
     ("-1002173777783", 924584),
   ]
+
+
+# ── TelegramCycleNotification (send once, then edit in place) ─────────────── #
+
+
+class _Response:
+  def __init__(self, status_code=200, payload=None, text=""):
+    self.status_code = status_code
+    self._payload = payload
+    self.text = text or ""
+
+  def json(self):
+    if self._payload is None:
+      raise ValueError("no json")
+    return self._payload
+
+
+def _cycle_sender(monkeypatch, response):
+  """A ready sender whose HTTP call returns *response*; records the calls."""
+  calls = []
+
+  def fake_post(url, json=None, timeout=None):
+    calls.append((url, json))
+    return response
+
+  monkeypatch.setattr(notification_service.requests, "post", fake_post)
+  sender = TelegramCycleNotification()
+  sender.enabled = True
+  sender.bot_token = SecretStr("token")
+  return sender, calls
+
+
+def test_cycle_send_returns_the_message_id(monkeypatch):
+  sender, calls = _cycle_sender(
+    monkeypatch, _Response(payload={"ok": True, "result": {"message_id": 4242}})
+  )
+  assert sender.send("-1001", "<pre>body</pre>") == "4242"
+  url, payload = calls[0]
+  assert url.endswith("/sendMessage")
+  assert payload["chat_id"] == "-1001"
+  assert payload["parse_mode"] == "HTML"
+
+
+def test_cycle_send_without_a_message_id_is_treated_as_no_message(monkeypatch):
+  # Nothing to edit later, so the caller must not record it as delivered.
+  sender, _ = _cycle_sender(monkeypatch, _Response(payload={"ok": True, "result": {}}))
+  assert sender.send("-1001", "body") is None
+
+
+def test_cycle_send_reports_an_http_failure(monkeypatch):
+  sender, _ = _cycle_sender(monkeypatch, _Response(status_code=429, text="Too Many"))
+  assert sender.send("-1001", "body") is None
+
+
+def test_cycle_send_is_skipped_when_telegram_is_disabled(monkeypatch):
+  sender, calls = _cycle_sender(monkeypatch, _Response())
+  sender.enabled = False
+  assert sender.send("-1001", "body") is None
+  assert calls == []
+
+
+def test_cycle_send_lands_in_the_configured_topic(monkeypatch):
+  # A cycle must reach the same forum topic as every other notification, so the
+  # stored entry keeps the "<chat>_<topic>" shape and is parsed at send time.
+  sender, calls = _cycle_sender(
+    monkeypatch, _Response(payload={"ok": True, "result": {"message_id": 7}})
+  )
+  assert sender.send("-1002173777783_924584", "body") == "7"
+  _, payload = calls[0]
+  assert payload["chat_id"] == "-1002173777783"
+  assert payload["message_thread_id"] == 924584
+
+
+def test_cycle_send_omits_the_thread_id_for_a_plain_chat(monkeypatch):
+  # Telegram rejects the field on a group without that thread.
+  sender, calls = _cycle_sender(
+    monkeypatch, _Response(payload={"ok": True, "result": {"message_id": 7}})
+  )
+  sender.send("-1001111111111", "body")
+  assert "message_thread_id" not in calls[0][1]
+
+
+def test_cycle_edit_identifies_the_message_without_a_thread_id(monkeypatch):
+  # The topic was fixed when the message was posted; editMessageText takes the
+  # chat and message id only.
+  sender, calls = _cycle_sender(monkeypatch, _Response(payload={"ok": True}))
+  assert sender.edit("-1002173777783_924584", "7", "body") is EditOutcome.OK
+  _, payload = calls[0]
+  assert payload["chat_id"] == "-1002173777783"
+  assert "message_thread_id" not in payload
+  assert payload["message_id"] == "7"
+
+
+def test_cycle_send_with_an_unusable_chat_id_is_a_noop(monkeypatch):
+  sender, calls = _cycle_sender(monkeypatch, _Response())
+  assert sender.send(" ", "body") is None
+  assert calls == []
+
+
+def test_cycle_edit_targets_the_stored_message(monkeypatch):
+  sender, calls = _cycle_sender(monkeypatch, _Response(payload={"ok": True}))
+  assert sender.edit("-1001", "4242", "<pre>new</pre>") is EditOutcome.OK
+  url, payload = calls[0]
+  assert url.endswith("/editMessageText")
+  assert payload["message_id"] == "4242"
+  assert payload["text"] == "<pre>new</pre>"
+
+
+def test_cycle_edit_of_an_unchanged_body_counts_as_delivered(monkeypatch):
+  # Telegram rejects a no-op edit; calling it a failure would make a redelivered
+  # signal re-post the whole cycle.
+  sender, _ = _cycle_sender(
+    monkeypatch,
+    _Response(status_code=400, text="Bad Request: message is not modified"),
+  )
+  assert sender.edit("-1001", "4242", "body") is EditOutcome.OK
+
+
+def test_cycle_edit_reports_a_deleted_message_as_missing(monkeypatch):
+  sender, _ = _cycle_sender(
+    monkeypatch,
+    _Response(status_code=400, text="Bad Request: message to edit not found"),
+  )
+  assert sender.edit("-1001", "4242", "body") is EditOutcome.MISSING
+
+
+def test_cycle_edit_reports_a_rate_limit_as_a_retryable_failure(monkeypatch):
+  sender, _ = _cycle_sender(monkeypatch, _Response(status_code=429, text="Too Many"))
+  assert sender.edit("-1001", "4242", "body") is EditOutcome.FAILED
+
+
+def test_cycle_edit_survives_a_network_exception(monkeypatch):
+  def boom(url, json=None, timeout=None):
+    raise ConnectionError("down")
+
+  monkeypatch.setattr(notification_service.requests, "post", boom)
+  sender = TelegramCycleNotification()
+  sender.enabled = True
+  sender.bot_token = SecretStr("token")
+  assert sender.edit("-1001", "4242", "body") is EditOutcome.FAILED

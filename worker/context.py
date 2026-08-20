@@ -14,8 +14,9 @@ will need:
     startup/shutdown banners, and for the NotificationJob dispatcher)
   - Outbox notifiers (for in-process notification calls that should be
     queued through SQLite for store-and-forward delivery)
+  - The signal-cycle notifier (one channel message per trade, edited in place)
   - NATS enqueue callback (used by the NATS client for connection events)
-  - Helper to start the NotificationJob dispatcher
+  - Helper to start the notification dispatchers
 
 Market-specific concerns (MT5 bridge, executor, NATS subscriber URL/footer,
 MT5-specific jobs) live in the per-market signal processor, which takes a
@@ -32,8 +33,13 @@ from worker.schemas.notification_schema import (
   NotificationModeEnum,
   NotificationPlatformEnum,
 )
+from worker.services.cycle_notification_service import CycleNotifier
 from worker.services.db_service import DBService
-from worker.services.notification_service import OutboxNotifier, TelegramNotification
+from worker.services.notification_service import (
+  OutboxNotifier,
+  TelegramCycleNotification,
+  TelegramNotification,
+)
 from worker.settings import settings
 
 log = get_logger("worker.worker_context")
@@ -60,6 +66,17 @@ class WorkerContext:
     )
     self.channel_notifier = OutboxNotifier(
       self._build_enqueue(NotificationChannelEnum.COMMUNITY, "TRADE_EVENT")
+    )
+
+    # One message per trade cycle, posted to the same channel chats as
+    # ``channel_notifier`` and edited in place as the trade progresses. The
+    # account footer is resolved per action (a live balance), so the processor
+    # supplies it via :meth:`bind_footer` once it can read the account.
+    self.cycle_sender = TelegramCycleNotification()
+    self.cycle_notifier = CycleNotifier(
+      db_service=self.db_service,
+      chat_ids=channel_ids,
+      settings_dict=settings_dict,
     )
 
   def _build_enqueue(
@@ -92,6 +109,7 @@ class WorkerContext:
     )
 
   def start_notification_job(self, stop_event) -> None:
+    from worker.jobs.cycle_notification_job import CycleNotificationJob
     from worker.jobs.notification_job import NotificationJob
 
     NotificationJob(
@@ -100,4 +118,13 @@ class WorkerContext:
         NotificationChannelEnum.INDIVIDUAL.value: self.direct_notifier,
         NotificationChannelEnum.COMMUNITY.value: self.direct_channel_notifier,
       },
+    ).start(stop_event=stop_event)
+
+    # Its own thread rather than a second pass inside NotificationJob: the two
+    # drain different tables with different delivery semantics (send-and-delete
+    # vs send-once-then-edit), and a cycle edit blocked on a Telegram timeout
+    # must not hold up an unrelated management notification.
+    CycleNotificationJob(
+      db_service=self.db_service,
+      sender=self.cycle_sender,
     ).start(stop_event=stop_event)

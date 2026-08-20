@@ -46,6 +46,11 @@ from worker.schemas.admin_schema import (
   PrivateAdminFlatSchema,
   PrivateAdminSignalControlSchema,
 )
+from worker.schemas.cycle_schema import (
+  CycleEventSchema,
+  CycleOutcomeEnum,
+  CycleStatusEnum,
+)
 from worker.schemas.inbox_schema import (
   WorkerConnectedAckSchema,
   WorkerConnectedErrorSchema,
@@ -93,6 +98,18 @@ _HANDSHAKE_ALERT_THRESHOLD = 3
 # cap applies to (exits must always be allowed so positions can be closed).
 _ENTRY_ACTIONS = (SignalActionEnum.LONG, SignalActionEnum.SHORT)
 
+# Actions that close (part of) a position, and are therefore the only ones that
+# can book a realized PnL onto the cycle.
+_CYCLE_EXIT_ACTIONS = frozenset(
+  {
+    SignalActionEnum.TP1,
+    SignalActionEnum.TP2,
+    SignalActionEnum.SL,
+    SignalActionEnum.R_SL,
+    SignalActionEnum.FLAT,
+  }
+)
+
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
   "TP1": PositionStatusEnum.TP1,
@@ -101,6 +118,14 @@ _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
   "R_SL": PositionStatusEnum.R_SL,
   "FLAT": PositionStatusEnum.FLATTED,
 }
+
+
+def _as_text(value: Any) -> Optional[str]:
+  """Broker reference as a string, or None when absent.
+
+  Ticket ids arrive as ints from some gateways and strings from others; the
+  cycle stores them as text so the two render identically."""
+  return None if value is None else str(value)
 
 
 def _seconds_since(ts: Optional[datetime], now: datetime) -> Optional[float]:
@@ -240,6 +265,9 @@ class BaseSignalProcessor(ABC):
     self.publisher.connect()
 
     self._footer = self._account_footer()
+    # The account footer needs a connected broker, so the cycle notifier (built
+    # in the market-agnostic context) only gets its source now.
+    self.ctx.cycle_notifier.bind_footer(self._current_footer)
 
     # Handshake: tell the broker this worker is online so it can push any
     # per-worker init (magics, leverage, replay). The broker decides from
@@ -444,6 +472,7 @@ class BaseSignalProcessor(ABC):
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
       signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
     )
 
     if result.get("success"):
@@ -453,6 +482,7 @@ class BaseSignalProcessor(ABC):
         # (or could not be) to avoid running unprotected — alert loudly instead
         # of reporting a normal fill.
         msg = self.presenter.position_unprotected_closed(signal, result, footer)
+        outcome = CycleOutcomeEnum.UNPROTECTED_CLOSED
       else:
         risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
@@ -463,9 +493,17 @@ class BaseSignalProcessor(ABC):
           risk_info=risk_info,
           settings_dict=self.settings,
         )
+        outcome = CycleOutcomeEnum.FILLED
     else:
       msg = self.presenter.order_failed(signal, result, footer)
-    self.ctx.channel_notifier.send_message(msg)
+      outcome = CycleOutcomeEnum.FAILED
+
+    self._notify_trade(
+      signal,
+      msg,
+      event=self._cycle_event(signal, result, outcome),
+      status=self._cycle_status(signal, result),
+    )
 
   def _persist_success(self, signal: SignalSchema, result: dict, footer: str) -> None:
     action_val = signal.action.value
@@ -473,8 +511,22 @@ class BaseSignalProcessor(ABC):
     signal_json = signal.model_dump_json()
 
     for fc in result.get("forced_closed", []):
-      self.ctx.channel_notifier.send_message(
-        self.presenter.force_closed(signal.symbol, signal.strategy, fc, footer)
+      # Part of this entry's story, so it joins the cycle as its own action
+      # rather than arriving as an unrelated message.
+      self._notify_trade(
+        signal,
+        self.presenter.force_closed(signal.symbol, signal.strategy, fc, footer),
+        event=CycleEventSchema(
+          action=action_val,
+          outcome=CycleOutcomeEnum.FORCE_CLOSED,
+          timestamp=signal.timestamp,
+          price=fc.get("price"),
+          volume=fc.get("volume"),
+          profit=fc.get("profit"),
+          ref_id=_as_text(fc.get("ref_id")),
+          ref_source_id=_as_text(fc.get("ref_source_id")),
+          reason="Closed to make room for a new entry",
+        ),
       )
 
     if action_val in ("LONG", "SHORT"):
@@ -491,6 +543,7 @@ class BaseSignalProcessor(ABC):
         strategy_code=self._magic_for(signal.strategy),
         market_type=self._market_type,
         signal_id=signal.signal_id,
+        signal_uxid=signal.signal_uxid,
       )
     else:
       status = _CLOSE_STATUS_MAP.get(action_val)
@@ -619,6 +672,7 @@ class BaseSignalProcessor(ABC):
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
       signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
     )
 
     self.ctx.db_service.insert_rejected_position(
@@ -634,10 +688,25 @@ class BaseSignalProcessor(ABC):
       strategy_code=self._magic_for(signal.strategy),
       market_type=self._market_type,
       signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
     )
 
-    self.ctx.channel_notifier.send_message(
-      self.presenter.order_rejected(signal, reason, footer)
+    self._notify_trade(
+      signal,
+      self.presenter.order_rejected(signal, reason, footer),
+      event=CycleEventSchema(
+        action=signal.action.value,
+        outcome=CycleOutcomeEnum.REJECTED,
+        timestamp=signal.timestamp,
+        price=signal.price,
+        volume=signal.quantity,
+        sl=signal.sl,
+        tp1=signal.tp1,
+        tp2=signal.tp2,
+        gateway_return_code=-1,
+        reason=reason,
+      ),
+      status=CycleStatusEnum.REJECTED,
     )
 
   # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
@@ -887,8 +956,26 @@ class BaseSignalProcessor(ABC):
           gateway_return_code=result.get("retcode", 0),
           comment=result.get("comment", ""),
         )
-        self.ctx.channel_notifier.send_message(
-          self.presenter.admin_flat_closed(db_pos, result, footer)
+        # An admin FLAT is the last action of the position's own cycle, so it
+        # closes out that message rather than opening a new one. The uxid comes
+        # off the position row — no signal is involved in an admin directive.
+        self._notify_cycle_or_send(
+          self.presenter.admin_flat_closed(db_pos, result, footer),
+          signal_uxid=db_pos.get("signal_uxid"),
+          strategy=db_pos.get("strategy") or "",
+          symbol=db_pos.get("symbol") or "",
+          event=CycleEventSchema(
+            action=AdminActionEnum.FLAT.value,
+            outcome=CycleOutcomeEnum.ADMIN_FLAT,
+            price=result.get("price"),
+            volume=result.get("volume"),
+            profit=result.get("profit"),
+            ref_id=_as_text(result.get("ticket")),
+            ref_source_id=_as_text(db_pos.get("ref_source_id")),
+            gateway_return_code=result.get("retcode"),
+            reason=result.get("comment") or None,
+          ),
+          status=CycleStatusEnum.FLATTED,
         )
       elif db_keys.isdisjoint(attempted):
         # Never seen live on the broker → already closed externally; sync the DB.
@@ -1417,6 +1504,135 @@ class BaseSignalProcessor(ABC):
       skipped_stale,
       failed,
       len(signals),
+    )
+
+  # ── Signal-cycle notifications ────────────────────────────────────────── #
+  #
+  # Every action of one trade folds into a single channel message that is
+  # rewritten in place (see
+  # :mod:`worker.services.cycle_notification_service`). The per-action message
+  # each call site already builds stays the fallback: a broker that sends no
+  # ``signal_uxid``, a cycle write that failed, or cycles turned off all mean
+  # there is no message to edit, and the action must still be reported.
+
+  def _notify_trade(
+    self,
+    signal: SignalSchema,
+    message: str,
+    *,
+    event: "CycleEventSchema",
+    status: Optional[CycleStatusEnum] = None,
+  ) -> None:
+    """Report one executed signal — through its cycle, or on its own."""
+    self._notify_cycle_or_send(
+      message,
+      signal_uxid=signal.signal_uxid,
+      strategy=signal.strategy,
+      symbol=signal.symbol,
+      event=event,
+      status=status,
+    )
+
+  def _notify_cycle_or_send(
+    self,
+    message: str,
+    *,
+    signal_uxid: Optional[str],
+    strategy: str,
+    symbol: str,
+    event: "CycleEventSchema",
+    status: Optional[CycleStatusEnum] = None,
+  ) -> None:
+    """Fold *event* into its cycle, falling back to sending *message* as-is.
+
+    Split from :meth:`_notify_trade` because not every cycle action comes from a
+    signal — an admin FLAT closes a position the operator named, and takes its
+    cycle key off the position row instead.
+    """
+    if self.ctx.cycle_notifier.record(
+      signal_uxid=signal_uxid,
+      strategy=strategy,
+      symbol=symbol,
+      event=event,
+      status=status,
+    ):
+      return
+    self.ctx.channel_notifier.send_message(message)
+
+  def _cycle_event(
+    self, signal: SignalSchema, result: dict, outcome: CycleOutcomeEnum
+  ) -> "CycleEventSchema":
+    """Build the timeline entry for one executed signal.
+
+    Levels are taken from the signal (what was asked for) while price/volume come
+    from the result (what actually happened), so a fill that slipped shows both
+    sides of the story.
+    """
+    risk_info = self._resolve_risk_info(signal)
+    return CycleEventSchema(
+      action=signal.action.value,
+      outcome=outcome,
+      timestamp=signal.timestamp,
+      price=result.get("price", signal.price),
+      volume=result.get("volume", signal.quantity),
+      sl=signal.sl,
+      tp1=signal.tp1,
+      tp2=signal.tp2,
+      risk_percent=risk_info[0] if risk_info else None,
+      risk_custom=bool(risk_info[1]) if risk_info else False,
+      auto_volume=bool(self.settings.get("volume_decision_enabled", False)),
+      tp1_percent=self._cycle_tp1_percent(signal),
+      is_scale_position=bool(getattr(signal, "is_scale_position", False)),
+      # Only a close books money. An entry carries no PnL at all, so it stays
+      # None and the timeline omits the line rather than claiming a 0.00 result
+      # — the same rule BaseMessagePresenter._exit_pnl_line applies.
+      profit=result.get("profit") if signal.action in _CYCLE_EXIT_ACTIONS else None,
+      ref_id=_as_text(result.get("ticket")),
+      ref_source_id=_as_text(result.get("source_ticket") or result.get("ticket")),
+      gateway_return_code=result.get("retcode"),
+      reason=result.get("comment") or None,
+    )
+
+  def _cycle_tp1_percent(self, signal: SignalSchema) -> Optional[float]:
+    """Percent of the position a TP1 closed, mirroring the executor's own choice.
+
+    Only TP1 sizes itself by percent, and only under VOLUME_DECISION_ENABLED —
+    otherwise the close is sized from ``signal.quantity`` and no percent applies.
+    """
+    if signal.action != SignalActionEnum.TP1:
+      return None
+    if not self.settings.get("volume_decision_enabled", False):
+      return None
+    if self.settings.get("use_custom_position_tp1_percent", False):
+      return self.settings.get("position_tp1_percent")
+    if signal.tp1_percent is not None:
+      return signal.tp1_percent
+    return self.settings.get("position_tp1_percent")
+
+  def _cycle_status(
+    self, signal: SignalSchema, result: dict
+  ) -> Optional[CycleStatusEnum]:
+    """The position's status after this action — the cycle's headline.
+
+    A branch-for-branch mirror of what :meth:`_persist_success` writes to the
+    positions table, so the message and the row can never disagree. A failed
+    action returns ``FAILED``, which
+    :func:`~worker.schemas.cycle_schema.merge_status` keeps from overwriting a
+    position that is still open.
+    """
+    if not result.get("success"):
+      return CycleStatusEnum.FAILED
+    if signal.action.value in ("LONG", "SHORT"):
+      return CycleStatusEnum.OPENED
+    # A breakeven SL that could not be placed leaves the remaining volume
+    # unprotected, so it is emergency-closed — fully flat, not a still-open
+    # partial. If that close itself failed the position is still live, and the
+    # status its action implies is the honest one (the message shouts about it).
+    failsafe = result.get("sl_failsafe_close")
+    if failsafe is not None and failsafe.get("success"):
+      return CycleStatusEnum.FORCED_CLOSED
+    return CycleStatusEnum.from_position_status(
+      _CLOSE_STATUS_MAP.get(signal.action.value)
     )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #

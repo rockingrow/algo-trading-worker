@@ -118,6 +118,7 @@ DESCRIPTIONS = {
     "Chat IDs for forwarded ERROR logs, comma-separated "
     "(blank -> falls back to TELEGRAM_WORKER_LOG_CHAT_IDS)"
   ),
+  "TELEGRAM_CYCLE_ENABLED": "One message per trade, edited as it progresses",
 }
 
 KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
