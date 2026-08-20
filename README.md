@@ -575,7 +575,7 @@ Toggle whether the worker **executes incoming SIGNALs**. `BLOCK_SIGNAL` suspends
 
 While blocked (`_signals_blocked = True`), every incoming SIGNAL is skipped at the single execution funnel `_process_signal` — this covers **both** live signals and the ACK's `retry_signals` replay. Open positions are **untouched**: they can still be closed out-of-band via an `ADMIN` `FLAT`, which is the escape hatch even while signals are blocked. A real state change is logged and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` Telegram notification; repeating the current state is a no-op (no duplicate alert).
 
-The flag is **in-memory only** — a worker restart resets it to *allowed*. There is no DB/schema change; if a durable block is needed, the broker can re-issue `BLOCK_SIGNAL` after the worker re-announces `WORKER_CONNECTED`.
+The flag is **in-memory only** — a worker restart resets it to *allowed*, and there is no DB/schema change. Durability comes from the broker instead of the worker: it owns the state and replays it in the [`settings` section of the `WORKER_CONNECTED_ACK`](#section-settings) on every handshake, which re-applies the block through this very same setter before the ACK's signal replay runs.
 
 ```json
 {
@@ -603,7 +603,7 @@ The `SYSTEM` NATS subject carries the connect handshake and the broker's config 
 
 | Path | Delivery | Used for |
 | --- | --- | --- |
-| **Connect-time** | Sections of the `WORKER_CONNECTED_ACK`, on the handshake's private reply inbox | Everything the worker needs before it trades: `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` |
+| **Connect-time** | Sections of the `WORKER_CONNECTED_ACK`, on the handshake's private reply inbox | Everything the worker needs before it trades: `settings`, `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` |
 | **Runtime** | A standalone action broadcast on the shared `SYSTEM` subject | A setting an admin changes *after* the worker is connected — currently `CRYPTO_LEVERAGE_INIT` |
 
 The split exists because a request reply inbox delivers exactly **one** message (see the handshake section below), so it cannot carry a push that arrives later; the shared subject has no such limit and the worker stays subscribed to it for its whole lifetime, so a broadcast always lands.
@@ -616,7 +616,7 @@ Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected`
 
 | Reply action | Meaning | Worker behaviour |
 | --- | --- | --- |
-| `WORKER_CONNECTED_ACK` | The normal reply — carries **all** of this worker's connect-time config in one payload (`strategy_magic_map` + `retry_signals`, both optional) | Applies each section that is present (see [WORKER_CONNECTED_ACK payload](#worker_connected_ack-payload-broker--worker-reply)); handshake complete |
+| `WORKER_CONNECTED_ACK` | The normal reply — carries **all** of this worker's connect-time config in one payload (`settings`, `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` — all optional) | Applies each section that is present (see [WORKER_CONNECTED_ACK payload](#worker_connected_ack-payload-broker--worker-reply)); handshake complete |
 | `WORKER_CONNECTED_ERROR` | Broker received it but couldn't process it (missing settings, invalid leverage config, …) | Logged with `reason` for operator attention; not retried — a config problem on the broker side isn't fixed by resending the same request |
 
 > **One reply per request — why the ACK carries everything.** `nc.request` opens a temporary reply inbox, resolves on the **first** message delivered to it, and unsubscribes immediately. A broker that publishes several messages to that inbox has all but the first silently discarded *by the client library*, below the worker's message handler: nothing is logged on either side, and which message "wins" is decided purely by the broker's send order. Splitting connect-time config across several sends is therefore not a delivery race the worker can retry out of — it is guaranteed loss, so every section rides in the single ACK payload.
@@ -643,16 +643,19 @@ The single reply carrying this worker's whole connect-time config. Every section
 
 | Field | Market | Behaviour when present | Behaviour when omitted (or `null`) |
 | --- | --- | --- | --- |
+| `settings` | both | The runtime toggles this account was left with in a previous session (currently `signal_blocked`) — each one is re-applied through the very same code path the runtime ADMIN action uses | Every toggle keeps its current value; on a fresh start that is its default (`signal_blocked` → *allowed*) |
 | `strategy_magic_map` | both | `{strategy_name: magic_number}` for the strategies this worker subscribes to. Entries for other strategies are ignored; an explicit `{}` **clears** the worker's magics | The worker's current map is left **untouched** — omitting the section means "nothing to push", so a reconnect ACK never wipes the magics the worker is already trading under |
 | `crypto_leverage_init` | CRYPTO | `{symbols, default_leverage}` — runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass before trading | The connect-time pass is skipped, so a worker that wasn't asked never touches exchange leverage. A change made later arrives instead as a runtime [`CRYPTO_LEVERAGE_INIT`](#action-crypto_leverage_init-crypto-runtime) broadcast |
 | `retry_signals` | both | A batch of full `SignalSchema` payloads to replay (deduped + age-gated, see below) | Nothing to replay (`[]` is equivalent) |
 
-Applied by `BaseSignalProcessor._apply_worker_connected_ack`, which runs the config sections first and the **replay last**. That ordering is load-bearing: a replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO entry is sized against the exchange's leverage, so replaying first would fire orders against config that hadn't been applied yet.
+Applied by `BaseSignalProcessor._apply_worker_connected_ack`, which restores `settings` first, runs the remaining config sections next, and the **replay last**. That ordering is load-bearing: a replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO entry is sized against the exchange's leverage, so replaying first would fire orders against config that hadn't been applied yet — and because the replay goes through the same `_process_signal` funnel as live traffic, a `signal_blocked` restored *before* it suppresses the batch, while one restored after would arrive a batch of orders too late.
 
 Merging every section into one payload would normally mean one malformed entry takes the whole ACK down, so `WorkerConnectedAckSchema` (`worker/schemas/inbox_schema.py`) validates each section — and each entry within it — **independently**, and a fault costs only the part that is actually broken:
 
 | Fault | Effect |
 | --- | --- |
+| One malformed value in `settings` | That setting is left at its current value; the other settings in the same section still apply, as do the other sections |
+| A `settings` key this worker has no field for | Ignored and reported (the broker believes it is in force, so the version skew is made visible); the known settings still apply |
 | One malformed signal in `retry_signals` | That signal is dropped; the rest of the batch still replays and every config section still applies |
 | One non-integer magic in `strategy_magic_map` | That strategy is dropped; the other magics still apply (its own signals are then rejected loudly by the unknown-strategy guard) |
 | **Every** magic in `strategy_magic_map` unparseable | The section is skipped and the worker's current map is left alone — never stored as `{}`, because an empty map is the broker's explicit *clear my magics* instruction and a parse failure must not be mistaken for one |
@@ -666,6 +669,7 @@ Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK
   "action": "WORKER_CONNECTED_ACK",
   "account_id": "FOREX-MT5-1234567",
   "timestamp": "2026-06-30T00:00:00+00:00",
+  "settings": { "signal_blocked": true },
   "strategy_magic_map": {
     "MT5_GOLD_M5_V1": 20260409,
     "MT5_FX_M15_V2": 20260410
@@ -687,6 +691,18 @@ Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK
   ]
 }
 ```
+
+##### Section: `settings`
+
+The **runtime toggles** the broker holds for this account, replayed so a worker comes back up in the state an operator left it in. They are the same switches the runtime [ADMIN actions](#actions-block_signal--allow_signal) flip, and the worker keeps them **in memory only** — so without this section a restart silently drops back to the defaults and resumes trading under a block nobody lifted. The broker owns the state; this is how it hands it back.
+
+`BaseSignalProcessor._apply_worker_settings` reads each attribute in turn and applies it through the *same helper the ADMIN action calls*, so restoring a value is indistinguishable from receiving the directive live: the same already-in-that-state no-op, the same log line, the same Telegram alert. Each field is independently optional — `null` (or absent) means "not pushed, leave this setting alone", which is why `signal_blocked` is a nullable bool: `false` is the broker explicitly saying *unblocked*, not the same statement as saying nothing.
+
+| Field | Behaviour when present | Behaviour when omitted (or `null`) |
+| --- | --- | --- |
+| `signal_blocked` | `true` re-applies the [`BLOCK_SIGNAL`](#actions-block_signal--allow_signal) gate (every SIGNAL — live **and** this ACK's `retry_signals` — is skipped); `false` clears it, exactly as `ALLOW_SIGNAL` does | The gate keeps its current value: its default (*allowed*) after a restart, or whatever ADMIN last set on a reconnect that kept the process alive |
+
+Adding a toggle means adding its field to `WorkerSettingsSchema` (`worker/schemas/inbox_schema.py`) plus one branch in `_apply_worker_settings` that delegates to the existing ADMIN-side setter — the ADMIN path stays the single implementation of *what the setting does*.
 
 ##### Section: `strategy_magic_map`
 

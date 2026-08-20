@@ -50,6 +50,7 @@ from worker.schemas.inbox_schema import (
   WorkerConnectedAckSchema,
   WorkerConnectedErrorSchema,
   WorkerConnectedSchema,
+  WorkerSettingsSchema,
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -1173,6 +1174,12 @@ class BaseSignalProcessor(ABC):
   def _apply_worker_connected_ack(self, data: dict) -> None:
     """Apply the config carried by a ``WORKER_CONNECTED_ACK``.
 
+    ``settings`` is restored first, before anything can act on it: it carries the
+    signal-execution gate, and the replay further down this same method runs
+    through ``_process_signal`` like a live signal does — so a block restored
+    here suppresses the replay exactly as it suppresses live traffic, while one
+    applied afterwards would arrive a batch of orders too late.
+
     Config sections land **before** the signal replay, which always runs last: a
     replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO
     entry is sized against the exchange's leverage, so replaying first would fire
@@ -1208,7 +1215,8 @@ class BaseSignalProcessor(ABC):
       log.error("[%s Process] WORKER_CONNECTED_ACK dropped %s", self.name, reason)
 
     has_config = (
-      ack.strategy_magic_map is not None
+      ack.settings is not None
+      or ack.strategy_magic_map is not None
       or ack.crypto_leverage_init is not None
       or bool(ack.retry_signals)
     )
@@ -1221,12 +1229,16 @@ class BaseSignalProcessor(ABC):
       return
 
     log.info(
-      "[%s Process] WORKER_CONNECTED_ACK — handshake complete | magics=%s leverage=%s replay=%d",
+      "[%s Process] WORKER_CONNECTED_ACK — handshake complete | settings=%s magics=%s "
+      "leverage=%s replay=%d",
       self.name,
+      "yes" if ack.settings is not None else "-",
       "-" if ack.strategy_magic_map is None else len(ack.strategy_magic_map),
       "yes" if ack.crypto_leverage_init is not None else "-",
       len(ack.retry_signals),
     )
+    if ack.settings is not None:
+      self._apply_worker_settings(ack.settings)
     if ack.strategy_magic_map is not None:
       self._apply_strategy_magic_map(ack.strategy_magic_map)
     self._apply_market_init(ack)
@@ -1243,6 +1255,29 @@ class BaseSignalProcessor(ABC):
         )
         return
       self._apply_retry_signals(ack.retry_signals)
+
+  def _apply_worker_settings(self, settings: WorkerSettingsSchema) -> None:
+    """Restore the runtime toggles the broker pushed in the ACK's ``settings``
+    section, reading each attribute in turn.
+
+    These toggles live in memory only (a restart resets them to their defaults),
+    so the broker — which owns the state — re-pushes whatever an operator set in
+    an earlier session and the worker replays it here. Each attribute is applied
+    through the very same helper the runtime ADMIN action calls, so restoring a
+    value is indistinguishable from receiving the directive live: the same
+    already-in-that-state no-op, the same log line, the same operator alert.
+
+    A field left ``None`` was not pushed and is skipped — only an explicit value
+    changes anything, so the broker can restore one toggle without disturbing the
+    rest. Adding a new toggle means adding its field to
+    :class:`~worker.schemas.inbox_schema.WorkerSettingsSchema` and one branch
+    here that delegates to the existing ADMIN-side setter.
+    """
+    if settings.signal_blocked is not None:
+      # Same setter as ADMIN BLOCK_SIGNAL / ALLOW_SIGNAL: notifies on a real
+      # change, no-ops when the worker is already in that state (which a fresh
+      # start is for signal_blocked=false).
+      self._set_signals_blocked(settings.signal_blocked)
 
   def _replay_blocked_reason(self) -> Optional[str]:
     """Why this worker must not run the ACK's signal replay, or None to proceed.
