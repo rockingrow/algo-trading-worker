@@ -84,8 +84,9 @@ class DBService:
     self,
     strategy: Optional[str] = None,
     symbol: Optional[str] = None,
+    ref_id: Optional[str] = None,
   ) -> list:
-    return self.positions.get_open_positions_for_flat(strategy=strategy, symbol=symbol)
+    return self.positions.get_open_positions_for_flat(strategy=strategy, symbol=symbol, ref_id=ref_id)
 
   def signal_exists(self, signal_id: str) -> bool:
     return self.positions.signal_exists(signal_id)

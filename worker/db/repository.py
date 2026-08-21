@@ -430,8 +430,9 @@ class PositionRepository:
     self,
     strategy: Optional[str] = None,
     symbol: Optional[str] = None,
+    ref_id: Optional[str] = None,
   ) -> list:
-    """Fetch all OPENED/TP1 positions, optionally filtered by strategy and/or symbol."""
+    """Fetch all OPENED/TP1 positions, optionally filtered by strategy, symbol and/or ref_id."""
     conn = None
     try:
       conn = _get_conn()
@@ -445,6 +446,9 @@ class PositionRepository:
       if symbol:
         conditions.append("symbol = ?")
         params.append(symbol)
+      if ref_id:
+        conditions.append("ref_id = ?")
+        params.append(ref_id)
       cursor.execute(
         f"SELECT * FROM positions WHERE {' AND '.join(conditions)}", params
       )
