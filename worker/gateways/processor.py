@@ -884,6 +884,16 @@ class BaseSignalProcessor(ABC):
     else:
       positions = self.executor.get_all_open_positions(strategy=admin.strategy)
 
+    ref_id = getattr(admin, "ref_id", None)
+    if ref_id:
+      db_positions = self.ctx.db_service.get_open_positions_for_flat(
+        strategy=admin.strategy, symbol=admin.symbol, ref_id=ref_id
+      )
+      allowed_keys = set()
+      for db_pos in db_positions:
+        allowed_keys.update(self._flat_db_match_keys(db_pos))
+      positions = [p for p in positions if self._flat_match_key(p) in allowed_keys]
+
     if positions:
       log.info(
         "[ADMIN FLAT] Closing %d %s position(s) (strategy=%s, symbol=%s)",
@@ -939,7 +949,7 @@ class BaseSignalProcessor(ABC):
     an append-only ``position_logs`` row, which is where per-event audit belongs.
     """
     db_positions = self.ctx.db_service.get_open_positions_for_flat(
-      strategy=admin.strategy, symbol=admin.symbol
+      strategy=admin.strategy, symbol=admin.symbol, ref_id=getattr(admin, "ref_id", None)
     )
     footer = self._account_footer()
     for db_pos in db_positions:

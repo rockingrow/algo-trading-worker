@@ -63,6 +63,7 @@ class PrivateAdminFlatSchema(PrivateAdminSchema):
 
   strategy: Optional[str] = None
   symbol: Optional[str] = None
+  ref_id: Optional[str] = None
 
 
 class PrivateAdminSignalControlSchema(PrivateAdminSchema):
