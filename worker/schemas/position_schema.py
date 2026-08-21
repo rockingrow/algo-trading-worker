@@ -68,6 +68,10 @@ class PositionEvent(BaseModel):
   # Signal-derived fields (parsed from `message` JSON) needed for broker upsert
   # the first time a position is seen.
   signal_id: Optional[str] = None
+  # Trade-cycle correlation id echoed from the broker signal. Entry and every
+  # close event of a trade share the same value; the broker uses it to gather
+  # this worker's executions under one cycle. Never used for dedup.
+  signal_uxid: Optional[str] = None
   strategy_code: Optional[str] = None
   sl: Optional[float] = None
   tp1: Optional[float] = None

@@ -14,6 +14,7 @@ from helpers import make_signal
 from worker.gateways import processor as processor_module
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor, parse_strategy_subjects
+from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
 from worker.schemas.system_schema import SystemActionEnum
@@ -55,6 +56,18 @@ class FakePresenter:
   def admin_flat_closed(db_pos, result, footer):
     return "admin_flat"
 
+  @staticmethod
+  def signals_blocked(footer):
+    return "signals_blocked"
+
+  @staticmethod
+  def signals_allowed(footer):
+    return "signals_allowed"
+
+  @staticmethod
+  def position_unprotected_closed(signal, result, footer):
+    return f"unprotected:{signal.action.value}"
+
 
 class FakeDb:
   def __init__(self):
@@ -89,6 +102,24 @@ class FakeDb:
     return signal_id in self.known_signal_ids
 
 
+class FakeCycleNotifier:
+  """Stand-in for CycleNotifier: owns an action only when it has a uxid.
+
+  Mirrors the real contract — ``record`` returns True when the cycle has taken
+  over reporting the action, and the processor must then NOT send its own
+  message."""
+
+  def __init__(self, accept: bool = True):
+    self.accept = accept
+    self.recorded = []
+
+  def record(self, *, signal_uxid, strategy, symbol, event, status=None):
+    if not signal_uxid or not self.accept:
+      return False
+    self.recorded.append((signal_uxid, strategy, symbol, event, status))
+    return True
+
+
 class FakeProcessor(BaseSignalProcessor):
   """Concrete processor wired entirely with fakes (bypasses the real __init__)."""
 
@@ -101,6 +132,7 @@ class FakeProcessor(BaseSignalProcessor):
     self.db = FakeDb()
     self.notifications = []
     self.mgmt_notifications = []
+    self.cycle = FakeCycleNotifier()
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
@@ -110,6 +142,7 @@ class FakeProcessor(BaseSignalProcessor):
         send_message=lambda m: self.mgmt_notifications.append(m)
       ),
       direct_notifier=SimpleNamespace(send_message=lambda m: None),
+      cycle_notifier=self.cycle,
     )
     self.handler = SimpleNamespace(handle=lambda sig: handle_result)
     self.settings = {}
@@ -518,6 +551,238 @@ def test_max_open_orders_zero_disables_cap():
 
   assert proc.db.rejected == []
   assert len(proc.db.inserted) == 1
+
+
+# ── Audit trail records the stop actually placed ───────────────────────────── #
+
+
+def test_log_position_records_the_broker_side_stop():
+  # The broker widened the stop to satisfy its minimum distance. The audit row
+  # must hold what the position really carries, not what the signal asked for —
+  # it is the record of the risk actually taken.
+  proc = FakeProcessor(
+    {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.33,
+      "sl": 1999.39,
+      "tp": 2000.11,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, sl=1999.45, tp2=2000.05).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["sl"] == 1999.39
+
+
+def test_log_position_falls_back_to_the_signal_stop():
+  # Exits carry no stop of their own, so the signal's value still lands in the
+  # audit row rather than a null.
+  proc = FakeProcessor(
+    {"success": True, "ticket": 9, "source_ticket": 5, "price": 1990.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.SL, sl=1990.0).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["sl"] == 1990.0
+
+
+def test_log_position_keeps_tp1_as_the_signal_partial_target():
+  # tp1 is the partial-close level, a different concept from the full-exit TP
+  # resting at the broker — result["tp"] must not overwrite it.
+  proc = FakeProcessor(
+    {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.1,
+      "sl": 1990.0,
+      "tp": 2050.0,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, tp1=2020.0, tp2=2050.0).model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["tp1"] == 2020.0
+
+
+# ── Stale-signal guard ─────────────────────────────────────────────────────── #
+
+
+def _quoting_handler(proc, quote, result):
+  """Give the processor a handler whose market strategy reports *quote* as the
+  live entry price, and record the signals it was asked to execute."""
+  seen = []
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: seen.append(sig) or result,
+    strategy=SimpleNamespace(entry_price=lambda sig: quote),
+  )
+  return seen
+
+
+def test_entry_rejected_when_market_already_past_tp():
+  # The XPDUSD failure: signal planned at 1375 with TP 1377, but the ask has
+  # already run to 1388. The entry must never reach the broker.
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  seen = _quoting_handler(proc, 1388.0, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="XPDUSD", price=1375.0, sl=1370.0, tp2=1377.0
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert proc.db.inserted == []
+  assert len(proc.db.rejected) == 1
+  rej = proc.db.rejected[0]
+  assert rej["symbol"] == "XPDUSD"
+  assert "already reached its take-profit" in rej["comment"]
+  assert proc.notifications == ["order_rejected:LONG:" + rej["comment"]]
+
+
+def test_entry_rejected_when_market_already_past_sl():
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  seen = _quoting_handler(proc, 1985.0, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "already reached its stop-loss" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_rejected_when_drift_exceeds_limit():
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_entry_drift_r_percent": 50}
+  seen = _quoting_handler(proc, 2006.0, {"success": True})
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "price moved too far" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_allowed_when_quote_is_close_to_the_signal():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2002.0, "volume": 0.1})
+  _quoting_handler(
+    proc, 2002.0, {"success": True, "ticket": 1, "price": 2002.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_exit_signal_not_gated_by_stale_guard():
+  # An exit must always be executable, however far the market has run — a TP2
+  # exit is *expected* to arrive with the price through the target.
+  proc = FakeProcessor(
+    {"success": True, "ticket": 9, "source_ticket": 5, "price": 2050.0, "volume": 0.1}
+  )
+  _quoting_handler(
+    proc,
+    2060.0,
+    {
+      "success": True,
+      "ticket": 9,
+      "source_ticket": 5,
+      "price": 2050.0,
+      "volume": 0.1,
+    },
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.TP2).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert proc.notifications == ["filled:TP2:5"]
+
+
+def test_entry_proceeds_when_no_live_quote_is_available():
+  # A missing quote must not block trading — the guard simply has nothing to
+  # judge on and defers to the broker.
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  _quoting_handler(
+    proc, None, {"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1}
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+
+
+def test_entry_proceeds_when_quote_lookup_raises():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+
+  def _boom(_sig):
+    raise RuntimeError("broker unreachable")
+
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: {
+      "success": True,
+      "ticket": 1,
+      "price": 2000.0,
+      "volume": 0.1,
+    },
+    strategy=SimpleNamespace(entry_price=_boom),
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert proc.db.rejected == []
+  assert len(proc.db.inserted) == 1
+
+
+def test_cheaper_db_guards_run_before_the_quote_lookup():
+  # The staleness guard needs a broker round-trip, so an entry already rejected
+  # by a DB-only guard must not pay for one.
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD")]
+  quote_calls = []
+
+  def _quote(_sig):
+    quote_calls.append(_sig)
+    return 2000.0
+
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: {"success": True},
+    strategy=SimpleNamespace(entry_price=_quote),
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.LONG).model_dump_json()
+  )
+
+  assert quote_calls == []
+  assert len(proc.db.rejected) == 1
+  assert "already has an open order" in proc.db.rejected[0]["comment"]
 
 
 def test_unknown_strategy_signal_is_skipped_with_alert():
@@ -958,6 +1223,7 @@ def test_worker_connected_payload_strategies_defaults_to_empty_when_unset():
 def _ack_payload(
   *,
   account_id="FAKE_MKT-FAKE_GW-acct-1",
+  settings=None,
   strategy_magic_map=None,
   crypto_leverage_init=None,
   retry_signals=None,
@@ -971,6 +1237,8 @@ def _ack_payload(
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "account_id": account_id,
   }
+  if settings is not None:
+    payload["settings"] = settings
   if strategy_magic_map is not None:
     payload["strategy_magic_map"] = strategy_magic_map
   if crypto_leverage_init is not None:
@@ -1299,6 +1567,138 @@ def test_ack_applies_every_config_section_before_replaying_signals():
   assert proc.db.inserted[0]["symbol"] == "AAA"
 
 
+# ── ACK: the settings section restores runtime toggles ─────────────────────── #
+
+
+def _settings_proc():
+  """A connected FakeProcessor with the signal gate at its post-restart default
+  (unblocked) — the state a worker always boots into, since the toggles the ADMIN
+  actions flip live in memory only."""
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "gw_key": "FAKE_GW"}
+  proc._gateway_setting_key = "gw_key"
+  proc.subscriber = None
+  proc._signals_blocked = False
+  return proc
+
+
+def test_ack_settings_restore_the_signal_block_set_before_the_restart():
+  """A worker restarting under an ADMIN BLOCK_SIGNAL comes back unblocked — the
+  gate is in-memory only. The broker owns that state and re-pushes it in the ACK,
+  so the worker must land back in the blocked state it was left in rather than
+  quietly resuming trading on an account an operator had stopped."""
+  proc = _settings_proc()
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": True})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  # Restoring goes through the ADMIN setter, so the operator gets the same alert
+  # they would have for a live BLOCK_SIGNAL.
+  assert proc.notifications == ["signals_blocked"]
+
+
+def test_ack_settings_signal_blocked_false_leaves_a_fresh_worker_alone():
+  """``false`` matches the state a fresh worker already boots into, so the shared
+  ADMIN setter treats it as the no-op it is: no flip, no duplicate alert."""
+  proc = _settings_proc()
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": False})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is False
+  assert proc.notifications == []
+
+
+def test_ack_settings_signal_blocked_false_clears_a_block_still_in_effect():
+  """A reconnect (not a restart) keeps the in-memory gate, so an explicit
+  ``false`` from the broker is a real change and must lift the block — same path,
+  same alert, as an ADMIN ALLOW_SIGNAL."""
+  proc = _settings_proc()
+  proc._signals_blocked = True
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": False})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is False
+  assert proc.notifications == ["signals_allowed"]
+
+
+def test_ack_without_settings_section_leaves_the_toggles_untouched():
+  """Omitting the section says nothing about the toggles — a worker mid-session
+  keeps whatever ADMIN last set rather than being reset to the defaults."""
+  proc = _settings_proc()
+  proc._signals_blocked = True
+  proc.publisher = FakePublisher([_ack_payload(strategy_magic_map={})])
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  assert proc.notifications == []
+
+
+def test_ack_settings_restore_the_block_before_the_replay_runs():
+  """The replay shares ``_process_signal`` with live traffic, so a restored block
+  has to land first: applying it afterwards would let the batch fire the very
+  orders the block exists to prevent."""
+  proc = _settings_proc()
+  sig = _fresh_signal(SignalActionEnum.LONG, signal_id="blocked-replay", symbol="AAA")
+  proc.publisher = FakePublisher(
+    [_ack_payload(settings={"signal_blocked": True}, retry_signals=[sig])]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  assert proc.db.inserted == []
+  assert proc.notifications == ["signals_blocked"]
+
+
+def test_ack_unparseable_setting_does_not_cost_the_other_sections():
+  """Settings are salvaged like every other section — a malformed value is
+  dropped on its own while the rest of the payload still applies."""
+  proc = _magic_map_proc()
+  proc._signals_blocked = False
+  proc.publisher = FakePublisher(
+    [
+      _ack_payload(
+        settings={"signal_blocked": "not-a-bool"},
+        strategy_magic_map={"MT5_GOLD": 20260409},
+      )
+    ]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is False
+  assert proc.settings["strategy_magic_map"] == {"MT5_GOLD": 20260409}
+
+
+def test_ack_unknown_setting_is_reported_but_costs_nothing():
+  """A newer broker pushing a toggle this worker has no field for keeps the known
+  ones working; the unknown key is recorded so the version skew is visible."""
+  proc = _settings_proc()
+  proc.publisher = FakePublisher(
+    [_ack_payload(settings={"signal_blocked": True, "future_toggle": 1})]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc._signals_blocked is True
+  from worker.schemas.inbox_schema import WorkerConnectedAckSchema
+
+  ack = WorkerConnectedAckSchema(
+    **{
+      "action": SystemActionEnum.WORKER_CONNECTED_ACK.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": "FAKE_MKT-FAKE_GW-acct-1",
+      "settings": {"signal_blocked": True, "future_toggle": 1},
+    }
+  )
+  assert ack.settings.signal_blocked is True
+  assert any("future_toggle" in reason for reason in ack.dropped)
+
+
 # ── ACK: the replay is gated on the config it depends on ───────────────────── #
 
 
@@ -1621,3 +2021,179 @@ def test_leverage_init_reaches_the_same_pass_from_both_delivery_paths():
   )
 
   assert runs == [(["BTC"], 10), (["BTC"], 10)]
+
+
+# ── Signal-cycle notifications ────────────────────────────────────────────── #
+#
+# Every action of one trade folds into a single channel message keyed by
+# signal_uxid. The per-action message stays the fallback for anything the cycle
+# cannot own, so exactly one of the two fires — never both, never neither.
+
+
+def _cycle_proc(handle_result, **kwargs):
+  proc = FakeProcessor(handle_result, **kwargs)
+  proc.settings = {"volume_decision_enabled": True, "position_tp1_percent": 50.0}
+  return proc
+
+
+def _uxid_signal(action=SignalActionEnum.LONG, **overrides):
+  overrides.setdefault("signal_uxid", "9f2c4b7e18a3d605")
+  return make_signal(action=action, **overrides)
+
+
+def test_a_fill_is_recorded_on_the_cycle_instead_of_its_own_message():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal())
+  assert proc.notifications == []  # no standalone message
+  (uxid, strategy, symbol, event, status) = proc.cycle.recorded[0]
+  assert uxid == "9f2c4b7e18a3d605"
+  assert (strategy, symbol) == ("strat-1", "XAUUSD")
+  assert event.action == "LONG"
+  assert event.outcome == CycleOutcomeEnum.FILLED
+  assert status is CycleStatusEnum.OPENED
+
+
+def test_a_signal_without_a_uxid_still_sends_its_own_message():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(make_signal())
+  assert proc.cycle.recorded == []
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_a_declined_cycle_falls_back_to_the_standalone_message():
+  # A failed cycle write must not swallow the action.
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc.cycle.accept = False
+  proc._process_signal(_uxid_signal())
+  assert proc.notifications == ["filled:LONG:1"]
+
+
+def test_a_failed_order_joins_the_cycle_without_closing_the_position():
+  proc = _cycle_proc({"success": False, "comment": "Market closed", "retcode": 10018})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  (_, _, _, event, status) = proc.cycle.recorded[0]
+  assert event.outcome == CycleOutcomeEnum.FAILED
+  assert event.reason == "Market closed"
+  # FAILED describes the action; merge_status keeps it off an open position.
+  assert status is CycleStatusEnum.FAILED
+
+
+def test_a_policy_rejection_joins_the_cycle():
+  proc = _cycle_proc({"success": True})
+  proc._reject_signal(_uxid_signal(), "MAX_OPEN_ORDERS reached")
+  assert proc.notifications == []
+  (_, _, _, event, status) = proc.cycle.recorded[0]
+  assert event.outcome == CycleOutcomeEnum.REJECTED
+  assert event.reason == "MAX_OPEN_ORDERS reached"
+  assert status is CycleStatusEnum.REJECTED
+
+
+def test_an_exit_carries_the_status_its_action_implies():
+  proc = _cycle_proc({"success": True, "ticket": "2", "price": 2050.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP2))
+  assert proc.cycle.recorded[0][4] is CycleStatusEnum.TP2
+
+
+def test_a_force_closed_position_is_its_own_action_on_the_cycle():
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "forced_closed": [{"price": 1995.0, "volume": 0.3, "ref_id": "9"}],
+    }
+  )
+  proc._process_signal(_uxid_signal())
+  outcomes = [event.outcome for (_, _, _, event, _) in proc.cycle.recorded]
+  assert outcomes == [CycleOutcomeEnum.FORCE_CLOSED, CycleOutcomeEnum.FILLED]
+  assert proc.notifications == []
+
+
+def test_an_unprotected_position_closed_after_a_failed_breakeven_sl():
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "sl_failsafe_close": {"success": True, "price": 1999.0, "volume": 0.5},
+    }
+  )
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  (_, _, _, event, status) = proc.cycle.recorded[0]
+  assert event.outcome == CycleOutcomeEnum.UNPROTECTED_CLOSED
+  assert status is CycleStatusEnum.FORCED_CLOSED
+
+
+def test_a_failed_failsafe_close_leaves_the_position_at_its_action_status():
+  # The emergency close itself failed, so the position is still live at TP1.
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "sl_failsafe_close": {"success": False, "comment": "close failed"},
+    }
+  )
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  assert proc.cycle.recorded[0][4] is CycleStatusEnum.TP1
+
+
+def test_tp1_records_the_percent_the_executor_actually_used():
+  proc = _cycle_proc({"success": True, "ticket": "2", "price": 2020.0, "volume": 0.25})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1, tp1_percent=30.0))
+  assert proc.cycle.recorded[0][3].tp1_percent == 30.0
+
+
+def test_tp1_falls_back_to_the_configured_percent_when_the_signal_has_none():
+  proc = _cycle_proc({"success": True, "ticket": "2", "price": 2020.0, "volume": 0.25})
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP1))
+  assert proc.cycle.recorded[0][3].tp1_percent == 50.0
+
+
+def test_only_tp1_carries_a_close_percent():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal())
+  assert proc.cycle.recorded[0][3].tp1_percent is None
+
+
+def test_the_uxid_is_persisted_alongside_the_position():
+  proc = _cycle_proc({"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5})
+  proc._process_signal(_uxid_signal())
+  assert proc.db.inserted[0]["signal_uxid"] == "9f2c4b7e18a3d605"
+  assert proc.db.logged[0]["signal_uxid"] == "9f2c4b7e18a3d605"
+
+
+def test_an_exit_carries_the_pnl_it_booked_onto_the_cycle():
+  proc = _cycle_proc(
+    {"success": True, "ticket": "2", "price": 2050.0, "volume": 0.5, "profit": 87.5}
+  )
+  proc._process_signal(_uxid_signal(action=SignalActionEnum.TP2))
+  assert proc.cycle.recorded[0][3].profit == 87.5
+
+
+def test_an_entry_records_no_pnl_even_when_the_broker_reports_one():
+  # An entry has booked nothing; a figure here would read as a closed result.
+  proc = _cycle_proc(
+    {"success": True, "ticket": "1", "price": 2000.0, "volume": 0.5, "profit": 0.0}
+  )
+  proc._process_signal(_uxid_signal())
+  assert proc.cycle.recorded[0][3].profit is None
+
+
+def test_a_force_close_carries_its_own_pnl():
+  proc = _cycle_proc(
+    {
+      "success": True,
+      "ticket": "1",
+      "price": 2000.0,
+      "volume": 0.5,
+      "forced_closed": [
+        {"price": 1995.0, "volume": 0.3, "ref_id": "9", "profit": -12.0}
+      ],
+    }
+  )
+  proc._process_signal(_uxid_signal())
+  assert proc.cycle.recorded[0][3].profit == -12.0

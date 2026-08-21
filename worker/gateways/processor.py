@@ -46,10 +46,16 @@ from worker.schemas.admin_schema import (
   PrivateAdminFlatSchema,
   PrivateAdminSignalControlSchema,
 )
+from worker.schemas.cycle_schema import (
+  CycleEventSchema,
+  CycleOutcomeEnum,
+  CycleStatusEnum,
+)
 from worker.schemas.inbox_schema import (
   WorkerConnectedAckSchema,
   WorkerConnectedErrorSchema,
   WorkerConnectedSchema,
+  WorkerSettingsSchema,
 )
 from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
@@ -92,6 +98,18 @@ _HANDSHAKE_ALERT_THRESHOLD = 3
 # cap applies to (exits must always be allowed so positions can be closed).
 _ENTRY_ACTIONS = (SignalActionEnum.LONG, SignalActionEnum.SHORT)
 
+# Actions that close (part of) a position, and are therefore the only ones that
+# can book a realized PnL onto the cycle.
+_CYCLE_EXIT_ACTIONS = frozenset(
+  {
+    SignalActionEnum.TP1,
+    SignalActionEnum.TP2,
+    SignalActionEnum.SL,
+    SignalActionEnum.R_SL,
+    SignalActionEnum.FLAT,
+  }
+)
+
 # Exit action → DB status, shared by every market.
 _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
   "TP1": PositionStatusEnum.TP1,
@@ -100,6 +118,14 @@ _CLOSE_STATUS_MAP: Dict[str, PositionStatusEnum] = {
   "R_SL": PositionStatusEnum.R_SL,
   "FLAT": PositionStatusEnum.FLATTED,
 }
+
+
+def _as_text(value: Any) -> Optional[str]:
+  """Broker reference as a string, or None when absent.
+
+  Ticket ids arrive as ints from some gateways and strings from others; the
+  cycle stores them as text so the two render identically."""
+  return None if value is None else str(value)
 
 
 def _seconds_since(ts: Optional[datetime], now: datetime) -> Optional[float]:
@@ -239,6 +265,9 @@ class BaseSignalProcessor(ABC):
     self.publisher.connect()
 
     self._footer = self._account_footer()
+    # The account footer needs a connected broker, so the cycle notifier (built
+    # in the market-agnostic context) only gets its source now.
+    self.ctx.cycle_notifier.bind_footer(self._current_footer)
 
     # Handshake: tell the broker this worker is online so it can push any
     # per-worker init (magics, leverage, replay). The broker decides from
@@ -331,9 +360,9 @@ class BaseSignalProcessor(ABC):
 
   def _process_signal(self, signal: SignalSchema) -> None:
     """Execute one validated, connection-checked signal end-to-end: apply the
-    MAX_OPEN_ORDERS exposure guard, run it through the handler, then persist and
-    notify the outcome. Split out of :meth:`_process_message` so each NATS subject
-    (ADMIN / SYSTEM / signal) has its own handler."""
+    entry guards (:meth:`_entry_rejection`), run it through the handler, then
+    persist and notify the outcome. Split out of :meth:`_process_message` so each
+    NATS subject (ADMIN / SYSTEM / signal) has its own handler."""
     # Signal-execution gate: an ADMIN BLOCK_SIGNAL suspends *all* signal
     # execution for this worker until an ALLOW_SIGNAL clears it. This is the
     # single funnel for both live signals and the ACK's replay, so blocking
@@ -400,29 +429,9 @@ class BaseSignalProcessor(ABC):
       signal.timestamp,
     )
 
-    # Entry guards: a rejected entry is never sent to the broker. It is still
-    # recorded (status REJECTED), forwarded to the broker via CDC on the TRADE
-    # subject, and notified. Exits are never gated here so a position can always
-    # be closed. The single-position-per-symbol guard runs first (it is the
-    # stricter rule): while any order is open on the symbol, no new entry is
-    # placed — unless the market allows multiple strategies per symbol
-    # (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
-    # already held by *this* strategy still blocks.
+    # Exits are never gated so a position can always be closed.
     if signal.action in _ENTRY_ACTIONS:
-      allow_multi_strategy = bool(
-        getattr(
-          getattr(self.handler, "strategy", None),
-          "allows_multi_strategy_per_symbol",
-          False,
-        )
-      )
-      reject_reason = guard.symbol_open_rejection(
-        self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
-      )
-      if reject_reason is None:
-        reject_reason = guard.max_open_orders_rejection(
-          self.ctx.db_service, self.settings, signal
-        )
+      reject_reason = self._entry_rejection(signal)
       if reject_reason is not None:
         self._reject_signal(signal, reject_reason)
         return
@@ -447,7 +456,15 @@ class BaseSignalProcessor(ABC):
       action=signal.action.value,
       volume=result.get("volume", signal.quantity),
       price=result.get("price", signal.price),
-      sl=getattr(signal, "sl", None),
+      # The stop the position really carries, not the one the signal asked for:
+      # an entry reports back the level it actually registered with the broker
+      # (FOREX widens it to the broker's minimum stop distance), and that is the
+      # number the audit trail must hold. Exits carry no stop of their own, so
+      # they fall back to the signal's.
+      sl=result.get("sl") or getattr(signal, "sl", None),
+      # tp1 is the signal's *partial-close* target and is deliberately not
+      # overwritten by result["tp"] — that is the full-exit level (tp2) resting
+      # on the broker, a different concept that this column does not track.
       tp1=getattr(signal, "tp1", None),
       gateway_return_code=result.get("retcode", -1),
       comment=result.get("comment", ""),
@@ -455,6 +472,7 @@ class BaseSignalProcessor(ABC):
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
       signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
     )
 
     if result.get("success"):
@@ -464,6 +482,7 @@ class BaseSignalProcessor(ABC):
         # (or could not be) to avoid running unprotected — alert loudly instead
         # of reporting a normal fill.
         msg = self.presenter.position_unprotected_closed(signal, result, footer)
+        outcome = CycleOutcomeEnum.UNPROTECTED_CLOSED
       else:
         risk_info = self._resolve_risk_info(signal)
         msg = self.presenter.order_filled(
@@ -474,9 +493,17 @@ class BaseSignalProcessor(ABC):
           risk_info=risk_info,
           settings_dict=self.settings,
         )
+        outcome = CycleOutcomeEnum.FILLED
     else:
       msg = self.presenter.order_failed(signal, result, footer)
-    self.ctx.channel_notifier.send_message(msg)
+      outcome = CycleOutcomeEnum.FAILED
+
+    self._notify_trade(
+      signal,
+      msg,
+      event=self._cycle_event(signal, result, outcome),
+      status=self._cycle_status(signal, result),
+    )
 
   def _persist_success(self, signal: SignalSchema, result: dict, footer: str) -> None:
     action_val = signal.action.value
@@ -484,8 +511,22 @@ class BaseSignalProcessor(ABC):
     signal_json = signal.model_dump_json()
 
     for fc in result.get("forced_closed", []):
-      self.ctx.channel_notifier.send_message(
-        self.presenter.force_closed(signal.symbol, signal.strategy, fc, footer)
+      # Part of this entry's story, so it joins the cycle as its own action
+      # rather than arriving as an unrelated message.
+      self._notify_trade(
+        signal,
+        self.presenter.force_closed(signal.symbol, signal.strategy, fc, footer),
+        event=CycleEventSchema(
+          action=action_val,
+          outcome=CycleOutcomeEnum.FORCE_CLOSED,
+          timestamp=signal.timestamp,
+          price=fc.get("price"),
+          volume=fc.get("volume"),
+          profit=fc.get("profit"),
+          ref_id=_as_text(fc.get("ref_id")),
+          ref_source_id=_as_text(fc.get("ref_source_id")),
+          reason="Closed to make room for a new entry",
+        ),
       )
 
     if action_val in ("LONG", "SHORT"):
@@ -502,6 +543,7 @@ class BaseSignalProcessor(ABC):
         strategy_code=self._magic_for(signal.strategy),
         market_type=self._market_type,
         signal_id=signal.signal_id,
+        signal_uxid=signal.signal_uxid,
       )
     else:
       status = _CLOSE_STATUS_MAP.get(action_val)
@@ -524,6 +566,69 @@ class BaseSignalProcessor(ABC):
           comment=result.get("comment", ""),
           message=signal_json,
         )
+
+  def _entry_rejection(self, signal: SignalSchema) -> Optional[str]:
+    """Run the entry guards against *signal*, returning the first rejection
+    reason or ``None`` when it may be sent to the broker.
+
+    A rejected entry is never sent: it is recorded (status REJECTED), forwarded
+    to the broker via CDC on the TRADE subject, and notified.
+
+    Ordered cheapest-first, and by how strict the rule is:
+
+    1. **One open order per symbol** — the strictest rule, so it answers first.
+       While any order is live on the symbol no new entry is placed, unless the
+       market allows several strategies per symbol
+       (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
+       already held by *this* strategy blocks.
+    2. **MAX_OPEN_ORDERS** — the worker's exposure cap.
+    3. **Staleness** — needs a live quote from the broker (a tick read / REST
+       round-trip), so it runs last: no reason to pay for one on an entry the
+       two DB-only guards above already rejected.
+    """
+    allow_multi_strategy = bool(
+      getattr(
+        getattr(self.handler, "strategy", None),
+        "allows_multi_strategy_per_symbol",
+        False,
+      )
+    )
+    reason = guard.symbol_open_rejection(
+      self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
+    )
+    if reason is not None:
+      return reason
+
+    reason = guard.max_open_orders_rejection(self.ctx.db_service, self.settings, signal)
+    if reason is not None:
+      return reason
+
+    return guard.stale_signal_rejection(
+      signal, self._entry_quote(signal), self.settings
+    )
+
+  def _entry_quote(self, signal: SignalSchema) -> Optional[float]:
+    """Live price the entry would fill at, or ``None`` when it can't be read.
+
+    ``getattr`` chain so a market strategy (or a test double) without the
+    capability is treated as "no quote": the staleness guard then skips rather
+    than blocking the entry. A broker error is swallowed for the same reason —
+    failing to fetch a quote must not stop trading, it just means this guard has
+    nothing to judge on.
+    """
+    strategy = getattr(self.handler, "strategy", None)
+    getter = getattr(strategy, "entry_price", None)
+    if getter is None:
+      return None
+    try:
+      return getter(signal)
+    except Exception:
+      log.exception(
+        "[%s Process] Could not read a live quote for %s — staleness guard skipped.",
+        self.name,
+        signal.symbol,
+      )
+      return None
 
   def _reject_signal(self, signal: SignalSchema, reason: str) -> None:
     """Handle a policy-rejected entry end-to-end without touching the broker.
@@ -567,6 +672,7 @@ class BaseSignalProcessor(ABC):
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
       signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
     )
 
     self.ctx.db_service.insert_rejected_position(
@@ -582,10 +688,25 @@ class BaseSignalProcessor(ABC):
       strategy_code=self._magic_for(signal.strategy),
       market_type=self._market_type,
       signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
     )
 
-    self.ctx.channel_notifier.send_message(
-      self.presenter.order_rejected(signal, reason, footer)
+    self._notify_trade(
+      signal,
+      self.presenter.order_rejected(signal, reason, footer),
+      event=CycleEventSchema(
+        action=signal.action.value,
+        outcome=CycleOutcomeEnum.REJECTED,
+        timestamp=signal.timestamp,
+        price=signal.price,
+        volume=signal.quantity,
+        sl=signal.sl,
+        tp1=signal.tp1,
+        tp2=signal.tp2,
+        gateway_return_code=-1,
+        reason=reason,
+      ),
+      status=CycleStatusEnum.REJECTED,
     )
 
   # ── Shared ADMIN FLAT handling ────────────────────────────────────────── #
@@ -763,6 +884,16 @@ class BaseSignalProcessor(ABC):
     else:
       positions = self.executor.get_all_open_positions(strategy=admin.strategy)
 
+    ref_id = getattr(admin, "ref_id", None)
+    if ref_id:
+      db_positions = self.ctx.db_service.get_open_positions_for_flat(
+        strategy=admin.strategy, symbol=admin.symbol, ref_id=ref_id
+      )
+      allowed_keys = set()
+      for db_pos in db_positions:
+        allowed_keys.update(self._flat_db_match_keys(db_pos))
+      positions = [p for p in positions if self._flat_match_key(p) in allowed_keys]
+
     if positions:
       log.info(
         "[ADMIN FLAT] Closing %d %s position(s) (strategy=%s, symbol=%s)",
@@ -807,9 +938,18 @@ class BaseSignalProcessor(ABC):
     A row is marked ``FLATTED`` only when its close succeeded, or when it was never
     live on the broker (already closed externally). A row whose close was
     *attempted but failed* is left OPEN — it is still live — and flagged loudly.
+
+    The ADMIN payload is **not** written over the row's ``gateway_message``. That
+    column holds the original *entry signal* JSON, and :class:`PositionCDC` parses
+    it for the ``signal_id`` / ``sl`` / ``tp1`` / ``tp2`` the broker needs to match
+    the TRADE event back to its own order. Overwriting it with the FLAT payload —
+    which carries none of those fields, on the public and private subject alike —
+    published an update with ``signal_id=null``, so the broker could not correlate
+    it and the order was never updated there. The payload is preserved instead as
+    an append-only ``position_logs`` row, which is where per-event audit belongs.
     """
     db_positions = self.ctx.db_service.get_open_positions_for_flat(
-      strategy=admin.strategy, symbol=admin.symbol
+      strategy=admin.strategy, symbol=admin.symbol, ref_id=getattr(admin, "ref_id", None)
     )
     footer = self._account_footer()
     for db_pos in db_positions:
@@ -817,6 +957,7 @@ class BaseSignalProcessor(ABC):
       matched_key = next((k for k in db_keys if k in closed), None)
       if matched_key is not None:
         result = closed[matched_key]
+        self._log_flat_event(db_pos, result, raw)
         self.ctx.db_service.update_position_status(
           ref_source_id=db_pos.get("ref_source_id"),
           status=PositionStatusEnum.FLATTED,
@@ -824,10 +965,27 @@ class BaseSignalProcessor(ABC):
           closed_price=result.get("price"),
           gateway_return_code=result.get("retcode", 0),
           comment=result.get("comment", ""),
-          message=raw,
         )
-        self.ctx.channel_notifier.send_message(
-          self.presenter.admin_flat_closed(db_pos, result, footer)
+        # An admin FLAT is the last action of the position's own cycle, so it
+        # closes out that message rather than opening a new one. The uxid comes
+        # off the position row — no signal is involved in an admin directive.
+        self._notify_cycle_or_send(
+          self.presenter.admin_flat_closed(db_pos, result, footer),
+          signal_uxid=db_pos.get("signal_uxid"),
+          strategy=db_pos.get("strategy") or "",
+          symbol=db_pos.get("symbol") or "",
+          event=CycleEventSchema(
+            action=AdminActionEnum.FLAT.value,
+            outcome=CycleOutcomeEnum.ADMIN_FLAT,
+            price=result.get("price"),
+            volume=result.get("volume"),
+            profit=result.get("profit"),
+            ref_id=_as_text(result.get("ticket")),
+            ref_source_id=_as_text(db_pos.get("ref_source_id")),
+            gateway_return_code=result.get("retcode"),
+            reason=result.get("comment") or None,
+          ),
+          status=CycleStatusEnum.FLATTED,
         )
       elif db_keys.isdisjoint(attempted):
         # Never seen live on the broker → already closed externally; sync the DB.
@@ -836,11 +994,11 @@ class BaseSignalProcessor(ABC):
           db_pos.get("symbol"),
           self.name,
         )
+        self._log_flat_event(db_pos, None, raw)
         self.ctx.db_service.update_position_status(
           ref_source_id=db_pos.get("ref_source_id"),
           status=PositionStatusEnum.FLATTED,
           comment=f"Admin FLAT (position not found on {self.name})",
-          message=raw,
         )
       else:
         # Attempted but the close FAILED → still live on the broker. Leave the DB
@@ -851,6 +1009,33 @@ class BaseSignalProcessor(ABC):
           db_pos.get("symbol"),
           self.name,
         )
+
+  def _log_flat_event(self, db_pos: dict, result: Optional[dict], raw: str) -> None:
+    """Record one ADMIN FLAT outcome in the append-only ``position_logs`` audit
+    trail, carrying the raw ADMIN payload.
+
+    This is where the payload lives now that it no longer overwrites the position
+    row's stored entry signal. *result* is the successful close, or ``None`` when
+    the row was already flat on the broker and is only being synced."""
+    self.ctx.db_service.log_position(
+      strategy=db_pos.get("strategy"),
+      ref_id=(result or {}).get("ticket") or db_pos.get("ref_id"),
+      ref_source_id=db_pos.get("ref_source_id"),
+      symbol=db_pos.get("symbol"),
+      action=PositionStatusEnum.FLATTED.value,
+      volume=(result or {}).get("volume") or db_pos.get("volume"),
+      price=(result or {}).get("price"),
+      sl=None,
+      tp1=None,
+      gateway_return_code=(result or {}).get("retcode", 0),
+      comment=(result or {}).get(
+        "comment", f"Admin FLAT (position not found on {self.name})"
+      ),
+      message=raw,
+      author=LogAuthorEnum.BROKER.value,
+      market_type=self._market_type,
+      signal_id=db_pos.get("signal_id"),
+    )
 
   # ── Shared SYSTEM handling ────────────────────────────────────────────── #
 
@@ -1086,6 +1271,12 @@ class BaseSignalProcessor(ABC):
   def _apply_worker_connected_ack(self, data: dict) -> None:
     """Apply the config carried by a ``WORKER_CONNECTED_ACK``.
 
+    ``settings`` is restored first, before anything can act on it: it carries the
+    signal-execution gate, and the replay further down this same method runs
+    through ``_process_signal`` like a live signal does — so a block restored
+    here suppresses the replay exactly as it suppresses live traffic, while one
+    applied afterwards would arrive a batch of orders too late.
+
     Config sections land **before** the signal replay, which always runs last: a
     replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO
     entry is sized against the exchange's leverage, so replaying first would fire
@@ -1121,7 +1312,8 @@ class BaseSignalProcessor(ABC):
       log.error("[%s Process] WORKER_CONNECTED_ACK dropped %s", self.name, reason)
 
     has_config = (
-      ack.strategy_magic_map is not None
+      ack.settings is not None
+      or ack.strategy_magic_map is not None
       or ack.crypto_leverage_init is not None
       or bool(ack.retry_signals)
     )
@@ -1134,12 +1326,16 @@ class BaseSignalProcessor(ABC):
       return
 
     log.info(
-      "[%s Process] WORKER_CONNECTED_ACK — handshake complete | magics=%s leverage=%s replay=%d",
+      "[%s Process] WORKER_CONNECTED_ACK — handshake complete | settings=%s magics=%s "
+      "leverage=%s replay=%d",
       self.name,
+      "yes" if ack.settings is not None else "-",
       "-" if ack.strategy_magic_map is None else len(ack.strategy_magic_map),
       "yes" if ack.crypto_leverage_init is not None else "-",
       len(ack.retry_signals),
     )
+    if ack.settings is not None:
+      self._apply_worker_settings(ack.settings)
     if ack.strategy_magic_map is not None:
       self._apply_strategy_magic_map(ack.strategy_magic_map)
     self._apply_market_init(ack)
@@ -1156,6 +1352,29 @@ class BaseSignalProcessor(ABC):
         )
         return
       self._apply_retry_signals(ack.retry_signals)
+
+  def _apply_worker_settings(self, settings: WorkerSettingsSchema) -> None:
+    """Restore the runtime toggles the broker pushed in the ACK's ``settings``
+    section, reading each attribute in turn.
+
+    These toggles live in memory only (a restart resets them to their defaults),
+    so the broker — which owns the state — re-pushes whatever an operator set in
+    an earlier session and the worker replays it here. Each attribute is applied
+    through the very same helper the runtime ADMIN action calls, so restoring a
+    value is indistinguishable from receiving the directive live: the same
+    already-in-that-state no-op, the same log line, the same operator alert.
+
+    A field left ``None`` was not pushed and is skipped — only an explicit value
+    changes anything, so the broker can restore one toggle without disturbing the
+    rest. Adding a new toggle means adding its field to
+    :class:`~worker.schemas.inbox_schema.WorkerSettingsSchema` and one branch
+    here that delegates to the existing ADMIN-side setter.
+    """
+    if settings.signal_blocked is not None:
+      # Same setter as ADMIN BLOCK_SIGNAL / ALLOW_SIGNAL: notifies on a real
+      # change, no-ops when the worker is already in that state (which a fresh
+      # start is for signal_blocked=false).
+      self._set_signals_blocked(settings.signal_blocked)
 
   def _replay_blocked_reason(self) -> Optional[str]:
     """Why this worker must not run the ACK's signal replay, or None to proceed.
@@ -1295,6 +1514,135 @@ class BaseSignalProcessor(ABC):
       skipped_stale,
       failed,
       len(signals),
+    )
+
+  # ── Signal-cycle notifications ────────────────────────────────────────── #
+  #
+  # Every action of one trade folds into a single channel message that is
+  # rewritten in place (see
+  # :mod:`worker.services.cycle_notification_service`). The per-action message
+  # each call site already builds stays the fallback: a broker that sends no
+  # ``signal_uxid``, a cycle write that failed, or cycles turned off all mean
+  # there is no message to edit, and the action must still be reported.
+
+  def _notify_trade(
+    self,
+    signal: SignalSchema,
+    message: str,
+    *,
+    event: "CycleEventSchema",
+    status: Optional[CycleStatusEnum] = None,
+  ) -> None:
+    """Report one executed signal — through its cycle, or on its own."""
+    self._notify_cycle_or_send(
+      message,
+      signal_uxid=signal.signal_uxid,
+      strategy=signal.strategy,
+      symbol=signal.symbol,
+      event=event,
+      status=status,
+    )
+
+  def _notify_cycle_or_send(
+    self,
+    message: str,
+    *,
+    signal_uxid: Optional[str],
+    strategy: str,
+    symbol: str,
+    event: "CycleEventSchema",
+    status: Optional[CycleStatusEnum] = None,
+  ) -> None:
+    """Fold *event* into its cycle, falling back to sending *message* as-is.
+
+    Split from :meth:`_notify_trade` because not every cycle action comes from a
+    signal — an admin FLAT closes a position the operator named, and takes its
+    cycle key off the position row instead.
+    """
+    if self.ctx.cycle_notifier.record(
+      signal_uxid=signal_uxid,
+      strategy=strategy,
+      symbol=symbol,
+      event=event,
+      status=status,
+    ):
+      return
+    self.ctx.channel_notifier.send_message(message)
+
+  def _cycle_event(
+    self, signal: SignalSchema, result: dict, outcome: CycleOutcomeEnum
+  ) -> "CycleEventSchema":
+    """Build the timeline entry for one executed signal.
+
+    Levels are taken from the signal (what was asked for) while price/volume come
+    from the result (what actually happened), so a fill that slipped shows both
+    sides of the story.
+    """
+    risk_info = self._resolve_risk_info(signal)
+    return CycleEventSchema(
+      action=signal.action.value,
+      outcome=outcome,
+      timestamp=signal.timestamp,
+      price=result.get("price", signal.price),
+      volume=result.get("volume", signal.quantity),
+      sl=signal.sl,
+      tp1=signal.tp1,
+      tp2=signal.tp2,
+      risk_percent=risk_info[0] if risk_info else None,
+      risk_custom=bool(risk_info[1]) if risk_info else False,
+      auto_volume=bool(self.settings.get("volume_decision_enabled", False)),
+      tp1_percent=self._cycle_tp1_percent(signal),
+      is_scale_position=bool(getattr(signal, "is_scale_position", False)),
+      # Only a close books money. An entry carries no PnL at all, so it stays
+      # None and the timeline omits the line rather than claiming a 0.00 result
+      # — the same rule BaseMessagePresenter._exit_pnl_line applies.
+      profit=result.get("profit") if signal.action in _CYCLE_EXIT_ACTIONS else None,
+      ref_id=_as_text(result.get("ticket")),
+      ref_source_id=_as_text(result.get("source_ticket") or result.get("ticket")),
+      gateway_return_code=result.get("retcode"),
+      reason=result.get("comment") or None,
+    )
+
+  def _cycle_tp1_percent(self, signal: SignalSchema) -> Optional[float]:
+    """Percent of the position a TP1 closed, mirroring the executor's own choice.
+
+    Only TP1 sizes itself by percent, and only under VOLUME_DECISION_ENABLED —
+    otherwise the close is sized from ``signal.quantity`` and no percent applies.
+    """
+    if signal.action != SignalActionEnum.TP1:
+      return None
+    if not self.settings.get("volume_decision_enabled", False):
+      return None
+    if self.settings.get("use_custom_position_tp1_percent", False):
+      return self.settings.get("position_tp1_percent")
+    if signal.tp1_percent is not None:
+      return signal.tp1_percent
+    return self.settings.get("position_tp1_percent")
+
+  def _cycle_status(
+    self, signal: SignalSchema, result: dict
+  ) -> Optional[CycleStatusEnum]:
+    """The position's status after this action — the cycle's headline.
+
+    A branch-for-branch mirror of what :meth:`_persist_success` writes to the
+    positions table, so the message and the row can never disagree. A failed
+    action returns ``FAILED``, which
+    :func:`~worker.schemas.cycle_schema.merge_status` keeps from overwriting a
+    position that is still open.
+    """
+    if not result.get("success"):
+      return CycleStatusEnum.FAILED
+    if signal.action.value in ("LONG", "SHORT"):
+      return CycleStatusEnum.OPENED
+    # A breakeven SL that could not be placed leaves the remaining volume
+    # unprotected, so it is emergency-closed — fully flat, not a still-open
+    # partial. If that close itself failed the position is still live, and the
+    # status its action implies is the honest one (the message shouts about it).
+    failsafe = result.get("sl_failsafe_close")
+    if failsafe is not None and failsafe.get("success"):
+      return CycleStatusEnum.FORCED_CLOSED
+    return CycleStatusEnum.from_position_status(
+      _CLOSE_STATUS_MAP.get(signal.action.value)
     )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #

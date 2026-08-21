@@ -387,10 +387,14 @@ class _FakeProc:
 
   _on_missed_close = ForexSignalProcessor._on_missed_close
   _best_effort_price = ForexSignalProcessor._best_effort_price
+  _reconciled_pnl = ForexSignalProcessor._reconciled_pnl
 
-  def __init__(self, tick=_DEFAULT_TICK):
+  def __init__(self, tick=_DEFAULT_TICK, position_pnl=None):
     self.executor = _FakeExecutor()
-    self.gateway = SimpleNamespace(get_tick=lambda symbol: tick)
+    self.gateway = SimpleNamespace(
+      get_tick=lambda symbol: tick,
+      get_position_realized_pnl=lambda ticket: position_pnl,
+    )
     self.db = _RecordingDb()
     self.notifications = []
     self._market_type = "forex"
@@ -436,3 +440,60 @@ def test_missed_close_still_syncs_db_without_a_tick():
   assert proc.db.status_updates[0]["status"] == PositionStatusEnum.TERMINAL_CLOSED
   assert proc.db.status_updates[0]["closed_price"] is None
   assert len(proc.notifications) == 1
+
+
+def test_missed_close_reports_the_positions_realized_pnl():
+  # The reconciler never saw the close, so there is no TradeResult to read a
+  # figure off — the platform's deal history is the only source, and it covers
+  # the position's whole life (hence the "position total" label).
+  proc = _FakeProc(position_pnl=13.85)
+
+  proc._on_missed_close(_row("111"))
+
+  assert "PnL (position total): <b>+13.85</b>" in proc.notifications[0]
+
+
+def test_missed_close_asks_for_the_pnl_by_the_rows_own_ticket():
+  """The ticket handed to the platform is the DB row's, unchanged — and the DB
+  stores every reference as TEXT.
+
+  That is the seam the reconciled PnL was lost at: MT5's ``history_deals_get``
+  takes an integer, so ``"798267992"`` raised inside the lookup and every
+  ``Position Reconciled`` message read ``n/a``. Normalising is the gateway's job
+  (``MT5Gateway._as_ticket_id``) since only it knows its platform's types, so
+  what is pinned here is that the reconciler hands over the reference as stored
+  rather than a re-derived one.
+  """
+  asked = []
+  proc = _FakeProc(position_pnl=2.3)
+  proc.gateway.get_position_realized_pnl = lambda ticket: asked.append(ticket) or 2.3
+
+  proc._on_missed_close(_row("798267992"))
+
+  assert asked == ["798267992"]
+  assert "PnL (position total): <b>+2.30</b>" in proc.notifications[0]
+
+
+def test_missed_close_reports_an_unreadable_pnl_as_unknown():
+  proc = _FakeProc(position_pnl=None)
+
+  proc._on_missed_close(_row("111"))
+
+  assert "PnL (position total): <b>n/a</b>" in proc.notifications[0]
+
+
+def test_missed_close_survives_a_platform_that_cannot_answer():
+  # A failed history read costs the PnL line, never the reconcile — unsticking
+  # the DB row is this job's actual purpose.
+  proc = _FakeProc()
+
+  def _boom(_ticket):
+    raise RuntimeError("terminal busy")
+
+  proc.gateway = SimpleNamespace(get_tick=lambda symbol: _DEFAULT_TICK)
+  proc.gateway.get_position_realized_pnl = _boom
+
+  proc._on_missed_close(_row("111"))
+
+  assert proc.db.status_updates[0]["status"] == PositionStatusEnum.TERMINAL_CLOSED
+  assert "PnL (position total): <b>n/a</b>" in proc.notifications[0]

@@ -107,8 +107,18 @@ DESCRIPTIONS = {
   "NOTIFICATION_MODE": "How much the worker notifies",
   "TELEGRAM_ENABLED": "Enable Telegram notifications",
   "TELEGRAM_BOT_TOKEN": "Telegram bot token",
-  "TELEGRAM_CHAT_ID": "Chat ID for management/service notifications",
-  "TELEGRAM_CHAT_CHANNEL_ID": "Broadcast channel IDs, comma-separated",
+  "TELEGRAM_WORKER_LOG_CHAT_IDS": (
+    "Chat IDs for management/service notifications, comma-separated "
+    "(-100123_456 targets topic 456 of a group with Topics enabled)"
+  ),
+  "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS": (
+    "Broadcast channel IDs, comma-separated (same _<topic id> syntax)"
+  ),
+  "TELEGRAM_LOG_CHAT_ID": (
+    "Chat IDs for forwarded ERROR logs, comma-separated "
+    "(blank -> falls back to TELEGRAM_WORKER_LOG_CHAT_IDS)"
+  ),
+  "TELEGRAM_CYCLE_ENABLED": "One message per trade, edited as it progresses",
 }
 
 KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -124,8 +134,10 @@ QUOTED_KEYS = {
   "CRYPTO_API_SECRET",
   "CRYPTO_ACCOUNT_ID",
   "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_CHAT_ID",
-  "TELEGRAM_CHAT_CHANNEL_ID",
+  "TELEGRAM_WORKER_LOG_CHAT_IDS",
+  "TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS",
+  "TELEGRAM_LOG_BOT_TOKEN",
+  "TELEGRAM_LOG_CHAT_ID",
   "CRYPTO_LEVERAGE_INIT_SYMBOLS",
 }
 

@@ -1,6 +1,8 @@
 """Tests for the TradeResult value object and its dict-compat shim."""
 
-from worker.schemas.trade_result import TradeResult
+import pytest
+
+from worker.schemas.trade_result import TradeResult, total_profit
 
 
 def test_ok_defaults():
@@ -56,3 +58,40 @@ def test_setdefault_only_fills_missing():
   assert r.volume == 0.5
   # already set → unchanged
   assert r.setdefault("volume", 9.9) == 0.5
+
+
+# ── Realized PnL ────────────────────────────────────────────────────────────── #
+
+
+def test_profit_is_a_declared_field():
+  # Declared (not stashed in `extra`) so every close path reads and writes it the
+  # same way, whichever access style it uses.
+  r = TradeResult.ok(ticket="5", price=100.0, volume=1.0, profit=12.5)
+  assert r.profit == 12.5 and r["profit"] == 12.5
+  assert "profit" not in r.extra
+
+
+def test_profit_defaults_to_unknown():
+  # None, not 0.0: an entry books nothing and a close whose amount we could not
+  # read is unknown — neither is a break-even result.
+  assert TradeResult.ok().profit is None
+
+
+def test_total_profit_sums_several_closes():
+  results = [TradeResult.ok(profit=11.5), TradeResult.ok(profit=-4.25)]
+  assert total_profit(results) == pytest.approx(7.25)
+
+
+def test_total_profit_skips_closes_that_reported_nothing():
+  # A partially-known total is closer to the truth than no figure at all.
+  results = [TradeResult.ok(profit=11.5), TradeResult.ok(), TradeResult.fail("nope")]
+  assert total_profit(results) == pytest.approx(11.5)
+
+
+def test_total_profit_is_unknown_when_nothing_reported_one():
+  assert total_profit([TradeResult.ok(), TradeResult.ok()]) is None
+  assert total_profit([]) is None
+
+
+def test_total_profit_keeps_a_genuine_break_even():
+  assert total_profit([TradeResult.ok(profit=0.0)]) == 0.0

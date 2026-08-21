@@ -29,7 +29,12 @@ class FakeExecutor:
     return quantity / 100.0
 
   def partial_close_position(
-    self, symbol, close_volume, position_ticket=None, strategy=None
+    self,
+    symbol,
+    close_volume,
+    position_ticket=None,
+    strategy=None,
+    fallback_close_price=None,
   ):
     self.calls.append(("partial", close_volume, position_ticket, strategy))
     return {"success": True, "volume": close_volume, "ticket": 1}
@@ -41,7 +46,9 @@ class FakeExecutor:
   def open_position(self, signal):
     return {"success": True}
 
-  def close_all_positions(self, symbol, reason="CLOSE", strategy=None):
+  def close_all_positions(
+    self, symbol, reason="CLOSE", strategy=None, fallback_close_price=None
+  ):
     return {"success": True, "reason": reason, "strategy": strategy}
 
 

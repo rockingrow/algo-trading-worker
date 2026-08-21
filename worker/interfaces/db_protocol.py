@@ -10,12 +10,15 @@ client depends on the narrowest contract it needs (Interface Segregation):
 
   * :class:`PositionStoreProtocol`     — what ``SignalHandler`` needs.
   * :class:`NotificationOutboxProtocol` — what the outbox enqueue path needs.
+  * :class:`CycleRecordStoreProtocol`   — what the signal-cycle recorder writes.
+  * :class:`CycleDispatchStoreProtocol` — what the cycle dispatcher drains.
 
 ``DBServiceProtocol`` is kept as the union for code that genuinely needs both.
 """
 
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, Iterable, List, Optional, Protocol
 
+from worker.schemas.cycle_schema import CycleStatusEnum
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationModeEnum,
@@ -31,7 +34,10 @@ class PositionStoreProtocol(Protocol):
     self, strategy: str, symbol: str
   ) -> List[Dict[str, Any]]: ...
   def get_open_positions_for_flat(
-    self, strategy: Optional[str] = None, symbol: Optional[str] = None
+    self,
+    strategy: Optional[str] = None,
+    symbol: Optional[str] = None,
+    ref_id: Optional[str] = None,
   ) -> List[Dict[str, Any]]: ...
   def update_position_status(
     self,
@@ -105,6 +111,40 @@ class NotificationDispatchStoreProtocol(Protocol):
   def mark_notification_failed(
     self, notification_id: int, error: str, next_attempt_at: str
   ) -> None: ...
+
+
+class CycleRecordStoreProtocol(Protocol):
+  """Cycle writes used by the signal-cycle recorder.
+
+  ``append_event`` returns the cycle as it must now be rendered (``id``,
+  ``revision``, ``events``, ``status``), or ``None`` when the write failed."""
+
+  def append_cycle_event(
+    self,
+    *,
+    strategy: str,
+    signal_uxid: str,
+    symbol: str,
+    event: Dict[str, Any],
+    status: Optional[CycleStatusEnum] = None,
+  ) -> Optional[Dict[str, Any]]: ...
+  def set_cycle_message_text(
+    self, cycle_id: int, message_text: str, revision: int
+  ) -> None: ...
+  def ensure_cycle_chats(self, cycle_id: int, chat_ids: Iterable[str]) -> None: ...
+
+
+class CycleDispatchStoreProtocol(Protocol):
+  """Cycle delivery bookkeeping used by the CycleNotificationJob dispatcher."""
+
+  def get_due_cycle_deliveries(self, limit: int = 20) -> List[Dict[str, Any]]: ...
+  def mark_cycle_delivered(
+    self, chat_row_id: int, message_id: Optional[str], revision: int
+  ) -> None: ...
+  def mark_cycle_delivery_failed(
+    self, chat_row_id: int, error: str, next_attempt_at: str
+  ) -> None: ...
+  def clear_cycle_message_id(self, chat_row_id: int) -> None: ...
 
 
 class DBServiceProtocol(PositionStoreProtocol, NotificationOutboxProtocol, Protocol):

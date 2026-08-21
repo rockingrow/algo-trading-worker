@@ -58,6 +58,7 @@ def test_db_keys_drops_none():
 class _FakeDb:
   def __init__(self, flat_positions):
     self.status_updates = []
+    self.logs = []
     self._flat = list(flat_positions)
 
   def get_open_positions_for_flat(self, strategy=None, symbol=None):
@@ -65,6 +66,9 @@ class _FakeDb:
 
   def update_position_status(self, **kwargs):
     self.status_updates.append(kwargs)
+
+  def log_position(self, **kwargs):
+    self.logs.append(kwargs)
 
 
 class _FakeExecutor:
@@ -84,6 +88,14 @@ class _FakeExecutor:
     return dict(self._close_result)
 
 
+class _FakeCycleNotifier:
+  """Stand-in for CycleNotifier — declines, since these rows carry no uxid, so
+  the FLAT falls back to its own message (what this suite asserts on)."""
+
+  def record(self, *, signal_uxid, strategy, symbol, event, status=None):
+    return bool(signal_uxid)
+
+
 class _FakeProc:
   """Drives the base FLAT handler through the REAL MT5 match-key hooks."""
 
@@ -96,6 +108,8 @@ class _FakeProc:
   _flat_targets_this_worker = BaseSignalProcessor._flat_targets_this_worker
   _close_live_positions_for_flat = BaseSignalProcessor._close_live_positions_for_flat
   _reconcile_flat_db = BaseSignalProcessor._reconcile_flat_db
+  _log_flat_event = BaseSignalProcessor._log_flat_event
+  _notify_cycle_or_send = BaseSignalProcessor._notify_cycle_or_send
 
   def __init__(self, db_positions, positions, close_result):
     self.name = "FOREX"
@@ -108,11 +122,13 @@ class _FakeProc:
     self.executor = _FakeExecutor(positions, close_result)
     self.db = _FakeDb(db_positions)
     self.notifications = []
+    self.cycle = _FakeCycleNotifier()
     self.ctx = SimpleNamespace(
       db_service=self.db,
       channel_notifier=SimpleNamespace(
         send_message=lambda m: self.notifications.append(m)
       ),
+      cycle_notifier=self.cycle,
     )
 
   def _ensure_connected(self):

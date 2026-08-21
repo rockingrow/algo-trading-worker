@@ -20,12 +20,14 @@ class TradeExecutorProtocol(Protocol):
   """The order-execution surface a market strategy needs from any broker."""
 
   def open_position(self, signal: SignalSchema) -> TradeResult: ...
+  def get_entry_price(self, signal: SignalSchema) -> Optional[float]: ...
   def partial_close_position(
     self,
     symbol: str,
     close_volume: float,
     position_ticket: Optional[int] = None,
     strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult: ...
   def update_position_sl(
     self,
@@ -35,7 +37,11 @@ class TradeExecutorProtocol(Protocol):
     strategy: Optional[str] = None,
   ) -> TradeResult: ...
   def close_all_positions(
-    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+    self,
+    symbol: str,
+    reason: str = "CLOSE",
+    strategy: Optional[str] = None,
+    fallback_close_price: Optional[float] = None,
   ) -> TradeResult: ...
   def get_open_positions(
     self, symbol: str, strategy: Optional[str] = None

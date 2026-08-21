@@ -399,7 +399,7 @@ Configuration is grouped into nested `<specific>Settings` sub-models on the main
 | `NatsSettings` | `settings.nats` | `url`, `token`, `subjects` |
 | `ForexSettings` | `settings.forex` | `platform`, MT5 `server`/`login`/`password`/`path`/`name` |
 | `CryptoSettings` | `settings.crypto` | `exchange`, API keys, `hedge_mode`, leverage caps, … |
-| `StrategySettings` | `settings.strategy` | `slippage_deviation`, `magic_map`, TP1 overrides |
+| `StrategySettings` | `settings.strategy` | `slippage_deviation`, entry-drift limits, `magic_map`, TP1 overrides |
 | `RiskSettings` | `settings.risk` | `capital`, `risk_percentage`, `max_open_orders`, … |
 | `TelegramSettings` | `settings.telegram` | `enabled`, tokens, chat ids, error-log hook |
 | `DatabaseSettings` | `settings.database` | `file` |
@@ -410,6 +410,34 @@ Configuration is grouped into nested `<specific>Settings` sub-models on the main
 
 - **Env vars are unchanged.** Each group is its own `BaseSettings` that reads the same flat variable names as before (e.g. `NATS_URL`, `MT5_LOGIN`, `MAX_LEVERAGE_CAP`) via per-field `validation_alias` — `.env` files and the initializer in `.env.example` need no changes.
 - **Flat dict for subprocesses.** `Settings.flat_dump()` reproduces the original flat `settings_dict` (legacy keys, with `SecretStr`/enum values intact) that is handed across the multiprocessing fork boundary and consumed by gateways, factories and presenters via `settings_dict.get("<flat_key>")`. Read config off the nested objects (`settings.nats.url`); consume the fork-boundary dict off the flat keys (`settings_dict["nats_url"]`).
+
+### Telegram chat ids: many chats, and group topics
+
+`TELEGRAM_WORKER_LOG_CHAT_IDS`, `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS` and `TELEGRAM_LOG_CHAT_ID` all run through the same `notification_service.parse_chat_targets()` — none of them is special — so each can reach several chats and can address a **topic** inside a group that has the Topics feature switched on:
+
+```bash
+# Two groups + one topic inside a third, all from one setting
+TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS="-1001111111111,@public_channel,-1002173777783_924584"
+# The same syntax works for the management chat and the error-log chat
+TELEGRAM_WORKER_LOG_CHAT_IDS="-1001111111111,-1002173777783_100"
+TELEGRAM_LOG_CHAT_ID="-1002173777783_555"
+```
+
+| Entry | Delivered to |
+| ----- | ------------ |
+| `-1001111111111` | The group/channel itself (a group with Topics enabled gets it in **General**) |
+| `@public_channel` | Public channel by username |
+| `-1002173777783_924584` | Topic `924584` of supergroup `-1002173777783` |
+
+The `_<topic id>` suffix makes the worker add [`message_thread_id`](https://core.telegram.org/bots/api#sendmessage) to the `sendMessage` call — the Bot API's identifier for "the target message thread (topic) of a forum", and the only way a bot can post into a specific topic rather than General. Both numbers are the ones in the topic's own link: `t.me/c/2173777783/924584` → `-1002173777783_924584` (the chat id is the link's first number prefixed with `-100`).
+
+Notes:
+
+- Only a **numeric** chat id may carry a topic suffix — usernames may contain underscores themselves (`@my_group_2`), so those are never split.
+- The suffix is sent *only* when configured: Telegram answers `400 Bad Request: message thread not found` if a `message_thread_id` is passed for a chat that has no such topic.
+- Each chat gets its own Bot API call, and one failing chat (bot kicked, topic deleted) is logged without stopping the others; `send_message()` returns `False` if any of them failed.
+- Whitespace and empty entries are ignored, and a chat listed twice is only notified once.
+- An empty `TELEGRAM_LOG_CHAT_ID` still falls back to `TELEGRAM_WORKER_LOG_CHAT_IDS`, list and topics included.
 
 ---
 
@@ -462,11 +490,59 @@ With the payload above, the worker executes against the SL/TP/quantity exactly a
 ```json
 {
   "strategy": "MT5_GOLD_M5_V1",
+  "signal_uxid": "9f2c4b7e18a3d605",
   "timestamp": "2026-04-18T21:55:00Z",
   "action": "FLAT",
   "symbol": "XAUUSD"
 }
 ```
+
+### Signal-cycle notifications
+
+Two ids travel on every signal and they answer different questions:
+
+| Field | Scope | Used for |
+| --- | --- | --- |
+| `signal_id` | This one signal — unique per action | **De-duplication**: a signal seen live and again in the ACK replay is recognised by this id |
+| `signal_uxid` | The whole trade — the entry and every TP/SL/FLAT that follows share one | **Correlation**: echoed on outbound `TRADE` events so the broker can gather this worker's executions under one cycle, and used locally to fold every action of a trade into a single Telegram message |
+
+`signal_uxid` is optional, so a broker that predates the field keeps working — those signals simply fall back to one message per action. When it is present, the worker reports the whole trade in **one broadcast message that it edits in place**, laid out as three boxes:
+
+```
+[⏳ OPENED]                        ← headline: icon + the position's latest status
+📈 LONG XAUUSD                     ┐
+----------------------------------  │ Box 1 — position: what the trade is, at
+Price: 2340.15 | Volume: 0.5 lot ⚙️ │ what price/size, with which levels, and
+SL: 2330 | TP1: 2350 | TP2: 2360    │ what the trade has booked so far
+Risk: 3% ⚙️ | Ticket: 778899        │ (summed over every close — omitted while
+Realized: +154.65 📈                ┘ nothing has closed yet).
+----------------------------------
+📡 Actions                         ┐
+----------------------------------  │ Box 2 — the timeline, one entry per
+✅ LONG — Filled                    │ action, appended as the trade moves.
+Price: 2340.15 | Volume: 0.5 lot ⚙️ │ The icon is the *outcome*, so a TP1
+2026-04-10 22:55:00                 │ the broker refused never looks like a
+                                    │ TP1 that hit. A close also reports the
+🎯 TP1 — Filled                     │ PnL it booked, in the same format the
+Price: 2350.4 | Volume: 0.25 lot (TP1 50%)
+PnL: +51.25 📈                      │ standalone close message used.
+2026-04-11 15:05:00                ┘
+----------------------------------
+⚙️ Settings                        ┐
+----------------------------------  │ Box 3 — the worker configuration this
+VOLUME_DECISION_ENABLED: ENABLED    │ trade ran under (same wording as the
+RISK_PERCENTAGE: ENABLED (3.0%)     │ startup banner), which cycle it is,
+...                                 │ and the live account footer.
+----------------------------------  │
+Strategy: MT5_GOLD_M5_V1            │
+Signal: 9f2c4b7e18a3d605            ┘
+```
+
+The headline status is **the position's**, not the action's: a TP1 the broker refused leaves an `OPENED` position `OPENED`, and once a position is closed (`TP2`/`SL`/`R_SL`/`FLATTED`/…) a late or replayed action can never advertise it as live again. An admin `FLAT` closes out the position's own cycle rather than opening a new message.
+
+Each chat entry keeps its `_<topic id>` suffix, so a cycle lands in the same forum topic as every other notification, and two topics of the same group each own their own message.
+
+Delivery, retries and the `TELEGRAM_CYCLE_ENABLED` toggle are covered in [CycleNotificationJob](#cyclenotificationjob--one-telegram-message-per-trade-workerjobscycle_notification_jobpy).
 
 ---
 
@@ -547,7 +623,7 @@ Toggle whether the worker **executes incoming SIGNALs**. `BLOCK_SIGNAL` suspends
 
 While blocked (`_signals_blocked = True`), every incoming SIGNAL is skipped at the single execution funnel `_process_signal` — this covers **both** live signals and the ACK's `retry_signals` replay. Open positions are **untouched**: they can still be closed out-of-band via an `ADMIN` `FLAT`, which is the escape hatch even while signals are blocked. A real state change is logged and sends a `🛑 Signals Blocked` / `✅ Signals Allowed` Telegram notification; repeating the current state is a no-op (no duplicate alert).
 
-The flag is **in-memory only** — a worker restart resets it to *allowed*. There is no DB/schema change; if a durable block is needed, the broker can re-issue `BLOCK_SIGNAL` after the worker re-announces `WORKER_CONNECTED`.
+The flag is **in-memory only** — a worker restart resets it to *allowed*, and there is no DB/schema change. Durability comes from the broker instead of the worker: it owns the state and replays it in the [`settings` section of the `WORKER_CONNECTED_ACK`](#section-settings) on every handshake, which re-applies the block through this very same setter before the ACK's signal replay runs.
 
 ```json
 {
@@ -565,6 +641,7 @@ The flag is **in-memory only** — a worker restart resets it to *allowed*. Ther
 - **Per-market match key, not symbol-only:** The admin FLAT correlates each live position with its DB row via `_flat_match_key` / `_flat_db_match_keys` — FOREX matches by ticket (checking both `ref_id` and `ref_source_id` so re-ticketed positions still match), CRYPTO by resolved exchange symbol. Two FOREX strategies running the same symbol are therefore handled independently.
 - **Graceful handling of already-closed positions:** If a position is tracked in SQLite but no longer live on the broker, it is marked `FLATTED` without sending a close order, so the DB stays consistent even after a connectivity gap.
 - **`PositionCDC` propagation:** After status updates, the CDC job picks up the `PENDING` rows and publishes `PositionEvent(event=UPDATED, status=FLATTED, …)` to the Broker via the NATS `TRADE` subject — no special handling required.
+- **The FLAT never overwrites the stored entry signal:** `positions.gateway_message` holds the *entry* signal JSON, which `PositionCDC` parses for the `signal_id` / `sl` / `tp1` / `tp2` the broker matches a `TRADE` event back to its own order. The ADMIN payload carries none of those, so it is written to the `position_logs` audit trail instead — where per-event history belongs — and the row's entry signal is left intact. (Overwriting it published an update with `signal_id: null` on both the public and the private subject, which the broker could not correlate, so the order was never updated there.)
 
 ---
 
@@ -574,7 +651,7 @@ The `SYSTEM` NATS subject carries the connect handshake and the broker's config 
 
 | Path | Delivery | Used for |
 | --- | --- | --- |
-| **Connect-time** | Sections of the `WORKER_CONNECTED_ACK`, on the handshake's private reply inbox | Everything the worker needs before it trades: `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` |
+| **Connect-time** | Sections of the `WORKER_CONNECTED_ACK`, on the handshake's private reply inbox | Everything the worker needs before it trades: `settings`, `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` |
 | **Runtime** | A standalone action broadcast on the shared `SYSTEM` subject | A setting an admin changes *after* the worker is connected — currently `CRYPTO_LEVERAGE_INIT` |
 
 The split exists because a request reply inbox delivers exactly **one** message (see the handshake section below), so it cannot carry a push that arrives later; the shared subject has no such limit and the worker stays subscribed to it for its whole lifetime, so a broadcast always lands.
@@ -587,7 +664,7 @@ Right after connecting to NATS, `BaseSignalProcessor._announce_worker_connected`
 
 | Reply action | Meaning | Worker behaviour |
 | --- | --- | --- |
-| `WORKER_CONNECTED_ACK` | The normal reply — carries **all** of this worker's connect-time config in one payload (`strategy_magic_map` + `retry_signals`, both optional) | Applies each section that is present (see [WORKER_CONNECTED_ACK payload](#worker_connected_ack-payload-broker--worker-reply)); handshake complete |
+| `WORKER_CONNECTED_ACK` | The normal reply — carries **all** of this worker's connect-time config in one payload (`settings`, `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` — all optional) | Applies each section that is present (see [WORKER_CONNECTED_ACK payload](#worker_connected_ack-payload-broker--worker-reply)); handshake complete |
 | `WORKER_CONNECTED_ERROR` | Broker received it but couldn't process it (missing settings, invalid leverage config, …) | Logged with `reason` for operator attention; not retried — a config problem on the broker side isn't fixed by resending the same request |
 
 > **One reply per request — why the ACK carries everything.** `nc.request` opens a temporary reply inbox, resolves on the **first** message delivered to it, and unsubscribes immediately. A broker that publishes several messages to that inbox has all but the first silently discarded *by the client library*, below the worker's message handler: nothing is logged on either side, and which message "wins" is decided purely by the broker's send order. Splitting connect-time config across several sends is therefore not a delivery race the worker can retry out of — it is guaranteed loss, so every section rides in the single ACK payload.
@@ -614,16 +691,19 @@ The single reply carrying this worker's whole connect-time config. Every section
 
 | Field | Market | Behaviour when present | Behaviour when omitted (or `null`) |
 | --- | --- | --- | --- |
+| `settings` | both | The runtime toggles this account was left with in a previous session (currently `signal_blocked`) — each one is re-applied through the very same code path the runtime ADMIN action uses | Every toggle keeps its current value; on a fresh start that is its default (`signal_blocked` → *allowed*) |
 | `strategy_magic_map` | both | `{strategy_name: magic_number}` for the strategies this worker subscribes to. Entries for other strategies are ignored; an explicit `{}` **clears** the worker's magics | The worker's current map is left **untouched** — omitting the section means "nothing to push", so a reconnect ACK never wipes the magics the worker is already trading under |
 | `crypto_leverage_init` | CRYPTO | `{symbols, default_leverage}` — runs the [per-symbol leverage initialisation](#per-symbol-leverage-initialisation-crypto) pass before trading | The connect-time pass is skipped, so a worker that wasn't asked never touches exchange leverage. A change made later arrives instead as a runtime [`CRYPTO_LEVERAGE_INIT`](#action-crypto_leverage_init-crypto-runtime) broadcast |
 | `retry_signals` | both | A batch of full `SignalSchema` payloads to replay (deduped + age-gated, see below) | Nothing to replay (`[]` is equivalent) |
 
-Applied by `BaseSignalProcessor._apply_worker_connected_ack`, which runs the config sections first and the **replay last**. That ordering is load-bearing: a replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO entry is sized against the exchange's leverage, so replaying first would fire orders against config that hadn't been applied yet.
+Applied by `BaseSignalProcessor._apply_worker_connected_ack`, which restores `settings` first, runs the remaining config sections next, and the **replay last**. That ordering is load-bearing: a replayed FOREX entry is routed by its strategy's magic and a replayed CRYPTO entry is sized against the exchange's leverage, so replaying first would fire orders against config that hadn't been applied yet — and because the replay goes through the same `_process_signal` funnel as live traffic, a `signal_blocked` restored *before* it suppresses the batch, while one restored after would arrive a batch of orders too late.
 
 Merging every section into one payload would normally mean one malformed entry takes the whole ACK down, so `WorkerConnectedAckSchema` (`worker/schemas/inbox_schema.py`) validates each section — and each entry within it — **independently**, and a fault costs only the part that is actually broken:
 
 | Fault | Effect |
 | --- | --- |
+| One malformed value in `settings` | That setting is left at its current value; the other settings in the same section still apply, as do the other sections |
+| A `settings` key this worker has no field for | Ignored and reported (the broker believes it is in force, so the version skew is made visible); the known settings still apply |
 | One malformed signal in `retry_signals` | That signal is dropped; the rest of the batch still replays and every config section still applies |
 | One non-integer magic in `strategy_magic_map` | That strategy is dropped; the other magics still apply (its own signals are then rejected loudly by the unknown-strategy guard) |
 | **Every** magic in `strategy_magic_map` unparseable | The section is skipped and the worker's current map is left alone — never stored as `{}`, because an empty map is the broker's explicit *clear my magics* instruction and a parse failure must not be mistaken for one |
@@ -637,6 +717,7 @@ Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK
   "action": "WORKER_CONNECTED_ACK",
   "account_id": "FOREX-MT5-1234567",
   "timestamp": "2026-06-30T00:00:00+00:00",
+  "settings": { "signal_blocked": true },
   "strategy_magic_map": {
     "MT5_GOLD_M5_V1": 20260409,
     "MT5_FX_M15_V2": 20260410
@@ -658,6 +739,18 @@ Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK
   ]
 }
 ```
+
+##### Section: `settings`
+
+The **runtime toggles** the broker holds for this account, replayed so a worker comes back up in the state an operator left it in. They are the same switches the runtime [ADMIN actions](#actions-block_signal--allow_signal) flip, and the worker keeps them **in memory only** — so without this section a restart silently drops back to the defaults and resumes trading under a block nobody lifted. The broker owns the state; this is how it hands it back.
+
+`BaseSignalProcessor._apply_worker_settings` reads each attribute in turn and applies it through the *same helper the ADMIN action calls*, so restoring a value is indistinguishable from receiving the directive live: the same already-in-that-state no-op, the same log line, the same Telegram alert. Each field is independently optional — `null` (or absent) means "not pushed, leave this setting alone", which is why `signal_blocked` is a nullable bool: `false` is the broker explicitly saying *unblocked*, not the same statement as saying nothing.
+
+| Field | Behaviour when present | Behaviour when omitted (or `null`) |
+| --- | --- | --- |
+| `signal_blocked` | `true` re-applies the [`BLOCK_SIGNAL`](#actions-block_signal--allow_signal) gate (every SIGNAL — live **and** this ACK's `retry_signals` — is skipped); `false` clears it, exactly as `ALLOW_SIGNAL` does | The gate keeps its current value: its default (*allowed*) after a restart, or whatever ADMIN last set on a reconnect that kept the process alive |
+
+Adding a toggle means adding its field to `WorkerSettingsSchema` (`worker/schemas/inbox_schema.py`) plus one branch in `_apply_worker_settings` that delegates to the existing ADMIN-side setter — the ADMIN path stays the single implementation of *what the setting does*.
 
 ##### Section: `strategy_magic_map`
 
@@ -736,6 +829,39 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 
 - **Max-open-orders exposure cap (`MAX_OPEN_ORDERS`):** Before any new `LONG`/`SHORT` is sent to the broker, the shared `BaseSignalProcessor._max_open_orders_rejection` guard counts the active (`OPENED`/`TP1`) positions across **every** strategy and symbol. If the count is already at the cap, the entry is rejected: `_reject_signal` audit-logs it, inserts a `REJECTED` position row (via `PositionRepository.insert_rejected_position`), and sends an `Order Rejected` operator notification — but **no order is placed**. The `REJECTED` row is picked up by `PositionCDC` and forwarded to the broker on the `TRADE` subject with status `REJECTED`, so a blocked signal is visible end-to-end even though nothing was traded. A re-entry or scale-in on a symbol the strategy already holds **replaces** the existing position rather than opening a new slot, so it is never counted against the cap. Exits (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`) are never gated — a position can always be closed even at the cap. The guard is market-agnostic (identical for FOREX and CRYPTO); `MAX_OPEN_ORDERS=0` disables it.
 
+- **Stale-signal guard (`MAX_ENTRY_DRIFT_R_PERCENT` / `MAX_ENTRY_DRIFT_PERCENT`):** Entries are **market** orders (`TRADE_ACTION_DEAL` on MT5, `MARKET` on a CEX), so they fill at the live quote — never at the `price` the signal was built on. When the market has already run past the signal's own levels, filling it opens a position that is broken from the first tick, so `guard.stale_signal_rejection` rejects it before anything reaches the broker (same `REJECTED` path as `MAX_OPEN_ORDERS` above). Three rules, evaluated against the price the entry would *actually* pay (ask for a LONG, bid for a SHORT; mark price on a CEX — `BaseMarketStrategy.entry_price`):
+  - **Already through `tp2`** — the position would open beyond its own target: instantly in loss by at least the spread, with no profit left to capture. Always rejected, no threshold. (Without this, `StopValidator` would silently rewrite the now-unreachable TP to one point above the entry, hiding the problem instead of surfacing it.)
+  - **Already through `sl`** — the position would open at or past its stop and be stopped out on entry. Always rejected, no threshold.
+  - **Drifted too far** — no level passed yet, but the market has moved enough that the trade no longer resembles the one signalled. Measured as a percentage of the signal's own entry-to-SL distance ("R"), which is why one setting fits every market: `MAX_ENTRY_DRIFT_R_PERCENT=50` means the same thing on BTCUSDT at 100,000 as on EURUSD at 1.08, and tightens automatically for a tight-stop signal — no per-symbol tuning, and no MT5-only `point` unit that a CEX has no equivalent for. `MAX_ENTRY_DRIFT_PERCENT` (percent of price) is the fallback for a signal carrying no SL. Either set to `0` disables that rule; the two level checks above are unaffected.
+
+  Note this is **not** what `SLIPPAGE_DEVIATION` does: that is MT5's `deviation` field, a *maximum tolerance* passed to the broker (an order filling further than that from the requested price is rejected/requoted), and on a **Market Execution** account most brokers ignore it entirely. It cannot stop an entry that is already stale when the quote is read — this guard can. The guard runs last of the three entry guards because it needs a live quote (a tick read / REST round-trip), so an entry already rejected by the DB-only guards never pays for one; a quote that can't be read skips the guard rather than blocking the entry.
+
+- **Entry lot is sized on the stop that is actually placed (FOREX):** `StopValidator` widens an SL that violates the broker's minimum stop distance (`stops_level`), so the order can carry a wider stop than the signal asked for. Risk sizing spreads `risk_cash` over the SL distance, so `ForexExecutor.open_position` validates the stops **before** sizing and feeds the *effective* SL into `LotSizer` — sizing on the signal's narrower stop and then submitting the widened one would silently make the position risk more than `RISK_PERCENTAGE` of capital. When a stop is widened, the sizing log line records both levels.
+
+- **The stops actually placed are what gets recorded (`TradeResult.sl` / `.tp`):** an entry reports back the SL/TP it really registered with the broker, not the signal's requested levels — FOREX after any `StopValidator` adjustment, CRYPTO as the resting orders that were successfully placed (a `tp` of `None` means the take-profit did not register and the position is running without a target). The `position_logs.sl` column and the `Order Filled` notification both read this, and the notification flags a level the broker moved by showing the signal's request beside it. Reading the signal's own numbers back out of a notification while the terminal holds different ones is how an adjusted stop goes unnoticed. Note `position_logs.tp1` deliberately keeps the signal's *partial-close* target — a different concept from the full-exit TP (`tp2`) resting at the broker, which the column does not track.
+
+- **Every close reports its PnL (`TradeResult.profit`):** a close — partial or full, whatever triggered it — books money, so its Telegram notification always carries a `PnL:` line. That covers `Order Filled` for an exit action (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`), `Force Closed`, `Admin FLAT Closed`, `Terminal Close`, `Exchange Close`, `Position Reconciled` and the emergency close behind `Unprotected Position`. An **entry** carries no such line: it has booked nothing yet, and a `0.00` there would read as a break-even trade. Where the figure comes from differs by market, and each path reports the most authoritative number it can get:
+
+  | Path | Source | Label |
+  | --- | --- | --- |
+  | FOREX, worker-placed close (signal / FLAT / force close) | the position's deals (`history_deals_get(position=…)`) narrowed to this close's own order, net of commission/swap/fee | `PnL` |
+  | FOREX, terminal close (SL / TP / stop-out / manual) | the closing deal the detector already read | `PnL` |
+  | FOREX, reconciled close | every deal of the position, summed | `PnL (position total)` |
+  | CRYPTO, worker-placed close | `(exit − entry) × qty`, signed by side — or the exchange's `realizedPnl` for the order when there is no usable fill price | `PnL` |
+  | CRYPTO, exchange close (SL / TP / liquidation / manual) | the stream's own `realizedPnl` | `PnL` |
+  | CRYPTO, reconciled close | the DB row against the approximate close price | `PnL (est.)` |
+
+  `order_send` returns no money figure at all, which is why FOREX reads the deal back (a bounded retry absorbs the terminal's history lag; the close has already succeeded, so a failed read never affects the trade). The CRYPTO product is not an approximation of the exchange's number — a linear USDⓈ-margined contract settles in the quote asset, so it *is* how Binance computes the `realizedPnl` it reports for exchange-side closes; both exclude commission and funding, so the two crypto close paths stay consistent with each other. That product needs a fill price, and Binance can answer a filled MARKET order with `avgPrice=0` **and** `cumQuote=0` (routinely on testnet, occasionally live — the same quirk `_order_result` and the processor's price fallback already work around). With no fill price there is nothing to measure the entry against, and because the processor's repair lands *after* the executor, the PnL would otherwise read `n/a` on every crypto close while the price beside it looked normal. So when the local computation cannot be made, the exchange is asked for that order's own `realizedPnl` (`/fapi/v1/userTrades`) — exact, consistent with the stream's figure, and a round-trip paid only in that case. Only the reconciler estimates, because the close it is reacting to was never observed — hence the distinct labels.
+
+  An amount that could not be read renders `PnL: n/a` rather than disappearing: a dropped line reads as break-even, and `0.00` would be a fabrication. `0.00` is reserved for a close that genuinely broke even. Where one logical exit fans out into several broker closes (a symbol held as multiple tickets, a netted FLAT), the reported figure is their **sum** — unlike `price`/`volume` on the same message, which describe the last fill.
+
+  Both FOREX reads go through `history_deals_get`, which answers a filter that matches nothing with an empty result rather than an error — so every way of reaching for it wrongly costs a permanent `n/a` and nothing else. Both are therefore pinned by tests against a fake that filters and type-checks exactly as the terminal does. Two rules came out of getting it wrong on a live account:
+
+  - **Query by position, narrow in Python.** `ticket=` selects the deals of one **order** (`DEAL_ORDER`) and never a deal by its own ticket — but even asked by order it returned nothing on a live close, for a position the reconciler then read in full through `position=` (`DEAL_POSITION_ID`). So a close reads the position's deals and picks out its own order's here. That narrowing is not optional: the entry deal and any earlier TP1 sit in the same result, and summing them would report the position's running total under a plain `PnL:` label.
+  - **Both arguments must be integers.** The reconciler's ticket comes out of the DB, where every reference is TEXT, so `MT5Gateway._as_ticket_id` normalises at the one place that talks to the extension.
+
+  A close reads its PnL *before* the DB status write and the notification, so the retry that absorbs the terminal's history lag is bounded (~1.25 s) and gives up rather than stalling the pipeline. Giving up logs how many deals the position held and which order was missing from them, which is what separates "history unreadable" from "this close has not landed yet" — a distinction a missing `PnL` line cannot make on its own.
+
 - **Data self-healing on inconsistency:** `SignalHandler._get_db_position` enforces the one-active-position-per-(strategy, symbol) invariant at read time. If more than one `OPENED`/`TP1` row is found (possible after a crash before the unique index existed), the oldest row is kept and all extras are immediately marked `FORCED_CLOSED` with an explanatory comment, so the DB self-heals on the next signal rather than silently producing split-brain state.
 
 - **SQLite as source of truth for exit signals:** Before executing any exit action (`TP1`, `TP2`, `SL`, `R_SL`), `SignalHandler` queries the local SQLite `positions` table for a tracked record matching the signal's `strategy + symbol`. If no record is found the signal is rejected — this prevents acting on untracked or already-closed positions. On success, `source_ticket` in the result is always taken from the DB record (not from the live broker ticket) so `_process_message` always updates the correct DB row, even in edge cases where the broker re-tickets a position after a partial close.
@@ -764,7 +890,7 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 
 - **Notification outbox (store-and-forward):** In-process notification calls (`ctx.notifier` and `ctx.channel_notifier`) do **not** hit the Telegram API directly — they enqueue a row in the SQLite `notifications` table via `OutboxNotifier`. A separate `NotificationJob` daemon thread drains the table every 1 s and performs the actual HTTP send, retrying failed messages with exponential backoff (`5s → 30s → 2m → 10m`) up to `max_attempts` (default `5`). This decouples signal handling from Telegram's availability/latency and prevents Telegram outages from blocking the NATS event loop. **Startup/shutdown banners** are sent **directly** via `ctx.direct_notifier` (bypassing the outbox) so the user sees them immediately — even before the DB/notification dispatcher is ready or after they are torn down.
 
-- **Error-log forwarding (opt-in):** With `TELEGRAM_ENABLED` and `TELEGRAM_LOG_ERRORS_ENABLED` set, `get_logger` attaches a shared `TelegramLogHandler` that forwards every `ERROR`-level (or above) log record to Telegram. `emit` only formats the record and pushes it onto a bounded queue; a background **thread** performs the blocking `send_message`, so logging never stalls the NATS loop and works even inside the FOREX child process (which has no event loop). The handler is process-aware — a forked child (re)starts its own worker thread — and self-limits: a filter drops records from the send path itself (no feedback loop), identical messages are deduplicated within `TELEGRAM_LOG_DEDUP_WINDOW` seconds, and the queue drops records under saturation. `TELEGRAM_LOG_BOT_TOKEN` / `TELEGRAM_LOG_CHAT_ID` route these alerts through a dedicated bot/chat (falling back to `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`).
+- **Error-log forwarding (opt-in):** With `TELEGRAM_ENABLED` and `TELEGRAM_LOG_ERRORS_ENABLED` set, `get_logger` attaches a shared `TelegramLogHandler` that forwards every `ERROR`-level (or above) log record to Telegram. `emit` only formats the record and pushes it onto a bounded queue; a background **thread** performs the blocking `send_message`, so logging never stalls the NATS loop and works even inside the FOREX child process (which has no event loop). The handler is process-aware — a forked child (re)starts its own worker thread — and self-limits: a filter drops records from the send path itself (no feedback loop), identical messages are deduplicated within `TELEGRAM_LOG_DEDUP_WINDOW` seconds, and the queue drops records under saturation. `TELEGRAM_LOG_BOT_TOKEN` / `TELEGRAM_LOG_CHAT_ID` route these alerts through a dedicated bot/chat (falling back to `TELEGRAM_BOT_TOKEN` / `TELEGRAM_WORKER_LOG_CHAT_IDS`), and the log chat id takes the same list/topic syntax as every other chat id — see [Telegram chat ids](#telegram-chat-ids-many-chats-and-group-topics).
 
 ### MT5EventJob — Terminal-Close Polling (`worker/jobs/mt5_event_job.py`)
 
@@ -925,8 +1051,10 @@ The job is constructed with a `{channel → TelegramNotification}` map built by 
 
 | `channel` value | Maps to | Backing chat IDs |
 | --- | --- | --- |
-| `INDIVIDUAL` | `ctx.direct_notifier` | `TELEGRAM_CHAT_ID` (management) |
-| `COMMUNITY` | `ctx.direct_channel_notifier` | `TELEGRAM_CHAT_CHANNEL_ID` (comma-separated signal channels) |
+| `INDIVIDUAL` | `ctx.direct_notifier` | `TELEGRAM_WORKER_LOG_CHAT_IDS` (management) |
+| `COMMUNITY` | `ctx.direct_channel_notifier` | `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS` (signal channels), falling back to `TELEGRAM_WORKER_LOG_CHAT_IDS` when unset |
+
+Both are comma-separated lists and both accept a `-<chat id>_<topic id>` entry to post into one topic of a group — see [Telegram chat ids](#telegram-chat-ids-many-chats-and-group-topics).
 
 In-process callers stay decoupled: they hold an `OutboxNotifier` whose `send_message()` just inserts a row tagged with the right `channel` and `category` — the dispatcher does the routing.
 
@@ -946,6 +1074,42 @@ Two notification paths intentionally bypass the outbox:
 
 1. **Startup / shutdown banners** sent via `ctx.direct_notifier` — must surface even before `NotificationJob` is running or after it has been torn down.
 2. **NATS connection events** still go through the outbox via `ctx.nats_enqueue`, but they use the `NATS_EVENT` category so they can be filtered out of analytics if desired.
+
+### CycleNotificationJob — One Telegram message per trade (`worker/jobs/cycle_notification_job.py`)
+
+Every action of one trade folds into a **single** broadcast message that is **rewritten in place** as the trade progresses, instead of an entry, a TP1, a TP2 and a FLAT arriving as four unrelated boxes a reader has to stitch together by eye. A trade is identified by the broker's `signal_uxid` (see [Signal-cycle notifications](#signal-cycle-notifications)); the write and the send are split across two halves that never call each other:
+
+| Half | Class | Responsibility |
+| --- | --- | --- |
+| Writer | `CycleNotifier` (`worker/services/cycle_notification_service.py`) | Appends the action to the cycle's timeline, re-renders the whole body, stores it. Never touches Telegram. |
+| Reader | `CycleNotificationJob` | Polls every 1 s for chats whose message is behind the cycle, and posts or edits. |
+
+Splitting them is what makes delivery recoverable: the timeline is durable the moment the signal is executed, so a Telegram outage can neither delay a signal nor lose an action.
+
+#### Delivery semantics
+
+Unlike the outbox — where a row is sent once and deleted — nothing here is ever deleted, and "delivered" means *this chat has been shown revision N*:
+
+| Chat state | Action |
+| --- | --- |
+| No `message_id` yet | `sendMessage` (with `message_thread_id` when the entry names a topic), store the id Telegram returns |
+| `message_id` present | `editMessageText` on that same message — no thread id, the topic was fixed when it was posted |
+| Edit → `message is not modified` | Counted as delivered (a no-op edit; re-posting would duplicate the trade) |
+| Edit → message deleted / too old | Forget the `message_id`; the next pass posts a fresh message |
+| Anything else failed | `attempts += 1`, back off **5s → 30s → 2m → 10m**, dead-letter at `max_attempts` |
+
+Ordering is guarded by a `revision` counter: recording an action bumps the cycle's `revision`, each chat records the highest `delivered_revision` it has been shown, and `delivered_revision` only ever moves forward. A slow edit therefore can never overwrite a newer body with an older one — a burst of signals on one trade always renders in order.
+
+#### Falling back to per-action messages
+
+The cycle takes over reporting only when it can. `CycleNotifier.record()` returns `False` — and the caller sends the standalone message it always sent — when:
+
+- the signal carries **no `signal_uxid`** (a broker that predates the field: there is nothing to group actions by);
+- `TELEGRAM_CYCLE_ENABLED=false`, `TELEGRAM_ENABLED=false`, or no broadcast chat resolves (the same list `ctx.channel_notifier` posts to: `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`, falling back to `TELEGRAM_WORKER_LOG_CHAT_IDS`);
+- `NOTIFICATION_MODE` is not `VERBOSE` (SILENT suppresses the broadcast channel, exactly as for the outbox);
+- the cycle write itself failed.
+
+Exactly one of the two fires — never both, never neither.
 
 ### ForexExecutor Primitives (`worker/gateways/forex/executor.py`)
 
@@ -1013,7 +1177,8 @@ A partial unique index `uidx_positions_one_active_per_strategy_symbol` enforces 
 #### Position Status Lifecycle
 
 ```text
-(entry rejected) ──► REJECTED           (MAX_OPEN_ORDERS cap — never sent to broker)
+(entry rejected) ──► REJECTED           (entry guard: open-order cap / symbol already
+                                         held / stale signal — never sent to broker)
 
 OPENED ──► TP1 ──► TP2
        │         └──► SL
@@ -1033,7 +1198,7 @@ OPENED ──► TP1 ──► TP2
 | `TERMINAL_CLOSED` | `MT5EventJob` / exchange event / either market's reconcile job | Broker/exchange closed the position (SL/TP/Stop-Out/manual) before a NATS signal arrived, or the reconciler found the position gone from the broker while the row was still open |
 | `FORCED_CLOSED` | New entry signal / liquidation | Position was force-closed (opposing/same-direction entry, or a crypto liquidation) |
 | `FLATTED` | FLAT signal | Position was closed by an administrative flat command |
-| `REJECTED` | `MAX_OPEN_ORDERS` guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
+| `REJECTED` | `MAX_OPEN_ORDERS` / open-order-per-symbol / stale-signal guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
 
 ### `position_logs` — Immutable execution audit trail
 
@@ -1069,6 +1234,42 @@ A durable queue of pending Telegram messages. `NotificationJob` polls this table
 | `created_at` / `updated_at` | DATETIME | Row timestamps |
 
 Indexed on `(next_attempt_at, id)` to make the dispatcher's poll query O(log n).
+
+### `notification_cycles` / `notification_cycle_chats` — One message per trade
+
+Notification state, not trade state: dropping these tables loses chat formatting, never a position. A cycle holds the whole timeline of one trade plus the body last rendered from it; a chat row holds the id of the message being edited in that chat.
+
+**`notification_cycles`**
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INTEGER PK | Auto-increment row ID |
+| `signal_uxid` | TEXT | The broker's trade-cycle id, shared by the entry and every close that follows |
+| `strategy` | TEXT | Part of the cycle key — a uxid is only unique within the strategy that minted it |
+| `symbol` | TEXT | Instrument the trade is on |
+| `status` | TEXT | Latest position status (`OPENED`/`TP1`/…/`FLATTED`, plus `FAILED`/`REJECTED` when nothing opened) — the message's headline |
+| `events` | TEXT | JSON array: the full timeline, one entry per action the worker executed |
+| `message_text` | TEXT | The body rendered from `events`, ready to send or edit |
+| `revision` | INTEGER | Bumped on every recorded action; drives what each chat still owes |
+| `created_at` / `updated_at` | DATETIME | Row timestamps |
+
+Unique on `(strategy, signal_uxid)`.
+
+**`notification_cycle_chats`**
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INTEGER PK | Auto-increment row ID |
+| `cycle_id` | INTEGER | The cycle this delivery belongs to |
+| `chat_id` | TEXT | One entry of `TELEGRAM_PRIVATE_BROADCAST_CHAT_IDS`, kept raw so a `_<topic id>` suffix survives and two topics of one group get their own message |
+| `message_id` | TEXT | Telegram's id for the message being edited; `NULL` = nothing posted yet |
+| `delivered_revision` | INTEGER | Highest cycle revision this chat has been shown; only ever moves forward |
+| `attempts` / `max_attempts` | INTEGER | Retry bookkeeping, dead-letter at the cap (default `5`) |
+| `last_error` | TEXT | Error string from the last failed attempt |
+| `next_attempt_at` | DATETIME | Earliest retry time; `NULL` = ready immediately |
+| `created_at` / `updated_at` | DATETIME | Row timestamps |
+
+Unique on `(cycle_id, chat_id)`, and indexed on `(delivered_revision, next_attempt_at, id)` for the dispatcher's poll.
 
 ---
 

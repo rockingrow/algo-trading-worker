@@ -60,7 +60,7 @@ def _job(magics, *, connected=True, db=None, notifier=None):
   )
 
 
-def _event(ticket="555", *, sl=1890.0, tp=1950.0):
+def _event(ticket="555", *, sl=1890.0, tp=1950.0, profit=None):
   return TerminalClosedEvent(
     source_ticket=ticket,
     deal_ticket=f"d{ticket}",
@@ -74,6 +74,7 @@ def _event(ticket="555", *, sl=1890.0, tp=1950.0):
     sl=sl,
     tp=tp,
     account=None,
+    profit=profit,
   )
 
 
@@ -259,3 +260,27 @@ def test_unknown_position_is_skipped_without_writing():
   job._handle(_event("999"))
 
   assert db.statuses == [] and notifier.sent == []
+
+
+def test_terminal_close_reports_what_the_deal_booked():
+  # A broker-side SL/TP/stop-out/manual close is still a close: the deal that
+  # flattened the position carries the money it made or lost, and the operator
+  # reads it off this message.
+  db = _FakeDb(position={"strategy": "strat-a"})
+  notifier = _Notifier()
+  job = _job({101}, db=db, notifier=notifier)
+
+  job._handle(_event("555", profit=-12.5))
+
+  assert "PnL: <b>-12.50</b>" in notifier.sent[0]
+
+
+def test_terminal_close_without_a_pnl_reports_it_as_unknown():
+  # Never silently dropped — a missing line would read as a break-even close.
+  db = _FakeDb(position={"strategy": "strat-a"})
+  notifier = _Notifier()
+  job = _job({101}, db=db, notifier=notifier)
+
+  job._handle(_event("555"))
+
+  assert "PnL: <b>n/a</b>" in notifier.sent[0]

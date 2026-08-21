@@ -20,7 +20,19 @@ from worker.gateways.forex.mt5.close_detector import (
 )
 
 
-def _deal(ticket, entry, reason, *, time=0, price=1900.0, volume=0.01):
+def _deal(
+  ticket,
+  entry,
+  reason,
+  *,
+  time=0,
+  price=1900.0,
+  volume=0.01,
+  profit=0.0,
+  commission=0.0,
+  swap=0.0,
+  fee=0.0,
+):
   return SimpleNamespace(
     ticket=ticket,
     entry=entry,
@@ -29,6 +41,10 @@ def _deal(ticket, entry, reason, *, time=0, price=1900.0, volume=0.01):
     price=price,
     volume=volume,
     symbol="XAUUSDm",
+    profit=profit,
+    commission=commission,
+    swap=swap,
+    fee=fee,
   )
 
 
@@ -182,3 +198,45 @@ def test_seen_tickets_tracks_only_our_magics(fake_mt5):
   seen = set()
   scan_terminal_closed_positions({101}, seen)
   assert seen == {777}
+
+
+# ── realized PnL ────────────────────────────────────────────────────────────── #
+
+
+def test_event_carries_what_the_closing_deal_booked(fake_mt5):
+  # The deal that flattened the position is also where MT5 booked the money, so
+  # the terminal-close notification gets its PnL from the same history read that
+  # detected the close — no second query.
+  fake_mt5._deals = [
+    _deal(1, fake_mt5.DEAL_ENTRY_IN, fake_mt5.DEAL_REASON_CLIENT, time=100),
+    _deal(
+      2,
+      fake_mt5.DEAL_ENTRY_OUT,
+      fake_mt5.DEAL_REASON_SL,
+      time=200,
+      profit=-14.0,
+      commission=-0.7,
+      swap=-0.3,
+    ),
+  ]
+  events = _detect(fake_mt5)
+
+  assert len(events) == 1
+  assert events[0].profit == pytest.approx(-15.0)
+
+
+def test_pnl_covers_only_the_close_that_flattened_the_position(fake_mt5):
+  # An earlier TP1 partial booked its own result and was reported at the time;
+  # counting it again here would double-report it.
+  fake_mt5._deals = [
+    _deal(1, fake_mt5.DEAL_ENTRY_IN, fake_mt5.DEAL_REASON_CLIENT, time=100),
+    _deal(
+      2, fake_mt5.DEAL_ENTRY_OUT, fake_mt5.DEAL_REASON_EXPERT, time=200, profit=9.0
+    ),
+    _deal(
+      3, fake_mt5.DEAL_ENTRY_OUT, fake_mt5.DEAL_REASON_CLIENT, time=300, profit=4.0
+    ),
+  ]
+  events = _detect(fake_mt5)
+
+  assert len(events) == 1 and events[0].profit == pytest.approx(4.0)
