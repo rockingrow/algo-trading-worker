@@ -454,16 +454,47 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 | **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open volume using the **actual live `position.volume`** — signal `quantity` is intentionally ignored |
 | **4 — Flat** | `FLAT` | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED` |
 
+#### Entry Sizing Mode — `USE_ACCOUNT_EQUITY` vs `position.use_equity_sizing`
+
+An entry is sized in one of two ways: **equity sizing** (the worker computes the volume itself from risk % / SL against the account's *real* equity, and the payload's `quantity` is ignored) or **payload quantity** (the volume is `signal.quantity` as sent).
+
+Which one applies is resolved per signal, highest priority first:
+
+| Priority | Source | Value | Effect |
+| --- | --- | --- | --- |
+| 1 | `USE_ACCOUNT_EQUITY` (.env) | `true` | Equity sizing — live account equity is the risk base, `quantity` ignored |
+| 1 | `USE_ACCOUNT_EQUITY` (.env) | `false` | Payload quantity — the entry uses `signal.quantity` |
+| 2 | `position.use_equity_sizing` (payload) | `true` / `false` | Same meaning as above; consulted **only** when `USE_ACCOUNT_EQUITY` is unset |
+| 3 | neither is set | — | Legacy behaviour: `VOLUME_DECISION_ENABLED` decides, and risk sizing uses the fixed `CAPITAL` |
+
+`USE_ACCOUNT_EQUITY` is therefore **tri-state**: leave it out of `.env` (or comment it out) to let each position decide for itself; set it to `true`/`false` to override every incoming signal from the worker side. The startup banner reflects this — `USE_ACCOUNT_EQUITY: PER SIGNAL` when unset, `ENABLED` / `DISABLED` when set.
+
+When equity sizing is on but the account equity cannot be read, the entry falls back to the broker's **minimum** lot/qty rather than silently sizing off `CAPITAL`.
+
+```json
+{
+  "strategy": "MT5_GOLD_M5_V1",
+  "action": "LONG",
+  "symbol": "XAUUSD",
+  "price": 2000.0,
+  "quantity": 1.0,
+  "sl": 1990.0,
+  "use_equity_sizing": true
+}
+```
+
+With `USE_ACCOUNT_EQUITY` unset, the payload above ignores `quantity: 1.0` and sizes the lot from the live account equity, the resolved risk percent and the effective SL.
+
 #### Scale-In (Averaging) Positions
 
 A signal may carry an optional `is_scale_position` boolean and a nested `scaling` object (`tp`, `sl`, `quantity`). **The broker has already applied these multipliers** — `sl`, `tp1`, `tp2`, and `quantity` arrive as their final, scaled values. The `scaling` object is passed through as metadata only. The worker therefore uses the payload's SL/TP/quantity **verbatim** for order entry, notifications, and persistence; it never re-scales them.
 
-The one exception is risk-based sizing. When `VOLUME_DECISION_ENABLED=true`, the worker computes the entry volume itself from risk/capital/SL and **ignores** `signal.quantity`. To keep a scale-in entry proportional, the executor re-applies `scaling.quantity` to that self-computed volume (sizing is linear in risk, so the lot/qty scales by the same factor). `scaling.tp`/`scaling.sl` are never re-applied.
+The one exception is risk-based sizing. When the worker sizes the entry itself (see [Entry Sizing Mode](#entry-sizing-mode--use_account_equity-vs-positionuse_equity_sizing)), it computes the entry volume from risk/capital-or-equity/SL and **ignores** `signal.quantity`. To keep a scale-in entry proportional, the executor re-applies `scaling.quantity` to that self-computed volume (sizing is linear in risk, so the lot/qty scales by the same factor). `scaling.tp`/`scaling.sl` are never re-applied.
 
 | Mode | What sizes the entry | Where `scaling.quantity` applies |
 | --- | --- | --- |
-| `VOLUME_DECISION_ENABLED=false` (payload-quantity) | `signal.quantity` (already broker-scaled) | Not re-applied — used as-is |
-| `VOLUME_DECISION_ENABLED=true` (risk sizing) | risk % / capital / SL → computed volume | Re-applied to the computed volume |
+| Payload-quantity mode | `signal.quantity` (already broker-scaled) | Not re-applied — used as-is |
+| Risk sizing (equity or `CAPITAL` base) | risk % / capital-or-equity / SL → computed volume | Re-applied to the computed volume |
 
 A signal without `is_scale_position: true` is passed through untouched (any `scaling` object is ignored), and an absent `scaling.quantity` leaves the computed volume unchanged.
 

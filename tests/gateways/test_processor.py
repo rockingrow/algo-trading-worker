@@ -150,7 +150,7 @@ class FakeProcessor(BaseSignalProcessor):
       volume_decision_enabled=True,
       capital=1000.0,
       risk_percentage=2.0,
-      use_account_equity=False,
+      use_account_equity=None,
     )
     self._market_type = "FAKE_MKT"
     self._connected = connected

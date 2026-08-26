@@ -140,7 +140,7 @@ class CryptoExecutor:
 
     symbol = self.get_symbol(signal.symbol)
 
-    if not self._config.volume_decision_enabled and signal.quantity is None:
+    if self._uses_payload_quantity(signal) and signal.quantity is None:
       return TradeResult.fail("Missing quantity")
 
     qty = self.normalize_volume(symbol, self._resolve_entry_qty(signal, symbol))
@@ -221,18 +221,33 @@ class CryptoExecutor:
       return None
     return price if price and price > 0 else None
 
+  def _uses_payload_quantity(self, signal: SignalSchema) -> bool:
+    """True when this entry must be sized from ``signal.quantity``.
+
+    Priority: ``USE_ACCOUNT_EQUITY`` (env) → ``signal.use_equity_sizing`` →
+    ``VOLUME_DECISION_ENABLED`` (legacy fallback when neither is set).
+    """
+    return self._config.uses_payload_quantity(signal.use_equity_sizing)
+
   def _resolve_entry_qty(self, signal: SignalSchema, symbol: str) -> float:
-    """Entry quantity before final step-size normalization: risk-based when
-    VOLUME_DECISION is on (min qty if the signal carries no SL), otherwise the
-    signal's own quantity. Caller guarantees a quantity exists in the latter case."""
-    if not self._config.volume_decision_enabled:
+    """Entry quantity before final step-size normalization: risk-based when the
+    worker sizes the entry itself (min qty if the signal carries no SL),
+    otherwise the signal's own quantity. Caller guarantees a quantity exists in
+    the latter case. See ``_uses_payload_quantity`` for the mode priority."""
+    equity_sizing = self._config.resolve_equity_sizing(signal.use_equity_sizing)
+    if self._uses_payload_quantity(signal):
+      logger.info(
+        "[open_position] Payload quantity mode (equity_sizing=%s) | qty=%s",
+        equity_sizing,
+        signal.quantity,
+      )
       return self.convert_quantity_to_lots(symbol, signal.quantity)
     if signal.sl:
-      capital = self._risk_capital()
+      capital = self._risk_capital(equity_sizing)
       if capital is None:
         qty = self._min_qty(symbol)
         logger.error(
-          "[open_position] USE_ACCOUNT_EQUITY set but equity unavailable — using min qty=%s",
+          "[open_position] Equity sizing requested but equity unavailable — using min qty=%s",
           qty,
         )
         return qty
@@ -266,21 +281,26 @@ class CryptoExecutor:
     logger.warning("[open_position] VOLUME_DECISION but no SL — using min qty=%s", qty)
     return qty
 
-  def _risk_capital(self) -> Optional[float]:
+  def _risk_capital(self, equity_sizing: Optional[bool] = None) -> Optional[float]:
     """Capital base for risk sizing.
 
-    Mirrors the Forex ``LotSizer``: live account equity when ``USE_ACCOUNT_EQUITY``
-    is set, otherwise the fixed configured ``CAPITAL``. Returns ``None`` when
-    equity is required but cannot be read, signalling the caller to fall back to
-    the symbol's minimum quantity rather than silently sizing off the wrong base.
+    Mirrors the Forex executor: the live account equity when equity sizing is on
+    for this entry, otherwise the fixed configured ``CAPITAL``. Returns ``None``
+    when equity is required but cannot be read, signalling the caller to fall
+    back to the symbol's minimum quantity rather than silently sizing off the
+    wrong base.
+
+    *equity_sizing* is the resolved decision from
+    :meth:`ExecutionConfig.resolve_equity_sizing`; ``None`` means no explicit
+    mode was expressed and the legacy ``CAPITAL`` base applies.
     """
-    if not self._config.use_account_equity:
+    if not equity_sizing:
       return self._config.capital
     account = self._gateway.get_account()
     equity = account.get("equity") if account else None
     if not equity:
       logger.error(
-        "[open_position] USE_ACCOUNT_EQUITY set but account equity unavailable (%s).",
+        "[open_position] Equity sizing requested but account equity unavailable (%s).",
         account,
       )
       return None

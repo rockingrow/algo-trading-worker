@@ -102,7 +102,7 @@ DESCRIPTIONS = {
   "CAPITAL_CURRENCY": "Currency of the configured capital",
   "VOLUME_DECISION_ENABLED": "Enable automatic position-size calculation",
   "RISK_PERCENTAGE": "Percent of capital risked per trade",
-  "USE_ACCOUNT_EQUITY": "Use live account equity instead of initial capital for sizing",
+  "USE_ACCOUNT_EQUITY": "Sizing override: true=live equity, false=payload quantity, unset=per-signal use_equity_sizing",
   "LOG_LEVEL": "Logging verbosity (DEBUG, INFO, WARNING, ERROR)",
   "NOTIFICATION_MODE": "How much the worker notifies",
   "TELEGRAM_ENABLED": "Enable Telegram notifications",

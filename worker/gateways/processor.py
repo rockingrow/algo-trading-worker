@@ -949,7 +949,9 @@ class BaseSignalProcessor(ABC):
     an append-only ``position_logs`` row, which is where per-event audit belongs.
     """
     db_positions = self.ctx.db_service.get_open_positions_for_flat(
-      strategy=admin.strategy, symbol=admin.symbol, ref_id=getattr(admin, "ref_id", None)
+      strategy=admin.strategy,
+      symbol=admin.symbol,
+      ref_id=getattr(admin, "ref_id", None),
     )
     footer = self._account_footer()
     for db_pos in db_positions:
@@ -1590,7 +1592,9 @@ class BaseSignalProcessor(ABC):
       tp2=signal.tp2,
       risk_percent=risk_info[0] if risk_info else None,
       risk_custom=bool(risk_info[1]) if risk_info else False,
-      auto_volume=bool(self.settings.get("volume_decision_enabled", False)),
+      auto_volume=not self.config.uses_payload_quantity(
+        getattr(signal, "use_equity_sizing", None)
+      ),
       tp1_percent=self._cycle_tp1_percent(signal),
       is_scale_position=bool(getattr(signal, "is_scale_position", False)),
       # Only a close books money. An entry carries no PnL at all, so it stays
@@ -1652,15 +1656,16 @@ class BaseSignalProcessor(ABC):
     return mt.value if isinstance(mt, MarketTypeEnum) else str(mt or "")
 
   def _resolve_risk_info(self, signal: SignalSchema):
-    """Return ``(risk_percent, is_custom)`` for entry signals when VDE is on, else None.
+    """Return ``(risk_percent, is_custom)`` for entry signals the worker sizes
+    itself (see ``ExecutionConfig.uses_payload_quantity``), else None.
 
     ``is_custom`` is True when USE_CUSTOM_RISK_PERCENTAGE overrides the signal's
     own risk_percent (so the gear icon is shown in notifications).
     """
-    if (
-      signal.action.value not in ("LONG", "SHORT")
-      or not self.config.volume_decision_enabled
-    ):
+    if signal.action.value not in (
+      "LONG",
+      "SHORT",
+    ) or self.config.uses_payload_quantity(getattr(signal, "use_equity_sizing", None)):
       return None
     if self.config.use_custom_risk_percentage:
       return (self.config.risk_percentage, True)

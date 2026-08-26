@@ -120,6 +120,37 @@ class BaseMessagePresenter:
     return f"{label}: <b>{body}</b>\n"
 
   @staticmethod
+  def _resolve_equity_sizing(signal, settings_dict: dict | None):
+    """Mirror ``ExecutionConfig.resolve_equity_sizing`` for display purposes:
+    USE_ACCOUNT_EQUITY (env) wins, else the signal's own ``use_equity_sizing``,
+    else ``None`` (no explicit mode)."""
+    env = (settings_dict or {}).get("use_account_equity")
+    if env is not None:
+      return bool(env)
+    flag = getattr(signal, "use_equity_sizing", None)
+    return None if flag is None else bool(flag)
+
+  @staticmethod
+  def _auto_sized(signal, settings_dict: dict | None) -> bool:
+    """True when the worker sized the volume itself (gear icon), mirroring
+    ``ExecutionConfig.uses_payload_quantity``."""
+    equity_sizing = BaseMessagePresenter._resolve_equity_sizing(signal, settings_dict)
+    if equity_sizing is not None:
+      return equity_sizing
+    return bool((settings_dict or {}).get("volume_decision_enabled", False))
+
+  @staticmethod
+  def _use_account_equity_line(settings_dict: dict) -> str:
+    """Render USE_ACCOUNT_EQUITY, which is tri-state: unset means each signal's
+    own ``use_equity_sizing`` decides."""
+    value = (settings_dict or {}).get("use_account_equity")
+    if value is None:
+      body = "PER SIGNAL"
+    else:
+      body = "ENABLED" if value else "DISABLED"
+    return f"USE_ACCOUNT_EQUITY: <b>{body}</b>\n"
+
+  @staticmethod
   def _volume_decision_line(settings_dict: dict) -> str:
     s = settings_dict
     enabled = bool(s.get("volume_decision_enabled", False))
@@ -179,7 +210,7 @@ class BaseMessagePresenter:
       f"{_DIVIDER}\n"
       f"{BaseMessagePresenter._volume_decision_line(s)}"
       f"{BaseMessagePresenter._risk_percentage_line(s)}"
-      f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
+      f"{BaseMessagePresenter._use_account_equity_line(s)}"
       f"{BaseMessagePresenter._tp1_percent_line(s)}"
       f"{BaseMessagePresenter._tp1_be_line(s)}"
     )

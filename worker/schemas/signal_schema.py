@@ -87,6 +87,12 @@ class SignalSchema(BaseModel):
   scaling: Optional[ScalingSchema] = None
   tp1_percent: Optional[float] = None
   move_sl_to_be: Optional[bool] = None
+  # Per-position sizing preference sent by the broker: True means "size this
+  # entry from the account's real equity and ignore the ``quantity`` in this
+  # payload"; False means "use ``quantity`` as sent". It is only consulted when
+  # the worker's own ``USE_ACCOUNT_EQUITY`` is left unset (None) — see
+  # :meth:`worker.gateways.config.ExecutionConfig.resolve_equity_sizing`.
+  use_equity_sizing: Optional[bool] = None
 
   def scale_quantity_factor(self) -> float:
     """Quantity multiplier to apply to a *self-computed* entry volume.
