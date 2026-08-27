@@ -20,7 +20,7 @@ def config():
     volume_decision_enabled=True,
     capital=1000.0,
     risk_percentage=2.0,
-    use_account_equity=False,
+    use_account_equity=None,
     use_custom_position_tp1_percent=False,
     position_tp1_percent=30.0,
     tp1_move_sl_to_breakeven=True,

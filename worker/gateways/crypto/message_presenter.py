@@ -49,7 +49,7 @@ class CryptoMessagePresenter(BaseMessagePresenter):
       f"{CryptoMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"{CryptoMessagePresenter._risk_percentage_line(s)}"
-      f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
+      f"{CryptoMessagePresenter._use_account_equity_line(s)}"
       f"{CryptoMessagePresenter._tp1_percent_line(s)}"
       f"{CryptoMessagePresenter._tp1_be_line(s)}"
       f"{CryptoMessagePresenter._max_open_orders_line(s)}"

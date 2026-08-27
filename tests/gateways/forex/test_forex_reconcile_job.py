@@ -346,7 +346,7 @@ def test_real_executor_reconciles_row_whose_magic_is_no_longer_live():
       volume_decision_enabled=True,
       capital=1000.0,
       risk_percentage=2.0,
-      use_account_equity=False,
+      use_account_equity=None,
     ),
     strategy_magic_map=_MAGICS,
   )

@@ -319,9 +319,16 @@ class RiskSettings(BaseSettings):
   risk_percentage: float = _opt(
     2.0, "RISK_PERCENTAGE", "risk_percentage"
   )  # Risk 2% of capital per trade
-  use_account_equity: bool = _opt(
-    False, "USE_ACCOUNT_EQUITY", "use_account_equity"
-  )  # If true, use account equity instead of initial capital for entry volume calculation
+  use_account_equity: Optional[bool] = _opt(
+    None, "USE_ACCOUNT_EQUITY", "use_account_equity"
+  )  # Tri-state worker-level override of the per-position ``use_equity_sizing``
+  # flag, and the highest-priority input to entry sizing:
+  #   True  → size every entry from the live account equity, ignoring the
+  #           payload's ``quantity``.
+  #   False → size every entry from the payload's ``quantity``.
+  #   unset → defer to ``position.use_equity_sizing`` in the signal payload;
+  #           when that is absent too, keep the legacy behaviour
+  #           (VOLUME_DECISION_ENABLED decides, risk sizing off CAPITAL).
   # Maximum number of concurrently open orders (OPENED/TP1 positions) this worker
   # may hold. A new entry (LONG/SHORT) that would exceed the cap is not sent to the
   # broker: it is recorded with status REJECTED, reported to the broker on the TRADE

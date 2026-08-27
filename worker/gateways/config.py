@@ -31,7 +31,10 @@ class ExecutionConfig:
   volume_decision_enabled: bool
   capital: float
   risk_percentage: float
-  use_account_equity: bool
+  # Tri-state (see ``resolve_equity_sizing``): True/False are a worker-level
+  # decision that wins over the signal, None defers to the signal's own
+  # ``use_equity_sizing``.
+  use_account_equity: Optional[bool]
   # Controls tp1_percent resolution at TP1 time:
   #   True  → always use position_tp1_percent (ignores signal.tp1_percent)
   #   False → use signal.tp1_percent if present, else fall back to position_tp1_percent
@@ -68,7 +71,7 @@ class ExecutionConfig:
       volume_decision_enabled=settings_dict.get("volume_decision_enabled", True),
       capital=settings_dict.get("capital", 1000.0),
       risk_percentage=settings_dict.get("risk_percentage", 1.0),
-      use_account_equity=settings_dict.get("use_account_equity", False),
+      use_account_equity=settings_dict.get("use_account_equity"),
       use_custom_position_tp1_percent=settings_dict.get(
         "use_custom_position_tp1_percent", False
       ),
@@ -77,6 +80,39 @@ class ExecutionConfig:
       allow_multi_strategy_per_symbol=cls._resolve_multi_strategy(settings_dict),
       use_custom_risk_percentage=settings_dict.get("use_custom_risk_percentage", False),
     )
+
+  def resolve_equity_sizing(self, signal_flag: Optional[bool]) -> Optional[bool]:
+    """Decide how an entry is sized, by priority.
+
+    *signal_flag* is ``position.use_equity_sizing`` from the payload.
+
+      1. ``USE_ACCOUNT_EQUITY`` set in the environment wins outright — True or
+         False is the worker's own decision and the payload flag is ignored.
+      2. Otherwise the payload's ``use_equity_sizing`` decides.
+      3. Neither expressed an opinion → ``None``: no explicit sizing mode, so
+         the caller keeps the legacy behaviour driven by
+         ``VOLUME_DECISION_ENABLED`` (risk sizing off the fixed ``CAPITAL``).
+
+    ``True``  → size from the live account equity and ignore ``quantity``.
+    ``False`` → size from the payload's ``quantity``.
+    """
+    if self.use_account_equity is not None:
+      return bool(self.use_account_equity)
+    if signal_flag is not None:
+      return bool(signal_flag)
+    return None
+
+  def uses_payload_quantity(self, signal_flag: Optional[bool]) -> bool:
+    """True when an entry carrying *signal_flag* must be sized from the payload's
+    ``quantity`` rather than by the worker itself.
+
+    Explicit equity sizing (env or payload) decides; with neither expressed the
+    legacy ``VOLUME_DECISION_ENABLED`` switch does.
+    """
+    equity_sizing = self.resolve_equity_sizing(signal_flag)
+    if equity_sizing is not None:
+      return equity_sizing is False
+    return not self.volume_decision_enabled
 
   @staticmethod
   def _resolve_multi_strategy(settings_dict: dict) -> bool:

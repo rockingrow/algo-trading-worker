@@ -49,7 +49,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"{ForexMessagePresenter._volume_decision_line(s)}"
       f"CAPITAL: <b>{s.get('capital')} {s.get('capital_currency', '')}</b>\n"
       f"{ForexMessagePresenter._risk_percentage_line(s)}"
-      f"USE_ACCOUNT_EQUITY: <b>{'ENABLED' if s.get('use_account_equity', False) else 'DISABLED'}</b>\n"
+      f"{ForexMessagePresenter._use_account_equity_line(s)}"
       f"{ForexMessagePresenter._tp1_percent_line(s)}"
       f"{ForexMessagePresenter._tp1_be_line(s)}"
       f"{ForexMessagePresenter._max_open_orders_line(s)}"
@@ -91,7 +91,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
     # VOLUME_DECISION_ENABLED=false the lot comes straight from signal.quantity,
     # so the icon must be dropped — mirrors _risk_line, which the processor
     # likewise suppresses when volume decision is off.
-    auto_sized = bool((settings_dict or {}).get("volume_decision_enabled", False))
+    auto_sized = ForexMessagePresenter._auto_sized(signal, settings_dict)
     volume = format_volume(result.get("volume"), auto_calculated=auto_sized)
     qty_suffix = ForexMessagePresenter._tp1_qty_suffix(signal, settings_dict)
     return _box(

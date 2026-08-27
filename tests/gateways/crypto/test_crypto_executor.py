@@ -594,3 +594,70 @@ def test_signal_price_fallback_is_skipped_when_the_fill_price_is_real(config):
 
   # (64500 - 64000) * 0.1 from the real fill, not the signal's 60100.
   assert res["profit"] == pytest.approx(50.0)
+
+
+def test_open_position_signal_equity_sizing_overrides_payload_quantity(config):
+  """position.use_equity_sizing=true sizes off live equity and ignores the
+  payload quantity, even with VOLUME_DECISION_ENABLED off."""
+  cfg = replace(config, use_account_equity=None, volume_decision_enabled=False)
+  gw = FakeGateway()  # equity = 5000
+  ex = CryptoExecutor(gw, cfg)
+  res = ex.open_position(
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="BTCUSD",
+      sl=29000.0,
+      quantity=1,
+      use_equity_sizing=True,
+    )
+  )
+  assert res["success"] is True
+  assert gw.orders == [("BTCUSDT", "LONG", 0.1, False)]
+
+
+def test_open_position_signal_equity_sizing_false_uses_payload_quantity(config):
+  """position.use_equity_sizing=false sizes from the payload quantity even with
+  VOLUME_DECISION_ENABLED on."""
+  cfg = replace(config, use_account_equity=None, volume_decision_enabled=True)
+  gw = FakeGateway()
+  ex = CryptoExecutor(gw, cfg)
+  res = ex.open_position(
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="BTCUSD",
+      sl=29000.0,
+      quantity=1,
+      use_equity_sizing=False,
+    )
+  )
+  assert res["success"] is True
+  assert gw.orders == [("BTCUSDT", "LONG", 1.0, False)]
+
+
+def test_open_position_env_flag_beats_signal_equity_sizing(config):
+  """USE_ACCOUNT_EQUITY=false in .env wins over use_equity_sizing=true."""
+  cfg = replace(config, use_account_equity=False, volume_decision_enabled=True)
+  gw = FakeGateway()
+  ex = CryptoExecutor(gw, cfg)
+  res = ex.open_position(
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="BTCUSD",
+      sl=29000.0,
+      quantity=1,
+      use_equity_sizing=True,
+    )
+  )
+  assert res["success"] is True
+  assert gw.orders == [("BTCUSDT", "LONG", 1.0, False)]
+
+
+def test_open_position_missing_quantity_in_payload_quantity_mode(config):
+  """No quantity and equity sizing explicitly off → fail cleanly."""
+  cfg = replace(config, use_account_equity=False, volume_decision_enabled=True)
+  ex = CryptoExecutor(FakeGateway(), cfg)
+  res = ex.open_position(
+    make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0, quantity=None)
+  )
+  assert res["success"] is False
+  assert "Missing quantity" in (res.get("comment") or res.get("message") or "")

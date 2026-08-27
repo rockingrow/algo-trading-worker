@@ -95,11 +95,17 @@ class ForexExecutor:
   def normalize_volume(self, symbol: str, volume: float) -> float:
     return self._lot_sizer.normalize_volume(self._spec(symbol), volume)
 
-  def _resolve_capital(self) -> Optional[float]:
-    """Capital base for risk sizing: fixed configured capital, or live account
-    equity when ``USE_ACCOUNT_EQUITY`` is set. Returns ``None`` when equity is
-    required but unavailable (caller falls back to the minimum lot)."""
-    if not self._config.use_account_equity:
+  def _resolve_capital(self, equity_sizing: Optional[bool] = None) -> Optional[float]:
+    """Capital base for risk sizing: the live account equity when equity sizing
+    is on for this entry, else the fixed configured capital. Returns ``None``
+    when equity is required but unavailable (caller falls back to the minimum
+    lot).
+
+    *equity_sizing* is the resolved decision from
+    :meth:`ExecutionConfig.resolve_equity_sizing`; ``None`` means no explicit
+    mode was expressed and the legacy ``CAPITAL`` base applies.
+    """
+    if not equity_sizing:
       return self._config.capital
     account = self._gateway.get_account()
     return account.get("equity") if account else None
@@ -226,10 +232,14 @@ class ForexExecutor:
     order will really carry or the position's true risk drifts from the
     configured percentage.
     """
-    if not self._config.volume_decision_enabled:
+    # Sizing mode, highest priority first: USE_ACCOUNT_EQUITY (env) →
+    # signal.use_equity_sizing → VOLUME_DECISION_ENABLED (legacy).
+    equity_sizing = self._config.resolve_equity_sizing(signal.use_equity_sizing)
+    if self._config.uses_payload_quantity(signal.use_equity_sizing):
       volume = self.convert_quantity_to_lots(signal.symbol, signal.quantity)
       logger.info(
-        f"[open_position] Payload quantity mode | qty={signal.quantity} → lot={volume}"
+        f"[open_position] Payload quantity mode (equity_sizing={equity_sizing}) "
+        f"| qty={signal.quantity} → lot={volume}"
       )
       return volume
 
@@ -258,18 +268,16 @@ class ForexExecutor:
     scale_factor = signal.scale_quantity_factor()
     risk *= scale_factor
 
-    capital = self._resolve_capital()
+    capital = self._resolve_capital(equity_sizing)
     if capital is None:
       logger.error(
-        "[open_position] USE_ACCOUNT_EQUITY set but account equity unavailable — using min lot."
+        "[open_position] Equity sizing requested but account equity unavailable — using min lot."
       )
       return 0.01
 
     volume = self._lot_sizer.calculate_lot_size(spec, price, sl, risk, capital)
     capital_src = (
-      "account_equity"
-      if self._config.use_account_equity
-      else f"capital={self._config.capital}"
+      "account_equity" if equity_sizing else f"capital={self._config.capital}"
     )
     # Surface the widened stop explicitly: the lot below is smaller than the
     # signal's own SL would have produced, and that difference is what keeps the

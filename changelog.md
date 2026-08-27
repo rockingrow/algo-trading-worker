@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - Unreleased
+
+### Added
+
+- **Per-position equity sizing (`position.use_equity_sizing`).** The signal payload may now carry a `use_equity_sizing` boolean, so the broker can decide *per position* how the entry is sized instead of the worker deciding once for every trade it will ever take. `true` means "size this entry from the account's **real** equity" — the payload's `quantity` is ignored and the volume is computed from the resolved risk percent against live equity (`ForexExecutor._resolve_capital` / `CryptoExecutor._risk_capital`), which is the only base that tracks an account that has grown or drawn down since `CAPITAL` was written into `.env`. `false` means "use `quantity` as sent". The flag is absent-safe: a payload without it behaves exactly as before. When equity sizing is on but the account equity cannot be read, the entry still falls back to the broker's **minimum** lot/qty rather than silently sizing off the wrong base — the pre-existing guard, now reached through the per-signal decision.
+
+### Changed
+
+- **`USE_ACCOUNT_EQUITY` is now tri-state and outranks the payload.** It was a plain bool defaulting to `false`; it is now `Optional[bool]` defaulting to **unset**, and it is the highest-priority input to entry sizing:
+  - `true` → every entry is sized from live account equity, ignoring `quantity`;
+  - `false` → every entry is sized from `position.quantity`, ignoring `use_equity_sizing`;
+  - unset (the line commented out of `.env`) → the signal's own `position.use_equity_sizing` decides;
+  - neither set → the legacy behaviour is untouched: `VOLUME_DECISION_ENABLED` decides, and risk sizing uses the fixed `CAPITAL`.
+
+  That last rule is what keeps existing deployments byte-identical, and it is why the default had to become `None` rather than stay `False`: with the new semantics an explicit `false` *means* payload-quantity, so leaving it as the default would have flipped every worker that never set the variable out of risk sizing. An operator who wants the old explicit "risk-size off `CAPITAL`, not equity" simply leaves it unset. The resolution lives in one place — `ExecutionConfig.resolve_equity_sizing` (the tri-state decision) and `ExecutionConfig.uses_payload_quantity` (that decision folded with `VOLUME_DECISION_ENABLED`) — so both executors, the cycle event's `auto_volume`, and the notification's risk/gear line read the same answer and cannot drift apart.
+- **Notifications follow the resolved mode, not the env var.** The startup/settings banner renders `USE_ACCOUNT_EQUITY: PER SIGNAL` when the variable is unset (`ENABLED`/`DISABLED` when set), and the ⚙ gear on an `Order Filled` volume — which marks a volume the worker sized itself — is now decided per signal, so an equity-sized entry under `VOLUME_DECISION_ENABLED=false` is marked as self-sized and a payload-quantity entry under `VOLUME_DECISION_ENABLED=true` is not.
+- CRYPTO's "Missing quantity" guard now fires whenever the resolved mode is payload-quantity, rather than only when `VOLUME_DECISION_ENABLED` is off — a signal that asks for `quantity` sizing and carries no quantity fails cleanly instead of sending a zero-size order.
+
 ## [1.2.2] - 2026-08-21
 
 ### Fixed
