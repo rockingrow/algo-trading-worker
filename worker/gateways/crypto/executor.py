@@ -35,6 +35,7 @@ from worker.gateways.crypto.base import (
   ExchangePosition,
   linear_realized_pnl,
 )
+from worker.gateways.position_matching import filter_by_ticket
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
@@ -560,9 +561,21 @@ class CryptoExecutor:
     reason: str = "CLOSE",
     strategy: Optional[str] = None,
     fallback_close_price: Optional[float] = None,
+    position_ticket: Optional[Any] = None,
   ) -> TradeResult:
+    """Close the symbol's position(s) with reduce-only market orders.
+
+    ``position_ticket`` is accepted for the shared executor contract and
+    narrows the close to that one position when given. A CEX nets every order
+    on a symbol into a single position, so there is never more than one to
+    choose from here — CRYPTO has no multi-positions-per-symbol toggle — but
+    honouring the argument keeps the contract honest rather than silently
+    closing something the caller did not name.
+    """
     resolved = self.get_symbol(symbol)
-    positions = self.get_open_positions(symbol, strategy=strategy)
+    positions = filter_by_ticket(
+      self.get_open_positions(symbol, strategy=strategy), position_ticket
+    )
     if not positions:
       return TradeResult.fail("No Positions Found")
 

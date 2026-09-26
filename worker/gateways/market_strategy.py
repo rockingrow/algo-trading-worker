@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
 from worker.gateways.config import ExecutionConfig
+from worker.gateways.position_matching import filter_by_ticket
 from worker.interfaces.executor_protocol import TradeExecutorProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
@@ -74,16 +75,47 @@ class BaseMarketStrategy(ABC):
   # ── Group 2: TP1 ─────────────────────────────────────────────────────── #
 
   @abstractmethod
-  def handle_tp1(self, signal: SignalSchema) -> TradeResult:
-    """Partial close, then optionally move SL to breakeven (see config)."""
+  def handle_tp1(
+    self, signal: SignalSchema, position_ticket: Optional[Any] = None
+  ) -> TradeResult:
+    """Partial close, then optionally move SL to breakeven (see config).
+
+    *position_ticket* is the broker reference of the position this exit belongs
+    to, resolved by ``SignalHandler`` from the tracked row for the signal's
+    composite key (symbol + strategy + signal_uxid). It is what keeps a TP1
+    from hitting a sibling position when one strategy holds several on the same
+    symbol; ``None`` means "the strategy's position on this symbol", the
+    behaviour when only one can exist.
+    """
 
   # ── Group 3: Full exits ───────────────────────────────────────────────── #
 
   @abstractmethod
-  def handle_full_close(self, signal: SignalSchema) -> TradeResult:
-    """Close all remaining volume. ``signal.action`` carries the exit reason."""
+  def handle_full_close(
+    self, signal: SignalSchema, position_ticket: Optional[Any] = None
+  ) -> TradeResult:
+    """Close all remaining volume. ``signal.action`` carries the exit reason.
+
+    *position_ticket* scopes the close to one position — see
+    :meth:`handle_tp1`. ``None`` closes every position the strategy holds on
+    the symbol, which is the same thing whenever only one can exist.
+    """
 
   # ── Capabilities ──────────────────────────────────────────────────────── #
+
+  @property
+  def allows_multi_positions_per_symbol(self) -> bool:
+    """Whether ONE strategy may hold several positions on the same symbol.
+
+    The positions are told apart by ``signal_uxid``, the third component of the
+    composite position key (symbol + strategy + signal_uxid). Concrete with a
+    conservative ``False`` default, like the sibling capability below: a market
+    opts in only when its broker really keeps the tickets, SL/TP and closes of
+    two positions on one symbol apart. ``SignalHandler`` reads it to decide
+    whether a second signal on a held symbol opens its own position or replaces
+    the existing one.
+    """
+    return False
 
   @property
   def allows_multi_strategy_per_symbol(self) -> bool:
@@ -101,21 +133,32 @@ class BaseMarketStrategy(ABC):
 
   @abstractmethod
   def get_open_positions(
-    self, symbol: str, strategy: Optional[str] = None
+    self,
+    symbol: str,
+    strategy: Optional[str] = None,
+    position_ticket: Optional[Any] = None,
   ) -> List[Any]:
     """Return open positions for *symbol*.
 
     When *strategy* is given, only positions belonging to that strategy are
-    returned, so strategies sharing a symbol stay isolated.
+    returned, so strategies sharing a symbol stay isolated. When
+    *position_ticket* is given, only the position carrying that broker
+    reference is returned, so signals sharing a (strategy, symbol) stay
+    isolated too.
     """
 
   @abstractmethod
   def close_all_positions(
-    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+    self,
+    symbol: str,
+    reason: str = "CLOSE",
+    strategy: Optional[str] = None,
+    position_ticket: Optional[Any] = None,
   ) -> TradeResult:
     """Force-close positions for *symbol*.
 
-    When *strategy* is given, only that strategy's positions are closed.
+    When *strategy* is given, only that strategy's positions are closed; when
+    *position_ticket* is given, only that one position is.
     """
 
 
@@ -209,13 +252,18 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     )
     return close_volume
 
-  def handle_tp1(self, signal: SignalSchema) -> TradeResult:
+  def handle_tp1(
+    self, signal: SignalSchema, position_ticket: Optional[Any] = None
+  ) -> TradeResult:
     """Partial close at TP1, then optionally move SL to entry (breakeven).
 
-    See _resolve_tp1_params for tp1_percent/move_sl_to_be resolution rules.
+    See _resolve_tp1_params for tp1_percent/move_sl_to_be resolution rules, and
+    the base class for what *position_ticket* scopes.
     """
     symbol = signal.symbol
-    positions = self._executor.get_open_positions(symbol, strategy=signal.strategy)
+    positions = self.get_open_positions(
+      symbol, strategy=signal.strategy, position_ticket=position_ticket
+    )
 
     if not positions:
       return TradeResult.fail("No open position — likely SL already triggered.")
@@ -300,12 +348,19 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 
   # ── Group 3 ──────────────────────────────────────────────────────────── #
 
-  def handle_full_close(self, signal: SignalSchema) -> TradeResult:
-    """Full close using actual broker volume; reason derived from signal.action."""
+  def handle_full_close(
+    self, signal: SignalSchema, position_ticket: Optional[Any] = None
+  ) -> TradeResult:
+    """Full close using actual broker volume; reason derived from signal.action.
+
+    *position_ticket* scopes the close to the one position the signal owns (see
+    the base class).
+    """
     return self._executor.close_all_positions(
       signal.symbol,
       reason=signal.action.value,
       strategy=signal.strategy,
+      position_ticket=position_ticket,
       # Value the close at the signal's price if the exchange returns no fill
       # price (Binance avgPrice=0) — matches the notification's closed_price.
       fallback_close_price=signal.price,
@@ -314,14 +369,24 @@ class ExecutorBackedMarket(BaseMarketStrategy):
   # ── Helpers ──────────────────────────────────────────────────────────── #
 
   def get_open_positions(
-    self, symbol: str, strategy: Optional[str] = None
+    self,
+    symbol: str,
+    strategy: Optional[str] = None,
+    position_ticket: Optional[Any] = None,
   ) -> List[Any]:
-    return self._executor.get_open_positions(symbol, strategy=strategy)
+    positions = self._executor.get_open_positions(symbol, strategy=strategy)
+    return filter_by_ticket(positions, position_ticket)
 
   def close_all_positions(
-    self, symbol: str, reason: str = "CLOSE", strategy: Optional[str] = None
+    self,
+    symbol: str,
+    reason: str = "CLOSE",
+    strategy: Optional[str] = None,
+    position_ticket: Optional[Any] = None,
   ) -> TradeResult:
-    return self._executor.close_all_positions(symbol, reason=reason, strategy=strategy)
+    return self._executor.close_all_positions(
+      symbol, reason=reason, strategy=strategy, position_ticket=position_ticket
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -331,6 +396,19 @@ class ExecutorBackedMarket(BaseMarketStrategy):
 
 class ForexMarket(ExecutorBackedMarket):
   """FOREX / CFD market via a trading platform (backed by ``ForexExecutor``)."""
+
+  @property
+  def allows_multi_positions_per_symbol(self) -> bool:
+    """FOREX can also hold several positions of ONE strategy on one symbol.
+
+    Each entry is its own platform ticket with its own SL/TP, so the positions
+    two different signals opened stay independent — provided the account is in
+    hedging mode, which ``FOREX_HEDGE_MODE`` makes the worker verify at connect
+    (a netting account merges them into one net position instead).
+    ``FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`` turns it on; every exit is then
+    routed to the ticket tracked for the signal's own ``signal_uxid``.
+    """
+    return self._config.allow_multi_positions_per_symbol
 
   @property
   def allows_multi_strategy_per_symbol(self) -> bool:

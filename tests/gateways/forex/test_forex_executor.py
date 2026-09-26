@@ -541,3 +541,45 @@ def test_payload_quantity_entries_are_margin_checked_too(config):
   )
   assert res["success"] is False
   assert gw.placed == []
+
+
+# ── Ticket-scoped full close (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL) ────── #
+#
+# When one strategy holds several positions on a symbol — one per signal_uxid —
+# every exit carries the ticket the signal's own DB row tracks. close_all must
+# honour it, or a TP2 on one signal would flatten its siblings.
+
+
+def test_close_all_honours_the_requested_ticket(config):
+  """Two positions of ONE strategy; only the named ticket is closed."""
+  pos_a = make_platform_position(ticket=301, magic=111, volume=1.0)
+  pos_b = make_platform_position(ticket=302, magic=111, volume=2.0)
+  ex = _multi_strategy_executor(config, positions=[pos_a, pos_b])
+
+  res = ex.close_all_positions("XAUUSD", strategy="strat-A", position_ticket="301")
+
+  assert res["success"] is True
+  assert [c["position"].ticket for c in ex._gateway.closed] == [301]
+
+
+def test_close_all_without_a_ticket_still_closes_everything(config):
+  """Unchanged default: no ticket means the strategy's whole book on the symbol."""
+  pos_a = make_platform_position(ticket=301, magic=111, volume=1.0)
+  pos_b = make_platform_position(ticket=302, magic=111, volume=2.0)
+  ex = _multi_strategy_executor(config, positions=[pos_a, pos_b])
+
+  res = ex.close_all_positions("XAUUSD", strategy="strat-A")
+
+  assert res["success"] is True
+  assert sorted(c["position"].ticket for c in ex._gateway.closed) == [301, 302]
+
+
+def test_close_all_fails_cleanly_when_the_ticket_is_gone(config):
+  """Better a clean failure the caller reports than closing the wrong position."""
+  pos_a = make_platform_position(ticket=301, magic=111, volume=1.0)
+  ex = _multi_strategy_executor(config, positions=[pos_a])
+
+  res = ex.close_all_positions("XAUUSD", strategy="strat-A", position_ticket="999")
+
+  assert res["success"] is False
+  assert ex._gateway.closed == []

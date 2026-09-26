@@ -29,6 +29,7 @@ from worker.gateways.forex.base import (
 )
 from worker.gateways.forex.lot_sizing import LotSizer
 from worker.gateways.forex.stop_validator import StopValidator
+from worker.gateways.position_matching import filter_by_ticket
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
@@ -455,16 +456,28 @@ class ForexExecutor:
     reason: str = "CLOSE",
     strategy: Optional[str] = None,
     fallback_close_price: Optional[float] = None,
+    position_ticket: Optional[Any] = None,
   ) -> TradeResult:
     """Close ALL open positions for the symbol at actual broker volume.
+
+    ``position_ticket`` narrows the close to that one position — what an exit
+    carries when one strategy holds several positions on the symbol
+    (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL) and only the signal's own must be
+    closed. ``None`` keeps the original close-everything behaviour.
 
     ``fallback_close_price`` is part of the shared executor contract but unused
     here — MT5 reads each close's realized PnL from its own deal, so it never
     needs to value the close at the signal's price (see ``partial_close_position``).
     """
-    positions = self.get_open_positions(symbol, strategy=strategy)
+    positions = filter_by_ticket(
+      self.get_open_positions(symbol, strategy=strategy), position_ticket
+    )
     if not positions:
-      logger.warning(f"[close_all] No open positions found for {symbol}")
+      logger.warning(
+        "[close_all] No open positions found for %s (ticket=%s)",
+        symbol,
+        position_ticket,
+      )
       return TradeResult.fail("No Positions Found")
 
     success_count = 0

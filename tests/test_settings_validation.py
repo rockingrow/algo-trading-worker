@@ -32,6 +32,8 @@ _LEGACY_FLAT_KEYS = {
   "mt5_path",
   "mt5_name",
   "forex_allow_multi_strategy_per_symbol",
+  "forex_allow_multi_positions_per_symbol",
+  "forex_hedge_mode",
   "crypto_exchange",
   "crypto_quote_asset",
   "crypto_api_key",
@@ -210,3 +212,41 @@ def test_duplicate_magics_tolerated_when_multi_strategy_disabled(monkeypatch):
   monkeypatch.setenv("FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL", "false")
   monkeypatch.setenv("STRATEGY_MAGIC_MAP", '{"MT5_GOLD": 111, "MT5_GOLD_SHORT": 111}')
   assert Settings(_env_file=None).forex.allow_multi_strategy_per_symbol is False
+
+
+# ── Multi-positions-per-symbol requires a verified hedging account ───────── #
+
+
+def test_multi_positions_rejected_without_hedge_mode(monkeypatch):
+  """Several tickets on one symbol only stay separate on a hedging account, and
+  FOREX_HEDGE_MODE is what makes the worker verify that at connect."""
+  _forex_env(monkeypatch)
+  monkeypatch.setenv("FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL", "true")
+  monkeypatch.setenv("FOREX_HEDGE_MODE", "false")
+  with pytest.raises(ValidationError, match="FOREX_HEDGE_MODE"):
+    Settings(_env_file=None)
+
+
+def test_multi_positions_accepted_with_hedge_mode(monkeypatch):
+  _forex_env(monkeypatch)
+  monkeypatch.setenv("FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL", "true")
+  monkeypatch.setenv("FOREX_HEDGE_MODE", "true")
+  s = Settings(_env_file=None)
+  assert s.forex.allow_multi_positions_per_symbol is True
+  assert s.forex.hedge_mode is True
+
+
+def test_hedge_mode_alone_is_allowed(monkeypatch):
+  """Asking for a verified hedging account does not require the new mode."""
+  _forex_env(monkeypatch)
+  monkeypatch.setenv("FOREX_HEDGE_MODE", "true")
+  s = Settings(_env_file=None)
+  assert s.forex.hedge_mode is True
+  assert s.forex.allow_multi_positions_per_symbol is False
+
+
+def test_multi_positions_defaults_to_off(monkeypatch):
+  _forex_env(monkeypatch)
+  s = Settings(_env_file=None)
+  assert s.forex.allow_multi_positions_per_symbol is False
+  assert s.forex.hedge_mode is False

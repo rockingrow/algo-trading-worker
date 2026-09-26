@@ -580,26 +580,39 @@ class BaseSignalProcessor(ABC):
        While any order is live on the symbol no new entry is placed, unless the
        market allows several strategies per symbol
        (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL), in which case only a position
-       already held by *this* strategy blocks.
-    2. **MAX_OPEN_ORDERS** — the worker's exposure cap.
+       already held by *this* strategy blocks, and/or several signals per
+       symbol (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL), in which case only a
+       position already held by *this* ``signal_uxid`` blocks.
+    2. **MAX_OPEN_ORDERS** — the worker's exposure cap. Account-wide whatever
+       those toggles allow: it counts every active position, so concurrent
+       signals on one symbol consume the same slots as signals spread across
+       symbols.
     3. **Staleness** — needs a live quote from the broker (a tick read / REST
        round-trip), so it runs last: no reason to pay for one on an entry the
        two DB-only guards above already rejected.
     """
+    market = getattr(self.handler, "strategy", None)
     allow_multi_strategy = bool(
-      getattr(
-        getattr(self.handler, "strategy", None),
-        "allows_multi_strategy_per_symbol",
-        False,
-      )
+      getattr(market, "allows_multi_strategy_per_symbol", False)
+    )
+    allow_multi_positions = bool(
+      getattr(market, "allows_multi_positions_per_symbol", False)
     )
     reason = guard.symbol_open_rejection(
-      self.ctx.db_service, signal, allow_multi_strategy=allow_multi_strategy
+      self.ctx.db_service,
+      signal,
+      allow_multi_strategy=allow_multi_strategy,
+      allow_multi_positions=allow_multi_positions,
     )
     if reason is not None:
       return reason
 
-    reason = guard.max_open_orders_rejection(self.ctx.db_service, self.settings, signal)
+    reason = guard.max_open_orders_rejection(
+      self.ctx.db_service,
+      self.settings,
+      signal,
+      allow_multi_positions=allow_multi_positions,
+    )
     if reason is not None:
       return reason
 

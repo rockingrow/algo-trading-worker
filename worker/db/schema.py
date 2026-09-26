@@ -168,10 +168,29 @@ _NOTIFICATION_CYCLE_CHATS_PENDING_INDEX = """
 # At most one active (OPENED/TP1) position per (strategy, symbol). Shared by both
 # markets — a crypto exchange in one-way mode also holds a single net position
 # per symbol, so the same invariant applies.
+# At most one active position per (strategy, symbol, signal_uxid) — the
+# composite key a tracked position is addressed by. ``signal_uxid`` joined the
+# key when FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL made several signals of one
+# strategy able to hold the same symbol at once; ``COALESCE(signal_uxid, '')``
+# folds every uxid-less row onto one key so a payload that carries no uxid
+# still gets the original one-active-per-(strategy, symbol) guarantee (a plain
+# column would let NULLs stack, since SQLite treats NULLs as distinct in a
+# UNIQUE index).
+#
+# With the toggle OFF nothing changes in practice: the signal handler still
+# replaces this strategy's existing position on the symbol whatever uxid it
+# carries, so a second active row never reaches the index.
 _ONE_ACTIVE_INDEX = """
-    CREATE UNIQUE INDEX IF NOT EXISTS uidx_positions_one_active_per_strategy_symbol
-        ON positions (strategy, symbol)
+    CREATE UNIQUE INDEX IF NOT EXISTS uidx_positions_one_active_per_signal
+        ON positions (strategy, symbol, COALESCE(signal_uxid, ''))
         WHERE status = 'OPENED' OR status = 'TP1'
+"""
+
+# The pre-signal_uxid form of the index above. It is dropped before the new one
+# is created so an existing database upgrades in place — left behind it would
+# keep rejecting the second signal on a symbol that the new key allows.
+_DROP_LEGACY_ONE_ACTIVE_INDEX = """
+    DROP INDEX IF EXISTS uidx_positions_one_active_per_strategy_symbol
 """
 
 # Fast dedup lookup for the ACK replay: the base processor's replay handler
@@ -222,6 +241,7 @@ def _create_tables(conn) -> None:
   conn.execute(_NOTIFICATION_CYCLE_CHATS_KEY_INDEX)
   conn.execute(_NOTIFICATION_CYCLE_CHATS_PENDING_INDEX)
   _ensure_retrofit_columns(conn)
+  conn.execute(_DROP_LEGACY_ONE_ACTIVE_INDEX)
   conn.execute(_ONE_ACTIVE_INDEX)
   conn.execute(_POSITION_LOGS_SIGNAL_ID_INDEX)
 

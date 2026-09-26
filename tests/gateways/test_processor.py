@@ -364,12 +364,13 @@ def test_failed_result_sends_failure_notification():
 # ── MAX_OPEN_ORDERS exposure guard ─────────────────────────────────────────── #
 
 
-def _open_row(strategy, symbol):
+def _open_row(strategy, symbol, signal_uxid=None):
   return {
     "strategy": strategy,
     "symbol": symbol,
     "status": "OPENED",
-    "ref_source_id": f"{strategy}:{symbol}",
+    "signal_uxid": signal_uxid,
+    "ref_source_id": f"{strategy}:{symbol}:{signal_uxid}",
   }
 
 
@@ -2197,3 +2198,133 @@ def test_a_force_close_carries_its_own_pnl():
   )
   proc._process_signal(_uxid_signal())
   assert proc.cycle.recorded[0][3].profit == -12.0
+
+
+# ── FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL (symbol+strategy+signal_uxid) ───── #
+#
+# With the toggle on, a position is addressed by all three key components, so a
+# second *signal* may enter a symbol this same strategy already holds. The
+# exposure cap is untouched: it stays account-wide.
+
+
+def _multi_positions_market():
+  return SimpleNamespace(
+    allows_multi_strategy_per_symbol=False,
+    allows_multi_positions_per_symbol=True,
+  )
+
+
+def test_second_signal_may_enter_a_symbol_the_same_strategy_holds():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True, "ticket": 1})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-B",
+    ).model_dump_json(),
+  )
+
+  assert len(seen) == 1
+  assert proc.db.rejected == []
+
+
+def test_same_signal_uxid_still_blocked_on_a_symbol_it_already_holds():
+  """The toggle separates *signals*, not re-entries of one signal."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-A",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "uxid-A" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_without_a_uxid_is_still_blocked_when_multi_positions_on():
+  """Nothing tells it apart from the open rows, so the strict rule applies."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-1"
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+
+
+def test_max_open_orders_counts_concurrent_signals_on_one_symbol():
+  """MAX_OPEN_ORDERS=5 caps the ACCOUNT: five signals on one symbol+strategy
+  fill the same five slots as five signals on five symbols."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 5}
+  proc.db.open_positions = [
+    _open_row("strat-1", "XAUUSD", signal_uxid=f"uxid-{i}") for i in range(5)
+  ]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-6",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert "Max open orders reached (5/5)" in proc.db.rejected[0]["comment"]
+
+
+def test_max_open_orders_counts_a_mixed_book_of_symbols_and_strategies():
+  """The same cap covers five positions spread across strategies and symbols."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 5}
+  proc.db.open_positions = [
+    _open_row("strat-1", "XAUUSD", signal_uxid="uxid-1"),
+    _open_row("strat-1", "EURUSD", signal_uxid="uxid-2"),
+    _open_row("strat-2", "XAUUSD", signal_uxid="uxid-3"),
+    _open_row("strat-2", "GBPUSD", signal_uxid="uxid-4"),
+    _open_row("strat-3", "USDJPY", signal_uxid="uxid-5"),
+  ]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = SimpleNamespace(
+    allows_multi_strategy_per_symbol=True,
+    allows_multi_positions_per_symbol=True,
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="AUDUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-6",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert "Max open orders reached (5/5)" in proc.db.rejected[0]["comment"]

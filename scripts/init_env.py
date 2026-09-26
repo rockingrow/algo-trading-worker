@@ -47,6 +47,8 @@ FOREX_KEYS = (
   "MT5_PATH",
   "MT5_NAME",
   "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL",
+  "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL",
+  "FOREX_HEDGE_MODE",
 )
 CRYPTO_KEYS = (
   "CRYPTO_EXCHANGE",
@@ -84,6 +86,13 @@ DESCRIPTIONS = {
   "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL": (
     "Let several strategies hold the same symbol (needs a HEDGING account "
     "+ STRATEGY_MAGIC_MAP)"
+  ),
+  "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL": (
+    "Let ONE strategy hold several positions per symbol, one per signal_uxid "
+    "(needs FOREX_HEDGE_MODE; MAX_OPEN_ORDERS still caps the account)"
+  ),
+  "FOREX_HEDGE_MODE": (
+    "Require a HEDGING MT5 account — a netting account blocks worker startup"
   ),
   "CRYPTO_EXCHANGE": "Crypto exchange gateway to use (currently BINANCE)",
   "CRYPTO_QUOTE_ASSET": "Quote asset appended to bare symbols (BTCUSD -> BTCUSDT)",

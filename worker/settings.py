@@ -181,6 +181,28 @@ class ForexSettings(BaseSettings):
     "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL",
     "forex_allow_multi_strategy_per_symbol",
   )
+  # Several *signals* of the same strategy living on one symbol at the same
+  # time. Each incoming signal carries its own ``signal_uxid``, which becomes
+  # the third component of the position key (symbol + strategy + signal_uxid),
+  # so a second signal opens its own ticket instead of replacing the first
+  # one's. The exposure cap (MAX_OPEN_ORDERS) is unchanged: it still counts
+  # every active position on the account, whatever strategy, symbol or signal
+  # holds it, so five concurrent signals on one symbol fill the same five slots
+  # as five signals on five symbols.
+  # Default False keeps the one-position-per-(strategy, symbol) behaviour.
+  # Requires a hedging account (FOREX_HEDGE_MODE) — a netting account merges
+  # every ticket on a symbol into one net position and the isolation is lost.
+  allow_multi_positions_per_symbol: bool = _opt(
+    False,
+    "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL",
+    "forex_allow_multi_positions_per_symbol",
+  )
+  # Declares that this account is expected to be in hedging mode. Checked once,
+  # at broker connect: if the account reports anything else (or does not report
+  # a margin mode at all), the worker refuses to start rather than trade with
+  # the isolation its position key assumes. See
+  # ``ForexSignalProcessor._enforce_hedge_mode``.
+  hedge_mode: bool = _opt(False, "FOREX_HEDGE_MODE", "forex_hedge_mode")
 
 
 class CryptoSettings(BaseSettings):
@@ -538,6 +560,29 @@ class Settings(BaseSettings):
       raise ValueError(
         "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true requires a unique magic "
         f"number per strategy in STRATEGY_MAGIC_MAP; duplicates: {'; '.join(collisions)}"
+      )
+    return self
+
+  @model_validator(mode="after")
+  def _validate_multi_positions_needs_hedging(self):
+    """Reject FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL without FOREX_HEDGE_MODE.
+
+    Several tickets of one strategy on one symbol only stay separate on a
+    hedging account; on a netting account the broker merges them into a single
+    net position, so the per-``signal_uxid`` rows the worker tracks would all
+    point at the same merged volume and every exit but the first would fail.
+    FOREX_HEDGE_MODE is what makes the worker verify the account at connect, so
+    requiring it here turns a silent mis-execution into a startup error.
+    """
+    if not (
+      self.market_type == MarketTypeEnum.FOREX
+      and self.forex.allow_multi_positions_per_symbol
+    ):
+      return self
+    if not self.forex.hedge_mode:
+      raise ValueError(
+        "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL=true requires FOREX_HEDGE_MODE=true: "
+        "multiple positions on one symbol are only isolated on a hedging account."
       )
     return self
 

@@ -16,6 +16,7 @@ class FakeStrategy(BaseMarketStrategy):
     entry_ok=True,
     cleanup_ok=True,
     multi_strategy=False,
+    multi_positions=False,
     cleanup_profit=None,
   ):
     self.calls = []
@@ -23,6 +24,7 @@ class FakeStrategy(BaseMarketStrategy):
     self._entry_ok = entry_ok
     self._cleanup_ok = cleanup_ok
     self._multi_strategy = multi_strategy
+    self._multi_positions = multi_positions
     self._cleanup_profit = cleanup_profit
 
   @property
@@ -39,20 +41,37 @@ class FakeStrategy(BaseMarketStrategy):
       "price": 2,
     }
 
-  def handle_tp1(self, signal):
-    self.calls.append("tp1")
+  @property
+  def allows_multi_positions_per_symbol(self):
+    return self._multi_positions
+
+  def handle_tp1(self, signal, position_ticket=None):
+    self.calls.append(f"tp1:{position_ticket}" if position_ticket else "tp1")
     return {"success": True, "retcode": 0, "volume": 1, "price": 2}
 
-  def handle_full_close(self, signal):
-    self.calls.append("full_close")
+  def handle_full_close(self, signal, position_ticket=None):
+    self.calls.append(
+      f"full_close:{position_ticket}" if position_ticket else "full_close"
+    )
     return {"success": True, "retcode": 0, "volume": 1, "price": 2}
 
-  def get_open_positions(self, symbol, strategy=None):
+  def get_open_positions(self, symbol, strategy=None, position_ticket=None):
     self.calls.append(f"get_open:{strategy}")
-    return list(self._open)
+    positions = list(self._open)
+    if position_ticket is not None:
+      positions = [
+        p for p in positions if str(getattr(p, "ticket", None)) == str(position_ticket)
+      ]
+    return positions
 
-  def close_all_positions(self, symbol, reason="CLOSE", strategy=None):
-    self.calls.append(f"close_all:{reason}:{strategy}")
+  def close_all_positions(
+    self, symbol, reason="CLOSE", strategy=None, position_ticket=None
+  ):
+    self.calls.append(
+      f"close_all:{reason}:{strategy}:{position_ticket}"
+      if position_ticket
+      else f"close_all:{reason}:{strategy}"
+    )
     return {
       "success": self._cleanup_ok,
       "retcode": 0,
@@ -67,8 +86,11 @@ class FakeStore:
     self._flat = flat_positions if flat_positions is not None else []
     self.status_updates = []
 
-  def get_open_positions_by_strategy(self, strategy, symbol):
-    return list(self._positions)
+  def get_open_positions_by_strategy(self, strategy, symbol, signal_uxid=None):
+    rows = list(self._positions)
+    if signal_uxid is not None:
+      rows = [r for r in rows if r.get("signal_uxid") == signal_uxid]
+    return rows
 
   def get_open_positions_for_flat(self, strategy=None, symbol=None):
     return list(self._flat)
@@ -332,3 +354,109 @@ def test_orphaned_db_row_reports_no_pnl():
   res = SignalHandler(strat, store).handle(make_signal(SignalActionEnum.LONG))
 
   assert res["forced_closed"][0]["profit"] is None
+
+
+# ── Multiple positions per symbol (symbol + strategy + signal_uxid) ───────── #
+#
+# With FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL the market reports
+# allows_multi_positions_per_symbol, and every step the handler takes is scoped
+# to the ticket tracked for the signal's own signal_uxid.
+
+
+def _row(ref_source_id, signal_uxid, status="OPENED"):
+  return {
+    "ref_source_id": ref_source_id,
+    "ref_id": ref_source_id,
+    "status": status,
+    "signal_uxid": signal_uxid,
+  }
+
+
+def test_exit_targets_the_ticket_tracked_for_this_signal_uxid():
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11), SimpleNamespace(ticket=22)],
+    multi_positions=True,
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A"), _row("22", "uxid-B")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.TP2, signal_uxid="uxid-B"))
+
+  assert res["success"] is True
+  # The sibling on ticket 11 is never named.
+  assert "full_close:22" in strat.calls
+  assert res["source_ticket"] == "22"
+
+
+def test_exit_for_an_unknown_uxid_does_not_touch_a_sibling_position():
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11)], multi_positions=True
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.SL, signal_uxid="uxid-ZZZ"))
+
+  assert res["success"] is False
+  assert not any(c.startswith("full_close") for c in strat.calls)
+
+
+def test_entry_leaves_a_sibling_signals_position_running():
+  """A new signal on a symbol the strategy already holds opens alongside it —
+  the stale-cleanup must not flatten the position another signal owns."""
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11)], multi_positions=True
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.LONG, signal_uxid="uxid-B"))
+
+  assert res["success"] is True
+  assert not any(c.startswith("close_all") for c in strat.calls)
+  assert store.status_updates == []
+  assert "forced_closed" not in res
+
+
+def test_entry_still_replaces_the_position_of_the_same_signal_uxid():
+  """Re-sending one signal replaces its own position, scoped to its ticket."""
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11), SimpleNamespace(ticket=22)],
+    multi_positions=True,
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A"), _row("22", "uxid-B")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.LONG, signal_uxid="uxid-A"))
+
+  assert res["success"] is True
+  assert "close_all:STALE_CLEANUP:strat-1:11" in strat.calls
+  # Only uxid-A's row was reconciled; uxid-B's is untouched.
+  assert [u["ref_source_id"] for u in store.status_updates] == ["11"]
+
+
+def test_flat_closes_only_the_position_of_the_signal_that_sent_it():
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11), SimpleNamespace(ticket=22)],
+    multi_positions=True,
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A"), _row("22", "uxid-B")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.FLAT, signal_uxid="uxid-A"))
+
+  assert res["success"] is True
+  assert "close_all:FLAT:strat-1:11" in strat.calls
+  assert res["source_ticket"] == "11"
+
+
+def test_uxid_is_ignored_when_the_market_does_not_allow_multi_positions():
+  """The toggle off keeps the (strategy, symbol) key, uxid or no uxid."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=11)])
+  store = FakeStore(positions=[_row("11", "uxid-A")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.TP2, signal_uxid="uxid-B"))
+
+  assert res["success"] is True
+  assert "full_close" in strat.calls

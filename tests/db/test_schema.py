@@ -20,11 +20,18 @@ def _make_db() -> sqlite3.Connection:
 
 
 def _insert(
-  conn, *, ref_source_id, strategy, symbol, status="OPENED", strategy_code=None
+  conn,
+  *,
+  ref_source_id,
+  strategy,
+  symbol,
+  status="OPENED",
+  strategy_code=None,
+  signal_uxid=None,
 ):
   conn.execute(
-    "INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, strategy_code) "
-    "VALUES (?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, opened_price, status, strategy_code, signal_uxid) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?)",
     (
       ref_source_id,
       ref_source_id,
@@ -35,6 +42,7 @@ def _insert(
       0.0,
       status,
       strategy_code,
+      signal_uxid,
     ),
   )
   conn.commit()
@@ -210,3 +218,68 @@ def test_missing_columns_are_retrofitted_onto_an_older_database():
   _create_tables(conn)
   for table in ("positions", "position_logs"):
     assert {"signal_id", "signal_uxid"} <= _cols(conn, table)
+
+
+# ── One active position per (strategy, symbol, signal_uxid) ───────────────── #
+
+
+def test_two_signals_may_hold_the_same_strategy_and_symbol():
+  """The composite key gained ``signal_uxid``, so two concurrent signals on one
+  symbol are no longer a unique-index violation."""
+  conn = _make_db()
+  _insert(conn, ref_source_id="1", strategy="s1", symbol="XAUUSD", signal_uxid="A")
+  _insert(conn, ref_source_id="2", strategy="s1", symbol="XAUUSD", signal_uxid="B")
+  assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 2
+
+
+def test_one_active_row_per_signal_uxid():
+  conn = _make_db()
+  _insert(conn, ref_source_id="1", strategy="s1", symbol="XAUUSD", signal_uxid="A")
+  with pytest.raises(sqlite3.IntegrityError):
+    _insert(conn, ref_source_id="2", strategy="s1", symbol="XAUUSD", signal_uxid="A")
+
+
+def test_rows_without_a_uxid_still_collapse_onto_one_key():
+  """COALESCE(signal_uxid, '') — a NULL column would let every uxid-less row
+  stack, losing the original one-active-per-(strategy, symbol) guarantee."""
+  conn = _make_db()
+  _insert(conn, ref_source_id="1", strategy="s1", symbol="XAUUSD")
+  with pytest.raises(sqlite3.IntegrityError):
+    _insert(conn, ref_source_id="2", strategy="s1", symbol="XAUUSD")
+
+
+def test_closed_rows_never_collide():
+  conn = _make_db()
+  _insert(
+    conn,
+    ref_source_id="1",
+    strategy="s1",
+    symbol="XAUUSD",
+    status="TP2",
+    signal_uxid="A",
+  )
+  _insert(conn, ref_source_id="2", strategy="s1", symbol="XAUUSD", signal_uxid="A")
+  assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 2
+
+
+def test_legacy_one_active_index_is_dropped_on_upgrade():
+  """A database created before signal_uxid joined the key carries the old index;
+  left behind it would keep rejecting the second signal on a symbol."""
+  conn = sqlite3.connect(":memory:")
+  conn.row_factory = sqlite3.Row
+  _create_tables(conn)
+  conn.execute(
+    "CREATE UNIQUE INDEX uidx_positions_one_active_per_strategy_symbol "
+    "ON positions (strategy, symbol) WHERE status = 'OPENED' OR status = 'TP1'"
+  )
+  conn.commit()
+
+  _create_tables(conn)  # re-run, as db_init() does on every start
+
+  names = {
+    row["name"] for row in conn.execute("PRAGMA index_list(positions)").fetchall()
+  }
+  assert "uidx_positions_one_active_per_strategy_symbol" not in names
+  assert "uidx_positions_one_active_per_signal" in names
+  _insert(conn, ref_source_id="1", strategy="s1", symbol="XAUUSD", signal_uxid="A")
+  _insert(conn, ref_source_id="2", strategy="s1", symbol="XAUUSD", signal_uxid="B")
