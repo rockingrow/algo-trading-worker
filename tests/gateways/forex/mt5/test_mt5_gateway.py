@@ -450,3 +450,136 @@ def test_close_position_fits_its_comment_too():
     comment="Full Close A_REASON_LONGER_THAN_THE_BUDGET",
   )
   assert len(mt5.sent_requests[0]["comment"]) <= gateway_module._MT5_COMMENT_MAX
+
+
+# ── Busy trade context ──────────────────────────────────────────────────────── #
+
+
+def _place(gw):
+  return gw.place_order(
+    symbol="XAUUSDc",
+    side="LONG",
+    volume=0.05,
+    price=2000.0,
+    sl=1990.0,
+    tp=2050.0,
+    magic=42,
+    comment="strat-1 04",
+  )
+
+
+def test_place_order_retries_a_busy_trade_context_and_fills(monkeypatch):
+  """The terminal serialises trade requests: one that arrives while another is in
+  flight is refused with "Trade context is busy", and the identical request works
+  a moment later. Reporting it as a failed trade loses the entry for nothing."""
+  waits = []
+  monkeypatch.setattr(gateway_module.time, "sleep", waits.append)
+  mt5 = FakeMt5(
+    order_results=[
+      make_order_result(retcode=10027, comment="Trade context is busy"),
+      make_order_result(retcode=10027, comment="Trade context is busy"),
+      make_order_result(retcode=10009, order=777, price=2001.0, volume=0.05),
+    ]
+  )
+
+  result = _place(_gateway(mt5))
+
+  assert result["success"] is True
+  assert result["ticket"] == "777"
+  assert len(mt5.sent_requests) == 3
+  assert waits == [0.3, 0.6]  # slept between attempts, doubling
+
+
+def test_place_order_retries_too_many_requests(monkeypatch):
+  """Retcode 10024 is the server-side sibling of a busy context — transient, and
+  cleared by the same wait."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[
+      make_order_result(retcode=10024, comment="Too many requests"),
+      make_order_result(retcode=10009, order=778),
+    ]
+  )
+
+  assert _place(_gateway(mt5))["success"] is True
+  assert len(mt5.sent_requests) == 2
+
+
+def test_place_order_gives_up_on_a_permanently_busy_context(monkeypatch):
+  """The retry budget is bounded: an entry is a market order, so retrying for
+  seconds would fill it at a price the signal never meant."""
+  waits = []
+  monkeypatch.setattr(gateway_module.time, "sleep", waits.append)
+  mt5 = FakeMt5(
+    order_results=[
+      make_order_result(retcode=10027, comment="Trade context is busy")
+      for _ in range(6)
+    ]
+  )
+
+  result = _place(_gateway(mt5))
+
+  assert result["success"] is False
+  assert result["retcode"] == 10027
+  assert len(mt5.sent_requests) == 4
+  assert len(waits) == 3  # no sleep after the final attempt
+
+
+def test_place_order_does_not_retry_a_real_rejection(monkeypatch):
+  """ "No money" is a verdict, not a collision — retrying it only delays the
+  failure line the operator needs."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(order_results=[make_order_result(retcode=10019, comment="No money")])
+
+  assert _place(_gateway(mt5))["success"] is False
+  assert len(mt5.sent_requests) == 1
+
+
+def test_place_order_retries_when_the_request_was_never_sent(monkeypatch):
+  """A busy context can also refuse the send outright: order_send returns None and
+  the reason is only in last_error()."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[None, make_order_result(retcode=10009, order=779)],
+    error=(-10004, "Trade context is busy"),
+  )
+
+  assert _place(_gateway(mt5))["success"] is True
+  assert len(mt5.sent_requests) == 2
+
+
+def test_close_position_retries_a_busy_trade_context(monkeypatch):
+  """An exit is the request that must not be lost to a collision: the position
+  stays open and only the reconciler would notice."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[
+      make_order_result(retcode=10027, comment="Trade context is busy"),
+      make_order_result(retcode=10009, order=888, volume=0.05),
+    ]
+  )
+  position = make_platform_position(ticket=123, side="LONG", volume=0.05)
+
+  result = _gateway(mt5).close_position(position, comment="TP2")
+
+  assert result["success"] is True
+  assert len(mt5.sent_requests) == 2
+
+
+def test_modify_sl_retries_a_busy_trade_context(monkeypatch):
+  """The SL move follows a TP1 partial on the same signal, so it is the request
+  most likely to collide with one still in flight."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[
+      make_order_result(retcode=10027, comment="Trade context is busy"),
+      make_order_result(retcode=10009, order=999),
+    ]
+  )
+  position = make_platform_position(ticket=123, side="LONG", volume=0.05, tp=2050.0)
+
+  result = _gateway(mt5).modify_sl(position, new_sl=2000.0)
+
+  assert result["success"] is True
+  assert result["new_sl"] == 2000.0
+  assert len(mt5.sent_requests) == 2

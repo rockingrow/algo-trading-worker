@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A busy MT5 trade context no longer costs the request.** The terminal serialises every trade request through a single trade context: one that arrives while another is still in flight is refused outright rather than queued, with `Trade context is busy` (or the server-side retcode **10024** *Too many requests*). The worker treated that refusal like any other rejection, so a scheduling collision — two signals landing together, most often a `TP1` partial and the breakeven SL move that follows it on the same signal, or two symbols filling on the same tick — surfaced as a failed trade: the entry was lost, the exit left the position open for the reconciler to notice, or the SL stayed where it was. Nothing was wrong with the request; the very same one succeeds a moment later.
+
+  `MT5Gateway._send_order_request` now wraps **every** `order_send` in the order path (`place_order`, `close_position`, `modify_sl`) in a bounded retry that sleeps between attempts: 4 attempts, 0.3 s doubling (~2.1 s at worst). The condition is matched on the terminal's own wording as well as on the retcode, because it reaches the worker by two routes — a rejected result carries it in `comment`, while a request the terminal refused to send at all returns `None` and leaves it in `last_error()`. The budget is small on purpose: an entry is a market order priced off the live quote, so retrying for seconds would fill it at a price the signal never meant, and once it is spent the refusal is reported as the failure it now really is. Anything that is *not* a busy context (10019 `No money`, 10014 `Invalid volume`, 10016 `Invalid stops`) is a verdict on the request and is still returned on the first attempt, unretried — retrying a verdict only delays the failure line the operator needs. No new setting; CRYPTO is untouched.
+
 ### Added
 
 - **One strategy can now hold several positions on the same symbol, one per signal (`FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`).** A tracked position was addressed by `(strategy, symbol)` alone, so a second signal on a symbol the strategy already held was not a second trade: the entry guard rejected it outright, and had it got through, `SignalHandler._handle_entry` would have force-closed the running position to make room and the DB's unique index would have refused the insert. A broker that fans several concurrent setups out on one instrument therefore lost every one after the first.
