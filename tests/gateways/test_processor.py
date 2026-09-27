@@ -2328,3 +2328,48 @@ def test_max_open_orders_counts_a_mixed_book_of_symbols_and_strategies():
 
   assert seen == []
   assert "Max open orders reached (5/5)" in proc.db.rejected[0]["comment"]
+
+
+def test_multi_positions_does_not_switch_off_the_cross_strategy_guard():
+  """Regression: the two toggles exempt along different axes. With
+  multi-positions ON and multi-strategy OFF, another strategy's position on the
+  symbol must still block, whatever signal_uxid it carries."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-2",
+      signal_uxid="uxid-B",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "strat-1" in proc.db.rejected[0]["comment"]
+
+
+def test_a_uxid_less_entry_is_still_counted_against_the_cap():
+  """Regression: a signal with no uxid opens an additional ticket rather than
+  replacing the uxid-carrying row, so it must not inherit that row's
+  MAX_OPEN_ORDERS exemption."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 1}
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="EURUSD", strategy="strat-1"
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert "Max open orders reached (1/1)" in proc.db.rejected[0]["comment"]

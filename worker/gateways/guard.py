@@ -63,16 +63,27 @@ def symbol_open_rejection(
   open_positions = db_service.get_open_positions_for_flat(symbol=signal.symbol)
   if not open_positions:
     return None
-  blocking = open_positions
-  if allow_multi_strategy:
-    blocking = [p for p in blocking if p.get("strategy") == signal.strategy]
-  if allow_multi_positions and signal.signal_uxid:
-    blocking = [p for p in blocking if p.get("signal_uxid") == signal.signal_uxid]
+  # Each toggle exempts along its own axis only, so they are applied per
+  # position rather than as two filters over the whole list: a row held by
+  # ANOTHER strategy is governed by ``allow_multi_strategy`` alone, and its
+  # ``signal_uxid`` must never exempt it — otherwise turning on multi-positions
+  # would silently switch off the cross-strategy netting guard the operator
+  # deliberately left off.
+  match_uxid = allow_multi_positions and bool(signal.signal_uxid)
+  blocking = []
+  for position in open_positions:
+    if position.get("strategy") != signal.strategy:
+      if not allow_multi_strategy:
+        blocking.append(position)
+      continue
+    if match_uxid and position.get("signal_uxid") != signal.signal_uxid:
+      continue
+    blocking.append(position)
   if not blocking:
     return None
   holders = sorted({p.get("strategy") for p in blocking if p.get("strategy")})
   held_by = f" (held by {', '.join(holders)})" if holders else ""
-  if allow_multi_positions and signal.signal_uxid:
+  if match_uxid and all(p.get("strategy") == signal.strategy for p in blocking):
     return (
       f"{signal.symbol} already has an open order for signal "
       f"{signal.signal_uxid}{held_by}; entry not placed "
@@ -113,11 +124,13 @@ def max_open_orders_rejection(
     return None
 
   open_positions = db_service.get_open_positions_for_flat()
-  match_uxid = allow_multi_positions and bool(signal.signal_uxid)
+  # With multi-positions on, the exemption is keyed on signal_uxid whether or
+  # not this signal carries one: a signal with no uxid does not replace a row
+  # that has one, it opens an additional ticket, so it must be counted.
   already_held = any(
     p.get("strategy") == signal.strategy
     and p.get("symbol") == signal.symbol
-    and (not match_uxid or p.get("signal_uxid") == signal.signal_uxid)
+    and (not allow_multi_positions or p.get("signal_uxid") == signal.signal_uxid)
     for p in open_positions
   )
   if already_held:

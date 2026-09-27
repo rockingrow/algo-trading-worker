@@ -460,3 +460,53 @@ def test_uxid_is_ignored_when_the_market_does_not_allow_multi_positions():
 
   assert res["success"] is True
   assert "full_close" in strat.calls
+
+
+def test_flat_for_an_unknown_uxid_closes_nothing():
+  """Regression: the DB-out-of-sync fallback must not apply here. A FLAT whose
+  signal owns no tracked row would otherwise close the strategy's whole book on
+  the symbol — flattening every sibling signal's live position."""
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11), SimpleNamespace(ticket=22)],
+    multi_positions=True,
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A"), _row("22", "uxid-B")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.FLAT, signal_uxid="uxid-GONE"))
+
+  assert res["success"] is False
+  assert not any(c.startswith("close_all") for c in strat.calls)
+  assert store.status_updates == []
+
+
+def test_flat_without_multi_positions_keeps_the_out_of_sync_fallback():
+  """The fallback still exists where it is safe: one position per key, so a
+  strategy-scoped close can only reach the position the FLAT is about."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=11)])
+  store = FakeStore(positions=[])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.FLAT))
+
+  assert res["success"] is True
+  assert "close_all:FLAT:strat-1" in strat.calls
+
+
+def test_entry_cleanup_closes_every_duplicate_row_of_one_uxid():
+  """Two active rows for one uxid (a crash artifact the DB self-heals): closing
+  only the first would leave the second live on the broker but FORCED_CLOSED in
+  the DB — a live untracked position."""
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11), SimpleNamespace(ticket=22)],
+    multi_positions=True,
+  )
+  store = FakeStore(positions=[_row("11", "uxid-A"), _row("22", "uxid-A")])
+  handler = SignalHandler(strat, store)
+
+  res = handler.handle(make_signal(SignalActionEnum.LONG, signal_uxid="uxid-A"))
+
+  assert res["success"] is True
+  assert "close_all:STALE_CLEANUP:strat-1:11" in strat.calls
+  assert "close_all:STALE_CLEANUP:strat-1:22" in strat.calls
+  assert sorted(u["ref_source_id"] for u in store.status_updates) == ["11", "22"]

@@ -231,6 +231,39 @@ class SignalHandler:
   #  Group 1 — Open position (LONG / SHORT)                             #
   # ------------------------------------------------------------------ #
 
+  def _force_close_stale(
+    self, symbol: str, strategy: str, tickets: list
+  ) -> TradeResult:
+    """Force-close this strategy's stale position(s) on *symbol*.
+
+    *tickets* is one entry per tracked position to close — ``[None]`` for the
+    single unscoped close used when positions are keyed by (strategy, symbol)
+    alone, or one ticket per tracked row when ``signal_uxid`` is in play. One
+    close per ticket, so a duplicate row left by an earlier crash does not
+    leave its live position open while the caller marks the row FORCED_CLOSED.
+
+    The first failure aborts (the caller refuses the entry), and the PnL is
+    summed across the closes because the caller reports them as one event.
+    """
+    price = None
+    retcode = None
+    profit = None
+    for ticket in tickets:
+      cleanup = self.strategy.close_all_positions(
+        symbol,
+        reason="STALE_CLEANUP",
+        strategy=strategy,
+        position_ticket=ticket,
+      )
+      if not cleanup.get("success"):
+        return cleanup
+      price = cleanup.get("price")
+      retcode = cleanup.get("retcode")
+      booked = cleanup.get("profit")
+      if booked is not None:
+        profit = (profit or 0.0) + booked
+    return TradeResult.ok(retcode=retcode, price=price, profit=profit)
+
   def _handle_entry(self, signal: SignalSchema) -> TradeResult:
     """
     1. Reject if another strategy already holds this symbol (netting conflict),
@@ -299,29 +332,36 @@ class SignalHandler:
     db_stale = self._db.get_open_positions_by_strategy(
       signal.strategy, symbol, signal_uxid=uxid
     )
-    stale_ticket = db_stale[0]["ref_source_id"] if (uxid and db_stale) else None
-    if uxid and stale_ticket is None:
+    # One close per tracked ticket when the uxid is in play, so a duplicate row
+    # left by an earlier crash does not leave its live position open while the
+    # loop below marks the row FORCED_CLOSED. Without a uxid it stays a single
+    # unscoped close, exactly as before.
+    stale_tickets: list = (
+      [r["ref_source_id"] for r in db_stale if r.get("ref_source_id")]
+      if uxid
+      else [None]
+    )
+    if uxid and not stale_tickets:
       # Several signals may share this (strategy, symbol) and none of the live
       # positions is tracked as this signal's. Every one of them belongs to a
       # sibling signal, so there is nothing for this entry to clean up — an
       # unscoped close here would flatten trades that are running as intended.
       stale = []
     else:
-      stale = self.strategy.get_open_positions(
-        symbol, strategy=strategy, position_ticket=stale_ticket
-      )
+      stale = [
+        pos
+        for ticket in stale_tickets
+        for pos in self.strategy.get_open_positions(
+          symbol, strategy=strategy, position_ticket=ticket
+        )
+      ]
     if stale:
       logger.warning(
         f"[SignalHandler._handle_entry] Found {len(stale)} stale position(s) "
         f"for strategy={strategy} symbol={symbol} signal_uxid={uxid}. "
         "Force-closing before entering new trade."
       )
-      cleanup = self.strategy.close_all_positions(
-        symbol,
-        reason="STALE_CLEANUP",
-        strategy=strategy,
-        position_ticket=stale_ticket,
-      )
+      cleanup = self._force_close_stale(symbol, strategy, stale_tickets)
       if not cleanup.get("success"):
         logger.error(
           f"[SignalHandler._handle_entry] Failed to clear stale positions: "
@@ -454,12 +494,28 @@ class SignalHandler:
 
     When one strategy may hold several positions on the symbol, a FLAT still
     belongs to the signal that sent it: the close is scoped to the ticket
-    tracked for that ``signal_uxid`` so the siblings keep running. Only when no
-    row resolves for the uxid (the DB-out-of-sync case FLAT exists for) does it
-    fall back to the strategy-wide close.
+    tracked for that ``signal_uxid`` so the siblings keep running. If no row
+    resolves for the uxid there is nothing this signal owns, and the
+    DB-out-of-sync fallback does NOT apply — a strategy-wide close would
+    flatten every sibling signal's live position to clean up one that is
+    already gone. The untracked position such a fallback exists for is left to
+    the close detector / reconciler instead, which is the same trade-off the
+    entry path and the unscoped-retry guard below already make.
     """
     uxid = self._uxid_scope(signal)
     owned = self._get_db_position(signal.strategy, signal.symbol, signal_uxid=uxid)
+    if uxid and not owned:
+      logger.warning(
+        "[SignalHandler._handle_flat] No tracked position for strategy=%s "
+        "symbol=%s signal_uxid=%s — closing nothing, because every live "
+        "position on this symbol belongs to a sibling signal.",
+        signal.strategy,
+        signal.symbol,
+        uxid,
+      )
+      return TradeResult.fail(
+        f"No tracked position for {signal.symbol} signal {uxid} [FLAT]"
+      )
     position_ticket = owned["ref_source_id"] if (uxid and owned) else None
     result = self.strategy.close_all_positions(
       signal.symbol,
