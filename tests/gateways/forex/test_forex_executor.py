@@ -583,3 +583,60 @@ def test_close_all_fails_cleanly_when_the_ticket_is_gone(config):
 
   assert res["success"] is False
   assert ex._gateway.closed == []
+
+
+# ── The entry comment fits the gateway's budget, tail first ────────────────── #
+#
+# MT5 refuses a request whose comment reaches 30 characters (see
+# ``MT5Gateway``), and the composed comment is ``<strategy> <last 2 of
+# signal_id>``: a 29-character strategy name made it 32, the wrapper rejected
+# the request client-side and the entry was never placed. What has to give way
+# is the strategy name, not the two-character tail — the tail is what
+# distinguishes the comments of two tickets one strategy holds on one symbol.
+
+_LONG_STRATEGY = "SIGNAL_SIMULATOR_LIFECYCLE_V1"  # 29 chars: the whole budget
+_SIGNAL_ID = "42e384fb-267e-448b-8299-b1bab72d98fe"
+
+
+def _long_strategy_executor(config, gateway):
+  return ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={_LONG_STRATEGY: 12345}
+  )
+
+
+def test_entry_comment_is_fitted_to_the_gateway_budget(config):
+  gw = FakePlatformGateway()
+  res = _long_strategy_executor(config, gw).open_position(
+    make_signal(
+      SignalActionEnum.LONG, strategy=_LONG_STRATEGY, signal_id=_SIGNAL_ID, sl=1990.0
+    )
+  )
+
+  assert res["success"] is True
+  comment = gw.placed[0]["comment"]
+  assert len(comment) <= gw.order_comment_max
+  assert comment == comment.rstrip()
+  # The signal tail survives; the strategy name is what was trimmed for it.
+  assert comment == "SIGNAL_SIMULATOR_LIFECYCLE fe"
+
+
+def test_entry_comment_that_already_fits_is_unchanged(config):
+  gw = FakePlatformGateway()
+  _executor(config, gw).open_position(
+    make_signal(SignalActionEnum.LONG, signal_id="a-04", sl=1990.0)
+  )
+
+  assert gw.placed[0]["comment"] == "strat-1 04"
+
+
+def test_entry_comment_without_a_signal_id_is_the_strategy_alone(config):
+  """A payload carrying no ``signal_id`` has no tail to keep, and the name must
+  not come back with a trailing separator where it used to be."""
+  gw = FakePlatformGateway()
+  _long_strategy_executor(config, gw).open_position(
+    make_signal(
+      SignalActionEnum.LONG, strategy=_LONG_STRATEGY, signal_id=None, sl=1990.0
+    )
+  )
+
+  assert gw.placed[0]["comment"] == _LONG_STRATEGY

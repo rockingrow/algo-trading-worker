@@ -47,6 +47,25 @@ _ACTION_SIDE = {"LONG": SIDE_LONG, "SHORT": SIDE_SHORT}
 _MARGIN_USABLE_FRACTION = 0.95
 
 
+def _entry_comment(strategy: str, signal_id: Optional[str], max_len: int) -> str:
+  """The order comment for an entry: *strategy* plus the tail of *signal_id*,
+  fitted into the platform's *max_len*.
+
+  The strategy name alone can fill the budget — MT5 accepts 29 characters and a
+  29-character strategy name is a real one — and the platform refuses the whole
+  order rather than trimming the label itself. What gives way is the name, not
+  the two-character signal tail: the tail is the only thing distinguishing the
+  comments of two tickets one strategy holds on the same symbol
+  (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL), which is precisely when an operator
+  reads them in the terminal.
+  """
+  tail = (signal_id or "")[-2:]
+  if not tail:
+    return strategy[:max_len].rstrip()
+  head = strategy[: max(max_len - len(tail) - 1, 0)].rstrip()
+  return f"{head} {tail}".strip()
+
+
 class ForexExecutor:
   """Sends trade orders to a forex platform gateway: open, partial-close, SL
   update, and full-close operations."""
@@ -202,7 +221,13 @@ class ForexExecutor:
         volume=requested_volume,
       )
 
-    comment = f"{signal.strategy} {(signal.signal_id or '')[-2:]}".strip()
+    comment = _entry_comment(
+      signal.strategy,
+      signal.signal_id,
+      getattr(
+        self._gateway, "order_comment_max", BasePlatformGateway.order_comment_max
+      ),
+    )
     result = self._gateway.place_order(
       symbol=symbol,
       side=side,
