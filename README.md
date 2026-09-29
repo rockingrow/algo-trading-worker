@@ -306,6 +306,14 @@ graph TD
     CDC -- "publish PENDING rows" --> Pub["services/nats_service.py<br/>NATSPublisher → TRADE"]
 ```
 
+### Busy trade context — `order_send` retry
+
+The terminal serialises every trade request through a single **trade context**. A request that arrives while another one is still in flight is refused outright rather than queued, and the refusal reads `Trade context is busy` (the server-side sibling is retcode `10024` *Too many requests*). It says nothing about the order: the identical request succeeds once the context frees up. Two signals landing together — a `TP1` partial and the breakeven SL move that follows it, or two symbols filling on the same tick — hit it routinely.
+
+`MT5Gateway._send_order_request` therefore wraps **every** `order_send` (entry, close, SL update) in a bounded retry with a sleep between attempts: **4 attempts**, delay **0.3 s doubling** (0.3 → 0.6 → 1.2, ~2.1 s at worst). The condition is matched on the terminal's own wording as well as on the retcode, because it arrives by two routes — a rejected result carries it in `comment`, while a request the terminal refused to send at all returns `None` and leaves it in `last_error()`.
+
+The budget is deliberately small: an entry is a market order priced off the live quote, so retrying for seconds would fill it at a price the signal never meant. Once the budget is spent the refusal is surfaced as the failed `TradeResult` it now really is. Anything that is *not* a busy context — `10019` *No money*, `10014` *Invalid volume*, `10016` *Invalid stops* — is a verdict on the request and is returned on the first attempt, unretried. There is no setting to tune; the attempt count and delay are module constants next to the existing deal-lookup budget in `worker/gateways/forex/mt5/gateway.py`.
+
 ---
 
 ## 📂 Project Structure
