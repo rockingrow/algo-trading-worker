@@ -39,7 +39,12 @@ from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.gateways.forex.mt5.gateway")
 
-_MT5_COMMENT_MAX = 31
+# Longest order comment the MetaTrader5 Python wrapper accepts. Measured against
+# 5.0.5735: a request whose comment reaches 30 characters is refused client-side
+# with ``(-2, 'Invalid "comment" argument')`` before the terminal ever sees it,
+# so one character too many costs the whole order, not just its label. The MQL5
+# struct's own 31 is not the binding limit here — the wrapper's check is.
+_MT5_COMMENT_MAX = 29
 
 # A deal is registered on the server before ``order_send`` returns its ticket,
 # but the terminal's own history trails that — by measurably more than the few
@@ -51,6 +56,17 @@ _MT5_COMMENT_MAX = 31
 # line at the cost of delaying them, and must never grow into a stall.
 _DEAL_LOOKUP_ATTEMPTS = 6
 _DEAL_LOOKUP_DELAY = 0.25  # seconds between attempts
+
+
+def _fit_comment(comment: str) -> str:
+  """Cut *comment* down to what the wrapper accepts (see ``_MT5_COMMENT_MAX``).
+
+  Every ``order_send`` goes through this: the caller composes the comment for a
+  reader, not for the wrapper's limit, and a comment that overflows is not a
+  cosmetic problem — the order is never sent. Trailing whitespace goes too, so a
+  cut that lands on a separator does not leave a dangling gap in the terminal.
+  """
+  return comment[:_MT5_COMMENT_MAX].rstrip()
 
 
 def _mt5_error_code(err) -> int:
@@ -82,6 +98,7 @@ class MT5Gateway(BasePlatformGateway):
   """MetaTrader 5 implementation of :class:`BasePlatformGateway`."""
 
   name = "MT5"
+  order_comment_max = _MT5_COMMENT_MAX
 
   def __init__(
     self,
@@ -247,7 +264,7 @@ class MT5Gateway(BasePlatformGateway):
       "price": float(price),
       "deviation": self._deviation,
       "magic": magic,
-      "comment": comment[: _MT5_COMMENT_MAX - 1],
+      "comment": _fit_comment(comment),
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
@@ -319,7 +336,7 @@ class MT5Gateway(BasePlatformGateway):
       "price": float(price),
       "deviation": self._deviation,
       "magic": position.magic,  # close deal inherits the position's own magic
-      "comment": comment,
+      "comment": _fit_comment(comment),
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }

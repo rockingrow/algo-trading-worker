@@ -79,3 +79,41 @@ def test_silent_when_margin_mode_is_unavailable():
     proc = _processor({"forex_allow_multi_strategy_per_symbol": True}, account)
     proc._warn_if_multi_strategy_needs_hedging()
     assert proc.ctx.notifier.messages == []
+
+
+# ── FOREX_HEDGE_MODE — a hard startup gate ───────────────────────────────── #
+#
+# Unlike the warn-only check above, FOREX_HEDGE_MODE is the operator asserting
+# the account really is hedging. Everything built on that (a position per
+# signal_uxid, a position per strategy magic, every ticket-scoped exit) silently
+# mis-executes on a netting account, so a mismatch must stop the worker instead
+# of degrading.
+
+
+def test_hedge_mode_allows_start_on_a_hedging_account():
+  proc = _processor(
+    {"forex_hedge_mode": True}, {"margin_mode": MT5_MARGIN_MODE_HEDGING}
+  )
+  assert proc._enforce_hedge_mode() is True
+  assert proc.ctx.notifier.messages == []
+
+
+def test_hedge_mode_blocks_start_on_a_netting_account():
+  proc = _processor({"forex_hedge_mode": True}, {"margin_mode": 0})
+  assert proc._enforce_hedge_mode() is False
+  assert len(proc.ctx.notifier.messages) == 1
+  assert "worker not started" in proc.ctx.notifier.messages[0]
+
+
+def test_hedge_mode_blocks_start_when_margin_mode_is_unreported():
+  """ "Could not verify" is not "verified hedging" — the flag asked for a check."""
+  for account in ({}, None):
+    proc = _processor({"forex_hedge_mode": True}, account)
+    assert proc._enforce_hedge_mode() is False
+    assert len(proc.ctx.notifier.messages) == 1
+
+
+def test_hedge_mode_off_never_blocks_start():
+  proc = _processor({"forex_hedge_mode": False}, {"margin_mode": 0})
+  assert proc._enforce_hedge_mode() is True
+  assert proc.ctx.notifier.messages == []

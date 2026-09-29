@@ -366,7 +366,7 @@ class _FakeDB:
   def __init__(self, rows):
     self._rows = rows
 
-  def get_open_positions_by_strategy(self, strategy, symbol):
+  def get_open_positions_by_strategy(self, strategy, symbol, signal_uxid=None):
     return list(self._rows)
 
 
@@ -562,7 +562,7 @@ class _FakeDbEntry:
   def __init__(self, opened_price):
     self._opened_price = opened_price
 
-  def get_open_positions_by_strategy(self, strategy, symbol):
+  def get_open_positions_by_strategy(self, strategy, symbol, signal_uxid=None):
     return [{"opened_price": self._opened_price, "symbol": symbol}]
 
 

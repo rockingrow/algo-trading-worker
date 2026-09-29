@@ -293,6 +293,18 @@ class BaseMessagePresenter:
     return f"{market.upper()}_ALLOW_MULTI_STRATEGY_PER_SYMBOL: <b>ENABLED</b>\n"
 
   @staticmethod
+  def _multi_positions_line(settings_dict: dict, market: str) -> str:
+    """Render the ALLOW_MULTI_POSITIONS_PER_SYMBOL line, or '' when disabled.
+
+    Same rule as the sibling above: only the enabled (riskier) state is
+    announced, and only FOREX has the toggle today.
+    """
+    key = f"{market.lower()}_allow_multi_positions_per_symbol"
+    if not settings_dict.get(key, False):
+      return ""
+    return f"{market.upper()}_ALLOW_MULTI_POSITIONS_PER_SYMBOL: <b>ENABLED</b>\n"
+
+  @staticmethod
   def signal_rejected(reason: str, footer: str) -> str:
     return _box(
       f"{REJECTED} <b>Signal Rejected</b>\n\n"

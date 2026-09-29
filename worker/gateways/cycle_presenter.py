@@ -383,6 +383,7 @@ def _settings_box(
     section += BaseMessagePresenter._max_open_orders_line(settings_dict)
     if market:
       section += BaseMessagePresenter._multi_strategy_line(settings_dict, market)
+      section += BaseMessagePresenter._multi_positions_line(settings_dict, market)
     lines.append(section.rstrip("\n"))
   lines.append(_DIVIDER)
   lines.append(f"Strategy: <b>{html.escape(str(cycle.get('strategy') or '—'))}</b>")

@@ -77,8 +77,12 @@ class DBService:
   def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
     return self.positions.mark_position_synced(position_id, updated_at)
 
-  def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
-    return self.positions.get_open_positions_by_strategy(strategy, symbol)
+  def get_open_positions_by_strategy(
+    self, strategy: str, symbol: str, signal_uxid: Optional[str] = None
+  ) -> list:
+    return self.positions.get_open_positions_by_strategy(
+      strategy, symbol, signal_uxid=signal_uxid
+    )
 
   def get_open_positions_for_flat(
     self,
@@ -86,7 +90,9 @@ class DBService:
     symbol: Optional[str] = None,
     ref_id: Optional[str] = None,
   ) -> list:
-    return self.positions.get_open_positions_for_flat(strategy=strategy, symbol=symbol, ref_id=ref_id)
+    return self.positions.get_open_positions_for_flat(
+      strategy=strategy, symbol=symbol, ref_id=ref_id
+    )
 
   def signal_exists(self, signal_id: str) -> bool:
     return self.positions.signal_exists(signal_id)

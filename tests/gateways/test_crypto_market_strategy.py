@@ -51,7 +51,12 @@ class FakeExecutor:
     return {"success": True}
 
   def close_all_positions(
-    self, symbol, reason="CLOSE", strategy=None, fallback_close_price=None
+    self,
+    symbol,
+    reason="CLOSE",
+    strategy=None,
+    fallback_close_price=None,
+    position_ticket=None,
   ):
     self.calls.append(("close_all", reason, strategy))
     return {

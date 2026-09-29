@@ -233,9 +233,74 @@ class ForexSignalProcessor(BaseSignalProcessor):
 
   def _connect_broker(self) -> bool:
     connected = self.gateway.reconnect(max_attempts=0, delay_seconds=10.0)
-    if connected:
-      self._warn_if_multi_strategy_needs_hedging()
-    return connected
+    if not connected:
+      return False
+    if not self._enforce_hedge_mode():
+      # Returning False makes the base processor abort startup: the account
+      # cannot deliver the isolation the configuration claims, so it must not
+      # trade at all.
+      return False
+    self._warn_if_multi_strategy_needs_hedging()
+    return True
+
+  def _enforce_hedge_mode(self) -> bool:
+    """Verify the account really is in hedging mode when FOREX_HEDGE_MODE=true.
+
+    ``FOREX_HEDGE_MODE`` is the operator asserting that this account keeps each
+    ticket as its own position. Everything the worker builds on that assertion
+    — a position per ``signal_uxid``, a position per strategy magic, every
+    ticket-scoped exit — silently mis-executes on a netting account, which
+    merges the tickets into one net position: the second position is never
+    owned by anyone, and its exits fail while the merged volume runs on.
+    Nothing downstream can detect that, so the account is checked once, at
+    connect, and a mismatch **blocks startup** rather than trading wrongly.
+
+    Unlike :meth:`_warn_if_multi_strategy_needs_hedging`, an unreported margin
+    mode is also a failure here: the flag asks for a verified hedging account,
+    and "could not verify" is not that. Leave FOREX_HEDGE_MODE unset (false) on
+    a gateway that does not report one.
+
+    Returns True when the worker may start.
+    """
+    if not self.settings.get("forex_hedge_mode", False):
+      return True
+    account = self.gateway.get_account() or {}
+    margin_mode = account.get("margin_mode")
+    if margin_mode == MT5_MARGIN_MODE_HEDGING:
+      log.info(
+        "[%s Process] FOREX_HEDGE_MODE verified: account margin_mode=%s (hedging).",
+        self.name,
+        margin_mode,
+      )
+      return True
+
+    detail = (
+      "the account does not report a margin mode"
+      if margin_mode is None
+      else f"the account margin_mode={margin_mode}"
+    )
+    log.critical(
+      "[%s Process] FOREX_HEDGE_MODE is ENABLED but %s is not hedging (%s). "
+      "Refusing to start: on a netting account the broker merges every ticket "
+      "on a symbol into one net position, so per-signal and per-strategy "
+      "positions would not exist and their exits would fail.",
+      self.name,
+      detail,
+      MT5_MARGIN_MODE_HEDGING,
+    )
+    self.ctx.notifier.send_message(
+      _box(
+        f"{WARNING} <b>[Config] Hedging account required — worker not started</b>\n\n"
+        f"<b>FOREX_HEDGE_MODE</b> is enabled, but {detail} "
+        f"(hedging is <b>{MT5_MARGIN_MODE_HEDGING}</b>).\n"
+        f"A netting account merges every ticket on a symbol into one position, "
+        f"so positions tracked per strategy and per signal would not exist and "
+        f"their exits would fail.\n"
+        f"Either switch to a hedging account or set FOREX_HEDGE_MODE=false."
+        f"{self.gateway.get_account_footer()}"
+      )
+    )
+    return False
 
   def _warn_if_multi_strategy_needs_hedging(self) -> None:
     """Escalate when FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL is on but the account

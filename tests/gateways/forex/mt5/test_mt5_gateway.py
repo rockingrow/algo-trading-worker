@@ -396,3 +396,57 @@ def test_a_rejected_order_reports_the_volume_it_was_rejected_for():
   assert result["success"] is False
   assert result["retcode"] == 10019
   assert result["volume"] == 0.07
+
+
+# ── Order comments are fitted to what the wrapper accepts ──────────────────── #
+#
+# The MetaTrader5 Python wrapper refuses a request whose comment reaches 30
+# characters with ``(-2, 'Invalid "comment" argument')`` — client-side, before
+# the terminal sees it — so an overlong comment does not cost the label, it
+# costs the order. A 29-character strategy name produced exactly that and both
+# live entries were lost with it (``retcode=-2 comment=Send Failed``).
+
+
+def test_place_order_fits_a_comment_the_wrapper_would_refuse():
+  mt5 = FakeMt5(tick=make_tick(ask=2000.0, bid=1999.5))
+  _gateway(mt5).place_order(
+    symbol="XAUUSDc",
+    side="LONG",
+    volume=0.01,
+    price=2000.0,
+    sl=1990.0,
+    tp=2050.0,
+    magic=42,
+    comment="SIGNAL_SIMULATOR_LIFECYCLE_V1 fe",
+  )
+  sent = mt5.sent_requests[0]["comment"]
+  assert len(sent) <= gateway_module._MT5_COMMENT_MAX
+  # And the cut never leaves a dangling separator behind.
+  assert sent == "SIGNAL_SIMULATOR_LIFECYCLE_V1"
+
+
+def test_place_order_keeps_a_comment_that_already_fits():
+  mt5 = FakeMt5(tick=make_tick(ask=2000.0, bid=1999.5))
+  _gateway(mt5).place_order(
+    symbol="XAUUSDc",
+    side="LONG",
+    volume=0.01,
+    price=2000.0,
+    sl=1990.0,
+    tp=2050.0,
+    magic=42,
+    comment="strat-1 04",
+  )
+  assert mt5.sent_requests[0]["comment"] == "strat-1 04"
+
+
+def test_close_position_fits_its_comment_too():
+  """A close carries a composed comment as well (``Full Close <reason>``), and a
+  refused close is worse than a refused entry: the position stays open with
+  nothing tracking the attempt."""
+  mt5 = FakeMt5(order_results=[make_order_result(order=999, deal=777)])
+  _gateway(mt5).close_position(
+    make_platform_position(ticket=111),
+    comment="Full Close A_REASON_LONGER_THAN_THE_BUDGET",
+  )
+  assert len(mt5.sent_requests[0]["comment"]) <= gateway_module._MT5_COMMENT_MAX

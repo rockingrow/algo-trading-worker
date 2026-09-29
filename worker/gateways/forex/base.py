@@ -156,6 +156,13 @@ class BasePlatformGateway(ABC):
 
   # ── Orders ────────────────────────────────────────────────────────────── #
 
+  # Longest order comment the platform accepts. Part of the contract because the
+  # caller composes the comment and therefore needs its budget: a truncation
+  # done down here can only drop the tail, and the tail is the part that tells
+  # two positions of one strategy apart. The default is the strictest known
+  # limit (MetaTrader 5's Python wrapper); a platform that takes more raises it.
+  order_comment_max: int = 29
+
   @abstractmethod
   def place_order(
     self,

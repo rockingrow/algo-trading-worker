@@ -29,6 +29,7 @@ from worker.gateways.forex.base import (
 )
 from worker.gateways.forex.lot_sizing import LotSizer
 from worker.gateways.forex.stop_validator import StopValidator
+from worker.gateways.position_matching import filter_by_ticket
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
@@ -44,6 +45,25 @@ _ACTION_SIDE = {"LONG": SIDE_LONG, "SHORT": SIDE_SHORT}
 # free margin still comes back rejected. The headroom also keeps the account off
 # its stop-out level the instant the position opens.
 _MARGIN_USABLE_FRACTION = 0.95
+
+
+def _entry_comment(strategy: str, signal_id: Optional[str], max_len: int) -> str:
+  """The order comment for an entry: *strategy* plus the tail of *signal_id*,
+  fitted into the platform's *max_len*.
+
+  The strategy name alone can fill the budget — MT5 accepts 29 characters and a
+  29-character strategy name is a real one — and the platform refuses the whole
+  order rather than trimming the label itself. What gives way is the name, not
+  the two-character signal tail: the tail is the only thing distinguishing the
+  comments of two tickets one strategy holds on the same symbol
+  (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL), which is precisely when an operator
+  reads them in the terminal.
+  """
+  tail = (signal_id or "")[-2:]
+  if not tail:
+    return strategy[:max_len].rstrip()
+  head = strategy[: max(max_len - len(tail) - 1, 0)].rstrip()
+  return f"{head} {tail}".strip()
 
 
 class ForexExecutor:
@@ -201,7 +221,13 @@ class ForexExecutor:
         volume=requested_volume,
       )
 
-    comment = f"{signal.strategy} {(signal.signal_id or '')[-2:]}".strip()
+    comment = _entry_comment(
+      signal.strategy,
+      signal.signal_id,
+      getattr(
+        self._gateway, "order_comment_max", BasePlatformGateway.order_comment_max
+      ),
+    )
     result = self._gateway.place_order(
       symbol=symbol,
       side=side,
@@ -455,16 +481,28 @@ class ForexExecutor:
     reason: str = "CLOSE",
     strategy: Optional[str] = None,
     fallback_close_price: Optional[float] = None,
+    position_ticket: Optional[Any] = None,
   ) -> TradeResult:
     """Close ALL open positions for the symbol at actual broker volume.
+
+    ``position_ticket`` narrows the close to that one position — what an exit
+    carries when one strategy holds several positions on the symbol
+    (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL) and only the signal's own must be
+    closed. ``None`` keeps the original close-everything behaviour.
 
     ``fallback_close_price`` is part of the shared executor contract but unused
     here — MT5 reads each close's realized PnL from its own deal, so it never
     needs to value the close at the signal's price (see ``partial_close_position``).
     """
-    positions = self.get_open_positions(symbol, strategy=strategy)
+    positions = filter_by_ticket(
+      self.get_open_positions(symbol, strategy=strategy), position_ticket
+    )
     if not positions:
-      logger.warning(f"[close_all] No open positions found for {symbol}")
+      logger.warning(
+        "[close_all] No open positions found for %s (ticket=%s)",
+        symbol,
+        position_ticket,
+      )
       return TradeResult.fail("No Positions Found")
 
     success_count = 0

@@ -296,6 +296,9 @@ class FakePlatformGateway:
   TradeResults so the executor's business logic is testable without MetaTrader5."""
 
   name = "FAKE"
+  # Same budget as MT5Gateway, so a comment the executor composes here is one
+  # the real gateway would have sent unchanged.
+  order_comment_max = 29
 
   def __init__(
     self,

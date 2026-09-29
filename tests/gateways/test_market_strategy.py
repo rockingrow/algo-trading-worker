@@ -47,9 +47,19 @@ class FakeExecutor:
     return {"success": True}
 
   def close_all_positions(
-    self, symbol, reason="CLOSE", strategy=None, fallback_close_price=None
+    self,
+    symbol,
+    reason="CLOSE",
+    strategy=None,
+    fallback_close_price=None,
+    position_ticket=None,
   ):
-    return {"success": True, "reason": reason, "strategy": strategy}
+    return {
+      "success": True,
+      "reason": reason,
+      "strategy": strategy,
+      "position_ticket": position_ticket,
+    }
 
 
 def test_handle_tp1_volume_decision_mode(config):
