@@ -89,7 +89,7 @@ DESCRIPTIONS = {
   ),
   "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL": (
     "Let ONE strategy hold several positions per symbol, one per signal_uxid "
-    "(needs FOREX_HEDGE_MODE; MAX_OPEN_ORDERS still caps the account)"
+    "(needs FOREX_HEDGE_MODE; the broker's max_open_orders still caps the account)"
   ),
   "FOREX_HEDGE_MODE": (
     "Require a HEDGING MT5 account — a netting account blocks worker startup"

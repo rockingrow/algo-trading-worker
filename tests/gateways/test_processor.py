@@ -199,9 +199,12 @@ class FakeProcessor(BaseSignalProcessor):
     self.admin_calls.append((raw, private))
 
   # Record dispatched runtime SYSTEM actions (base parses the envelope + ensures
-  # connection + routes by identity, then calls this hook).
+  # connection + routes by identity, then calls this hook), then delegate like a
+  # real market does — the base owns WORKER_SETTINGS_UPDATE, so swallowing
+  # everything here would hide it.
   def _handle_system_action(self, action, data):
     self.system_calls.append((action, data))
+    super()._handle_system_action(action, data)
 
 
 # ── Abstract enforcement ──────────────────────────────────────────────────── #
@@ -1653,6 +1656,162 @@ def test_ack_settings_restore_the_block_before_the_replay_runs():
   assert proc._signals_blocked is True
   assert proc.db.inserted == []
   assert proc.notifications == ["signals_blocked"]
+
+
+# ── max_open_orders: the broker owns the exposure cap ─────────────────────── #
+#
+# MAX_OPEN_ORDERS is no longer an .env setting. The value in force arrives in the
+# ACK's settings block (and as a runtime WORKER_SETTINGS_UPDATE), and lands in
+# the flat settings dict, which is exactly where guard.max_open_orders_rejection
+# reads it — so the guard needs no knowledge of where the number came from.
+
+
+def test_ack_settings_apply_the_brokers_max_open_orders():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"max_open_orders": 2})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 2
+
+
+def test_ack_settings_max_open_orders_zero_disables_the_cap():
+  """0 is a value, not an absence — the broker's way of saying "no cap"."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"max_open_orders": 0})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 0
+
+
+def test_ack_without_max_open_orders_keeps_the_workers_backfill():
+  """A broker too old to send the field says nothing about the cap, so the
+  worker's own default stands rather than being reset to no-cap."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": False})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 5
+
+
+def test_ack_negative_max_open_orders_is_dropped_on_its_own():
+  """``ge=0`` — a negative cap is a broker-side bug, and salvaging it per field
+  means it costs only itself: the signal block in the same push still lands."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher(
+    [_ack_payload(settings={"max_open_orders": -1, "signal_blocked": True})]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 5
+  assert proc._signals_blocked is True
+
+
+def test_the_cap_from_the_ack_is_what_the_entry_guard_enforces():
+  """End to end: the broker's number reaches the guard, not just the dict."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"max_open_orders": 1})])
+  proc._announce_worker_connected()
+
+  proc.db.open_positions = [_open_row("other", "BBB")]
+  proc._process_signal(_fresh_signal(SignalActionEnum.LONG, symbol="AAA"))
+
+  assert proc.db.inserted == []
+  assert len(proc.db.rejected) == 1
+  # 1/1, not the 5/5 the worker's own backfill would have allowed.
+  assert "Max open orders reached (1/1)" in proc.db.rejected[0]["comment"]
+
+
+# ── WORKER_SETTINGS_UPDATE: the runtime half of the same block ────────────── #
+
+
+def _settings_update_payload(settings, *, account_id="FAKE_MKT-FAKE_GW-acct-1"):
+  import json as _json
+
+  return _json.dumps(
+    {
+      "action": SystemActionEnum.WORKER_SETTINGS_UPDATE.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": account_id,
+      "settings": settings,
+    }
+  )
+
+
+def test_settings_update_applies_a_new_cap_without_a_reconnect():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+
+  proc._handle_system_message(_settings_update_payload({"max_open_orders": 2}))
+
+  assert proc.settings["max_open_orders"] == 2
+
+
+def test_settings_update_goes_through_the_same_setter_as_the_ack():
+  """A block arriving live is indistinguishable from one restored on connect —
+  same helper, so the same operator alert."""
+  proc = _settings_proc()
+
+  proc._handle_system_message(_settings_update_payload({"signal_blocked": True}))
+
+  assert proc._signals_blocked is True
+  assert proc.notifications == ["signals_blocked"]
+
+
+def test_settings_update_for_another_worker_is_ignored():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+
+  proc._handle_system_message(
+    _settings_update_payload({"max_open_orders": 2}, account_id="OTHER-GW-acct-9")
+  )
+
+  assert proc.settings["max_open_orders"] == 5
+
+
+def test_settings_update_with_an_unusable_block_changes_nothing():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc._signals_blocked = True
+
+  proc._handle_system_message(
+    _settings_update_payload({"max_open_orders": "lots", "signal_blocked": "maybe"})
+  )
+
+  assert proc.settings["max_open_orders"] == 5
+  assert proc._signals_blocked is True
+
+
+def test_settings_update_salvages_field_by_field():
+  """One malformed value must not cost the other settings in the same push."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+
+  proc._handle_system_message(
+    _settings_update_payload({"max_open_orders": 3, "signal_blocked": "maybe"})
+  )
+
+  assert proc.settings["max_open_orders"] == 3
+  assert proc._signals_blocked is False
+
+
+def test_settings_update_omitting_a_field_leaves_it_alone():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc._signals_blocked = True
+
+  proc._handle_system_message(_settings_update_payload({"max_open_orders": 3}))
+
+  assert proc.settings["max_open_orders"] == 3
+  assert proc._signals_blocked is True
 
 
 def test_ack_unparseable_setting_does_not_cost_the_other_sections():

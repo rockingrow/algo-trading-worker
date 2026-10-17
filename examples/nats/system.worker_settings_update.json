@@ -1,0 +1,9 @@
+{
+  "action": "WORKER_SETTINGS_UPDATE",
+  "account_id": "FOREX-MT5-1234567",
+  "timestamp": "2026-06-30T00:05:00+00:00",
+  "settings": {
+    "signal_blocked": false,
+    "max_open_orders": 3
+  }
+}
