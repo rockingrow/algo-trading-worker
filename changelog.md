@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   populated, so `guard.max_open_orders_rejection` and every other consumer read
   it unchanged — the entry guard needed no change at all.
 
+  **⚠️ This changes how a running fleet trades — seed the broker first.** The
+  old `.env.example` shipped `MAX_OPEN_ORDERS=0`, i.e. **uncapped**, and
+  `init_env.py` copies that key set into `.env`, so a host bootstrapped with
+  `make init` is uncapped today. After this release that line is ignored and an
+  unseeded broker resolves to its default of `5`, so such a worker would
+  silently start rejecting entries beyond the 5th. Before deploying, set the
+  broker-wide default to what the fleet is on today (`/admin_max_orders`, or
+  `POST /admin/settings/max-open-orders` — `0` to stay uncapped); the upgrade is
+  then a no-op and you tighten the cap deliberately afterwards. `grep
+  MAX_OPEN_ORDERS .env` on each host tells you what it is on now.
+
   `MAX_OPEN_ORDERS` is removed from `.env.example`; a line for it in a `.env`
   now does nothing. `worker/settings.py` keeps `risk.max_open_orders` with its
   default of `5`, deliberately **without** an env var, as the backfill for the
