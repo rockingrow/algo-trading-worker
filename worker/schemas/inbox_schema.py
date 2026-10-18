@@ -15,33 +15,38 @@ for its whole lifetime and which can therefore be split across several
 messages).
 
 Both envelopes below reuse :class:`~worker.schemas.system_schema.SystemSchema`
-(the ``action``/``timestamp``/``account_id`` envelope) and
-:class:`~worker.schemas.system_schema.CryptoLeverageInitSchema` (the
-``crypto_leverage_init`` section, shared with the runtime broadcast) from
-``system_schema.py``.
+(the ``action``/``timestamp``/``account_id`` envelope) and the two sections the
+broker can also push at runtime, from ``system_schema.py``:
+:class:`~worker.schemas.system_schema.CryptoLeverageInitSchema`
+(``crypto_leverage_init``) and
+:class:`~worker.schemas.system_schema.WorkerSettingsSchema` (``settings``).
 """
 
 from typing import Any, Callable, Optional
 
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
 from worker.schemas.signal_schema import SignalSchema
 from worker.schemas.system_schema import (
   CryptoLeverageInitSchema,
   SystemActionEnum,
   SystemSchema,
+  WorkerSettingsSchema,
+  _salvage_settings,
+  _why,
 )
 
+# Re-exported: WorkerSettingsSchema was defined here before the broker gained a
+# runtime path for the same block, and the processor and tests still import it
+# from the ACK's module, which is where it reads as belonging.
+__all__ = [
+  "WorkerConnectedAckSchema",
+  "WorkerConnectedErrorSchema",
+  "WorkerConnectedSchema",
+  "WorkerSettingsSchema",
+]
+
 _MAGIC_ADAPTER = TypeAdapter(int)
-
-
-def _why(err: ValidationError) -> str:
-  """Compact one-line reason from a ValidationError — a dropped ACK entry is
-  logged per line, so a full multi-line pydantic report would drown the log."""
-  first = err.errors()[0]
-  loc = ".".join(str(p) for p in first.get("loc", ())) or "value"
-  more = f" (+{err.error_count() - 1} more)" if err.error_count() > 1 else ""
-  return f"{loc}: {first.get('msg', 'invalid')}{more}"
 
 
 def _salvage_section(
@@ -92,66 +97,6 @@ def _salvage_signals(raw: Any, dropped: list[str]) -> list[SignalSchema]:
   return kept
 
 
-class WorkerSettingsSchema(BaseModel):
-  """The ``settings`` section of a WORKER_CONNECTED_ACK — the runtime toggles the
-  broker holds for this account, re-pushed on every connect.
-
-  These are the same switches the runtime ADMIN directives flip
-  (``BLOCK_SIGNAL`` / ``ALLOW_SIGNAL`` → ``signal_blocked``). The worker keeps
-  them in memory only, so a restart would otherwise silently drop back to the
-  defaults and start trading again under a block an operator never lifted. The
-  broker owns the state, so it replays it here and the worker re-applies it
-  through the very same code path the ADMIN action uses — one behaviour, one
-  notification, whichever way the value arrives.
-
-  Every field is ``Optional`` and defaults to ``None`` meaning **"not pushed —
-  leave this setting as it is"**, so a broker that knows nothing about a given
-  toggle simply omits it. That is why ``signal_blocked`` is a nullable bool
-  rather than a plain one: ``false`` is the broker explicitly saying "unblocked",
-  which is not the same statement as saying nothing at all.
-
-  Fields are salvaged one by one (see :func:`_salvage_settings`), so a malformed
-  value costs only its own setting.
-  """
-
-  #: Whether signal execution is suspended for this worker. True == the account
-  #: is under a BLOCK_SIGNAL; False == explicitly allowed; None == not pushed.
-  signal_blocked: Optional[bool] = None
-
-
-def _salvage_settings(raw: Any, dropped: list[str]) -> Optional[WorkerSettingsSchema]:
-  """Validate the ``settings`` section one field at a time.
-
-  Each toggle is independent live-trading state, so they are salvaged like the
-  magic map's entries rather than as one block: a broker that sends a malformed
-  value for one setting must not cost the worker every *other* setting in the
-  same push (losing a valid ``signal_blocked: true`` that way would resume
-  trading on an account an operator had stopped).
-
-  A key the worker does not know is reported too — the broker believes that
-  setting is in force while this worker silently ignores it, which is exactly the
-  kind of version skew an operator needs to see. Returns ``None`` when nothing
-  usable survived, which reads downstream as "no settings pushed".
-  """
-  if not isinstance(raw, dict):
-    dropped.append("settings — not an object")
-    return None
-
-  known = WorkerSettingsSchema.model_fields
-  kept: dict[str, Any] = {}
-  for key, value in raw.items():
-    field = known.get(str(key))
-    if field is None:
-      dropped.append(f"settings[{key!r}] — unknown setting, this worker ignores it")
-      continue
-    try:
-      kept[str(key)] = TypeAdapter(field.annotation).validate_python(value)
-    except ValidationError as err:
-      dropped.append(f"settings[{key!r}] — {_why(err)}")
-
-  return WorkerSettingsSchema(**kept) if kept else None
-
-
 class WorkerConnectedSchema(SystemSchema):
   """Handshake a worker publishes as a NATS **request** right after it connects
   to NATS. ``account_id`` is the worker identity in "<market>-<gateway>-<id>"
@@ -188,12 +133,16 @@ class WorkerConnectedAckSchema(SystemSchema):
   exactly as they read the old .env value. Omitting the field (or ``null``)
   leaves the worker's current map untouched; an explicit ``{}`` clears it.
 
-  ``settings`` restores the runtime toggles an operator set on this account in a
-  previous session (currently ``signal_blocked``, the ADMIN
-  ``BLOCK_SIGNAL``/``ALLOW_SIGNAL`` gate) — see :class:`WorkerSettingsSchema`.
-  The worker holds those in memory only, so without this replay a restart would
-  quietly resume trading under a block nobody lifted. Omitting the section (or
-  any single field in it) leaves the corresponding setting at its current value.
+  ``settings`` restores the settings an operator set on this account in a
+  previous session — ``signal_blocked`` (the ADMIN ``BLOCK_SIGNAL``/
+  ``ALLOW_SIGNAL`` gate) and ``max_open_orders`` (the exposure cap, which the
+  broker now owns instead of this worker's ``.env``) — see
+  :class:`WorkerSettingsSchema`. The worker holds those in memory only, so
+  without this replay a restart would quietly resume trading under a block
+  nobody lifted, or under its own default cap rather than the account's.
+  Omitting the section (or any single field in it) leaves the corresponding
+  setting at its current value; a change made while the worker is connected
+  arrives as a SYSTEM ``WORKER_SETTINGS_UPDATE`` instead.
 
   ``crypto_leverage_init`` (CRYPTO only) asks the worker to re-initialise
   per-symbol leverage on the exchange before it trades — see

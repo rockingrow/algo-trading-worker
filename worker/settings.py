@@ -356,8 +356,29 @@ class RiskSettings(BaseSettings):
   # broker: it is recorded with status REJECTED, reported to the broker on the TRADE
   # subject (also REJECTED) and notified — but no order is placed. A re-entry/scale-in
   # on a symbol the strategy already holds replaces that position rather than opening
-  # a new slot, so it never counts against the cap. Set to 0 to disable the limit.
-  max_open_orders: int = _opt(5, "MAX_OPEN_ORDERS", "max_open_orders")
+  # a new slot, so it never counts against the cap. 0 disables the limit.
+  #
+  # **Owned by the broker, not by .env.** The value in force comes from the
+  # account's ``max_open_orders`` setting, which the broker resolves (the
+  # account's own value, else its broker-wide default) and sends in the
+  # ``settings`` block of every WORKER_CONNECTED_ACK, plus a SYSTEM
+  # WORKER_SETTINGS_UPDATE when it changes mid-session. This field is therefore
+  # deliberately **not** read from an env var — there is no MAX_OPEN_ORDERS to
+  # set, and a stale one on a host could not win over the broker anyway. It
+  # survives only as the backfill for the window before the first handshake, and
+  # for a broker too old to send the field at all; the setting still flows into
+  # the child process through ``flat_dump``, which is where the guard reads it.
+  #
+  # The validation_alias is a name nothing sets, and that is its whole job: with
+  # no alias at all, pydantic-settings falls back to matching the *field name*
+  # case-insensitively, so a stale MAX_OPEN_ORDERS left behind in a host's .env
+  # would quietly come back and silently cap a worker below what the broker
+  # told it. There is no env var for this value.
+  max_open_orders: int = Field(
+    5,
+    validation_alias="max_open_orders_broker_owned",
+    serialization_alias="max_open_orders",
+  )
 
 
 class TelegramSettings(BaseSettings):

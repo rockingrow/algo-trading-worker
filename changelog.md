@@ -29,6 +29,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`MAX_OPEN_ORDERS` is gone from `.env` — the broker owns the open-position
+  cap.** Changing a worker's exposure limit meant editing a file on its host and
+  restarting it, and nothing stopped a stale line there from disagreeing with
+  what the account's owner believed was set. The cap now arrives from the broker
+  in the `settings` block of every `WORKER_CONNECTED_ACK`, as a new
+  `max_open_orders` field alongside `signal_blocked`, and on the new SYSTEM
+  **`WORKER_SETTINGS_UPDATE`** broadcast when it changes while this worker is
+  connected. An owner changes it from the Telegram bot (`/maxorders`; an admin
+  sets the default every account inherits with `/admin_max_orders`), and it
+  applies without a restart.
+
+  The broker resolves its two scopes — the account's own value, else its
+  broker-wide default — before sending, so what arrives is always a concrete
+  number and this worker never has to know a global default exists. `0` is a
+  real value meaning "no cap", not an absence. The value lands in the flat
+  settings dict under `max_open_orders`, the exact key the old `.env` variable
+  populated, so `guard.max_open_orders_rejection` and every other consumer read
+  it unchanged — the entry guard needed no change at all.
+
+  **⚠️ This changes how a running fleet trades — seed the broker first.** The
+  old `.env.example` shipped `MAX_OPEN_ORDERS=0`, i.e. **uncapped**, and
+  `init_env.py` copies that key set into `.env`, so a host bootstrapped with
+  `make init` is uncapped today. After this release that line is ignored and an
+  unseeded broker resolves to its default of `5`, so such a worker would
+  silently start rejecting entries beyond the 5th. Before deploying, set the
+  broker-wide default to what the fleet is on today (`/admin_max_orders`, or
+  `POST /admin/settings/max-open-orders` — `0` to stay uncapped); the upgrade is
+  then a no-op and you tighten the cap deliberately afterwards. `grep
+  MAX_OPEN_ORDERS .env` on each host tells you what it is on now.
+
+  `MAX_OPEN_ORDERS` is removed from `.env.example`; a line for it in a `.env`
+  now does nothing. `worker/settings.py` keeps `risk.max_open_orders` with its
+  default of `5`, deliberately **without** an env var, as the backfill for the
+  window before the first handshake and for a broker too old to send the field.
+  Its `validation_alias` points at a name nothing sets, and that is the whole
+  point: with no alias, pydantic-settings falls back to matching the field
+  *name* case-insensitively, so a stale `MAX_OPEN_ORDERS` left in a host's
+  `.env` would have quietly come back and capped a worker below what the broker
+  told it.
+
+  `WorkerSettingsSchema` moved from `inbox_schema.py` to `system_schema.py`
+  (re-exported from its old home), next to `CryptoLeverageInitSchema`, which is
+  shared between the ACK and a runtime broadcast in exactly the same way. The
+  runtime push is handled in `BaseSignalProcessor`, not a market hook, because
+  the settings it carries are market-neutral, and it funnels into the same
+  `_apply_worker_settings` the ACK uses — so a value cannot behave one way live
+  and another on the next reconnect. New example
+  `examples/nats/system.worker_settings_update.json`.
+
+  **Fixed along the way:** `_salvage_settings` validated each field against its
+  bare *annotation*, which drops the field's own constraints. A value that the
+  annotation accepted but the model rejected (`max_open_orders: -1` is the first
+  such case, being `ge=0`) escaped the salvage as a `ValidationError` from the
+  final construction and failed the **whole** envelope — taking down the magic
+  map and the signal replay with it, which is the one outcome per-field
+  salvaging exists to prevent. Each field is now validated through the model
+  itself, so a bad value still costs only its own setting.
+
 - **`positions`' unique index is now `(strategy, symbol, COALESCE(signal_uxid, ''))`** for active (`OPENED`/`TP1`) rows, replacing `(strategy, symbol)`. Applied in place on an existing database: `_create_tables` drops the old `uidx_positions_one_active_per_strategy_symbol` before creating `uidx_positions_one_active_per_signal`, since the old index left behind would keep rejecting the second signal on a symbol. `COALESCE(..., '')` rather than a plain column, because SQLite treats NULLs as distinct in a UNIQUE index: folding every uxid-less row onto one key is what preserves the original one-active-per-(strategy, symbol) guarantee for a broker that sends no `signal_uxid`. No data migration and no column change — `positions.signal_uxid` already existed and was already written on every entry.
 
 - **Every action line of the cycle message carries the timezone of its time, and can be rendered in the operator's own zone.** The timeline in box 2 printed a bare `2026-09-11 10:10:02` under each action — the instant was UTC, but nothing on the line said so, while the broker's own report of the same trade quotes its times in the operator's zone (`… (UTC+7)`). Two clocks, neither labelled: reading the worker's `LONG`, `TP1` and `TP2` next to the broker's close made the trade look hours off, and there was no way to tell an unlabelled time in the wrong zone from a genuinely late fill.

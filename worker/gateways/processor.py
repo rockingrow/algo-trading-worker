@@ -61,7 +61,11 @@ from worker.schemas.job_schema import LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
-from worker.schemas.system_schema import SystemActionEnum, SystemSchema
+from worker.schemas.system_schema import (
+  SystemActionEnum,
+  SystemSchema,
+  SystemWorkerSettingsUpdateSchema,
+)
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import (
   MAX_RETRY_TIMEOUT,
@@ -1104,19 +1108,60 @@ class BaseSignalProcessor(ABC):
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
     """Dispatch a parsed SYSTEM ``action``. Default: log and ignore.
 
-    The base owns no runtime SYSTEM action of its own — the config it manages
-    (magic map, signal replay) is connect-time only and arrives in the
-    WORKER_CONNECTED_ACK. Markets that do have one override this hook and
-    delegate to ``super()`` for anything they don't recognise; CRYPTO handles
+    The base owns one runtime action, ``WORKER_SETTINGS_UPDATE``, because the
+    settings it carries are market-neutral — the same block both markets already
+    receive in their WORKER_CONNECTED_ACK. Everything else it manages (magic
+    map, signal replay) is connect-time only and arrives in that ACK. Markets
+    with a runtime action of their own override this hook and delegate to
+    ``super()`` for anything they don't recognise; CRYPTO handles
     ``CRYPTO_LEVERAGE_INIT``. The base still sees the worker's own
     ``WORKER_CONNECTED`` fanned back out on the shared subject, which lands here
     and is ignored.
     """
+    if action == SystemActionEnum.WORKER_SETTINGS_UPDATE:
+      self._apply_system_settings_update(data)
+      return
     log.info(
       "[%s SYSTEM] No handler for action=%s — ignoring.",
       self.name,
       getattr(action, "value", action),
     )
+
+  def _apply_system_settings_update(self, data: dict) -> None:
+    """Apply a runtime ``WORKER_SETTINGS_UPDATE``.
+
+    The runtime half of the ACK's ``settings`` section: an owner changed a value
+    from the Telegram bot (or an admin changed a broker-wide default) while this
+    worker was connected, so the new block arrives here instead of waiting for
+    the next handshake. It is handed to the very same
+    :meth:`_apply_worker_settings` the ACK goes through, so a value behaves
+    identically whichever path it arrives on — and the broker is still the
+    source of truth either way, re-sending it on every connect.
+
+    Fields are salvaged one by one, so a malformed value costs only its own
+    setting; each discard is logged. A push whose whole block was unusable
+    leaves every setting as it is, which is the same outcome as no push at all.
+    """
+    try:
+      update = SystemWorkerSettingsUpdateSchema(**data)
+    except ValidationError as err:
+      log.error(
+        "[%s SYSTEM] WORKER_SETTINGS_UPDATE envelope invalid: %s", self.name, err
+      )
+      return
+
+    for reason in update.dropped:
+      log.error("[%s SYSTEM] WORKER_SETTINGS_UPDATE dropped %s", self.name, reason)
+
+    if update.settings is None:
+      log.warning(
+        "[%s SYSTEM] WORKER_SETTINGS_UPDATE carried no usable setting — "
+        "nothing changed.",
+        self.name,
+      )
+      return
+
+    self._apply_worker_settings(update.settings)
 
   @property
   def _system_account_id(self) -> Optional[str]:
@@ -1390,6 +1435,31 @@ class BaseSignalProcessor(ABC):
       # change, no-ops when the worker is already in that state (which a fresh
       # start is for signal_blocked=false).
       self._set_signals_blocked(settings.signal_blocked)
+    if settings.max_open_orders is not None:
+      self._set_max_open_orders(settings.max_open_orders)
+
+  def _set_max_open_orders(self, max_open_orders: int) -> None:
+    """Store the broker's exposure cap, which the entry guard reads per signal.
+
+    It goes into the live settings dict rather than onto an attribute because
+    that dict is what ``guard.max_open_orders_rejection`` is handed on every
+    entry — the same place the setting used to arrive from ``.env``, so nothing
+    downstream has to change or learn where the value came from.
+
+    Logged on a real change only. No operator alert: unlike a signal block this
+    does not stop the worker trading, and the cap is already printed in the
+    startup message and every rejection line.
+    """
+    current = self.settings.get("max_open_orders")
+    if current == max_open_orders:
+      log.info("[SYSTEM] MAX_OPEN_ORDERS already %s — no change.", max_open_orders)
+      return
+    self.settings["max_open_orders"] = max_open_orders
+    log.warning(
+      "[SYSTEM] MAX_OPEN_ORDERS now %s for this worker (was %s).",
+      max_open_orders,
+      current,
+    )
 
   def _replay_blocked_reason(self) -> Optional[str]:
     """Why this worker must not run the ACK's signal replay, or None to proceed.

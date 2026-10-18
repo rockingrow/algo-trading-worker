@@ -167,22 +167,38 @@ def test_forex_account_id_derived_from_mt5_login(monkeypatch):
   assert s.account_id == "FOREX-MT5-413652379"
 
 
-def test_max_open_orders_defaults_to_five(monkeypatch):
+def _forex_env(monkeypatch):
   monkeypatch.setenv("MARKET_TYPE", "FOREX")
   monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
   monkeypatch.setenv("MT5_LOGIN", "413652379")
   monkeypatch.setenv("MT5_PASSWORD", "pw")
+
+
+def test_max_open_orders_defaults_to_five(monkeypatch):
+  # The backfill the worker runs on until the broker's first WORKER_CONNECTED_ACK
+  # tells it the account's actual cap.
+  _forex_env(monkeypatch)
   monkeypatch.delenv("MAX_OPEN_ORDERS", raising=False)
   assert Settings(_env_file=None).risk.max_open_orders == 5
 
 
-def test_max_open_orders_overridable(monkeypatch):
-  monkeypatch.setenv("MARKET_TYPE", "FOREX")
-  monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
-  monkeypatch.setenv("MT5_LOGIN", "413652379")
-  monkeypatch.setenv("MT5_PASSWORD", "pw")
+def test_max_open_orders_ignores_the_env_var(monkeypatch):
+  # The broker owns this value now, so MAX_OPEN_ORDERS is no longer a setting.
+  # Without the explicit validation_alias, pydantic-settings would match the
+  # field *name* case-insensitively and a stale entry in a host's .env would
+  # silently cap a worker below what the broker told it.
+  _forex_env(monkeypatch)
   monkeypatch.setenv("MAX_OPEN_ORDERS", "10")
-  assert Settings(_env_file=None).risk.max_open_orders == 10
+  assert Settings(_env_file=None).risk.max_open_orders == 5
+
+
+def test_max_open_orders_still_reaches_the_child_process(monkeypatch):
+  # It is read from the flat settings dict by guard.max_open_orders_rejection,
+  # which is also where the broker's pushed value lands — so the dump key has
+  # to survive the field losing its env var.
+  _forex_env(monkeypatch)
+  monkeypatch.delenv("MAX_OPEN_ORDERS", raising=False)
+  assert Settings(_env_file=None).flat_dump()["max_open_orders"] == 5
 
 
 # ── Multi-strategy-per-symbol requires unique magics ─────────────────────── #

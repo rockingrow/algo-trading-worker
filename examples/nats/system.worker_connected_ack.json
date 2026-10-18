@@ -6,6 +6,10 @@
     "MT5_GOLD_M5_V1": 20260409,
     "MT5_FX_M15_V2": 20260410
   },
+  "settings": {
+    "signal_blocked": false,
+    "max_open_orders": 5
+  },
   "crypto_leverage_init": {
     "symbols": [
       "BTC",
