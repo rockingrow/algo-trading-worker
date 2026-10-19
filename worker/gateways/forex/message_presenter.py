@@ -54,6 +54,7 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"{ForexMessagePresenter._tp1_be_line(s)}"
       f"{ForexMessagePresenter._max_open_orders_line(s)}"
       f"{ForexMessagePresenter._multi_strategy_line(s, 'FOREX')}"
+      f"{ForexMessagePresenter._multi_positions_line(s, 'FOREX')}"
     )
     return _box(
       f"{CONNECTED} <b>[Connected] FOREX Worker</b>\n\n{volume_config}{_DIVIDER}\n{footer}"

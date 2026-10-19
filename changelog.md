@@ -5,6 +5,114 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-19
+
+### Fixed
+
+- **The worker was subscribing to the wrong subjects and never heard `SYSTEM` or `ADMIN`.** `NatsSubjectEnum` mixes in `str`, so `_subject_str` recognised a member as a string and handed it to `nc.subscribe` as-is. nats-py builds its `SUB` protocol line with an f-string, and on Python 3.11+ `Enum` overrides `__str__`/`__format__`, so what reached the server was `SUB NatsSubjectEnum.SYSTEM` — a syntactically valid subject the server accepted without an error, an exception or a warning anywhere. The log line said `Subscribed to NATS subjects: [SYSTEM, ADMIN, ...]` because it builds its text with `", ".join(...)`, which reads the member's underlying `str` data and prints the right name; only the subject actually registered on the server was wrong (`/subsz` listed `NatsSubjectEnum.SYSTEM`).
+
+  Everything delivered on those two subjects was therefore dropped on the floor: the live **`WORKER_SETTINGS_UPDATE`** push (so `/maxorders` and a signal block/unblock applied only at the worker's next reconnect, when the ACK re-delivers them), the live **`CRYPTO_LEVERAGE_INIT`** push, and every broadcast **ADMIN** action that is not account-scoped. What kept working — and kept the fault invisible — is everything that never passes a member to `subscribe`: the strategy subjects and the private `ADMIN.<market>.<gateway>.<account_id>` subject are plain strings, the `WORKER_CONNECTED` handshake publishes with `subject.value` and is answered on a request inbox, so signals executed and the ACK's whole config landed normally.
+
+  Fixed in both places the value can escape: `_subject_str` now unwraps on `isinstance(s, NatsSubjectEnum)` rather than on `isinstance(s, str)` (which is true for every member), and `NatsSubjectEnum` restores `str`'s `__str__`/`__format__` so formatting a member yields its wire name wherever it is used, on every supported Python version. No configuration changes, and the subject names themselves are unchanged — a worker on this version subscribes to the `SYSTEM` and `ADMIN` the broker has been publishing on all along.
+
+- **A SYSTEM push is no longer lost to a disconnected platform.** With the subject reachable again, `_handle_system_message`'s connection gate became live for the first time — and it ran before the `account_id` routing check, so every worker on the fleet attempted a platform reconnect for a broadcast addressed to someone else, and a worker whose terminal was momentarily down dropped the push outright. The broker does not re-send until the next handshake, so that worker would have kept trading on the old cap, or under a block an operator had just set, until it reconnected.
+
+  Identity is now checked first (it has no side effects, so a message for another account costs nothing), and the connection check moved to the one action that actually reaches the market: `CRYPTO_LEVERAGE_INIT`, in `CryptoSignalProcessor._handle_system_action`. This mirrors how the ADMIN subject has always worked — `FLAT` is gated on the connection, `BLOCK_SIGNAL`/`ALLOW_SIGNAL` are not, because in-memory state does not need a broker.
+
+- **A busy MT5 trade context no longer costs the request.** The terminal serialises every trade request through a single trade context: one that arrives while another is still in flight is refused outright rather than queued, with `Trade context is busy` (or the server-side retcode **10024** *Too many requests*). The worker treated that refusal like any other rejection, so a scheduling collision — two signals landing together, most often a `TP1` partial and the breakeven SL move that follows it on the same signal, or two symbols filling on the same tick — surfaced as a failed trade: the entry was lost, the exit left the position open for the reconciler to notice, or the SL stayed where it was. Nothing was wrong with the request; the very same one succeeds a moment later.
+
+  `MT5Gateway._send_order_request` now wraps **every** `order_send` in the order path (`place_order`, `close_position`, `modify_sl`) in a bounded retry that sleeps between attempts: 4 attempts, 0.3 s doubling (~2.1 s at worst). The condition is matched on the terminal's own wording as well as on the retcode, because it reaches the worker by two routes — a rejected result carries it in `comment`, while a request the terminal refused to send at all returns `None` and leaves it in `last_error()`. The budget is small on purpose: an entry is a market order priced off the live quote, so retrying for seconds would fill it at a price the signal never meant, and once it is spent the refusal is reported as the failure it now really is. Anything that is *not* a busy context (10019 `No money`, 10014 `Invalid volume`, 10016 `Invalid stops`) is a verdict on the request and is still returned on the first attempt, unretried — retrying a verdict only delays the failure line the operator needs. No new setting; CRYPTO is untouched.
+
+- **A strategy name near 29 characters cost every FOREX entry it sent.** The MT5 order comment is composed as `<strategy> <last 2 chars of signal_id>`, and the gateway cut it to 30 characters on the assumption that MQL5's own 31-character limit was what applied. It is not: the MetaTrader5 Python wrapper refuses a request whose comment reaches **30** characters with `(-2, 'Invalid "comment" argument')` — client-side, before the terminal or the broker ever sees it. A 29-character strategy name (`SIGNAL_SIMULATOR_LIFECYCLE_V1`) made the composed comment 32 characters, the 30-character cut still overflowed by one, and `order_send` never left the process: the entry was logged as `retcode=-2 comment=Send Failed` and nothing reached `positions`. The `TP1` that followed a minute later then failed as `No tracked opening position in DB` — the visible symptom, one step removed from the cause. Shorter strategy names never reached the cut, so the off-by-one had never been exercised.
+
+  `_MT5_COMMENT_MAX` is now the measured 29 (verified against wrapper 5.0.5735), and **every** `order_send` comment goes through one fitting helper — the close path (`Full Close <reason>`) was passing its comment through untruncated, and a refused close is worse than a refused entry: the position stays open with nothing tracking the attempt. The fitting also drops trailing whitespace, so a cut that lands on the separator no longer shows up in the terminal as a name with a dangling gap.
+
+  The budget is part of the gateway contract (`BasePlatformGateway.order_comment_max`), so `ForexExecutor` composes the entry comment to fit instead of handing down something that will be cut: with a long strategy name the **name** gives way and the two-character signal tail is kept (`SIGNAL_SIMULATOR_LIFECYCLE fe`). That tail is the only thing telling apart the comments of two tickets one strategy holds on the same symbol under `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`, which is exactly when an operator reads them side by side in the terminal.
+
+### Added
+
+- **One strategy can now hold several positions on the same symbol, one per signal (`FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`).** A tracked position was addressed by `(strategy, symbol)` alone, so a second signal on a symbol the strategy already held was not a second trade: the entry guard rejected it outright, and had it got through, `SignalHandler._handle_entry` would have force-closed the running position to make room and the DB's unique index would have refused the insert. A broker that fans several concurrent setups out on one instrument therefore lost every one after the first.
+
+  The position key gains a third component — the `signal_uxid` the payload already carries — so a position is now addressed by **symbol + strategy + signal_uxid**. With `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL=true` each signal opens its own platform ticket with its own SL/TP, and every step that used to work on "the strategy's position on this symbol" is scoped to the ticket tracked for that one signal: the entry's stale-cleanup (a re-send of one signal still replaces only its own position), the DB reconcile, the `TP1` partial and breakeven move, the `TP2`/`SL`/`R_SL` full close, and `FLAT`. A signal whose uxid resolves to no tracked row closes nothing rather than falling back to a symbol-wide close — including `FLAT`, whose usual DB-out-of-sync fallback would otherwise flatten every sibling signal's live position to clean up one that is already gone. The entry guards keep their axes separate too: a position held by *another* strategy is governed by `FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL` alone and its uxid never exempts it, so enabling multi-positions cannot silently switch off the cross-strategy netting guard.
+
+  **`MAX_OPEN_ORDERS` is unchanged and still caps the account**: it counts every active position the worker tracks, whatever strategy, symbol or signal holds it, so `MAX_OPEN_ORDERS=5` allows any five concurrent positions — five symbols, five strategies, or five signals on one symbol+strategy. Its one exemption (a re-entry that replaces rather than adds) is now keyed on the uxid too, so a *second* signal on an already-held symbol is counted normally instead of slipping past the cap.
+
+  FOREX only: a CEX nets every order on a symbol into a single position, so `CryptoMarket` does not report the capability and there is no crypto equivalent of the setting. Default `false` keeps the previous one-position-per-(strategy, symbol) behaviour exactly, including for a payload that carries no `signal_uxid` — nothing tells such a signal apart from the open rows, so it keeps being rejected rather than stacking a position the worker could not later address.
+
+- **`FOREX_HEDGE_MODE` — a verified hedging account, or the worker does not start.** Several tickets on one symbol only stay separate on a hedging MT5 account; a netting account merges them into one net position, so the per-signal (and per-strategy) rows the worker tracks would all point at the same merged volume and every exit but the first would fail with "No open position" while the merged volume ran on unmanaged. Nothing downstream can detect that. With `FOREX_HEDGE_MODE=true` the account's `margin_mode` is now checked once, at broker connect: anything other than hedging — including an account that reports no margin mode at all, since "could not verify" is not "verified hedging" — is logged at `CRITICAL`, sent to Telegram, and **blocks startup** (`ForexSignalProcessor._enforce_hedge_mode`). `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL=true` requires it, and `Settings` refuses to load without it rather than letting the mismatch surface as failed exits.
+
+  This is deliberately stricter than the existing `FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL` hedging check, which stays warn-only: that toggle degrades to the old one-strategy-per-symbol behaviour on a netting account, whereas `FOREX_HEDGE_MODE` is the operator asserting a property of the account, and trading on an account that does not have it is worse than not trading.
+
+### Changed
+
+- **`MAX_OPEN_ORDERS` is gone from `.env` — the broker owns the open-position
+  cap.** Changing a worker's exposure limit meant editing a file on its host and
+  restarting it, and nothing stopped a stale line there from disagreeing with
+  what the account's owner believed was set. The cap now arrives from the broker
+  in the `settings` block of every `WORKER_CONNECTED_ACK`, as a new
+  `max_open_orders` field alongside `signal_blocked`, and on the new SYSTEM
+  **`WORKER_SETTINGS_UPDATE`** broadcast when it changes while this worker is
+  connected. An owner changes it from the Telegram bot (`/maxorders`; an admin
+  sets the default every account inherits with `/admin_max_orders`), and it
+  applies without a restart.
+
+  The broker resolves its two scopes — the account's own value, else its
+  broker-wide default — before sending, so what arrives is always a concrete
+  number and this worker never has to know a global default exists. `0` is a
+  real value meaning "no cap", not an absence. The value lands in the flat
+  settings dict under `max_open_orders`, the exact key the old `.env` variable
+  populated, so `guard.max_open_orders_rejection` and every other consumer read
+  it unchanged — the entry guard needed no change at all.
+
+  **⚠️ This changes how a running fleet trades — seed the broker first.** The
+  old `.env.example` shipped `MAX_OPEN_ORDERS=0`, i.e. **uncapped**, and
+  `init_env.py` copies that key set into `.env`, so a host bootstrapped with
+  `make init` is uncapped today. After this release that line is ignored and an
+  unseeded broker resolves to its default of `5`, so such a worker would
+  silently start rejecting entries beyond the 5th. Before deploying, set the
+  broker-wide default to what the fleet is on today (`/admin_max_orders`, or
+  `POST /admin/settings/max-open-orders` — `0` to stay uncapped); the upgrade is
+  then a no-op and you tighten the cap deliberately afterwards. `grep
+  MAX_OPEN_ORDERS .env` on each host tells you what it is on now.
+
+  `MAX_OPEN_ORDERS` is removed from `.env.example`; a line for it in a `.env`
+  now does nothing. `worker/settings.py` keeps `risk.max_open_orders` with its
+  default of `5`, deliberately **without** an env var, as the backfill for the
+  window before the first handshake and for a broker too old to send the field.
+  Its `validation_alias` points at a name nothing sets, and that is the whole
+  point: with no alias, pydantic-settings falls back to matching the field
+  *name* case-insensitively, so a stale `MAX_OPEN_ORDERS` left in a host's
+  `.env` would have quietly come back and capped a worker below what the broker
+  told it.
+
+  `WorkerSettingsSchema` moved from `inbox_schema.py` to `system_schema.py`
+  (re-exported from its old home), next to `CryptoLeverageInitSchema`, which is
+  shared between the ACK and a runtime broadcast in exactly the same way. The
+  runtime push is handled in `BaseSignalProcessor`, not a market hook, because
+  the settings it carries are market-neutral, and it funnels into the same
+  `_apply_worker_settings` the ACK uses — so a value cannot behave one way live
+  and another on the next reconnect. New example
+  `examples/nats/system.worker_settings_update.json`.
+
+  **Fixed along the way:** `_salvage_settings` validated each field against its
+  bare *annotation*, which drops the field's own constraints. A value that the
+  annotation accepted but the model rejected (`max_open_orders: -1` is the first
+  such case, being `ge=0`) escaped the salvage as a `ValidationError` from the
+  final construction and failed the **whole** envelope — taking down the magic
+  map and the signal replay with it, which is the one outcome per-field
+  salvaging exists to prevent. Each field is now validated through the model
+  itself, so a bad value still costs only its own setting.
+
+- **`positions`' unique index is now `(strategy, symbol, COALESCE(signal_uxid, ''))`** for active (`OPENED`/`TP1`) rows, replacing `(strategy, symbol)`. Applied in place on an existing database: `_create_tables` drops the old `uidx_positions_one_active_per_strategy_symbol` before creating `uidx_positions_one_active_per_signal`, since the old index left behind would keep rejecting the second signal on a symbol. `COALESCE(..., '')` rather than a plain column, because SQLite treats NULLs as distinct in a UNIQUE index: folding every uxid-less row onto one key is what preserves the original one-active-per-(strategy, symbol) guarantee for a broker that sends no `signal_uxid`. No data migration and no column change — `positions.signal_uxid` already existed and was already written on every entry.
+
+- **Every action line of the cycle message carries the timezone of its time, and can be rendered in the operator's own zone.** The timeline in box 2 printed a bare `2026-09-11 10:10:02` under each action — the instant was UTC, but nothing on the line said so, while the broker's own report of the same trade quotes its times in the operator's zone (`… (UTC+7)`). Two clocks, neither labelled: reading the worker's `LONG`, `TP1` and `TP2` next to the broker's close made the trade look hours off, and there was no way to tell an unlabelled time in the wrong zone from a genuinely late fill.
+
+  `cycle_presenter._timestamp` now always labels the zone it rendered in — `2026-09-11 10:10:02 (UTC)` — and renders in the zone chosen by the new **`TELEGRAM_MESSAGE_TIMEZONE`** (a UTC offset in **hours**, default `0`): `7` → `2026-09-11 17:10:02 (UTC+7)`, `-4` → `(UTC-4)`, `5.5` → `(UTC+5:30)`. Set it to the zone the broker reports in and the two reports of one trade read off the same clock. Nothing is stored differently: cycle event timestamps stay UTC in SQLite and on the `TRADE` subject, so this changes display only, and a value that is unset, non-numeric or outside ±14h falls back to UTC rather than failing a render — a message with a surprising offset is still a message. A stored timestamp with no offset is read as UTC (what the worker writes), and a `timestamp` that is not a time at all is passed through **unlabelled** rather than being given an invented zone.
+
+### Notes
+
+- The **subscribed/closed broadcast message** shown in the request (`[🏁CLOSED] … Close price: … Updated: 2026-09-11 18:17:05 (UTC+7)`, with its `Actions:` list) is rendered by the **broker**, not by this worker — no string in this repository produces those lines. Adding the entry `LONG`/`SHORT` line to it, and putting `<action> (datetime + timezone)` on each of its action lines, is a change in the broker's presenter; the worker already publishes everything that message needs (`action`, `opened_price`, `closed_price`, `created_at`, `updated_at` on every `PositionEvent`).
+
 ## [1.2.3] - 2026-09-11
 
 ### Added
@@ -243,6 +351,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
+[1.3.0]: https://github.com/rockingrow/algo-trading-worker/compare/v1.3.0...dev
 [1.2.3]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.3...dev
 [1.2.2]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.2...dev
 [1.2.1]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.1...dev

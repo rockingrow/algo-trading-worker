@@ -65,6 +65,29 @@ class SignalHandler:
   # ------------------------------------------------------------------ #
 
   @property
+  def _multi_positions_allowed(self) -> bool:
+    """True when the active market may hold several positions of ONE strategy
+    on one symbol, told apart by ``signal_uxid``.
+
+    ``getattr`` with a ``False`` default so a strategy implementation that
+    predates the capability (or a lightweight test double) keeps the safe
+    one-position-per-(strategy, symbol) behaviour.
+    """
+    return bool(getattr(self.strategy, "allows_multi_positions_per_symbol", False))
+
+  def _uxid_scope(self, signal: SignalSchema) -> Optional[str]:
+    """The ``signal_uxid`` to scope DB lookups by, or ``None`` for "any".
+
+    Only when the market allows multiple positions per symbol *and* the payload
+    actually carries a uxid is the third key component meaningful. A worker
+    with the toggle off, or a payload from a broker that does not send one,
+    keeps addressing positions by (strategy, symbol) alone.
+    """
+    if not self._multi_positions_allowed:
+      return None
+    return signal.signal_uxid or None
+
+  @property
   def _multi_strategy_allowed(self) -> bool:
     """True when the active market may hold several strategies on one symbol.
 
@@ -79,25 +102,35 @@ class SignalHandler:
   # ------------------------------------------------------------------ #
 
   def _get_db_position(
-    self, strategy_name: str, symbol: str
+    self, strategy_name: str, symbol: str, signal_uxid: Optional[str] = None
   ) -> Optional[Dict[str, Any]]:
-    """Return the single open/TP1 position for strategy_name+symbol from SQLite, or None.
+    """Return the single open/TP1 position for this key from SQLite, or None.
 
-    Invariant: at most one active position per (strategy, symbol) should exist
-    at any time. If more than one is found (data inconsistency from a prior
-    crash), keep the oldest row and mark the extras FORCED_CLOSED so the DB
-    self-heals rather than silently ignoring the duplicates.
+    The key is (strategy, symbol) — plus *signal_uxid* when the market allows
+    one strategy to hold several positions on a symbol, which is what tells
+    them apart (see :meth:`_uxid_scope`).
+
+    Invariant: at most one active position per key should exist at any time. If
+    more than one is found (data inconsistency from a prior crash), keep the
+    oldest row and mark the extras FORCED_CLOSED so the DB self-heals rather
+    than silently ignoring the duplicates. Note the self-heal is scoped to the
+    same key: with the uxid in play it never touches a sibling signal's
+    legitimate position on the same symbol.
     """
-    positions = self._db.get_open_positions_by_strategy(strategy_name, symbol)
+    positions = self._db.get_open_positions_by_strategy(
+      strategy_name, symbol, signal_uxid=signal_uxid
+    )
     if not positions:
       return None
     if len(positions) > 1:
       logger.error(
-        "[SignalHandler] Data inconsistency: %d active DB rows for strategy=%s symbol=%s. "
-        "Keeping source_ticket=%s, marking %d extra(s) FORCED_CLOSED.",
+        "[SignalHandler] Data inconsistency: %d active DB rows for strategy=%s "
+        "symbol=%s signal_uxid=%s. Keeping source_ticket=%s, marking %d "
+        "extra(s) FORCED_CLOSED.",
         len(positions),
         strategy_name,
         symbol,
+        signal_uxid,
         positions[0]["ref_source_id"],
         len(positions) - 1,
       )
@@ -116,7 +149,7 @@ class SignalHandler:
   def _execute_exit(
     self,
     signal: SignalSchema,
-    strategy_fn: Callable[[SignalSchema], TradeResult],
+    strategy_fn: Callable[[SignalSchema, Optional[Any]], TradeResult],
     *,
     no_db_comment: str,
     no_mt5_comment: str,
@@ -125,33 +158,45 @@ class SignalHandler:
     Shared skeleton for all exit-type signals (TP1, full close).
 
     1. DB lookup — early return if no tracked position.
-    2. Live MT5 guard — early return if position already gone.
-    3. Execute *strategy_fn*.
+    2. Live broker guard — early return if position already gone.
+    3. Execute *strategy_fn*, scoped to the tracked position's ticket.
     4. Inject source_ticket from DB into a successful result.
+
+    Step 3 is what makes several positions on one symbol safe: the ticket comes
+    from the row the signal's own composite key resolved to, so a TP1/TP2/SL
+    never reaches a sibling signal's position. It is passed only when the
+    market allows those siblings to exist — otherwise ``None`` keeps the
+    original "the strategy's position on this symbol" behaviour, including the
+    re-ticketing tolerance SQLite-as-source-of-truth relies on.
     """
-    db_pos = self._get_db_position(signal.strategy, signal.symbol)
+    uxid = self._uxid_scope(signal)
+    db_pos = self._get_db_position(signal.strategy, signal.symbol, signal_uxid=uxid)
     if not db_pos:
       logger.warning(
         f"[SignalHandler] No DB record for strategy={signal.strategy} "
-        f"symbol={signal.symbol} action={signal.action.value}. "
+        f"symbol={signal.symbol} signal_uxid={uxid} action={signal.action.value}. "
         "Position may have been closed already."
       )
       return TradeResult.fail(no_db_comment)
 
     logger.info(
       f"[SignalHandler] DB position found | "
-      f"ref_source_id={db_pos['ref_source_id']} ref_id={db_pos['ref_id']} status={db_pos['status']}"
+      f"ref_source_id={db_pos['ref_source_id']} ref_id={db_pos['ref_id']} "
+      f"signal_uxid={uxid} status={db_pos['status']}"
     )
 
-    if not self.strategy.get_open_positions(signal.symbol, strategy=signal.strategy):
+    position_ticket = db_pos["ref_source_id"] if uxid else None
+    if not self.strategy.get_open_positions(
+      signal.symbol, strategy=signal.strategy, position_ticket=position_ticket
+    ):
       logger.warning(
-        f"[SignalHandler] No live MT5 position for strategy={signal.strategy} "
-        f"symbol={signal.symbol} action={signal.action.value}. "
-        "May have been closed already."
+        f"[SignalHandler] No live broker position for strategy={signal.strategy} "
+        f"symbol={signal.symbol} ticket={position_ticket} "
+        f"action={signal.action.value}. May have been closed already."
       )
       return TradeResult.fail(no_mt5_comment)
 
-    result = strategy_fn(signal)
+    result = strategy_fn(signal, position_ticket)
     if result.get("success"):
       result["source_ticket"] = db_pos["ref_source_id"]
     return result
@@ -186,6 +231,39 @@ class SignalHandler:
   #  Group 1 — Open position (LONG / SHORT)                             #
   # ------------------------------------------------------------------ #
 
+  def _force_close_stale(
+    self, symbol: str, strategy: str, tickets: list
+  ) -> TradeResult:
+    """Force-close this strategy's stale position(s) on *symbol*.
+
+    *tickets* is one entry per tracked position to close — ``[None]`` for the
+    single unscoped close used when positions are keyed by (strategy, symbol)
+    alone, or one ticket per tracked row when ``signal_uxid`` is in play. One
+    close per ticket, so a duplicate row left by an earlier crash does not
+    leave its live position open while the caller marks the row FORCED_CLOSED.
+
+    The first failure aborts (the caller refuses the entry), and the PnL is
+    summed across the closes because the caller reports them as one event.
+    """
+    price = None
+    retcode = None
+    profit = None
+    for ticket in tickets:
+      cleanup = self.strategy.close_all_positions(
+        symbol,
+        reason="STALE_CLEANUP",
+        strategy=strategy,
+        position_ticket=ticket,
+      )
+      if not cleanup.get("success"):
+        return cleanup
+      price = cleanup.get("price")
+      retcode = cleanup.get("retcode")
+      booked = cleanup.get("profit")
+      if booked is not None:
+        profit = (profit or 0.0) + booked
+    return TradeResult.ok(retcode=retcode, price=price, profit=profit)
+
   def _handle_entry(self, signal: SignalSchema) -> TradeResult:
     """
     1. Reject if another strategy already holds this symbol (netting conflict),
@@ -195,6 +273,11 @@ class SignalHandler:
     """
     symbol = signal.symbol
     strategy = signal.strategy
+    # Third component of the position key when this market supports it: with a
+    # uxid in play every step below is scoped to *this signal's* position, so a
+    # sibling signal already running on the symbol is neither closed nor
+    # reconciled away by this entry.
+    uxid = self._uxid_scope(signal)
 
     # Guard: reject if another strategy already holds this symbol in the DB.
     # This MUST run before the stale-cleanup below because cancel_all_orders is
@@ -238,21 +321,47 @@ class SignalHandler:
 
     # Step 1 — Pre-flight: close this strategy's stale position to start clean.
     # Scoped to signal.strategy so a concurrent strategy holding a position on
-    # the same symbol is untouched (enforced by the guard above).
+    # the same symbol is untouched (enforced by the guard above), and — when
+    # several signals may share the (strategy, symbol) — further scoped to the
+    # ticket tracked for this signal's own uxid, so re-sending one signal
+    # replaces only its own position.
     forced_closed: list[dict] = []
     cleanup_price: Optional[float] = None
     cleanup_retcode: Optional[int] = None
     cleanup_profit: Optional[float] = None
-    stale = self.strategy.get_open_positions(symbol, strategy=strategy)
+    db_stale = self._db.get_open_positions_by_strategy(
+      signal.strategy, symbol, signal_uxid=uxid
+    )
+    # One close per tracked ticket when the uxid is in play, so a duplicate row
+    # left by an earlier crash does not leave its live position open while the
+    # loop below marks the row FORCED_CLOSED. Without a uxid it stays a single
+    # unscoped close, exactly as before.
+    stale_tickets: list = (
+      [r["ref_source_id"] for r in db_stale if r.get("ref_source_id")]
+      if uxid
+      else [None]
+    )
+    if uxid and not stale_tickets:
+      # Several signals may share this (strategy, symbol) and none of the live
+      # positions is tracked as this signal's. Every one of them belongs to a
+      # sibling signal, so there is nothing for this entry to clean up — an
+      # unscoped close here would flatten trades that are running as intended.
+      stale = []
+    else:
+      stale = [
+        pos
+        for ticket in stale_tickets
+        for pos in self.strategy.get_open_positions(
+          symbol, strategy=strategy, position_ticket=ticket
+        )
+      ]
     if stale:
       logger.warning(
         f"[SignalHandler._handle_entry] Found {len(stale)} stale position(s) "
-        f"for strategy={strategy} symbol={symbol}. "
+        f"for strategy={strategy} symbol={symbol} signal_uxid={uxid}. "
         "Force-closing before entering new trade."
       )
-      cleanup = self.strategy.close_all_positions(
-        symbol, reason="STALE_CLEANUP", strategy=strategy
-      )
+      cleanup = self._force_close_stale(symbol, strategy, stale_tickets)
       if not cleanup.get("success"):
         logger.error(
           f"[SignalHandler._handle_entry] Failed to clear stale positions: "
@@ -275,9 +384,10 @@ class SignalHandler:
     # A prior position may have been closed externally (SL/liquidation on the
     # exchange, manual close, or a missed close event), leaving an orphaned
     # OPENED row that the broker no longer reports. If we skip it here, the
-    # fresh position below would violate the one-active-per-(strategy,symbol)
-    # unique index on insert, leaving the new trade live but untracked.
-    db_stale = self._db.get_open_positions_by_strategy(signal.strategy, symbol)
+    # fresh position below would violate the one-active-per-(strategy, symbol,
+    # signal_uxid) unique index on insert, leaving the new trade live but
+    # untracked. Read above, before the broker cleanup, because the ticket it
+    # holds is what scopes that cleanup.
     if db_stale:
       comment = (
         "Force-closed by new entry signal"
@@ -381,9 +491,37 @@ class SignalHandler:
     is out of sync (position exists in MT5 but not in DB), other full-close
     handlers would bail early and leave the position open. FLAT always
     attempts the MT5 close first, then reconciles the DB afterward.
+
+    When one strategy may hold several positions on the symbol, a FLAT still
+    belongs to the signal that sent it: the close is scoped to the ticket
+    tracked for that ``signal_uxid`` so the siblings keep running. If no row
+    resolves for the uxid there is nothing this signal owns, and the
+    DB-out-of-sync fallback does NOT apply — a strategy-wide close would
+    flatten every sibling signal's live position to clean up one that is
+    already gone. The untracked position such a fallback exists for is left to
+    the close detector / reconciler instead, which is the same trade-off the
+    entry path and the unscoped-retry guard below already make.
     """
+    uxid = self._uxid_scope(signal)
+    owned = self._get_db_position(signal.strategy, signal.symbol, signal_uxid=uxid)
+    if uxid and not owned:
+      logger.warning(
+        "[SignalHandler._handle_flat] No tracked position for strategy=%s "
+        "symbol=%s signal_uxid=%s — closing nothing, because every live "
+        "position on this symbol belongs to a sibling signal.",
+        signal.strategy,
+        signal.symbol,
+        uxid,
+      )
+      return TradeResult.fail(
+        f"No tracked position for {signal.symbol} signal {uxid} [FLAT]"
+      )
+    position_ticket = owned["ref_source_id"] if (uxid and owned) else None
     result = self.strategy.close_all_positions(
-      signal.symbol, reason="FLAT", strategy=signal.strategy
+      signal.symbol,
+      reason="FLAT",
+      strategy=signal.strategy,
+      position_ticket=position_ticket,
     )
 
     if not result.get("success"):
@@ -395,11 +533,12 @@ class SignalHandler:
       # there would flatten the *other* strategies' live positions to clean up
       # this one, which is far worse than leaving an untracked position open for
       # the terminal-close detector / reconciler to pick up.
-      if self._multi_strategy_allowed:
+      if self._multi_strategy_allowed or self._multi_positions_allowed:
         logger.warning(
           "[SignalHandler._handle_flat] Strategy-scoped close found no positions for "
           "strategy=%s symbol=%s — skipping the unscoped retry because other "
-          "strategies may hold %s (multi-strategy per symbol enabled).",
+          "strategies or signals may hold %s (multi-strategy / multi-positions "
+          "per symbol enabled).",
           signal.strategy,
           signal.symbol,
           signal.symbol,
@@ -416,7 +555,9 @@ class SignalHandler:
         )
 
     if result.get("success"):
-      db_pos = self._get_db_position(signal.strategy, signal.symbol)
+      db_pos = owned or self._get_db_position(
+        signal.strategy, signal.symbol, signal_uxid=uxid
+      )
       if db_pos:
         result["source_ticket"] = db_pos["ref_source_id"]
       logger.info(
@@ -428,7 +569,9 @@ class SignalHandler:
       return result
 
     # MT5 had no positions to close — check if DB has a stale open record
-    db_pos = self._get_db_position(signal.strategy, signal.symbol)
+    db_pos = owned or self._get_db_position(
+      signal.strategy, signal.symbol, signal_uxid=uxid
+    )
     if db_pos:
       logger.warning(
         "[SignalHandler._handle_flat] No MT5 positions but DB has open record — "

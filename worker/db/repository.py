@@ -377,21 +377,37 @@ class PositionRepository:
       if conn:
         conn.close()
 
-  def get_open_positions_by_strategy(self, strategy: str, symbol: str) -> list:
+  def get_open_positions_by_strategy(
+    self, strategy: str, symbol: str, signal_uxid: Optional[str] = None
+  ) -> list:
+    """Active (OPENED/TP1) rows for *strategy* + *symbol*.
+
+    *signal_uxid* narrows the result to the single signal that opened the
+    position — the third component of the composite position key, used when
+    FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL lets one strategy hold several
+    positions on a symbol. ``None`` (the default) means "every signal", which
+    is what a worker with the toggle off, or a payload carrying no uxid, wants.
+    """
     conn = None
     try:
       conn = _get_conn()
       conn.row_factory = sqlite3.Row
       cursor = conn.cursor()
-      cursor.execute(
-        "SELECT * FROM positions WHERE strategy = ? AND symbol = ? AND status IN ('OPENED', 'TP1')",
-        (strategy, symbol),
+      sql = (
+        "SELECT * FROM positions WHERE strategy = ? AND symbol = ? "
+        "AND status IN ('OPENED', 'TP1')"
       )
+      params: list = [strategy, symbol]
+      if signal_uxid:
+        sql += " AND signal_uxid = ?"
+        params.append(signal_uxid)
+      cursor.execute(sql, params)
       rows = cursor.fetchall()
       return [self._row_to_dict(row) for row in rows]
     except Exception as e:
       logger.exception(
-        f"Failed to fetch open positions for strategy={strategy} symbol={symbol}: {e}"
+        f"Failed to fetch open positions for strategy={strategy} symbol={symbol} "
+        f"signal_uxid={signal_uxid}: {e}"
       )
       return []
     finally:

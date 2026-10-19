@@ -42,6 +42,7 @@ class TradeExecutorProtocol(Protocol):
     reason: str = "CLOSE",
     strategy: Optional[str] = None,
     fallback_close_price: Optional[float] = None,
+    position_ticket: Optional[Any] = None,
   ) -> TradeResult: ...
   def get_open_positions(
     self, symbol: str, strategy: Optional[str] = None

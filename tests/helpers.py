@@ -160,11 +160,15 @@ class FakeMt5:
     symbols=None,
     deals: Optional[List] = None,
     margin_per_lot=None,
+    error=(1, "fake error"),
   ):
     # Margin the terminal quotes per lot. None models a terminal that cannot
     # price it (order_calc_margin returns None), which is the default so the
     # caller's margin pre-flight stays out of the way of unrelated tests.
     self._margin_per_lot = margin_per_lot
+    # (code, description) the terminal reports for the last failed call. The
+    # description carries "Trade context is busy", which the gateway matches on.
+    self._error = error
     self._symbol_info = symbol_info if symbol_info is not None else make_symbol_info()
     self._tick = tick if tick is not None else make_tick()
     self._positions = list(positions or [])
@@ -245,7 +249,7 @@ class FakeMt5:
     return list(self._deals)
 
   def last_error(self):
-    return (1, "fake error")
+    return self._error
 
 
 # ── FOREX platform-gateway fakes (agnostic layer) ──────────────────────────── #
@@ -296,6 +300,9 @@ class FakePlatformGateway:
   TradeResults so the executor's business logic is testable without MetaTrader5."""
 
   name = "FAKE"
+  # Same budget as MT5Gateway, so a comment the executor composes here is one
+  # the real gateway would have sent unchanged.
+  order_comment_max = 29
 
   def __init__(
     self,

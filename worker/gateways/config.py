@@ -23,6 +23,14 @@ _MULTI_STRATEGY_SETTING_BY_MARKET = {
   "CRYPTO": "crypto_allow_multi_strategy_per_symbol",
 }
 
+# Market → the settings key holding that market's multi-*positions*-per-symbol
+# toggle (several signals of ONE strategy on one symbol, told apart by
+# ``signal_uxid``). FOREX only: a CEX nets every order on a symbol into one
+# position, so a market absent from this map resolves to False.
+_MULTI_POSITIONS_SETTING_BY_MARKET = {
+  "FOREX": "forex_allow_multi_positions_per_symbol",
+}
+
 
 @dataclass(frozen=True)
 class ExecutionConfig:
@@ -59,6 +67,15 @@ class ExecutionConfig:
   # one-active-position-per-(strategy, symbol) invariant, which holds in both
   # markets.
   allow_multi_strategy_per_symbol: bool = False
+  # Allow one strategy to hold several positions on the same symbol, one per
+  # ``signal_uxid``: the position key becomes symbol + strategy + signal_uxid,
+  # so a second signal opens its own ticket instead of replacing the first.
+  # Resolved per market from FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL (see
+  # ``from_dict``); FOREX-only, because only a hedging platform account keeps
+  # the tickets, SL/TP and closes of two positions on one symbol apart.
+  # Default False keeps one position per (strategy, symbol). It never relaxes
+  # MAX_OPEN_ORDERS, which counts every active position on the account.
+  allow_multi_positions_per_symbol: bool = False
   # When True, always use risk_percentage from settings regardless of signal.
   # When False (default): use signal.risk_percent if present, else risk_percentage.
   use_custom_risk_percentage: bool = False
@@ -78,6 +95,9 @@ class ExecutionConfig:
       position_tp1_percent=settings_dict.get("position_tp1_percent"),
       tp1_move_sl_to_breakeven=settings_dict.get("tp1_move_sl_to_breakeven"),
       allow_multi_strategy_per_symbol=cls._resolve_multi_strategy(settings_dict),
+      allow_multi_positions_per_symbol=cls._resolve_market_toggle(
+        settings_dict, _MULTI_POSITIONS_SETTING_BY_MARKET
+      ),
       use_custom_risk_percentage=settings_dict.get("use_custom_risk_percentage", False),
     )
 
@@ -114,17 +134,26 @@ class ExecutionConfig:
       return equity_sizing is False
     return not self.volume_decision_enabled
 
-  @staticmethod
-  def _resolve_multi_strategy(settings_dict: dict) -> bool:
+  @classmethod
+  def _resolve_multi_strategy(cls, settings_dict: dict) -> bool:
     """Pick the multi-strategy-per-symbol toggle belonging to the active market.
 
     Each market has its own env var (they carry different risk — see the field
     docstring above), so exactly one of them is in play for a given worker and
     the other is ignored rather than silently leaking across markets.
     """
+    return cls._resolve_market_toggle(settings_dict, _MULTI_STRATEGY_SETTING_BY_MARKET)
+
+  @staticmethod
+  def _resolve_market_toggle(settings_dict: dict, setting_by_market: dict) -> bool:
+    """Read the active market's entry from a market → settings-key map.
+
+    A market with no entry (or a settings dict without the key) resolves to
+    False, so a toggle never leaks from the market it was written for.
+    """
     raw = settings_dict.get("market_type") or "FOREX"
     market = str(getattr(raw, "value", raw)).upper()
-    key = _MULTI_STRATEGY_SETTING_BY_MARKET.get(market)
+    key = setting_by_market.get(market)
     if key is None:
       return False
     return bool(settings_dict.get(key, False))

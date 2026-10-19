@@ -72,7 +72,7 @@ class FakeExecutor:
   def get_all_open_positions(self, strategy=None):
     return list(self._positions)
 
-  def get_open_positions(self, symbol, strategy=None):
+  def get_open_positions(self, symbol, strategy=None, position_ticket=None):
     return list(self._positions)
 
   def close_single_position(self, pos, reason="FLAT"):

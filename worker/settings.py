@@ -181,6 +181,28 @@ class ForexSettings(BaseSettings):
     "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL",
     "forex_allow_multi_strategy_per_symbol",
   )
+  # Several *signals* of the same strategy living on one symbol at the same
+  # time. Each incoming signal carries its own ``signal_uxid``, which becomes
+  # the third component of the position key (symbol + strategy + signal_uxid),
+  # so a second signal opens its own ticket instead of replacing the first
+  # one's. The exposure cap (MAX_OPEN_ORDERS) is unchanged: it still counts
+  # every active position on the account, whatever strategy, symbol or signal
+  # holds it, so five concurrent signals on one symbol fill the same five slots
+  # as five signals on five symbols.
+  # Default False keeps the one-position-per-(strategy, symbol) behaviour.
+  # Requires a hedging account (FOREX_HEDGE_MODE) — a netting account merges
+  # every ticket on a symbol into one net position and the isolation is lost.
+  allow_multi_positions_per_symbol: bool = _opt(
+    False,
+    "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL",
+    "forex_allow_multi_positions_per_symbol",
+  )
+  # Declares that this account is expected to be in hedging mode. Checked once,
+  # at broker connect: if the account reports anything else (or does not report
+  # a margin mode at all), the worker refuses to start rather than trade with
+  # the isolation its position key assumes. See
+  # ``ForexSignalProcessor._enforce_hedge_mode``.
+  hedge_mode: bool = _opt(False, "FOREX_HEDGE_MODE", "forex_hedge_mode")
 
 
 class CryptoSettings(BaseSettings):
@@ -334,8 +356,29 @@ class RiskSettings(BaseSettings):
   # broker: it is recorded with status REJECTED, reported to the broker on the TRADE
   # subject (also REJECTED) and notified — but no order is placed. A re-entry/scale-in
   # on a symbol the strategy already holds replaces that position rather than opening
-  # a new slot, so it never counts against the cap. Set to 0 to disable the limit.
-  max_open_orders: int = _opt(5, "MAX_OPEN_ORDERS", "max_open_orders")
+  # a new slot, so it never counts against the cap. 0 disables the limit.
+  #
+  # **Owned by the broker, not by .env.** The value in force comes from the
+  # account's ``max_open_orders`` setting, which the broker resolves (the
+  # account's own value, else its broker-wide default) and sends in the
+  # ``settings`` block of every WORKER_CONNECTED_ACK, plus a SYSTEM
+  # WORKER_SETTINGS_UPDATE when it changes mid-session. This field is therefore
+  # deliberately **not** read from an env var — there is no MAX_OPEN_ORDERS to
+  # set, and a stale one on a host could not win over the broker anyway. It
+  # survives only as the backfill for the window before the first handshake, and
+  # for a broker too old to send the field at all; the setting still flows into
+  # the child process through ``flat_dump``, which is where the guard reads it.
+  #
+  # The validation_alias is a name nothing sets, and that is its whole job: with
+  # no alias at all, pydantic-settings falls back to matching the *field name*
+  # case-insensitively, so a stale MAX_OPEN_ORDERS left behind in a host's .env
+  # would quietly come back and silently cap a worker below what the broker
+  # told it. There is no env var for this value.
+  max_open_orders: int = Field(
+    5,
+    validation_alias="max_open_orders_broker_owned",
+    serialization_alias="max_open_orders",
+  )
 
 
 class TelegramSettings(BaseSettings):
@@ -367,6 +410,15 @@ class TelegramSettings(BaseSettings):
   # ``signal_uxid`` fall back to per-action messages either way — there is no
   # cycle to group them by.
   cycle_enabled: bool = _opt(True, "TELEGRAM_CYCLE_ENABLED", "telegram_cycle_enabled")
+
+  # Display timezone for the timestamps in that message, as a UTC offset in
+  # hours: ``7`` renders UTC+7, ``-4`` UTC-4, ``5.5`` UTC+5:30. Timestamps are
+  # stored in UTC and only their rendering changes; the offset is printed beside
+  # every time, so an operator reading the message never has to guess which zone
+  # it is in — and can line it up with the broker's own report.
+  message_timezone: float = _opt(
+    0.0, "TELEGRAM_MESSAGE_TIMEZONE", "telegram_message_timezone"
+  )
 
   # ── Telegram error-log hook ──────────────────────────────────────
   # When enabled (and enabled is true), log records at ERROR level or above are
@@ -529,6 +581,29 @@ class Settings(BaseSettings):
       raise ValueError(
         "FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL=true requires a unique magic "
         f"number per strategy in STRATEGY_MAGIC_MAP; duplicates: {'; '.join(collisions)}"
+      )
+    return self
+
+  @model_validator(mode="after")
+  def _validate_multi_positions_needs_hedging(self):
+    """Reject FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL without FOREX_HEDGE_MODE.
+
+    Several tickets of one strategy on one symbol only stay separate on a
+    hedging account; on a netting account the broker merges them into a single
+    net position, so the per-``signal_uxid`` rows the worker tracks would all
+    point at the same merged volume and every exit but the first would fail.
+    FOREX_HEDGE_MODE is what makes the worker verify the account at connect, so
+    requiring it here turns a silent mis-execution into a startup error.
+    """
+    if not (
+      self.market_type == MarketTypeEnum.FOREX
+      and self.forex.allow_multi_positions_per_symbol
+    ):
+      return self
+    if not self.forex.hedge_mode:
+      raise ValueError(
+        "FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL=true requires FOREX_HEDGE_MODE=true: "
+        "multiple positions on one symbol are only isolated on a hedging account."
       )
     return self
 

@@ -306,6 +306,14 @@ graph TD
     CDC -- "publish PENDING rows" --> Pub["services/nats_service.py<br/>NATSPublisher → TRADE"]
 ```
 
+### Busy trade context — `order_send` retry
+
+The terminal serialises every trade request through a single **trade context**. A request that arrives while another one is still in flight is refused outright rather than queued, and the refusal reads `Trade context is busy` (the server-side sibling is retcode `10024` *Too many requests*). It says nothing about the order: the identical request succeeds once the context frees up. Two signals landing together — a `TP1` partial and the breakeven SL move that follows it, or two symbols filling on the same tick — hit it routinely.
+
+`MT5Gateway._send_order_request` therefore wraps **every** `order_send` (entry, close, SL update) in a bounded retry with a sleep between attempts: **4 attempts**, delay **0.3 s doubling** (0.3 → 0.6 → 1.2, ~2.1 s at worst). The condition is matched on the terminal's own wording as well as on the retcode, because it arrives by two routes — a rejected result carries it in `comment`, while a request the terminal refused to send at all returns `None` and leaves it in `last_error()`.
+
+The budget is deliberately small: an entry is a market order priced off the live quote, so retrying for seconds would fill it at a price the signal never meant. Once the budget is spent the refusal is surfaced as the failed `TradeResult` it now really is. Anything that is *not* a busy context — `10019` *No money*, `10014` *Invalid volume*, `10016` *Invalid stops* — is a verdict on the request and is returned on the first attempt, unretried. There is no setting to tune; the attempt count and delay are module constants next to the existing deal-lookup budget in `worker/gateways/forex/mt5/gateway.py`.
+
 ---
 
 ## 📂 Project Structure
@@ -409,6 +417,7 @@ Configuration is grouped into nested `<specific>Settings` sub-models on the main
 `market_type` and the derived `account_id` stay at the top level (`settings.market_type` / `settings.account_id`).
 
 - **Env vars are unchanged.** Each group is its own `BaseSettings` that reads the same flat variable names as before (e.g. `NATS_URL`, `MT5_LOGIN`, `MAX_LEVERAGE_CAP`) via per-field `validation_alias` — `.env` files and the initializer in `.env.example` need no changes.
+- **One field reads no env var at all:** `risk.max_open_orders`. The broker owns that value (see [the `settings` ACK section](#section-settings)), so there is no `MAX_OPEN_ORDERS` variable and a line for it in a `.env` does nothing. The field survives with a default of `5` purely as the backfill until the first handshake lands, and its `validation_alias` points at a name nothing sets — without one, pydantic-settings would match the field *name* case-insensitively and a stale `MAX_OPEN_ORDERS` could quietly cap a worker below what the broker told it.
 - **Flat dict for subprocesses.** `Settings.flat_dump()` reproduces the original flat `settings_dict` (legacy keys, with `SecretStr`/enum values intact) that is handed across the multiprocessing fork boundary and consumed by gateways, factories and presenters via `settings_dict.get("<flat_key>")`. Read config off the nested objects (`settings.nats.url`); consume the fork-boundary dict off the flat keys (`settings_dict["nats_url"]`).
 
 ### Telegram chat ids: many chats, and group topics
@@ -449,7 +458,7 @@ Every incoming signal is parsed into a `SignalSchema` and passed to `SignalHandl
 
 | Group | Action(s) | Behaviour |
 | --- | --- | --- |
-| **1 — Entry** | `LONG` / `SHORT` | Force-close any stale position for the same strategy → open a fresh market order with a hard SL set on the broker/exchange server. Gated by `MAX_OPEN_ORDERS`: an entry that would exceed the open-position cap is rejected (status `REJECTED`) and never sent to the broker. Also rejected when **another** strategy already holds the symbol, unless `FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL` is on (FOREX only) — see [Key Design Decisions](#-signal-execution--key-design-decisions). |
+| **1 — Entry** | `LONG` / `SHORT` | Force-close any stale position for the same strategy → open a fresh market order with a hard SL set on the broker/exchange server. Gated by the broker-supplied `max_open_orders` cap: an entry that would exceed the open-position cap is rejected (status `REJECTED`) and never sent to the broker. Also rejected when **another** strategy already holds the symbol, unless `FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL` is on (FOREX only), and when **this** strategy already holds it, unless `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL` is on and the entry carries a new `signal_uxid` — see [Key Design Decisions](#-signal-execution--key-design-decisions). |
 | **2 — Partial Exit** | `TP1` | Partial close using the resolved TP1 percent of live volume (or signal `quantity` when `VOLUME_DECISION_ENABLED=false`) → optionally move remaining SL to breakeven (`price_open`). TP1 percent and breakeven flag are resolved from the signal (`tp1_percent`, `move_sl_to_be`) or overridden by config (`USE_CUSTOM_POSITION_TP1_PERCENT` / `TP1_MOVE_SL_TO_BREAKEVEN`). |
 | **3 — Full Exit** | `TP2` / `SL` / `R_SL` | Close ALL open volume using the **actual live `position.volume`** — signal `quantity` is intentionally ignored |
 | **4 — Flat** | `FLAT` | Close all `OPENED`/`TP1` positions for the strategy+symbol at market price, marks status `FLATTED` |
@@ -552,12 +561,12 @@ Realized: +154.65 📈                ┘ nothing has closed yet).
 ----------------------------------  │ Box 2 — the timeline, one entry per
 ✅ LONG — Filled                    │ action, appended as the trade moves.
 Price: 2340.15 | Volume: 0.5 lot ⚙️ │ The icon is the *outcome*, so a TP1
-2026-04-10 22:55:00                 │ the broker refused never looks like a
+2026-04-10 22:55:00 (UTC)           │ the broker refused never looks like a
                                     │ TP1 that hit. A close also reports the
 🎯 TP1 — Filled                     │ PnL it booked, in the same format the
 Price: 2350.4 | Volume: 0.25 lot (TP1 50%)
-PnL: +51.25 📈                      │ standalone close message used.
-2026-04-11 15:05:00                ┘
+PnL: +51.25 📈                      │ standalone close message used. Every
+2026-04-11 15:05:00 (UTC)          ┘ time carries its zone (see below).
 ----------------------------------
 ⚙️ Settings                        ┐
 ----------------------------------  │ Box 3 — the worker configuration this
@@ -572,6 +581,8 @@ Signal: 9f2c4b7e18a3d605            ┘
 The headline status is **the position's**, not the action's: a TP1 the broker refused leaves an `OPENED` position `OPENED`, and once a position is closed (`TP2`/`SL`/`R_SL`/`FLATTED`/…) a late or replayed action can never advertise it as live again. An admin `FLAT` closes out the position's own cycle rather than opening a new message.
 
 Each chat entry keeps its `_<topic id>` suffix, so a cycle lands in the same forum topic as every other notification, and two topics of the same group each own their own message.
+
+Every action line in box 2 ends with the time that action happened **and the zone it is quoted in** — `2026-04-11 15:05:00 (UTC)`. Times are stored in UTC; `TELEGRAM_MESSAGE_TIMEZONE` (a UTC offset in **hours**, default `0`) chooses the zone they are rendered in, and the label follows it: `7` → `2026-04-11 22:05:00 (UTC+7)`, `-4` → `(UTC-4)`, `5.5` → `(UTC+5:30)`. Set it to the zone the broker reports in and both reports of the same trade read off one clock. An offset that is unset, non-numeric or outside ±14h falls back to UTC rather than failing the render, and a stored timestamp that carries no offset is read as UTC — which is what the worker writes.
 
 Delivery, retries and the `TELEGRAM_CYCLE_ENABLED` toggle are covered in [CycleNotificationJob](#cyclenotificationjob--one-telegram-message-per-trade-workerjobscycle_notification_jobpy).
 
@@ -683,11 +694,11 @@ The `SYSTEM` NATS subject carries the connect handshake and the broker's config 
 | Path | Delivery | Used for |
 | --- | --- | --- |
 | **Connect-time** | Sections of the `WORKER_CONNECTED_ACK`, on the handshake's private reply inbox | Everything the worker needs before it trades: `settings`, `strategy_magic_map`, `crypto_leverage_init`, `retry_signals` |
-| **Runtime** | A standalone action broadcast on the shared `SYSTEM` subject | A setting an admin changes *after* the worker is connected — currently `CRYPTO_LEVERAGE_INIT` |
+| **Runtime** | A standalone action broadcast on the shared `SYSTEM` subject | A setting changed *after* the worker is connected — `WORKER_SETTINGS_UPDATE` (the account's settings, by its owner from the bot or by an admin) and `CRYPTO_LEVERAGE_INIT` |
 
 The split exists because a request reply inbox delivers exactly **one** message (see the handshake section below), so it cannot carry a push that arrives later; the shared subject has no such limit and the worker stays subscribed to it for its whole lifetime, so a broadcast always lands.
 
-Broadcasts are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp` + `account_id`), routes by worker identity, then dispatches to the market's `_handle_system_action` hook — CRYPTO handles `CRYPTO_LEVERAGE_INIT`, the base handles none of its own. An action a market does not understand is logged and ignored, so a `SYSTEM` message meant for another market type is harmless (the worker's own `WORKER_CONNECTED`, fanned back out on the shared subject, lands here too and is ignored).
+Broadcasts are received by `BaseSignalProcessor._handle_system_message`, which validates the common envelope (`action` + `timestamp` + `account_id`), routes by worker identity, then dispatches to the `_handle_system_action` hook. The base handles `WORKER_SETTINGS_UPDATE` itself, because the settings it carries are market-neutral; CRYPTO overrides the hook for `CRYPTO_LEVERAGE_INIT` and delegates anything else back to the base. An action no one understands is logged and ignored, so a `SYSTEM` message meant for another market type is harmless (the worker's own `WORKER_CONNECTED`, fanned back out on the shared subject, lands here too and is ignored).
 
 ### WORKER_CONNECTED handshake (request/reply)
 
@@ -748,7 +759,7 @@ Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK
   "action": "WORKER_CONNECTED_ACK",
   "account_id": "FOREX-MT5-1234567",
   "timestamp": "2026-06-30T00:00:00+00:00",
-  "settings": { "signal_blocked": true },
+  "settings": { "signal_blocked": true, "max_open_orders": 3 },
   "strategy_magic_map": {
     "MT5_GOLD_M5_V1": 20260409,
     "MT5_FX_M15_V2": 20260410
@@ -773,15 +784,20 @@ Every discarded entry is logged at `ERROR`, one line each (`WORKER_CONNECTED_ACK
 
 ##### Section: `settings`
 
-The **runtime toggles** the broker holds for this account, replayed so a worker comes back up in the state an operator left it in. They are the same switches the runtime [ADMIN actions](#actions-block_signal--allow_signal) flip, and the worker keeps them **in memory only** — so without this section a restart silently drops back to the defaults and resumes trading under a block nobody lifted. The broker owns the state; this is how it hands it back.
+The **account settings** the broker holds for this worker, replayed so it comes back up in the state an operator left it in. The worker keeps them **in memory only** — so without this section a restart silently drops back to the defaults and resumes trading under a block nobody lifted, or under its own cap rather than the account's. The broker owns the state; this is how it hands it back.
 
-`BaseSignalProcessor._apply_worker_settings` reads each attribute in turn and applies it through the *same helper the ADMIN action calls*, so restoring a value is indistinguishable from receiving the directive live: the same already-in-that-state no-op, the same log line, the same Telegram alert. Each field is independently optional — `null` (or absent) means "not pushed, leave this setting alone", which is why `signal_blocked` is a nullable bool: `false` is the broker explicitly saying *unblocked*, not the same statement as saying nothing.
+`BaseSignalProcessor._apply_worker_settings` reads each attribute in turn and applies it through the *same helper the runtime path calls*, so restoring a value is indistinguishable from receiving it live: the same already-in-that-state no-op, the same log line, the same Telegram alert. Each field is independently optional — `null` (or absent) means "not pushed, leave this setting alone", which is why `signal_blocked` is a nullable bool: `false` is the broker explicitly saying *unblocked*, not the same statement as saying nothing. Fields are salvaged one at a time, so a malformed value costs only its own setting.
 
 | Field | Behaviour when present | Behaviour when omitted (or `null`) |
 | --- | --- | --- |
 | `signal_blocked` | `true` re-applies the [`BLOCK_SIGNAL`](#actions-block_signal--allow_signal) gate (every SIGNAL — live **and** this ACK's `retry_signals` — is skipped); `false` clears it, exactly as `ALLOW_SIGNAL` does | The gate keeps its current value: its default (*allowed*) after a restart, or whatever ADMIN last set on a reconnect that kept the process alive |
+| `max_open_orders` | Becomes this worker's open-position cap — see [the exposure-cap guard](#-signal-execution--key-design-decisions). `0` disables the cap and is a real value, not an absence | The cap keeps its current value: the `5` backfill after a restart, or whatever the broker last pushed |
 
-Adding a toggle means adding its field to `WorkerSettingsSchema` (`worker/schemas/inbox_schema.py`) plus one branch in `_apply_worker_settings` that delegates to the existing ADMIN-side setter — the ADMIN path stays the single implementation of *what the setting does*.
+**`max_open_orders` replaces the `MAX_OPEN_ORDERS` .env setting, which no longer exists.** The broker owns the cap: it resolves the account's own value against its own broker-wide default and sends one concrete number, so this worker never has to know a global default exists, and a stale value on a host can no longer disagree with what an owner set. It is stored into the live settings dict under `max_open_orders` — the exact key the old `.env` value populated — so `guard.max_open_orders_rejection` and every other consumer read it unchanged. `worker/settings.py` keeps the field with a default of `5`, deliberately **without** an env var, purely as the backfill for the window before the first handshake and for a broker too old to send the field.
+
+A change made while the worker is connected does not wait for a reconnect: it arrives on the shared `SYSTEM` subject as a [`WORKER_SETTINGS_UPDATE`](#action-worker_settings_update-runtime) carrying the same block.
+
+Adding a setting means adding its field to `WorkerSettingsSchema` (`worker/schemas/system_schema.py`, shared by the ACK section and the runtime broadcast) plus one branch in `_apply_worker_settings` that delegates to the existing setter — that setter stays the single implementation of *what the setting does*, whichever path the value arrives on.
 
 ##### Section: `strategy_magic_map`
 
@@ -817,6 +833,27 @@ A replay of recent SIGNALs for the worker's subscribed strategies, so a worker r
 }
 ```
 
+### Action: `WORKER_SETTINGS_UPDATE` (runtime)
+
+The **runtime** counterpart of the ACK's [`settings`](#section-settings) section: the same block, nested in a `SYSTEM` envelope and broadcast to an **already-connected** worker when the account's owner changes a value from the Telegram bot (`/maxorders`) or an admin changes a broker-wide default (`/admin_max_orders`). It cannot ride in the ACK because the handshake is long over by then and the reply inbox it used is gone — the shared `SYSTEM` subject, which the worker stays subscribed to for its whole lifetime, is the path that still reaches it.
+
+Handled by `BaseSignalProcessor._handle_system_action` — in the **base**, not a market hook, because these settings are market-neutral — which funnels it into the very same `_apply_worker_settings` the ACK section uses. One behaviour, one notification, whichever path a value arrives on — including the log line, whose prefix names the setting's *owner* (`[SYSTEM]` for the cap, `[ADMIN]` for the signal gate) rather than the delivery path, exactly as the ADMIN-owned toggles already do. To tell a connect-time restore from a runtime change, read the line above it: the restore is preceded by `WORKER_CONNECTED_ACK — handshake complete`, the runtime change by `Received action=WORKER_SETTINGS_UPDATE`.
+
+The broker sends the whole block rather than only the field that changed, since the worker applies it through a path that reads every setting it knows. Fields are salvaged one at a time, so a malformed value costs only its own setting; a push with nothing usable in it leaves every setting as it was, which is the same outcome as no push at all.
+
+```json
+{
+  "action": "WORKER_SETTINGS_UPDATE",
+  "account_id": "FOREX-MT5-1234567",
+  "timestamp": "2026-06-30T00:05:00+00:00",
+  "settings": { "signal_blocked": false, "max_open_orders": 3 }
+}
+```
+
+`action`, `timestamp` and `account_id` are required; every field inside `settings` is optional, with the same "omitted means leave it alone" rule as the ACK section. `account_id` scopes the broadcast to one worker — every other worker logs a skip and ignores it.
+
+The broker still re-sends the block on every handshake, so this push is a convenience and not the contract: a worker that was offline for the change picks the new value up when it reconnects.
+
 ### Action: `CRYPTO_LEVERAGE_INIT` (CRYPTO, runtime)
 
 The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same payload, flattened into a `SYSTEM` envelope and broadcast to an **already-connected** worker when an admin edits a sub-account's leverage cap or onboards new symbols. It cannot ride in the ACK because the handshake is long over by then, and the reply inbox it used is gone — the shared `SYSTEM` subject, which the worker stays subscribed to for its whole lifetime, is the path that still reaches it.
@@ -847,20 +884,33 @@ The **runtime** counterpart of the ACK's `crypto_leverage_init` section: same pa
 - **Per-strategy position isolation on a shared symbol:** `get_open_positions`, `close_all_positions`, `partial_close_position`, and `update_position_sl` all accept an optional `strategy` parameter that `SignalHandler` populates from `signal.strategy`. This ensures two strategies trading the same symbol (e.g. a Long-only and a Short-only strategy) cannot accidentally touch each other's positions — every entry, exit, and SL update is scoped to the originating strategy. Isolation differs per gateway:
 
   - **FOREX (magic-based):** Each strategy is assigned a dedicated MT5 magic number, supplied by the broker in the [`WORKER_CONNECTED_ACK`](#section-strategy_magic_map) (stored in settings under `strategy_magic_map`). `open_position` stamps a new order with `_magic_for(signal.strategy)` and `get_open_positions(symbol, strategy)` filters live MT5 positions by that same magic — native MT5-level isolation, no DB lookup. Every FOREX strategy that trades must be mapped (an unmapped strategy raises). Closing operations stamp the closing deal with `pos.magic`, and `owned_magics()` (all mapped values) defines the magics the worker recognises as its own, used by account-wide queries (`get_all_open_positions`) and terminal-close detection (`MT5EventJob`).
-  - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol)` DB invariant and the `strategy` column.
+  - **CRYPTO (logical):** A centralized exchange holds a single net position per symbol in one-way mode, so there is no magic equivalent (`strategy_code` is `NULL`). Strategy isolation is logical only — enforced by the one-active-per-`(strategy, symbol, signal_uxid)` DB invariant and the `strategy` column. CRYPTO never uses the third component: it has no multi-positions-per-symbol toggle, so its key is effectively `(strategy, symbol)` as before.
 
 - **Multiple strategies on one symbol — FOREX only (`FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL`, default `false`):** By default a `LONG`/`SHORT` entry on a symbol **another strategy already holds** is rejected as a netting conflict (`SignalHandler._handle_entry`, before any cleanup runs). With the toggle on, a FOREX worker lets the entry through and the two strategies hold *parallel* positions on that symbol. The handler asks the market for the capability (`BaseMarketStrategy.allows_multi_strategy_per_symbol`) rather than reading config directly, and only `ForexMarket` ever reports it:
 
   - **FOREX** can isolate the two: each strategy trades under its own magic number, `get_open_positions`/`close_all_positions` filter on it, and closes/SL edits target a specific ticket (`request["position"]`), so neither strategy can touch the other's orders. Requires a **hedging** account — on a netting account the broker merges both strategies into one position, and the second strategy would own nothing while its exits fail with "No open position". `ForexSignalProcessor._warn_if_multi_strategy_needs_hedging` checks `account_info().margin_mode` once at connect and escalates (log + Telegram) if the account is not hedging; it warns rather than refuses, so a mid-migration deployment still trades. The toggle also makes a **unique magic per strategy** load-bearing, so `Settings` rejects a `STRATEGY_MAGIC_MAP` .env fallback with duplicate magics at startup when it is on.
   - **CRYPTO cannot**, so `CryptoMarket` never reports the capability and the rejection stands regardless of config: `CryptoExecutor.get_open_positions` ignores the `strategy` argument (there is no magic-number equivalent on a CEX) and `cancel_all_orders` is symbol-scoped, so a second strategy's entry would force-close the first strategy's position and wipe its resting SL/TP. `CRYPTO_ALLOW_MULTI_STRATEGY_PER_SYMBOL` only relaxes the redundant `CryptoExecutor._netting_conflict` check behind that guard.
 
-  What the toggle does **not** relax: **one open order per `(strategy, symbol)`**. A strategy re-entering (or scaling into) its own symbol still force-closes and *replaces* its existing position — enforced by the stale cleanup below and the `uidx_positions_one_active_per_strategy_symbol` unique index, which is unchanged. One extra safeguard rides along with the flag: when it is on, a `FLAT` that finds no strategy-scoped position **skips** the unscoped retry (`close_all_positions(strategy=None)`), which would otherwise flatten the other strategies' live positions while cleaning up this one.
+  What the toggle does **not** relax: **one open order per `(strategy, symbol, signal_uxid)`**. A strategy re-entering (or scaling into) its own symbol under the *same* signal still force-closes and *replaces* its existing position — enforced by the stale cleanup below and the `uidx_positions_one_active_per_signal` unique index. Opening a second position under a *different* signal is what `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL` below is for. One extra safeguard rides along with the flag: when it is on, a `FLAT` that finds no strategy-scoped position **skips** the unscoped retry (`close_all_positions(strategy=None)`), which would otherwise flatten the other strategies' live positions while cleaning up this one.
 
-- **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries the broker/exchange for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. It then reconciles **every** active (`OPENED`/`TP1`) DB row for that `(strategy, symbol)` to `FORCED_CLOSED`, independently of whether the broker still reported a live position: a prior position may have been closed externally (exchange SL/liquidation, a manual close, or a missed close event), leaving an orphaned `OPENED` row the broker no longer reports. Clearing it is required — otherwise the fresh entry below would collide with the one-active-per-`(strategy, symbol)` unique index on insert and leave the new trade live but untracked. Only then is the new position opened.
+- **Multiple signals on one symbol — FOREX only (`FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`, default `false`):** The composite key a tracked position is addressed by is **symbol + strategy + `signal_uxid`**. By default only the first two components are used, so one strategy holds at most one position per symbol and a second signal on that symbol is rejected. With the toggle on (and each signal carrying its own `signal_uxid`, which the broker already sends), each signal opens its **own** platform ticket with its own SL/TP, and every step that used to mean "the strategy's position on this symbol" is scoped to the ticket tracked for that one signal:
 
-- **Max-open-orders exposure cap (`MAX_OPEN_ORDERS`):** Before any new `LONG`/`SHORT` is sent to the broker, the shared `BaseSignalProcessor._max_open_orders_rejection` guard counts the active (`OPENED`/`TP1`) positions across **every** strategy and symbol. If the count is already at the cap, the entry is rejected: `_reject_signal` audit-logs it, inserts a `REJECTED` position row (via `PositionRepository.insert_rejected_position`), and sends an `Order Rejected` operator notification — but **no order is placed**. The `REJECTED` row is picked up by `PositionCDC` and forwarded to the broker on the `TRADE` subject with status `REJECTED`, so a blocked signal is visible end-to-end even though nothing was traded. A re-entry or scale-in on a symbol the strategy already holds **replaces** the existing position rather than opening a new slot, so it is never counted against the cap. Exits (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`) are never gated — a position can always be closed even at the cap. The guard is market-agnostic (identical for FOREX and CRYPTO); `MAX_OPEN_ORDERS=0` disables it.
+  - **Entry** — the stale cleanup and the DB reconcile only touch the row for this signal's own uxid, so re-sending one signal replaces only its own position and a sibling signal's position keeps running. When no row resolves for the uxid, the cleanup is skipped entirely rather than closing positions that belong to siblings.
+  - **`TP1`** — the partial close and the breakeven SL edit target the signal's ticket (`partial_close_position(position_ticket=…)` / `update_position_sl(position_ticket=…)`), never `positions[0]`.
+  - **`TP2` / `SL` / `R_SL` / `FLAT`** — `close_all_positions(position_ticket=…)` closes that one position. A `FLAT` whose uxid resolves to no row closes **nothing**: the strategy-wide fallback `FLAT` normally uses for a DB-out-of-sync position does not apply here, because every other position on the symbol belongs to a sibling signal and flattening them to clean up one that is already gone is the worse failure. The untracked position is left to the close detector / reconciler.
+  - **Guards** — `guard.symbol_open_rejection` exempts a *same-strategy* position carrying a different uxid. Positions held by **another** strategy are governed by `FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL` alone and their uxid never exempts them, so turning this toggle on cannot switch off the cross-strategy netting guard. A signal with **no** `signal_uxid` is still blocked, because nothing tells it apart from the open rows.
 
-- **Stale-signal guard (`MAX_ENTRY_DRIFT_R_PERCENT` / `MAX_ENTRY_DRIFT_PERCENT`):** Entries are **market** orders (`TRADE_ACTION_DEAL` on MT5, `MARKET` on a CEX), so they fill at the live quote — never at the `price` the signal was built on. When the market has already run past the signal's own levels, filling it opens a position that is broken from the first tick, so `guard.stale_signal_rejection` rejects it before anything reaches the broker (same `REJECTED` path as `MAX_OPEN_ORDERS` above). Three rules, evaluated against the price the entry would *actually* pay (ask for a LONG, bid for a SHORT; mark price on a CEX — `BaseMarketStrategy.entry_price`):
+  Requires a **hedging** account, enforced rather than assumed: the setting is only accepted together with `FOREX_HEDGE_MODE=true` (`Settings` refuses to load otherwise), and that flag makes the worker verify the account at connect and **refuse to start** on a netting one — see below. `CryptoMarket` never reports the capability (a CEX nets every order on a symbol into one position), so there is no crypto equivalent of the setting. The `max_open_orders` cap is untouched: see its bullet below.
+
+- **Hedging account required — FOREX (`FOREX_HEDGE_MODE`, default `false`):** `true` asserts that this MT5 account keeps each ticket as its own position. `ForexSignalProcessor._enforce_hedge_mode` reads `account_info().margin_mode` once, right after connect, and if it is anything but hedging — **including an account that reports no margin mode at all**, since "could not verify" is not "verified hedging" — it logs at `CRITICAL`, sends a Telegram alert and returns `False` from `_connect_broker`, which **stops the worker from starting**. On a netting account the broker merges every ticket on a symbol into one net position, so positions tracked per signal and per strategy would not exist and their exits would fail with "No open position" while the merged volume ran on unmanaged. This is deliberately stricter than `_warn_if_multi_strategy_needs_hedging` above, which only warns: that toggle degrades to the old behaviour on a netting account, whereas this flag is a claim about the account itself. Leave it `false` on a gateway that does not report a margin mode.
+
+- **Stale position cleanup (Entry):** Before opening any new LONG/SHORT, the handler queries the broker/exchange for stale positions belonging to the *same strategy* on that symbol and force-closes them — leaving positions from other strategies on the same symbol untouched. It then reconciles **every** active (`OPENED`/`TP1`) DB row for that `(strategy, symbol)` to `FORCED_CLOSED`, independently of whether the broker still reported a live position: a prior position may have been closed externally (exchange SL/liquidation, a manual close, or a missed close event), leaving an orphaned `OPENED` row the broker no longer reports. Clearing it is required — otherwise the fresh entry below would collide with the one-active-per-`(strategy, symbol, signal_uxid)` unique index on insert and leave the new trade live but untracked. With `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL` on, both the broker-side cleanup and this reconcile are narrowed to the signal's own `signal_uxid`. Only then is the new position opened.
+
+- **Max-open-orders exposure cap (`max_open_orders`, from the broker):** Before any new `LONG`/`SHORT` is sent to the broker, the shared `BaseSignalProcessor._max_open_orders_rejection` guard counts the active (`OPENED`/`TP1`) positions across **every** strategy and symbol. If the count is already at the cap, the entry is rejected: `_reject_signal` audit-logs it, inserts a `REJECTED` position row (via `PositionRepository.insert_rejected_position`), and sends an `Order Rejected` operator notification — but **no order is placed**. The `REJECTED` row is picked up by `PositionCDC` and forwarded to the broker on the `TRADE` subject with status `REJECTED`, so a blocked signal is visible end-to-end even though nothing was traded. A re-entry or scale-in on a symbol the strategy already holds **replaces** the existing position rather than opening a new slot, so it is never counted against the cap — with `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL` on, that exemption is keyed on `signal_uxid` too, so only the *same signal's* own position is exempt and a second signal on an already-held symbol is counted normally. The cap is account-wide whatever the multi-strategy / multi-positions toggles allow: a cap of 5 permits any five concurrent positions — five symbols, five strategies, or five signals on one symbol+strategy. Exits (`TP1`/`TP2`/`SL`/`R_SL`/`FLAT`) are never gated — a position can always be closed even at the cap. The guard is market-agnostic (identical for FOREX and CRYPTO); a cap of `0` disables it.
+
+  **The cap comes from the broker, not from `.env`.** There is no `MAX_OPEN_ORDERS` setting any more: the value is the account's `max_open_orders`, which the broker resolves (the account's own, else its broker-wide default) and delivers in the [`settings` block](#section-settings) of every `WORKER_CONNECTED_ACK`, plus a [`WORKER_SETTINGS_UPDATE`](#action-worker_settings_update-runtime) when it changes mid-session. It is changed from the Telegram bot — `/maxorders` for one account, `/admin_max_orders` for the default — so an owner can tighten their own exposure without anyone touching a host. The guard reads it from the same flat-settings key as before, so nothing in this path had to learn where the number came from; `worker/settings.py` keeps a `5` default with no env var as the backfill until the first handshake lands.
+
+- **Stale-signal guard (`MAX_ENTRY_DRIFT_R_PERCENT` / `MAX_ENTRY_DRIFT_PERCENT`):** Entries are **market** orders (`TRADE_ACTION_DEAL` on MT5, `MARKET` on a CEX), so they fill at the live quote — never at the `price` the signal was built on. When the market has already run past the signal's own levels, filling it opens a position that is broken from the first tick, so `guard.stale_signal_rejection` rejects it before anything reaches the broker (same `REJECTED` path as the exposure cap above). Three rules, evaluated against the price the entry would *actually* pay (ask for a LONG, bid for a SHORT; mark price on a CEX — `BaseMarketStrategy.entry_price`):
   - **Already through `tp2`** — the position would open beyond its own target: instantly in loss by at least the spread, with no profit left to capture. Always rejected, no threshold. (Without this, `StopValidator` would silently rewrite the now-unreachable TP to one point above the entry, hiding the problem instead of surfacing it.)
   - **Already through `sl`** — the position would open at or past its stop and be stopped out on entry. Always rejected, no threshold.
   - **Drifted too far** — no level passed yet, but the market has moved enough that the trade no longer resembles the one signalled. Measured as a percentage of the signal's own entry-to-SL distance ("R"), which is why one setting fits every market: `MAX_ENTRY_DRIFT_R_PERCENT=50` means the same thing on BTCUSDT at 100,000 as on EURUSD at 1.08, and tightens automatically for a tight-stop signal — no per-symbol tuning, and no MT5-only `point` unit that a CEX has no equivalent for. `MAX_ENTRY_DRIFT_PERCENT` (percent of price) is the fallback for a signal carrying no SL. Either set to `0` disables that rule; the two level checks above are unaffected.
@@ -974,7 +1024,7 @@ The job shares the process-level `stop_event` (`multiprocessing.Event`) with the
 
 ### Position Reconciliation — the shared broker↔DB safety net (`worker/gateways/reconcile_job.py`)
 
-Every market has a channel that reports broker-side closes (FOREX: `MT5EventJob`; CRYPTO: the user-data websocket) and every one of them can miss one. A missed close leaves the row stuck `OPENED`/`TP1` **forever**, which then blocks later signals (`MAX_OPEN_ORDERS`, the netting guard) even though nothing is live on the broker.
+Every market has a channel that reports broker-side closes (FOREX: `MT5EventJob`; CRYPTO: the user-data websocket) and every one of them can miss one. A missed close leaves the row stuck `OPENED`/`TP1` **forever**, which then blocks later signals (the `max_open_orders` cap, the netting guard) even though nothing is live on the broker.
 
 `BasePositionReconcileJob` is the market-agnostic backstop behind both: a daemon thread that polls the live broker positions and diffs them against the DB's open rows. It owns the poll loop, the two-scan confirmation, both reconcile directions, and the safety rules below; each market subclasses it and supplies only **how a live position correlates with a DB row** (`_live_keys` / `_db_keys` — the same variation point `BaseSignalProcessor._flat_match_key` / `_flat_db_match_keys` solves for ADMIN FLAT).
 
@@ -1052,7 +1102,7 @@ A confirmed manual position is persisted as a brand-new `OPENED` row so the work
 
 | Field | Value |
 | --- | --- |
-| `strategy` | Synthetic `MANUAL` strategy — never a real signal strategy, so it can never collide with the one-active-per-`(strategy, symbol)` invariant |
+| `strategy` | Synthetic `MANUAL` strategy — never a real signal strategy, so it can never collide with the one-active-per-`(strategy, symbol, signal_uxid)` invariant |
 | `ref_id` / `ref_source_id` | `MANUAL-<symbol>-<uuid8>` — the uuid suffix means a symbol that is manually opened, closed, then re-opened gets a fresh id each time instead of upserting onto the prior, already-closed trade |
 | `action` / `volume` / `opened_price` | Read straight off the live `ExchangePosition` (`side`, `volume`, `price_open`) |
 | `sl` / `tp1` / `gateway_message` | `None` — there is no originating signal to record |
@@ -1210,7 +1260,9 @@ The canonical record for each open trade. `PositionCDC` watches this table for `
 
 #### Constraints
 
-A partial unique index `uidx_positions_one_active_per_strategy_symbol` enforces at most one `OPENED` or `TP1` row per `(strategy, symbol)` pair. Closed/force-closed rows are unrestricted. The index is created together with the table (`CREATE UNIQUE INDEX IF NOT EXISTS`).
+A partial unique index `uidx_positions_one_active_per_signal` enforces at most one `OPENED` or `TP1` row per `(strategy, symbol, COALESCE(signal_uxid, ''))` key — the composite key a tracked position is addressed by. Closed/force-closed rows are unrestricted. The index is created together with the table (`CREATE UNIQUE INDEX IF NOT EXISTS`).
+
+`COALESCE(signal_uxid, '')` rather than the plain column, because SQLite treats NULLs as distinct in a UNIQUE index: folding every uxid-less row onto one key preserves the original one-active-per-`(strategy, symbol)` guarantee for a broker that sends no `signal_uxid`. The key gained its third component when `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL` made several signals of one strategy able to hold the same symbol; a database created before that carries the previous `uidx_positions_one_active_per_strategy_symbol`, which `_create_tables` **drops** before creating the new index, so an existing database upgrades in place (left behind it would keep rejecting the second signal on a symbol).
 
 #### Position Status Lifecycle
 
@@ -1236,7 +1288,7 @@ OPENED ──► TP1 ──► TP2
 | `TERMINAL_CLOSED` | `MT5EventJob` / exchange event / either market's reconcile job | Broker/exchange closed the position (SL/TP/Stop-Out/manual) before a NATS signal arrived, or the reconciler found the position gone from the broker while the row was still open |
 | `FORCED_CLOSED` | New entry signal / liquidation | Position was force-closed (opposing/same-direction entry, or a crypto liquidation) |
 | `FLATTED` | FLAT signal | Position was closed by an administrative flat command |
-| `REJECTED` | `MAX_OPEN_ORDERS` / open-order-per-symbol / stale-signal guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
+| `REJECTED` | `max_open_orders` / open-order-per-symbol / stale-signal guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
 
 ### `position_logs` — Immutable execution audit trail
 

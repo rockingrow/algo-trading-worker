@@ -31,7 +31,7 @@ class PositionStoreProtocol(Protocol):
   """Position lookups + status updates used by SignalHandler and close jobs."""
 
   def get_open_positions_by_strategy(
-    self, strategy: str, symbol: str
+    self, strategy: str, symbol: str, signal_uxid: Optional[str] = None
   ) -> List[Dict[str, Any]]: ...
   def get_open_positions_for_flat(
     self,

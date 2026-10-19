@@ -26,7 +26,7 @@ difference is the volume unit, taken from ``settings_dict["market_type"]``.
 from __future__ import annotations
 
 import html
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from worker import icons
@@ -153,16 +153,57 @@ def _volume_unit(settings_dict: dict | None) -> str:
   return "lot" if value == MarketTypeEnum.FOREX.value else ""
 
 
-def _timestamp(value: Any) -> str:
-  """Render an event's stored ISO timestamp; fall back to the raw text."""
+def _display_tz(settings_dict: dict | None) -> timezone:
+  """The timezone the message renders its timestamps in.
+
+  ``TELEGRAM_MESSAGE_TIMEZONE`` is a UTC offset in hours, so an operator can
+  read the message in the zone they trade in without the worker having to carry
+  a zone database. An unset or unusable value falls back to UTC rather than
+  failing the render — a message with a surprising offset is still a message.
+  """
+  raw = (settings_dict or {}).get("telegram_message_timezone")
+  try:
+    hours = float(raw) if raw is not None else 0.0
+  except (TypeError, ValueError):
+    hours = 0.0
+  # datetime rejects an offset beyond ±24h; nothing real is outside ±14h.
+  if not -14.0 <= hours <= 14.0:
+    hours = 0.0
+  return timezone(timedelta(hours=hours))
+
+
+def _tz_label(tz: timezone) -> str:
+  """``UTC``, ``UTC+7``, ``UTC-4``, ``UTC+5:30`` — the zone a time is in."""
+  total_minutes = int(tz.utcoffset(None).total_seconds() // 60)
+  if total_minutes == 0:
+    return "UTC"
+  sign = "+" if total_minutes > 0 else "-"
+  hours, minutes = divmod(abs(total_minutes), 60)
+  return f"UTC{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
+
+
+def _timestamp(value: Any, tz: timezone = timezone.utc) -> str:
+  """Render an event's stored timestamp in *tz*, labelled with that zone.
+
+  Every action line carries the zone, because the same trade is reported by the
+  broker in its own zone: an unlabelled time invites the reader to compare two
+  clocks that were never the same one. A stored value without an offset is
+  treated as UTC, which is what the worker writes. Text that is not a timestamp
+  at all is passed through unlabelled — inventing a zone for it would be a lie.
+  """
   if value is None:
     return ""
   if isinstance(value, datetime):
-    return value.strftime("%Y-%m-%d %H:%M:%S")
-  try:
-    return datetime.fromisoformat(str(value)).strftime("%Y-%m-%d %H:%M:%S")
-  except ValueError:
-    return str(value)
+    moment = value
+  else:
+    try:
+      moment = datetime.fromisoformat(str(value))
+    except ValueError:
+      return str(value)
+  if moment.tzinfo is None:
+    moment = moment.replace(tzinfo=timezone.utc)
+  local = moment.astimezone(tz)
+  return f"{local.strftime('%Y-%m-%d %H:%M:%S')} ({_tz_label(tz)})"
 
 
 def _enum(value: Any, enum_cls, default=None):
@@ -264,7 +305,7 @@ def _position_box(
 # ── Box 2: actions ──────────────────────────────────────────────────────────
 
 
-def _action_block(event: dict, *, unit: str) -> str:
+def _action_block(event: dict, *, unit: str, tz: timezone) -> str:
   """One timeline entry: what was asked, how it went, and what it moved."""
   action = event.get("action") or ""
   outcome = _enum(event.get("outcome"), CycleOutcomeEnum, CycleOutcomeEnum.FILLED)
@@ -309,14 +350,14 @@ def _action_block(event: dict, *, unit: str) -> str:
       ).rstrip("\n")
     )
 
-  stamp = _timestamp(event.get("timestamp"))
+  stamp = _timestamp(event.get("timestamp"), tz)
   if stamp:
     lines.append(stamp)
   return "\n".join(lines)
 
 
-def _actions_box(events: list[dict], *, unit: str) -> str:
-  blocks = [_action_block(event, unit=unit) for event in events]
+def _actions_box(events: list[dict], *, unit: str, tz: timezone) -> str:
+  blocks = [_action_block(event, unit=unit, tz=tz) for event in events]
   return "\n".join(
     [f"{icons.SIGNAL} <b>Actions</b>", _DIVIDER, "\n\n".join(blocks), _DIVIDER]
   )
@@ -342,6 +383,7 @@ def _settings_box(
     section += BaseMessagePresenter._max_open_orders_line(settings_dict)
     if market:
       section += BaseMessagePresenter._multi_strategy_line(settings_dict, market)
+      section += BaseMessagePresenter._multi_positions_line(settings_dict, market)
     lines.append(section.rstrip("\n"))
   lines.append(_DIVIDER)
   lines.append(f"Strategy: <b>{html.escape(str(cycle.get('strategy') or '—'))}</b>")
@@ -377,7 +419,7 @@ def format_cycle_message(
 
   boxes = [_position_box(cycle, entry, events, unit=unit, symbol=symbol)]
   if events:
-    boxes.append(_actions_box(events, unit=unit))
+    boxes.append(_actions_box(events, unit=unit, tz=_display_tz(settings_dict)))
   boxes.append(
     _settings_box(cycle, settings_dict, footer, market=str(market_value or ""))
   )

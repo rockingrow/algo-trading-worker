@@ -39,7 +39,12 @@ from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.gateways.forex.mt5.gateway")
 
-_MT5_COMMENT_MAX = 31
+# Longest order comment the MetaTrader5 Python wrapper accepts. Measured against
+# 5.0.5735: a request whose comment reaches 30 characters is refused client-side
+# with ``(-2, 'Invalid "comment" argument')`` before the terminal ever sees it,
+# so one character too many costs the whole order, not just its label. The MQL5
+# struct's own 31 is not the binding limit here — the wrapper's check is.
+_MT5_COMMENT_MAX = 29
 
 # A deal is registered on the server before ``order_send`` returns its ticket,
 # but the terminal's own history trails that — by measurably more than the few
@@ -52,10 +57,56 @@ _MT5_COMMENT_MAX = 31
 _DEAL_LOOKUP_ATTEMPTS = 6
 _DEAL_LOOKUP_DELAY = 0.25  # seconds between attempts
 
+# "Trade context is busy": the terminal serialises every trade request through a
+# single trade context, so a request that arrives while another one is still in
+# flight is refused outright rather than queued. Two signals landing together (a
+# TP1 partial and the SL move that follows it, or two symbols filling on the same
+# tick) hit it routinely, and the refusal says nothing about the order itself —
+# the very same request succeeds once the context frees up. So it is retried with
+# a short sleep between attempts instead of being reported as a failed trade.
+#
+# The budget stays small on purpose: an entry is a market order priced off the
+# live quote, so seconds of retrying would fill it at a price the signal never
+# meant. Four attempts at a doubling delay spend ~2.1 s at worst, then the
+# refusal is surfaced as the failure it now really is.
+_BUSY_SEND_ATTEMPTS = 4
+_BUSY_SEND_DELAY = 0.3  # seconds before the first retry, doubling after that
+# TRADE_RETCODE_TOO_MANY_REQUESTS — the server-side sibling of a busy context:
+# same transient refusal, same remedy. Named rather than read off the module so a
+# terminal build that omits the constant cannot break the check.
+_BUSY_RETCODES = frozenset({10024})
+
+
+def _fit_comment(comment: str) -> str:
+  """Cut *comment* down to what the wrapper accepts (see ``_MT5_COMMENT_MAX``).
+
+  Every ``order_send`` goes through this: the caller composes the comment for a
+  reader, not for the wrapper's limit, and a comment that overflows is not a
+  cosmetic problem — the order is never sent. Trailing whitespace goes too, so a
+  cut that lands on a separator does not leave a dangling gap in the terminal.
+  """
+  return comment[:_MT5_COMMENT_MAX].rstrip()
+
 
 def _mt5_error_code(err) -> int:
   """mt5.last_error() returns (code, description); extract just the int."""
   return err[0] if isinstance(err, tuple) else int(err)
+
+
+def _is_trade_context_busy(result: Any, error: Any) -> bool:
+  """Is this rejected ``order_send`` outcome the busy trade context?
+
+  Matched on the text as well as on the retcode because the condition reaches the
+  worker by two different routes: a rejected order carries it in ``comment``,
+  while a request the terminal refused to send at all returns ``None`` and leaves
+  it in ``last_error()``. The text is the only thing common to both, and the
+  wording ("Trade context is busy") is the terminal's own.
+  """
+  if result is None:
+    return "busy" in str(error).lower()
+  if getattr(result, "retcode", None) in _BUSY_RETCODES:
+    return True
+  return "busy" in str(getattr(result, "comment", "") or "").lower()
 
 
 def _as_ticket_id(ticket: Any) -> Optional[int]:
@@ -82,6 +133,7 @@ class MT5Gateway(BasePlatformGateway):
   """MetaTrader 5 implementation of :class:`BasePlatformGateway`."""
 
   name = "MT5"
+  order_comment_max = _MT5_COMMENT_MAX
 
   def __init__(
     self,
@@ -195,6 +247,40 @@ class MT5Gateway(BasePlatformGateway):
 
   # ── Orders ────────────────────────────────────────────────────────────── #
 
+  def _send_order_request(self, request: Dict[str, Any], label: str) -> Any:
+    """``order_send``, retried while the terminal reports a busy trade context.
+
+    Every order the worker places goes through here, so open/close/SL all get the
+    same treatment: a busy context is a scheduling collision, not a verdict on the
+    request. Anything else — a real rejection, a fill — is returned untouched on
+    the first attempt, and the caller keeps owning the interpretation.
+    """
+    for attempt in range(1, _BUSY_SEND_ATTEMPTS + 1):
+      result = self._mt5.order_send(request)
+      if result is not None and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+        return result
+
+      error = self._mt5.last_error() if result is None else None
+      if not _is_trade_context_busy(result, error):
+        return result
+
+      if attempt == _BUSY_SEND_ATTEMPTS:
+        logger.error(
+          f"[{label}] Trade context still busy after {attempt} attempts — "
+          f"giving up on {request.get('symbol')}."
+        )
+        return result
+
+      delay = _BUSY_SEND_DELAY * (2 ** (attempt - 1))
+      logger.warning(
+        f"[{label}] Trade context is busy (attempt {attempt}/"
+        f"{_BUSY_SEND_ATTEMPTS}) — retrying in {delay:.2f}s."
+      )
+      time.sleep(delay)
+
+    # Unreachable: the loop returns on its final attempt.
+    return None
+
   def calc_margin(
     self, symbol: str, side: str, volume: float, price: float
   ) -> Optional[float]:
@@ -247,7 +333,7 @@ class MT5Gateway(BasePlatformGateway):
       "price": float(price),
       "deviation": self._deviation,
       "magic": magic,
-      "comment": comment[: _MT5_COMMENT_MAX - 1],
+      "comment": _fit_comment(comment),
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
@@ -257,7 +343,7 @@ class MT5Gateway(BasePlatformGateway):
       request["tp"] = float(tp)
 
     logger.info(f"[place_order] Sending Order: {request}")
-    result = self._mt5.order_send(request)
+    result = self._send_order_request(request, "place_order")
 
     if result is None:
       logger.error(f"order_send failed. error code: {self._mt5.last_error()}")
@@ -319,7 +405,7 @@ class MT5Gateway(BasePlatformGateway):
       "price": float(price),
       "deviation": self._deviation,
       "magic": position.magic,  # close deal inherits the position's own magic
-      "comment": comment,
+      "comment": _fit_comment(comment),
       "type_time": self._mt5.ORDER_TIME_GTC,
       "type_filling": self._mt5.ORDER_FILLING_IOC,
     }
@@ -327,7 +413,7 @@ class MT5Gateway(BasePlatformGateway):
     logger.info(
       f"[close_position] Closing ticket {position.ticket}, vol={close_volume}"
     )
-    result = self._mt5.order_send(request)
+    result = self._send_order_request(request, "close_position")
 
     if result is None:
       logger.error(
@@ -362,7 +448,7 @@ class MT5Gateway(BasePlatformGateway):
     }
 
     logger.info(f"[modify_sl] Updating SL for ticket {position.ticket} → {new_sl}")
-    result = self._mt5.order_send(request)
+    result = self._send_order_request(request, "modify_sl")
 
     if result is None:
       logger.error(f"modify_sl order_send failed. error: {self._mt5.last_error()}")

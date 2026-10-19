@@ -198,10 +198,14 @@ class FakeProcessor(BaseSignalProcessor):
   def _handle_admin_message(self, raw, *, private=False):
     self.admin_calls.append((raw, private))
 
-  # Record dispatched runtime SYSTEM actions (base parses the envelope + ensures
-  # connection + routes by identity, then calls this hook).
+  # Record dispatched runtime SYSTEM actions (the base parses the envelope and
+  # routes by identity, then calls this hook; the connection check belongs to
+  # whichever action needs the platform), then delegate like a real market does
+  # — the base owns WORKER_SETTINGS_UPDATE, so swallowing everything here would
+  # hide it.
   def _handle_system_action(self, action, data):
     self.system_calls.append((action, data))
+    super()._handle_system_action(action, data)
 
 
 # ── Abstract enforcement ──────────────────────────────────────────────────── #
@@ -364,12 +368,13 @@ def test_failed_result_sends_failure_notification():
 # ── MAX_OPEN_ORDERS exposure guard ─────────────────────────────────────────── #
 
 
-def _open_row(strategy, symbol):
+def _open_row(strategy, symbol, signal_uxid=None):
   return {
     "strategy": strategy,
     "symbol": symbol,
     "status": "OPENED",
-    "ref_source_id": f"{strategy}:{symbol}",
+    "signal_uxid": signal_uxid,
+    "ref_source_id": f"{strategy}:{symbol}:{signal_uxid}",
   }
 
 
@@ -1058,15 +1063,6 @@ def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatc
   assert levels == ["WARNING", "WARNING", "ERROR"]
 
 
-def test_system_not_connected_short_circuits():
-  proc = FakeProcessor({"success": True}, connected=False)
-  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
-
-  proc._process_message(NatsSubjectEnum.SYSTEM, _leverage_broadcast())
-
-  assert proc.system_calls == []
-
-
 def test_invalid_signal_notifies_operator_and_skips_execution():
   """A signal that fails validation must not silently vanish: it never reaches
   the handler/DB, and the operator is told *which* field was wrong via the
@@ -1654,6 +1650,183 @@ def test_ack_settings_restore_the_block_before_the_replay_runs():
   assert proc.notifications == ["signals_blocked"]
 
 
+# ── max_open_orders: the broker owns the exposure cap ─────────────────────── #
+#
+# MAX_OPEN_ORDERS is no longer an .env setting. The value in force arrives in the
+# ACK's settings block (and as a runtime WORKER_SETTINGS_UPDATE), and lands in
+# the flat settings dict, which is exactly where guard.max_open_orders_rejection
+# reads it — so the guard needs no knowledge of where the number came from.
+
+
+def test_ack_settings_apply_the_brokers_max_open_orders():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"max_open_orders": 2})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 2
+
+
+def test_ack_settings_max_open_orders_zero_disables_the_cap():
+  """0 is a value, not an absence — the broker's way of saying "no cap"."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"max_open_orders": 0})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 0
+
+
+def test_ack_without_max_open_orders_keeps_the_workers_backfill():
+  """A broker too old to send the field says nothing about the cap, so the
+  worker's own default stands rather than being reset to no-cap."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"signal_blocked": False})])
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 5
+
+
+def test_ack_negative_max_open_orders_is_dropped_on_its_own():
+  """``ge=0`` — a negative cap is a broker-side bug, and salvaging it per field
+  means it costs only itself: the signal block in the same push still lands."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher(
+    [_ack_payload(settings={"max_open_orders": -1, "signal_blocked": True})]
+  )
+
+  proc._announce_worker_connected()
+
+  assert proc.settings["max_open_orders"] == 5
+  assert proc._signals_blocked is True
+
+
+def test_the_cap_from_the_ack_is_what_the_entry_guard_enforces():
+  """End to end: the broker's number reaches the guard, not just the dict."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc.publisher = FakePublisher([_ack_payload(settings={"max_open_orders": 1})])
+  proc._announce_worker_connected()
+
+  proc.db.open_positions = [_open_row("other", "BBB")]
+  proc._process_signal(_fresh_signal(SignalActionEnum.LONG, symbol="AAA"))
+
+  assert proc.db.inserted == []
+  assert len(proc.db.rejected) == 1
+  # 1/1, not the 5/5 the worker's own backfill would have allowed.
+  assert "Max open orders reached (1/1)" in proc.db.rejected[0]["comment"]
+
+
+# ── WORKER_SETTINGS_UPDATE: the runtime half of the same block ────────────── #
+
+
+def _settings_update_payload(settings, *, account_id="FAKE_MKT-FAKE_GW-acct-1"):
+  import json as _json
+
+  return _json.dumps(
+    {
+      "action": SystemActionEnum.WORKER_SETTINGS_UPDATE.value,
+      "timestamp": datetime.now(timezone.utc).isoformat(),
+      "account_id": account_id,
+      "settings": settings,
+    }
+  )
+
+
+def test_system_dispatches_even_while_the_platform_is_disconnected():
+  """A disconnected platform must not cost the worker a SYSTEM push.
+
+  The settings this subject carries are in-memory state that never touches the
+  platform, and the broker does not re-send until the next handshake — so a
+  subject-wide connection gate would leave the worker on the old cap, or
+  trading under a block an operator had set, for as long as the platform was
+  down. An action that *does* reach the broker checks the connection itself
+  (CRYPTO_LEVERAGE_INIT; see CryptoSignalProcessor._handle_system_action).
+  """
+  proc = FakeProcessor({"success": True}, connected=False)
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "max_open_orders": 5}
+
+  proc._handle_system_message(_settings_update_payload({"max_open_orders": 7}))
+
+  assert [action for action, _ in proc.system_calls] == [
+    SystemActionEnum.WORKER_SETTINGS_UPDATE
+  ]
+  assert proc.settings["max_open_orders"] == 7
+
+
+def test_settings_update_applies_a_new_cap_without_a_reconnect():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+
+  proc._handle_system_message(_settings_update_payload({"max_open_orders": 2}))
+
+  assert proc.settings["max_open_orders"] == 2
+
+
+def test_settings_update_goes_through_the_same_setter_as_the_ack():
+  """A block arriving live is indistinguishable from one restored on connect —
+  same helper, so the same operator alert."""
+  proc = _settings_proc()
+
+  proc._handle_system_message(_settings_update_payload({"signal_blocked": True}))
+
+  assert proc._signals_blocked is True
+  assert proc.notifications == ["signals_blocked"]
+
+
+def test_settings_update_for_another_worker_is_ignored():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+
+  proc._handle_system_message(
+    _settings_update_payload({"max_open_orders": 2}, account_id="OTHER-GW-acct-9")
+  )
+
+  assert proc.settings["max_open_orders"] == 5
+
+
+def test_settings_update_with_an_unusable_block_changes_nothing():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc._signals_blocked = True
+
+  proc._handle_system_message(
+    _settings_update_payload({"max_open_orders": "lots", "signal_blocked": "maybe"})
+  )
+
+  assert proc.settings["max_open_orders"] == 5
+  assert proc._signals_blocked is True
+
+
+def test_settings_update_salvages_field_by_field():
+  """One malformed value must not cost the other settings in the same push."""
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+
+  proc._handle_system_message(
+    _settings_update_payload({"max_open_orders": 3, "signal_blocked": "maybe"})
+  )
+
+  assert proc.settings["max_open_orders"] == 3
+  assert proc._signals_blocked is False
+
+
+def test_settings_update_omitting_a_field_leaves_it_alone():
+  proc = _settings_proc()
+  proc.settings["max_open_orders"] = 5
+  proc._signals_blocked = True
+
+  proc._handle_system_message(_settings_update_payload({"max_open_orders": 3}))
+
+  assert proc.settings["max_open_orders"] == 3
+  assert proc._signals_blocked is True
+
+
 def test_ack_unparseable_setting_does_not_cost_the_other_sections():
   """Settings are salvaged like every other section — a malformed value is
   dropped on its own while the rest of the payload still applies."""
@@ -2197,3 +2370,178 @@ def test_a_force_close_carries_its_own_pnl():
   )
   proc._process_signal(_uxid_signal())
   assert proc.cycle.recorded[0][3].profit == -12.0
+
+
+# ── FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL (symbol+strategy+signal_uxid) ───── #
+#
+# With the toggle on, a position is addressed by all three key components, so a
+# second *signal* may enter a symbol this same strategy already holds. The
+# exposure cap is untouched: it stays account-wide.
+
+
+def _multi_positions_market():
+  return SimpleNamespace(
+    allows_multi_strategy_per_symbol=False,
+    allows_multi_positions_per_symbol=True,
+  )
+
+
+def test_second_signal_may_enter_a_symbol_the_same_strategy_holds():
+  proc = FakeProcessor({"success": True, "ticket": 1, "price": 2000.0, "volume": 0.1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True, "ticket": 1})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-B",
+    ).model_dump_json(),
+  )
+
+  assert len(seen) == 1
+  assert proc.db.rejected == []
+
+
+def test_same_signal_uxid_still_blocked_on_a_symbol_it_already_holds():
+  """The toggle separates *signals*, not re-entries of one signal."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-A",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "uxid-A" in proc.db.rejected[0]["comment"]
+
+
+def test_entry_without_a_uxid_is_still_blocked_when_multi_positions_on():
+  """Nothing tells it apart from the open rows, so the strict rule applies."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="XAUUSD", strategy="strat-1"
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+
+
+def test_max_open_orders_counts_concurrent_signals_on_one_symbol():
+  """MAX_OPEN_ORDERS=5 caps the ACCOUNT: five signals on one symbol+strategy
+  fill the same five slots as five signals on five symbols."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 5}
+  proc.db.open_positions = [
+    _open_row("strat-1", "XAUUSD", signal_uxid=f"uxid-{i}") for i in range(5)
+  ]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-6",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert "Max open orders reached (5/5)" in proc.db.rejected[0]["comment"]
+
+
+def test_max_open_orders_counts_a_mixed_book_of_symbols_and_strategies():
+  """The same cap covers five positions spread across strategies and symbols."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 5}
+  proc.db.open_positions = [
+    _open_row("strat-1", "XAUUSD", signal_uxid="uxid-1"),
+    _open_row("strat-1", "EURUSD", signal_uxid="uxid-2"),
+    _open_row("strat-2", "XAUUSD", signal_uxid="uxid-3"),
+    _open_row("strat-2", "GBPUSD", signal_uxid="uxid-4"),
+    _open_row("strat-3", "USDJPY", signal_uxid="uxid-5"),
+  ]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = SimpleNamespace(
+    allows_multi_strategy_per_symbol=True,
+    allows_multi_positions_per_symbol=True,
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="AUDUSD",
+      strategy="strat-1",
+      signal_uxid="uxid-6",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert "Max open orders reached (5/5)" in proc.db.rejected[0]["comment"]
+
+
+def test_multi_positions_does_not_switch_off_the_cross_strategy_guard():
+  """Regression: the two toggles exempt along different axes. With
+  multi-positions ON and multi-strategy OFF, another strategy's position on the
+  symbol must still block, whatever signal_uxid it carries."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG,
+      symbol="XAUUSD",
+      strategy="strat-2",
+      signal_uxid="uxid-B",
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert len(proc.db.rejected) == 1
+  assert "strat-1" in proc.db.rejected[0]["comment"]
+
+
+def test_a_uxid_less_entry_is_still_counted_against_the_cap():
+  """Regression: a signal with no uxid opens an additional ticket rather than
+  replacing the uxid-carrying row, so it must not inherit that row's
+  MAX_OPEN_ORDERS exemption."""
+  proc = FakeProcessor({"success": True, "ticket": 1})
+  proc.settings = {"max_open_orders": 1}
+  proc.db.open_positions = [_open_row("strat-1", "XAUUSD", signal_uxid="uxid-A")]
+  seen = _capturing_handler(proc, {"success": True})
+  proc.handler.strategy = _multi_positions_market()
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(
+      SignalActionEnum.LONG, symbol="EURUSD", strategy="strat-1"
+    ).model_dump_json(),
+  )
+
+  assert seen == []
+  assert "Max open orders reached (1/1)" in proc.db.rejected[0]["comment"]

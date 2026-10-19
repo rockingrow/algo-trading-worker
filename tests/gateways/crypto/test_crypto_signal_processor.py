@@ -1,9 +1,11 @@
 """Tests for CRYPTO-specific signal-processor hooks."""
 
+import json
 from types import SimpleNamespace
 
 from worker.gateways.crypto.signal_processor import CryptoSignalProcessor
 from worker.schemas.position_schema import PositionStatusEnum
+from worker.schemas.system_schema import SystemActionEnum
 
 
 def _proc(settings: dict) -> CryptoSignalProcessor:
@@ -207,3 +209,49 @@ def test_manual_position_ref_source_id_unique_per_import():
   proc._on_manual_position(_exchange_position(symbol="BTCUSDT"))
   proc._on_manual_position(_exchange_position(symbol="BTCUSDT"))
   assert inserts[0]["ref_id"] != inserts[1]["ref_id"]
+
+
+# ── runtime SYSTEM actions ─────────────────────────────────────────────────── #
+
+
+def _leverage_init_proc(*, connected: bool):
+  """A processor stubbed just enough to exercise _handle_system_action, recording
+  the leverage-init passes it runs instead of talking to an exchange."""
+  proc = object.__new__(CryptoSignalProcessor)
+  proc.name = "CRYPTO"
+  proc.settings = {"account_id": "CRYPTO-BINANCE-acct-1"}
+  passes: list[dict] = []
+  proc._run_leverage_init = lambda **kwargs: passes.append(kwargs)
+  proc._ensure_connected = lambda: connected
+  return proc, passes
+
+
+def _leverage_broadcast(symbols=None, default_leverage=10):
+  return json.dumps(
+    {
+      "action": SystemActionEnum.CRYPTO_LEVERAGE_INIT.value,
+      "timestamp": "2026-10-19T02:05:50.377695Z",
+      "account_id": "CRYPTO-BINANCE-acct-1",
+      "symbols": symbols or ["BTCUSDT"],
+      "default_leverage": default_leverage,
+    }
+  )
+
+
+def test_runtime_leverage_init_runs_when_the_exchange_is_connected():
+  proc, passes = _leverage_init_proc(connected=True)
+
+  proc._handle_system_message(_leverage_broadcast())
+
+  assert passes == [{"symbols": ["BTCUSDT"], "max_leverage_cap": 10}]
+
+
+def test_runtime_leverage_init_skipped_while_the_exchange_is_disconnected():
+  """The connection check lives on this action rather than on the SYSTEM subject:
+  a leverage init needs the exchange, so it is skipped here, while the subject's
+  market-neutral settings pushes still reach the base handler."""
+  proc, passes = _leverage_init_proc(connected=False)
+
+  proc._handle_system_message(_leverage_broadcast())
+
+  assert passes == []

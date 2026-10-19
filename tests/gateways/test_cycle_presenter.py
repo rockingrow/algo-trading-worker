@@ -172,6 +172,50 @@ def test_every_action_appears_in_order():
   assert actions.index("<b>TP1</b>") < actions.index("<b>TP2</b>")
 
 
+def test_every_action_line_carries_the_timezone_of_its_time():
+  msg = _render(_cycle([_event(), _event(action="TP1"), _event(action="TP2")]))
+  assert msg.count("2026-06-02 08:00:00 (UTC)") == 3
+
+
+def test_times_are_rendered_in_the_configured_offset():
+  settings = dict(FOREX_SETTINGS, telegram_message_timezone=7.0)
+  msg = _render(_cycle([_event()]), settings_dict=settings)
+  assert "2026-06-02 15:00:00 (UTC+7)" in msg
+
+
+def test_a_half_hour_offset_keeps_its_minutes():
+  settings = dict(FOREX_SETTINGS, telegram_message_timezone=5.5)
+  msg = _render(_cycle([_event()]), settings_dict=settings)
+  assert "2026-06-02 13:30:00 (UTC+5:30)" in msg
+
+
+def test_a_negative_offset_reads_as_such():
+  settings = dict(FOREX_SETTINGS, telegram_message_timezone=-4)
+  msg = _render(_cycle([_event()]), settings_dict=settings)
+  assert "2026-06-02 04:00:00 (UTC-4)" in msg
+
+
+def test_a_stored_time_without_an_offset_is_read_as_utc():
+  settings = dict(FOREX_SETTINGS, telegram_message_timezone=7)
+  msg = _render(
+    _cycle([_event(timestamp="2026-06-02 08:00:00")]), settings_dict=settings
+  )
+  assert "2026-06-02 15:00:00 (UTC+7)" in msg
+
+
+def test_an_unusable_offset_falls_back_to_utc():
+  for value in ("east", None, 99):
+    settings = dict(FOREX_SETTINGS, telegram_message_timezone=value)
+    msg = _render(_cycle([_event()]), settings_dict=settings)
+    assert "2026-06-02 08:00:00 (UTC)" in msg
+
+
+def test_text_that_is_not_a_time_is_passed_through_unlabelled():
+  msg = _render(_cycle([_event(timestamp="unknown")]))
+  assert "unknown" in msg
+  assert "unknown (UTC)" not in msg
+
+
 def test_outcome_icon_separates_a_filled_action_from_a_failed_one():
   msg = _render(
     _cycle(

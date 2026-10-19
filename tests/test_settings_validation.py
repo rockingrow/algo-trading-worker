@@ -32,6 +32,8 @@ _LEGACY_FLAT_KEYS = {
   "mt5_path",
   "mt5_name",
   "forex_allow_multi_strategy_per_symbol",
+  "forex_allow_multi_positions_per_symbol",
+  "forex_hedge_mode",
   "crypto_exchange",
   "crypto_quote_asset",
   "crypto_api_key",
@@ -63,6 +65,7 @@ _LEGACY_FLAT_KEYS = {
   "telegram_chat_id",
   "telegram_chat_channel_id",
   "telegram_cycle_enabled",
+  "telegram_message_timezone",
   "telegram_log_errors_enabled",
   "telegram_log_dedup_window",
   "telegram_log_chat_id",
@@ -164,22 +167,38 @@ def test_forex_account_id_derived_from_mt5_login(monkeypatch):
   assert s.account_id == "FOREX-MT5-413652379"
 
 
-def test_max_open_orders_defaults_to_five(monkeypatch):
+def _forex_env(monkeypatch):
   monkeypatch.setenv("MARKET_TYPE", "FOREX")
   monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
   monkeypatch.setenv("MT5_LOGIN", "413652379")
   monkeypatch.setenv("MT5_PASSWORD", "pw")
+
+
+def test_max_open_orders_defaults_to_five(monkeypatch):
+  # The backfill the worker runs on until the broker's first WORKER_CONNECTED_ACK
+  # tells it the account's actual cap.
+  _forex_env(monkeypatch)
   monkeypatch.delenv("MAX_OPEN_ORDERS", raising=False)
   assert Settings(_env_file=None).risk.max_open_orders == 5
 
 
-def test_max_open_orders_overridable(monkeypatch):
-  monkeypatch.setenv("MARKET_TYPE", "FOREX")
-  monkeypatch.setenv("MT5_SERVER", "Exness-MT5Trial6")
-  monkeypatch.setenv("MT5_LOGIN", "413652379")
-  monkeypatch.setenv("MT5_PASSWORD", "pw")
+def test_max_open_orders_ignores_the_env_var(monkeypatch):
+  # The broker owns this value now, so MAX_OPEN_ORDERS is no longer a setting.
+  # Without the explicit validation_alias, pydantic-settings would match the
+  # field *name* case-insensitively and a stale entry in a host's .env would
+  # silently cap a worker below what the broker told it.
+  _forex_env(monkeypatch)
   monkeypatch.setenv("MAX_OPEN_ORDERS", "10")
-  assert Settings(_env_file=None).risk.max_open_orders == 10
+  assert Settings(_env_file=None).risk.max_open_orders == 5
+
+
+def test_max_open_orders_still_reaches_the_child_process(monkeypatch):
+  # It is read from the flat settings dict by guard.max_open_orders_rejection,
+  # which is also where the broker's pushed value lands — so the dump key has
+  # to survive the field losing its env var.
+  _forex_env(monkeypatch)
+  monkeypatch.delenv("MAX_OPEN_ORDERS", raising=False)
+  assert Settings(_env_file=None).flat_dump()["max_open_orders"] == 5
 
 
 # ── Multi-strategy-per-symbol requires unique magics ─────────────────────── #
@@ -209,3 +228,41 @@ def test_duplicate_magics_tolerated_when_multi_strategy_disabled(monkeypatch):
   monkeypatch.setenv("FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL", "false")
   monkeypatch.setenv("STRATEGY_MAGIC_MAP", '{"MT5_GOLD": 111, "MT5_GOLD_SHORT": 111}')
   assert Settings(_env_file=None).forex.allow_multi_strategy_per_symbol is False
+
+
+# ── Multi-positions-per-symbol requires a verified hedging account ───────── #
+
+
+def test_multi_positions_rejected_without_hedge_mode(monkeypatch):
+  """Several tickets on one symbol only stay separate on a hedging account, and
+  FOREX_HEDGE_MODE is what makes the worker verify that at connect."""
+  _forex_env(monkeypatch)
+  monkeypatch.setenv("FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL", "true")
+  monkeypatch.setenv("FOREX_HEDGE_MODE", "false")
+  with pytest.raises(ValidationError, match="FOREX_HEDGE_MODE"):
+    Settings(_env_file=None)
+
+
+def test_multi_positions_accepted_with_hedge_mode(monkeypatch):
+  _forex_env(monkeypatch)
+  monkeypatch.setenv("FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL", "true")
+  monkeypatch.setenv("FOREX_HEDGE_MODE", "true")
+  s = Settings(_env_file=None)
+  assert s.forex.allow_multi_positions_per_symbol is True
+  assert s.forex.hedge_mode is True
+
+
+def test_hedge_mode_alone_is_allowed(monkeypatch):
+  """Asking for a verified hedging account does not require the new mode."""
+  _forex_env(monkeypatch)
+  monkeypatch.setenv("FOREX_HEDGE_MODE", "true")
+  s = Settings(_env_file=None)
+  assert s.forex.hedge_mode is True
+  assert s.forex.allow_multi_positions_per_symbol is False
+
+
+def test_multi_positions_defaults_to_off(monkeypatch):
+  _forex_env(monkeypatch)
+  s = Settings(_env_file=None)
+  assert s.forex.allow_multi_positions_per_symbol is False
+  assert s.forex.hedge_mode is False

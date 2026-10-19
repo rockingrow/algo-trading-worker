@@ -24,7 +24,11 @@ _DEFAULT_DRIFT_PERCENT = 0.5
 
 
 def symbol_open_rejection(
-  db_service, signal: SignalSchema, *, allow_multi_strategy: bool = False
+  db_service,
+  signal: SignalSchema,
+  *,
+  allow_multi_strategy: bool = False,
+  allow_multi_positions: bool = False,
 ) -> Optional[str]:
   """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
   because an order is already open on its symbol, else ``None``.
@@ -36,21 +40,55 @@ def symbol_open_rejection(
   placed. The rejected entry is still logged and forwarded to the broker with
   status REJECTED by the caller.
 
-  ``allow_multi_strategy`` (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL, resolved per
-  market — see BaseMarketStrategy.allows_multi_strategy_per_symbol) exempts
-  *other* strategies' positions from this rule: each strategy trades under its
-  own magic number there, so a concurrent position is intended, not a netting
-  conflict. A position already held by *this* strategy still blocks — the
-  one-open-order-per-(strategy, symbol) rule is untouched by the toggle.
+  Two toggles narrow which open positions count, each along one axis of the
+  composite position key (symbol + strategy + signal_uxid):
+
+  * ``allow_multi_strategy`` (FOREX_ALLOW_MULTI_STRATEGY_PER_SYMBOL, resolved
+    per market — see BaseMarketStrategy.allows_multi_strategy_per_symbol)
+    exempts *other* strategies' positions: each strategy trades under its own
+    magic number there, so a concurrent position is intended, not a netting
+    conflict.
+  * ``allow_multi_positions`` (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL, see
+    BaseMarketStrategy.allows_multi_positions_per_symbol) exempts positions
+    opened by a *different signal* — a different ``signal_uxid``. Only a
+    position this same signal already opened still blocks, so a re-entry of one
+    signal keeps replacing its own position rather than stacking a second one.
+    A signal carrying no ``signal_uxid`` cannot be told apart from the open
+    rows, so it is treated as blocking regardless of the toggle.
+
+  Neither toggle relaxes MAX_OPEN_ORDERS — see
+  :func:`max_open_orders_rejection`, which counts every active position on the
+  account whatever key it lives under.
   """
   open_positions = db_service.get_open_positions_for_flat(symbol=signal.symbol)
   if not open_positions:
     return None
-  same_strategy_open = any(p.get("strategy") == signal.strategy for p in open_positions)
-  if allow_multi_strategy and not same_strategy_open:
+  # Each toggle exempts along its own axis only, so they are applied per
+  # position rather than as two filters over the whole list: a row held by
+  # ANOTHER strategy is governed by ``allow_multi_strategy`` alone, and its
+  # ``signal_uxid`` must never exempt it — otherwise turning on multi-positions
+  # would silently switch off the cross-strategy netting guard the operator
+  # deliberately left off.
+  match_uxid = allow_multi_positions and bool(signal.signal_uxid)
+  blocking = []
+  for position in open_positions:
+    if position.get("strategy") != signal.strategy:
+      if not allow_multi_strategy:
+        blocking.append(position)
+      continue
+    if match_uxid and position.get("signal_uxid") != signal.signal_uxid:
+      continue
+    blocking.append(position)
+  if not blocking:
     return None
-  holders = sorted({p.get("strategy") for p in open_positions if p.get("strategy")})
+  holders = sorted({p.get("strategy") for p in blocking if p.get("strategy")})
   held_by = f" (held by {', '.join(holders)})" if holders else ""
+  if match_uxid and all(p.get("strategy") == signal.strategy for p in blocking):
+    return (
+      f"{signal.symbol} already has an open order for signal "
+      f"{signal.signal_uxid}{held_by}; entry not placed "
+      f"(open position on symbol+strategy+signal_uxid)."
+    )
   return (
     f"{signal.symbol} already has an open order{held_by}; "
     f"entry not placed (open position on symbol)."
@@ -58,23 +96,41 @@ def symbol_open_rejection(
 
 
 def max_open_orders_rejection(
-  db_service, settings: dict, signal: SignalSchema
+  db_service,
+  settings: dict,
+  signal: SignalSchema,
+  *,
+  allow_multi_positions: bool = False,
 ) -> Optional[str]:
   """Return a reason string when *signal* (a LONG/SHORT entry) must be rejected
   because the worker is already at its MAX_OPEN_ORDERS cap, else ``None``.
 
-  The cap counts active (OPENED/TP1) positions across every strategy/symbol. A
-  re-entry or scale-in on a symbol this strategy already holds replaces the
-  existing position rather than opening a new slot, so it is never counted
-  against the cap. A value of 0 (or unset) disables the limit.
+  The cap is account-wide: it counts every active (OPENED/TP1) position the
+  worker tracks, whatever strategy, symbol or signal holds it. Five concurrent
+  signals on one symbol therefore fill the same five slots as five signals on
+  five different symbols — the toggles that widen the position key never widen
+  the cap.
+
+  The one exemption is a re-entry that *replaces* an existing position rather
+  than opening a new slot: a position already held under this entry's own key.
+  With ``allow_multi_positions`` (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL) that
+  key includes ``signal_uxid``, so only the same signal's own position is
+  exempt and a second signal on an already-held symbol is counted normally.
+
+  A value of 0 (or unset) disables the limit.
   """
   max_orders = settings.get("max_open_orders")
   if not max_orders or max_orders <= 0:
     return None
 
   open_positions = db_service.get_open_positions_for_flat()
+  # With multi-positions on, the exemption is keyed on signal_uxid whether or
+  # not this signal carries one: a signal with no uxid does not replace a row
+  # that has one, it opens an additional ticket, so it must be counted.
   already_held = any(
-    p.get("strategy") == signal.strategy and p.get("symbol") == signal.symbol
+    p.get("strategy") == signal.strategy
+    and p.get("symbol") == signal.symbol
+    and (not allow_multi_positions or p.get("signal_uxid") == signal.signal_uxid)
     for p in open_positions
   )
   if already_held:
