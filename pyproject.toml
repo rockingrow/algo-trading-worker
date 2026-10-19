@@ -1,6 +1,6 @@
 [project]
 name = "algo-trading-worker"
-version = "1.2.3"
+version = "1.3.0"
 description = "Market execution worker listening to NATS signals"
 readme = "README.md"
 requires-python = ">=3.10"

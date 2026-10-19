@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-19
 
 ### Fixed
 
@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A busy MT5 trade context no longer costs the request.** The terminal serialises every trade request through a single trade context: one that arrives while another is still in flight is refused outright rather than queued, with `Trade context is busy` (or the server-side retcode **10024** *Too many requests*). The worker treated that refusal like any other rejection, so a scheduling collision — two signals landing together, most often a `TP1` partial and the breakeven SL move that follows it on the same signal, or two symbols filling on the same tick — surfaced as a failed trade: the entry was lost, the exit left the position open for the reconciler to notice, or the SL stayed where it was. Nothing was wrong with the request; the very same one succeeds a moment later.
 
   `MT5Gateway._send_order_request` now wraps **every** `order_send` in the order path (`place_order`, `close_position`, `modify_sl`) in a bounded retry that sleeps between attempts: 4 attempts, 0.3 s doubling (~2.1 s at worst). The condition is matched on the terminal's own wording as well as on the retcode, because it reaches the worker by two routes — a rejected result carries it in `comment`, while a request the terminal refused to send at all returns `None` and leaves it in `last_error()`. The budget is small on purpose: an entry is a market order priced off the live quote, so retrying for seconds would fill it at a price the signal never meant, and once it is spent the refusal is reported as the failure it now really is. Anything that is *not* a busy context (10019 `No money`, 10014 `Invalid volume`, 10016 `Invalid stops`) is a verdict on the request and is still returned on the first attempt, unretried — retrying a verdict only delays the failure line the operator needs. No new setting; CRYPTO is untouched.
+
+- **A strategy name near 29 characters cost every FOREX entry it sent.** The MT5 order comment is composed as `<strategy> <last 2 chars of signal_id>`, and the gateway cut it to 30 characters on the assumption that MQL5's own 31-character limit was what applied. It is not: the MetaTrader5 Python wrapper refuses a request whose comment reaches **30** characters with `(-2, 'Invalid "comment" argument')` — client-side, before the terminal or the broker ever sees it. A 29-character strategy name (`SIGNAL_SIMULATOR_LIFECYCLE_V1`) made the composed comment 32 characters, the 30-character cut still overflowed by one, and `order_send` never left the process: the entry was logged as `retcode=-2 comment=Send Failed` and nothing reached `positions`. The `TP1` that followed a minute later then failed as `No tracked opening position in DB` — the visible symptom, one step removed from the cause. Shorter strategy names never reached the cut, so the off-by-one had never been exercised.
+
+  `_MT5_COMMENT_MAX` is now the measured 29 (verified against wrapper 5.0.5735), and **every** `order_send` comment goes through one fitting helper — the close path (`Full Close <reason>`) was passing its comment through untruncated, and a refused close is worse than a refused entry: the position stays open with nothing tracking the attempt. The fitting also drops trailing whitespace, so a cut that lands on the separator no longer shows up in the terminal as a name with a dangling gap.
+
+  The budget is part of the gateway contract (`BasePlatformGateway.order_comment_max`), so `ForexExecutor` composes the entry comment to fit instead of handing down something that will be cut: with a long strategy name the **name** gives way and the two-character signal tail is kept (`SIGNAL_SIMULATOR_LIFECYCLE fe`). That tail is the only thing telling apart the comments of two tickets one strategy holds on the same symbol under `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`, which is exactly when an operator reads them side by side in the terminal.
 
 ### Added
 
@@ -102,14 +108,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Every action line of the cycle message carries the timezone of its time, and can be rendered in the operator's own zone.** The timeline in box 2 printed a bare `2026-09-11 10:10:02` under each action — the instant was UTC, but nothing on the line said so, while the broker's own report of the same trade quotes its times in the operator's zone (`… (UTC+7)`). Two clocks, neither labelled: reading the worker's `LONG`, `TP1` and `TP2` next to the broker's close made the trade look hours off, and there was no way to tell an unlabelled time in the wrong zone from a genuinely late fill.
 
   `cycle_presenter._timestamp` now always labels the zone it rendered in — `2026-09-11 10:10:02 (UTC)` — and renders in the zone chosen by the new **`TELEGRAM_MESSAGE_TIMEZONE`** (a UTC offset in **hours**, default `0`): `7` → `2026-09-11 17:10:02 (UTC+7)`, `-4` → `(UTC-4)`, `5.5` → `(UTC+5:30)`. Set it to the zone the broker reports in and the two reports of one trade read off the same clock. Nothing is stored differently: cycle event timestamps stay UTC in SQLite and on the `TRADE` subject, so this changes display only, and a value that is unset, non-numeric or outside ±14h falls back to UTC rather than failing a render — a message with a surprising offset is still a message. A stored timestamp with no offset is read as UTC (what the worker writes), and a `timestamp` that is not a time at all is passed through **unlabelled** rather than being given an invented zone.
-
-### Fixed
-
-- **A strategy name near 29 characters cost every FOREX entry it sent.** The MT5 order comment is composed as `<strategy> <last 2 chars of signal_id>`, and the gateway cut it to 30 characters on the assumption that MQL5's own 31-character limit was what applied. It is not: the MetaTrader5 Python wrapper refuses a request whose comment reaches **30** characters with `(-2, 'Invalid "comment" argument')` — client-side, before the terminal or the broker ever sees it. A 29-character strategy name (`SIGNAL_SIMULATOR_LIFECYCLE_V1`) made the composed comment 32 characters, the 30-character cut still overflowed by one, and `order_send` never left the process: the entry was logged as `retcode=-2 comment=Send Failed` and nothing reached `positions`. The `TP1` that followed a minute later then failed as `No tracked opening position in DB` — the visible symptom, one step removed from the cause. Shorter strategy names never reached the cut, so the off-by-one had never been exercised.
-
-  `_MT5_COMMENT_MAX` is now the measured 29 (verified against wrapper 5.0.5735), and **every** `order_send` comment goes through one fitting helper — the close path (`Full Close <reason>`) was passing its comment through untruncated, and a refused close is worse than a refused entry: the position stays open with nothing tracking the attempt. The fitting also drops trailing whitespace, so a cut that lands on the separator no longer shows up in the terminal as a name with a dangling gap.
-
-  The budget is part of the gateway contract (`BasePlatformGateway.order_comment_max`), so `ForexExecutor` composes the entry comment to fit instead of handing down something that will be cut: with a long strategy name the **name** gives way and the two-character signal tail is kept (`SIGNAL_SIMULATOR_LIFECYCLE fe`). That tail is the only thing telling apart the comments of two tickets one strategy holds on the same symbol under `FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL`, which is exactly when an operator reads them side by side in the terminal.
 
 ### Notes
 
@@ -353,6 +351,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Previous Release
 
+[1.3.0]: https://github.com/rockingrow/algo-trading-worker/compare/v1.3.0...dev
 [1.2.3]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.3...dev
 [1.2.2]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.2...dev
 [1.2.1]: https://github.com/rockingrow/algo-trading-worker/compare/v1.2.1...dev
