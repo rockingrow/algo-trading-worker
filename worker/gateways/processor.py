@@ -1062,6 +1062,8 @@ class BaseSignalProcessor(ABC):
     """Handle a message received on the NATS ``SYSTEM`` subscription: validate the
     common envelope (action + timestamp + account_id), route it by worker
     identity, then dispatch to the market's :meth:`_handle_system_action` hook.
+    Whether the platform has to be connected is each action's own call, not this
+    subject's.
 
     This is the **runtime** half of the broker→worker config flow: the worker
     stays subscribed to ``SYSTEM`` for its whole lifetime, so a broadcast here
@@ -1087,12 +1089,11 @@ class BaseSignalProcessor(ABC):
       system.account_id,
     )
 
-    if not self._ensure_connected():
-      return
-
     # Route by worker identity: every SYSTEM message carries a required
     # account_id (NATS-name format "<market>-<gateway>-<account_id>") and is
     # executed only by the matching worker. A blank value would match nobody.
+    # Checked before anything with a side effect, so a broadcast addressed to
+    # another account costs this worker nothing.
     if system.account_id and system.account_id != self._system_account_id:
       log.info(
         "[%s SYSTEM] Skipping action=%s: account_id=%s != worker=%s",
@@ -1103,6 +1104,13 @@ class BaseSignalProcessor(ABC):
       )
       return
 
+    # No platform check for the subject as a whole: an action that needs a live
+    # broker asks for one itself (CRYPTO_LEVERAGE_INIT does), the way the ADMIN
+    # path gates FLAT alone and lets BLOCK_SIGNAL through. The settings this
+    # subject carries are in-memory state that does not touch the platform, and
+    # the broker does not re-send until the next handshake — so dropping a push
+    # over a momentary disconnect would leave the worker running on the old cap,
+    # or trading under a block an operator had set, until it reconnects.
     self._handle_system_action(system.action, data)
 
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:

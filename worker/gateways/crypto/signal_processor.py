@@ -161,8 +161,15 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   def _handle_system_action(self, action: SystemActionEnum, data: dict) -> None:
     """Re-run the leverage-init pass on a runtime ``CRYPTO_LEVERAGE_INIT``
     broadcast — the same payload the ACK carries, sent after the handshake when
-    an admin edits a sub-account's leverage cap or onboards new symbols."""
+    an admin edits a sub-account's leverage cap or onboards new symbols.
+
+    This is the one SYSTEM action that talks to the exchange, so it is also the
+    one that checks the connection; the base dispatches without checking, so an
+    action that only changes in-memory settings is never lost to a disconnect.
+    """
     if action == SystemActionEnum.CRYPTO_LEVERAGE_INIT:
+      if not self._ensure_connected():
+        return
       self._leverage_init_from(SystemCryptoLeverageInitSchema(**data), source="SYSTEM")
       return
     super()._handle_system_action(action, data)

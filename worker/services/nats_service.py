@@ -17,7 +17,17 @@ _Subject = str | NatsSubjectEnum
 
 
 def _subject_str(s: _Subject) -> str:
-  return s if isinstance(s, str) else s.value
+  """The wire name of a subject, as a plain ``str``.
+
+  ``NatsSubjectEnum`` mixes in ``str``, so an ``isinstance`` check cannot tell a
+  member apart from a strategy name and would hand the member straight through.
+  nats-py formats the subject into its SUB line with an f-string, and on Python
+  3.11+ that prints ``NatsSubjectEnum.SYSTEM`` — a valid subject the server
+  accepts without complaint, leaving the worker deaf to SYSTEM and ADMIN. The
+  enum guards its own formatting too (see ``worker.schemas.nats_schema``); this
+  unwraps it here as well so what leaves this module is never an enum member.
+  """
+  return s.value if isinstance(s, NatsSubjectEnum) else s
 
 
 class _CallbackDedup:
