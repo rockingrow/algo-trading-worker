@@ -198,10 +198,11 @@ class FakeProcessor(BaseSignalProcessor):
   def _handle_admin_message(self, raw, *, private=False):
     self.admin_calls.append((raw, private))
 
-  # Record dispatched runtime SYSTEM actions (base parses the envelope + ensures
-  # connection + routes by identity, then calls this hook), then delegate like a
-  # real market does — the base owns WORKER_SETTINGS_UPDATE, so swallowing
-  # everything here would hide it.
+  # Record dispatched runtime SYSTEM actions (the base parses the envelope and
+  # routes by identity, then calls this hook; the connection check belongs to
+  # whichever action needs the platform), then delegate like a real market does
+  # — the base owns WORKER_SETTINGS_UPDATE, so swallowing everything here would
+  # hide it.
   def _handle_system_action(self, action, data):
     self.system_calls.append((action, data))
     super()._handle_system_action(action, data)
@@ -1062,15 +1063,6 @@ def test_announce_worker_connected_escalates_to_error_after_threshold(monkeypatc
   assert levels == ["WARNING", "WARNING", "ERROR"]
 
 
-def test_system_not_connected_short_circuits():
-  proc = FakeProcessor({"success": True}, connected=False)
-  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1"}
-
-  proc._process_message(NatsSubjectEnum.SYSTEM, _leverage_broadcast())
-
-  assert proc.system_calls == []
-
-
 def test_invalid_signal_notifies_operator_and_skips_execution():
   """A signal that fails validation must not silently vanish: it never reaches
   the handler/DB, and the operator is told *which* field was wrong via the
@@ -1744,6 +1736,27 @@ def _settings_update_payload(settings, *, account_id="FAKE_MKT-FAKE_GW-acct-1"):
       "settings": settings,
     }
   )
+
+
+def test_system_dispatches_even_while_the_platform_is_disconnected():
+  """A disconnected platform must not cost the worker a SYSTEM push.
+
+  The settings this subject carries are in-memory state that never touches the
+  platform, and the broker does not re-send until the next handshake — so a
+  subject-wide connection gate would leave the worker on the old cap, or
+  trading under a block an operator had set, for as long as the platform was
+  down. An action that *does* reach the broker checks the connection itself
+  (CRYPTO_LEVERAGE_INIT; see CryptoSignalProcessor._handle_system_action).
+  """
+  proc = FakeProcessor({"success": True}, connected=False)
+  proc.settings = {"account_id": "FAKE_MKT-FAKE_GW-acct-1", "max_open_orders": 5}
+
+  proc._handle_system_message(_settings_update_payload({"max_open_orders": 7}))
+
+  assert [action for action, _ in proc.system_calls] == [
+    SystemActionEnum.WORKER_SETTINGS_UPDATE
+  ]
+  assert proc.settings["max_open_orders"] == 7
 
 
 def test_settings_update_applies_a_new_cap_without_a_reconnect():

@@ -11,7 +11,12 @@ import threading
 import pytest
 
 from worker.schemas.nats_schema import NatsSubjectEnum
-from worker.services.nats_service import NATSPublisher, _CallbackDedup
+from worker.services.nats_service import (
+  NATSPublisher,
+  NATSSubscriber,
+  _CallbackDedup,
+  _subject_str,
+)
 
 
 class _Msg:
@@ -119,3 +124,84 @@ def test_callback_dedup_expires_after_window(monkeypatch):
     "worker.services.nats_service.settings.telegram.log_dedup_window", 0
   )
   assert dedup.is_duplicate("error:EOF") is False
+
+
+# ── Subject names handed to nats.py ───────────────────────────────────────── #
+# The subscribe path is where a NatsSubjectEnum member used to leak through:
+# nats-py formats the subject into its SUB line, so a member registered interest
+# in a subject literally named "NatsSubjectEnum.SYSTEM" and the worker never
+# heard SYSTEM or ADMIN again. Nothing errored, so only the subject string
+# actually handed to nc.subscribe() can catch it.
+
+
+def test_subject_str_unwraps_enum_members_and_passes_strategies_through():
+  assert _subject_str(NatsSubjectEnum.SYSTEM) == "SYSTEM"
+  assert type(_subject_str(NatsSubjectEnum.SYSTEM)) is str
+  assert _subject_str("MT5_GOLD_M5_V1") == "MT5_GOLD_M5_V1"
+
+
+class _FakeSub:
+  async def unsubscribe(self) -> None:
+    pass
+
+
+class _SubscribingNc:
+  """Fake nats.py client recording the subject of every subscribe() call."""
+
+  def __init__(self) -> None:
+    self.subscribed: list[object] = []
+
+  async def subscribe(self, subject, cb=None):
+    self.subscribed.append(subject)
+    return _FakeSub()
+
+
+class _FakeNatsClient:
+  """Stand-in for NatsClient that runs the subscriber's body against a fake nc,
+  on its own loop in its own thread, the way the real client does."""
+
+  last: "_FakeNatsClient | None" = None
+
+  def __init__(self, **_kwargs) -> None:
+    self.nc = _SubscribingNc()
+    self._loop = None
+    self._stop_event = threading.Event()
+    self._thread: threading.Thread | None = None
+    _FakeNatsClient.last = self
+
+  def start(self, body, thread_name: str = "nats-loop") -> None:
+    def _run():
+      asyncio.run(body(self.nc, self._stop_event))
+
+    self._thread = threading.Thread(target=_run, daemon=True)
+    self._thread.start()
+
+  def stop(self) -> None:
+    self._stop_event.set()
+    if self._thread is not None:
+      self._thread.join(timeout=2)
+
+
+def test_subscribe_registers_the_wire_subject_names(monkeypatch):
+  monkeypatch.setattr("worker.services.nats_service.NatsClient", _FakeNatsClient)
+  subscriber = NATSSubscriber(
+    url="nats://fake",
+    subjects=[
+      NatsSubjectEnum.SYSTEM,
+      NatsSubjectEnum.ADMIN,
+      "MT5_GOLD_M5_V1",
+      "ADMIN.FOREX.MT5.434309400",
+    ],
+  )
+  subscriber.connect()
+  assert subscriber.wait_subscribed(timeout=5)
+  subscriber.close()
+
+  registered = _FakeNatsClient.last.nc.subscribed
+  # Formatted the way nats-py does it, since that is what reaches the server.
+  assert [f"{subject}" for subject in registered] == [
+    "SYSTEM",
+    "ADMIN",
+    "MT5_GOLD_M5_V1",
+    "ADMIN.FOREX.MT5.434309400",
+  ]
