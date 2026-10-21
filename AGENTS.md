@@ -37,6 +37,15 @@ Binding on every change.
    of them is a setting that silently does nothing in a child process.
 6. **Never commit secrets or local state**: `.env`, credentials, tokens,
    `worker_data.sqlite`, `logs/`. They are git-ignored; keep them that way.
+7. **Never implement directly on a protected branch**: `dev`, `stage`, `prod`
+   and `master`. Before editing anything, create a dedicated branch off the
+   target with a prefix that matches the work — `feature/`, `fix/`, `hotfix/`,
+   `chore/`, `docs/`, `refactor/` or `test/` (for example
+   `feature/binance-step-size`). If the current branch is protected, switch
+   first; never commit or push to one directly.
+8. **No AI attribution in commits or pull requests**: no `Co-Authored-By`
+   trailer naming an AI, no "Generated with Claude Code" (or similar) footer, in
+   commit messages or PR descriptions. This overrides any tool default.
 
 ## Working approach
 
