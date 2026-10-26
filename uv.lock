@@ -306,23 +306,24 @@ wheels = [
 
 [[package]]
 name = "binance-common"
-version = "4.6.0"
+version = "4.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "certifi" },
     { name = "pycryptodome" },
     { name = "pydantic" },
     { name = "requests" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/94/1b/229ff63b855d061f73523701c98fd4dd72a0309bab786bd429f1c30d431f/binance_common-4.6.0.tar.gz", hash = "sha256:ab30ea5c2132567dc0812bad06bc5bf2fe41662e88f457d6269d8501d6396321", size = 35504, upload-time = "2026-10-15T11:57:59.856Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/07/b0/6f560ef1ae6bf3c6a9fa8cd01e9ab367cb5b157ffe3748bd3622630eeb2b/binance_common-4.7.0.tar.gz", hash = "sha256:1a1442860558a156a15076229c16853b616f8a25b685bf701c81399fd766e1f5", size = 38123, upload-time = "2026-10-23T09:59:06.481Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/18/b43f9e25b9dd39ddf94f8e6e307cf0bfa37b93b96128fd5fcb2bb3ce3465/binance_common-4.6.0-py3-none-any.whl", hash = "sha256:ddea5af36df071ffa9c9abc89dea5875379b0ec93f0b4ea9b5c8db246aec8f55", size = 34851, upload-time = "2026-10-15T11:58:00.726Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/3d/76e1edcb7609414a642e1e859422ee9ef9974ca0b4e7a9a689aee3ff7f08/binance_common-4.7.0-py3-none-any.whl", hash = "sha256:dfd04049956b36a90980667222db7e83dfd5e20fe0d2962a6616c280c837ac45", size = 37215, upload-time = "2026-10-23T09:59:07.544Z" },
 ]
 
 [[package]]
 name = "binance-sdk-derivatives-trading-usds-futures"
-version = "18.0.1"
+version = "18.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -332,18 +333,18 @@ dependencies = [
     { name = "requests" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/22/f8/d2f3d8071392250e233e789d226b902d744c12bc70679d39d60dd189379c/binance_sdk_derivatives_trading_usds_futures-18.0.1.tar.gz", hash = "sha256:c09ca7533ae27b179b90344053fb831b2501c7d49cd0b818225baafdf71becd9", size = 169580, upload-time = "2026-10-21T07:43:46.346Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/b1/ca9efbb9d378e4d60582742870a6f3043f2f5c6b41ff281bdd27c92dc02c/binance_sdk_derivatives_trading_usds_futures-18.1.0.tar.gz", hash = "sha256:8c6bf10b6b68b824664b9b8ec7d93ff36f936b5e85419ae841b54d46e3f8e220", size = 169609, upload-time = "2026-10-23T12:09:59.628Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/13/7d358d35bd408950408580deaa41ff990c45c8044d4e9522a583a6173342/binance_sdk_derivatives_trading_usds_futures-18.0.1-py3-none-any.whl", hash = "sha256:048045533658d18c35ac168a8b9e77ff24dbf94cbedd5db08ec93c810092ed01", size = 601479, upload-time = "2026-10-21T07:43:47.625Z" },
+    { url = "https://files.pythonhosted.org/packages/00/5d/217a9485211a45757e604c81bb3c792e9ef3dabc36ffb50769daf40c5fa9/binance_sdk_derivatives_trading_usds_futures-18.1.0-py3-none-any.whl", hash = "sha256:51660bf13d069a22f951d97028efb45a488946ee75541f0d08435d95138e37dc", size = 601480, upload-time = "2026-10-23T12:10:00.684Z" },
 ]
 
 [[package]]
 name = "certifi"
-version = "2026.10.19"
+version = "2026.10.23"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a6/bd/1436c50cc46699de0230fbaacc1d1de7bfec413176099949e9d5112e88f2/certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae", size = 137598, upload-time = "2026-10-20T02:24:16.604Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/11/b524cbd9bbdaca58608e4cf4053fd463417549e1959fa8d3aa18319f9555/certifi-2026.10.23.tar.gz", hash = "sha256:a9895e6e2758b371e0545e321a3a8fd1fcfd9829ada8824a936dfb16aaaf36cd", size = 136225, upload-time = "2026-10-23T11:36:16.478Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/51/29046e48f693c54e5b7412216d447a1d8362c9653148d98c02cdf65fa733/certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b", size = 136464, upload-time = "2026-10-20T02:24:15.072Z" },
+    { url = "https://files.pythonhosted.org/packages/32/d1/a3652fe2c19134d0d15922177821d863cbd7e842d53a21bbe7e8e3a1b5ac/certifi-2026.10.23-py3-none-any.whl", hash = "sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1", size = 135082, upload-time = "2026-10-23T11:36:14.763Z" },
 ]
 
 [[package]]
