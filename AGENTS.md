@@ -27,9 +27,11 @@ Binding on every change.
 3. **Pull requests always target `dev`**, never `master`. Opening the PR is the
    user's call.
 4. **A user-facing change updates `changelog.md`** under an unreleased version
-   heading, and `README.md` when it changes behaviour the README describes
-   (settings, payload fields, execution logic, schema). Both files are part of
-   the change, not a follow-up.
+   heading, and the affected page under `docs/` when it changes behaviour the
+   documentation describes (settings, payload fields, execution logic, schema).
+   `README.md` is only the landing page and index: touch it when the quick start,
+   the overview or the list of pages changes. The docs are part of the change,
+   not a follow-up.
 5. **A new setting is added in five places**: `worker/settings.py`,
    `.env.example`, `scripts/init_env.py`, the key list in
    `tests/test_settings_validation.py`, and — if execution consumes it —
@@ -115,8 +117,10 @@ never scan from the repository root.
 | Process/thread lifecycle, watchdog, composition root | `worker/{market,process_manager,worker_runtime,context,app}.py` |
 | Example payloads for every subject | `examples/nats/` |
 
-`README.md` is ~124KB and `changelog.md` ~84KB — never read either whole. Run
-`rg -n '^#{1,3} ' README.md` for the section index, then read only that range.
+Reference documentation lives in `docs/`, one page per topic; `README.md` links
+to each. `changelog.md` is ~100KB and several `docs/` pages are 20–30KB — never
+read them whole. Run `rg -n '^#{1,3} ' <file>` for the section index, then read
+only that range.
 
 Do not scan `.venv/`, `uv.lock`, caches, or `logs/`.
 

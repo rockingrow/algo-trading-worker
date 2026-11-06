@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The README is now a short landing page; the reference material moved to `docs/`.** `README.md` keeps the overview, quick start, a documentation index and the development commands. Everything else moved, unchanged in substance, into one page per topic: `docs/architecture.md`, `docs/configuration.md`, `docs/signal-execution.md`, `docs/design-decisions.md`, `docs/nats-admin.md`, `docs/nats-system.md`, `docs/background-jobs.md`, `docs/database.md`, `docs/forex.md` and `docs/crypto.md`. In-page links were rewritten to point across pages, and the `#section-settings` / `#section-strategy_magic_map` links, which never resolved, now point at the `WORKER_CONNECTED_ACK` payload table.
+
 ## [1.3.0] - 2026-10-19
 
 ### Fixed
