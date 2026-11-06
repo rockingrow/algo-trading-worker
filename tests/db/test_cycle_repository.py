@@ -179,3 +179,15 @@ def test_clearing_the_message_id_makes_the_row_send_again(repo):
   repo.clear_cycle_message_id(row["chat_row_id"])
   (row,) = repo.get_due_cycle_deliveries()
   assert row["message_id"] is None
+
+
+def test_append_event_returns_none_when_the_database_cannot_be_opened(tmp_path):
+  """A failed open must surface as the documented None, not escape the handler
+  (it used to reference a connection that was never bound)."""
+  repo = NotificationCycleRepository(db_file=str(tmp_path))  # a directory
+  assert (
+    repo.append_event(
+      strategy="s", signal_uxid="u", symbol="XAUUSD", event={"action": "LONG"}
+    )
+    is None
+  )

@@ -63,7 +63,7 @@ class DBService:
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
-  ):
+  ) -> bool:
     return self.positions.update_position_status(
       ref_source_id, status, ref_id, closed_price, gateway_return_code, comment, message
     )

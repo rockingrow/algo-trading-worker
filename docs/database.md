@@ -69,6 +69,8 @@ OPENED ──► TP1 ──► TP2
 | `FLATTED` | FLAT signal | Position was closed by an administrative flat command |
 | `REJECTED` | `max_open_orders` / open-order-per-symbol / stale-signal guard | Entry blocked by a worker-side policy before it reached the broker — recorded for audit and forwarded to the broker, but no order was placed |
 
+**Only an active row changes state.** `PositionRepository.update_position_status` updates `WHERE ref_source_id = ? AND status IN ('OPENED', 'TP1')`. `ref_source_id` is not unique over the table's history (a `REJECTED` row is keyed by the signal's id), and a close event can arrive after another path already closed the row. A terminal or `REJECTED` row is therefore never rewritten, and so never re-published by `PositionCDC`. An update that matches no active row is logged at `WARNING` and does nothing.
+
 ## `position_logs` — Immutable execution audit trail
 
 An append-only log of every signal processed and its execution result. Never updated — only inserted.

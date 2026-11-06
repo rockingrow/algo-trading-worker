@@ -29,11 +29,15 @@ from worker.gateways.forex.base import (
 )
 from worker.gateways.forex.lot_sizing import LotSizer
 from worker.gateways.forex.stop_validator import StopValidator
-from worker.gateways.position_matching import filter_by_ticket
+from worker.gateways.position_matching import filter_by_ticket, same_ticket
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult, total_profit
+from worker.schemas.trade_result import (
+  TradeFailureEnum,
+  TradeResult,
+  close_batch_result,
+)
 
 logger = get_logger("worker.gateways.forex.executor")
 
@@ -445,9 +449,11 @@ class ForexExecutor:
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
       logger.warning(f"[partial_close] No open positions found for {symbol}")
-      return TradeResult.fail("No Positions Found")
+      return TradeResult.no_position()
 
     pos = self._pick(positions, position_ticket)
+    if pos is None:
+      return self._ticket_not_found("partial_close", symbol, position_ticket)
     # Clamp so we never close more than is actually open.
     safe_volume = min(close_volume, pos.volume)
 
@@ -468,9 +474,11 @@ class ForexExecutor:
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
       logger.warning(f"[update_sl] No open positions found for {symbol}")
-      return TradeResult.fail("No Positions Found")
+      return TradeResult.no_position()
 
     pos = self._pick(positions, position_ticket)
+    if pos is None:
+      return self._ticket_not_found("update_sl", symbol, position_ticket)
     return self._gateway.modify_sl(pos, new_sl)
 
   # ── TP2 / SL / R_SL: full close ───────────────────────────────────────── #
@@ -503,44 +511,46 @@ class ForexExecutor:
         symbol,
         position_ticket,
       )
-      return TradeResult.fail("No Positions Found")
+      return TradeResult.no_position()
 
-    success_count = 0
-    last_result: Optional[Any] = None
-    closed_results: List[Any] = []
+    closed: List[Any] = []
+    failed: List[Any] = []
     for pos in positions:
       result = self._gateway.close_position(pos, comment=f"Full Close {reason}")
       if result.get("success"):
-        success_count += 1
-        last_result = result
-        closed_results.append(result)
+        closed.append(result)
       else:
+        failed.append(result)
         logger.error(
           f"[close_all] Failed to close ticket {pos.ticket}: {result.get('comment')}"
         )
-
-    if success_count > 0 and last_result is not None:
-      return TradeResult.ok(
-        retcode=last_result.get("retcode"),
-        ticket=last_result.get("ticket"),
-        source_ticket=str(positions[0].ticket),
-        price=last_result.get("price"),
-        volume=last_result.get("volume"),
-        comment=f"Closed {success_count} position(s) [{reason}]",
-        # Unlike price/volume — which describe the last fill — the PnL is summed
-        # across every position closed here, because the notification reports one
-        # close event and the operator's question is what the whole exit booked.
-        profit=total_profit(closed_results),
-      )
-    return TradeResult.fail(f"Failed to close positions [{reason}]")
+    return close_batch_result(
+      closed,
+      failed,
+      source_ticket=str(positions[0].ticket),
+      reason=reason,
+      nothing_closed_comment=f"Failed to close positions [{reason}]",
+    )
 
   # ── Helpers ───────────────────────────────────────────────────────────── #
 
   @staticmethod
   def _pick(
-    positions: List[PlatformPosition], ticket: Optional[int]
-  ) -> PlatformPosition:
-    """Target a specific ticket, else the first open position."""
-    if ticket:
-      return next((p for p in positions if p.ticket == ticket), positions[0])
-    return positions[0]
+    positions: List[PlatformPosition], ticket: Optional[Any]
+  ) -> Optional[PlatformPosition]:
+    """The position carrying *ticket*, or the first one when no ticket is given.
+
+    ``None`` when a ticket was named and is not live. Falling back to another
+    position there would partial-close or re-stop a position the caller never
+    asked about — with several positions per symbol, a sibling signal's.
+    """
+    if ticket is None:
+      return positions[0]
+    return next((p for p in positions if same_ticket(p.ticket, ticket)), None)
+
+  @staticmethod
+  def _ticket_not_found(op: str, symbol: str, ticket: Any) -> TradeResult:
+    logger.warning("[%s] Ticket %s is not open on %s", op, ticket, symbol)
+    return TradeResult.fail(
+      f"Position {ticket} not found", failure=TradeFailureEnum.TICKET_NOT_FOUND
+    )

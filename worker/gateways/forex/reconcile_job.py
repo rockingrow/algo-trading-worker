@@ -62,6 +62,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from worker.gateways.errors import PositionsUnavailableError
 from worker.gateways.reconcile_job import BasePositionReconcileJob
 from worker.logger import get_logger
 from worker.settings import MT5_HEALTH_INTERVAL_WEEKEND, is_market_closed
@@ -137,7 +138,13 @@ class ForexReconcileJob(BasePositionReconcileJob):
   # ── Market hooks ────────────────────────────────────────────────────────── #
 
   def _fetch_live_positions(self) -> Optional[List[Any]]:
-    positions = self._executor.get_all_open_positions()
+    try:
+      positions = self._executor.get_all_open_positions()
+    except PositionsUnavailableError as exc:
+      # The terminal could not answer: an expected outage, so a WARNING (from
+      # the base scan) rather than a stack trace on every interval.
+      log.debug("[%s] %s", self.name, exc)
+      return None
     if not positions and self._gateway is not None and not self._gateway.is_connected():
       # The terminal dropped mid-scan: an empty list here means "no data", not
       # "flat account". Report unavailable so the scan is skipped.

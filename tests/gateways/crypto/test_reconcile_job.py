@@ -45,7 +45,7 @@ class _FakeDb:
   def __init__(self, rows):
     self._rows = list(rows)
 
-  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+  def get_open_positions_for_flat(self, strategy=None, symbol=None, ref_id=None):
     return list(self._rows)
 
   def close(self, ref_source_id):

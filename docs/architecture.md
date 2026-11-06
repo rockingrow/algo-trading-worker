@@ -63,7 +63,11 @@ worker/
 ├── gateways/            # External trading-platform integrations + shared signal pipeline
 │   ├── config.py                 # ExecutionConfig value object (risk/volume params)
 │   ├── market_strategy.py        # MarketStrategyFactory + ExecutorBackedMarket / Forex / Crypto
-│   ├── processor.py              # BaseSignalProcessor — shared NATS loop (Template Method)
+│   ├── processor.py              # BaseSignalProcessor — lifecycle, dispatch, SIGNAL path (Template Method)
+│   ├── admin_commands.py         # AdminCommandsMixin — ADMIN FLAT / BLOCK_SIGNAL / ALLOW_SIGNAL
+│   ├── system_messages.py        # SystemMessagesMixin — SYSTEM, WORKER_CONNECTED handshake + ACK
+│   ├── trade_notifications.py    # TradeNotificationsMixin — one cycle message per trade
+│   ├── errors.py                 # PositionsUnavailableError (market-neutral)
 │   ├── reconcile_job.py          # BasePositionReconcileJob — shared broker↔DB reconciler (Template Method)
 │   ├── signal_handler.py         # Routes signals to the correct execution flow
 │   ├── forex/           # FOREX — platform-agnostic layer + per-platform adapters (mt6 slots in beside mt5)
@@ -119,8 +123,8 @@ worker/
 │   ├── nats_service.py           # NATSSubscriber & NATSPublisher (over the NatsClient lifecycle)
 │   └── notification_service.py   # TelegramNotification + OutboxNotifier wrapper
 ├── db/                  # SQLite persistence layer
-│   ├── connection.py             # Connection factory
-│   ├── repository.py             # SQL + gateway-neutral column ↔ app-domain mapping
+│   ├── connection.py             # open_connection() + connect() context manager (always closes)
+│   ├── repository.py             # SQL + gateway-neutral column ↔ app-domain mapping (db_file injectable)
 │   └── schema.py                 # Table DDL (gateway-neutral columns)
 ├── utils/               # Shared utilities
 │   └── logging.py                # Structured logging helpers

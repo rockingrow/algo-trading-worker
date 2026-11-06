@@ -60,6 +60,9 @@ class CryptoSignalProcessor(BaseSignalProcessor):
   # Synthetic strategy tag for positions opened directly on the exchange (no
   # originating worker signal) and imported by the reconciler.
   _MANUAL_STRATEGY = "MANUAL"
+  # A CEX nets one position per symbol and tags it with no strategy, so the
+  # executor's ``strategy`` argument filters nothing (see the base class).
+  _live_positions_carry_strategy = False
 
   # ── Broker hooks ──────────────────────────────────────────────────────── #
 
@@ -220,7 +223,9 @@ class CryptoSignalProcessor(BaseSignalProcessor):
 
   def _start_broker_jobs(self, stop_event) -> None:
     # Exchange-side event ingestion (Binance → websocket user data stream).
-    event_stream = self.gateway.create_event_stream(self._on_exchange_close)
+    event_stream = self.gateway.create_event_stream(
+      self._serialized(self._on_exchange_close)
+    )
     if event_stream is not None:
       event_stream.start(stop_event=stop_event)
     else:
@@ -235,8 +240,8 @@ class CryptoSignalProcessor(BaseSignalProcessor):
     CryptoReconcileJob(
       db_service=self.ctx.db_service,
       executor=self.executor,
-      handler=self._on_missed_close,
-      manual_handler=self._on_manual_position,
+      handler=self._serialized(self._on_missed_close),
+      manual_handler=self._serialized(self._on_manual_position),
     ).start(stop_event=stop_event)
 
   # ── Exchange-triggered close handler (from the user data stream) ──────── #

@@ -96,7 +96,9 @@ never scan from the repository root.
 | ADMIN / SYSTEM / handshake payloads | `worker/schemas/{admin,system,inbox}_schema.py` |
 | NATS subjects | `worker/schemas/nats_schema.py`, `examples/nats/subjects.md` |
 | Which flow an action takes (the three groups) | `worker/gateways/signal_handler.py` |
-| Shared NATS loop, persistence, notification (Template Method) | `worker/gateways/processor.py` |
+| Shared NATS loop, SIGNAL path, persistence (Template Method) | `worker/gateways/processor.py` |
+| ADMIN `FLAT` / `BLOCK_SIGNAL` / `ALLOW_SIGNAL` handling | `worker/gateways/admin_commands.py` |
+| SYSTEM subject, `WORKER_CONNECTED` handshake and ACK replay | `worker/gateways/system_messages.py` |
 | Entry policy gates (MAX_OPEN_ORDERS, symbol/strategy conflicts) | `worker/gateways/guard.py` |
 | Market abstraction + TP1/exit orchestration | `worker/gateways/market_strategy.py` |
 | Execution config value object (risk/volume params) | `worker/gateways/config.py` |
@@ -107,7 +109,7 @@ never scan from the repository root.
 | Binance transport and user-data stream | `worker/gateways/crypto/binance/` |
 | Missed-close / missed-fill safety nets | `worker/gateways/{reconcile_job,forex/reconcile_job,crypto/reconcile_job}.py` |
 | Telegram message strings | `worker/gateways/message_presenter.py` + the per-market ones |
-| One-message-per-trade cycle | `worker/gateways/cycle_presenter.py`, `worker/services/cycle_notification_service.py`, `worker/jobs/cycle_notification_job.py` |
+| One-message-per-trade cycle | `worker/gateways/trade_notifications.py`, `worker/gateways/cycle_presenter.py`, `worker/services/cycle_notification_service.py`, `worker/jobs/cycle_notification_job.py` |
 | Publishing position rows to NATS (CDC) | `worker/jobs/cdc_job.py` |
 | Notification outbox dispatcher | `worker/jobs/notification_job.py`, `worker/services/notification_service.py` |
 | SQLite tables, SQL, migrations-by-guarded-ALTER | `worker/db/{schema,repository,connection}.py` |
