@@ -7,6 +7,7 @@ from worker.gateways.market_strategy import BaseMarketStrategy
 from worker.gateways.signal_handler import SignalHandler
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum
+from worker.schemas.trade_result import TradeResult
 
 
 class FakeStrategy(BaseMarketStrategy):
@@ -18,6 +19,7 @@ class FakeStrategy(BaseMarketStrategy):
     multi_strategy=False,
     multi_positions=False,
     cleanup_profit=None,
+    cleanup_refused=False,
   ):
     self.calls = []
     self._open = open_positions if open_positions is not None else []
@@ -26,6 +28,9 @@ class FakeStrategy(BaseMarketStrategy):
     self._multi_strategy = multi_strategy
     self._multi_positions = multi_positions
     self._cleanup_profit = cleanup_profit
+    # cleanup_ok=False alone means "nothing to close"; with cleanup_refused the
+    # broker found the position and refused the close.
+    self._cleanup_refused = cleanup_refused
 
   @property
   def allows_multi_strategy_per_symbol(self):
@@ -72,12 +77,11 @@ class FakeStrategy(BaseMarketStrategy):
       if position_ticket
       else f"close_all:{reason}:{strategy}"
     )
-    return {
-      "success": self._cleanup_ok,
-      "retcode": 0,
-      "price": 1999.0,
-      "profit": self._cleanup_profit,
-    }
+    if self._cleanup_ok:
+      return TradeResult.ok(price=1999.0, profit=self._cleanup_profit)
+    if self._cleanup_refused:
+      return TradeResult.fail("Requote", retcode=10004)
+    return TradeResult.no_position()
 
 
 class FakeStore:
@@ -92,7 +96,7 @@ class FakeStore:
       rows = [r for r in rows if r.get("signal_uxid") == signal_uxid]
     return rows
 
-  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+  def get_open_positions_for_flat(self, strategy=None, symbol=None, ref_id=None):
     return list(self._flat)
 
   def update_position_status(self, **kwargs):
@@ -155,6 +159,26 @@ def test_flat_syncs_stale_db_record_when_no_mt5_positions():
   assert res["success"] is False
   assert store.status_updates[0]["ref_source_id"] == "7"
   assert store.status_updates[0]["status"] == PositionStatusEnum.FLATTED
+
+
+def test_flat_refused_by_broker_leaves_db_row_open():
+  """A close the broker refuses proves the position is still live: the row must
+  not be synced to FLATTED (that would publish a flat position to the broker
+  while it keeps trading untracked), and the unscoped retry must not run."""
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=7)],
+    cleanup_ok=False,
+    cleanup_refused=True,
+  )
+  store = FakeStore(
+    positions=[{"ref_source_id": "7", "ref_id": "7", "status": "OPENED"}]
+  )
+  handler = SignalHandler(strat, store)
+  res = handler.handle(make_signal(SignalActionEnum.FLAT, strategy="strat-1"))
+  assert res["success"] is False
+  assert res["comment"] == "Requote"
+  assert store.status_updates == []
+  assert "close_all:FLAT:None" not in strat.calls
 
 
 def test_entry_no_stale_position():

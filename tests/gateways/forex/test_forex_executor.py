@@ -13,7 +13,7 @@ from helpers import (
 from worker.gateways.forex.base import Tick
 from worker.gateways.forex.executor import ForexExecutor
 from worker.schemas.signal_schema import SignalActionEnum
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeFailureEnum, TradeResult
 
 
 def _executor(cfg, gateway=None):
@@ -583,6 +583,66 @@ def test_close_all_fails_cleanly_when_the_ticket_is_gone(config):
 
   assert res["success"] is False
   assert ex._gateway.closed == []
+
+
+def test_close_all_that_leaves_a_ticket_open_is_a_failure(config):
+  """One of two tickets refused: the exit did not happen, so it must not be
+  reported as one (the caller would mark the tracked row closed)."""
+  gateway = FakePlatformGateway(
+    positions=[
+      make_platform_position(ticket=201, magic=12345, volume=0.5),
+      make_platform_position(ticket=202, magic=12345, volume=0.3),
+    ],
+    close_results=[
+      TradeResult.ok(retcode=10009, ticket="1", price=1999.5, volume=0.5),
+      TradeResult.fail("Close Failed"),
+    ],
+  )
+  ex = ForexExecutor(
+    gateway=gateway, config=config, strategy_magic_map={"strat-1": 12345}
+  )
+
+  res = ex.close_all_positions("XAUUSD", reason="TP2", strategy="strat-1")
+
+  assert res["success"] is False
+  assert res["failure"] is TradeFailureEnum.PARTIAL_CLOSE
+  assert "1 of 2" in res["comment"]
+  # The refusal's code, not the fill's DONE: a failed exit must not read as one.
+  assert res["retcode"] == -1
+  assert res["price"] == 1999.5  # what the closed ticket did is still reported
+
+
+def test_close_all_with_nothing_open_reports_no_position(config):
+  ex = _multi_strategy_executor(config, positions=[])
+
+  res = ex.close_all_positions("XAUUSD", strategy="strat-A")
+
+  assert res.is_no_position
+
+
+def test_partial_close_never_falls_back_to_another_ticket(config):
+  """A named ticket that is gone must not turn into a close of a sibling."""
+  pos_a = make_platform_position(ticket=301, magic=111, volume=1.0)
+  ex = _multi_strategy_executor(config, positions=[pos_a])
+
+  res = ex.partial_close_position(
+    "XAUUSD", close_volume=0.5, position_ticket=999, strategy="strat-A"
+  )
+
+  assert res["success"] is False
+  assert res["failure"] is TradeFailureEnum.TICKET_NOT_FOUND
+  assert ex._gateway.closed == []
+
+
+def test_update_sl_matches_a_text_ticket_from_the_db(config):
+  """The DB hands tickets back as TEXT; an int MT5 ticket must still match."""
+  pos_a = make_platform_position(ticket=301, magic=111, volume=1.0)
+  pos_b = make_platform_position(ticket=302, magic=111, volume=1.0)
+  ex = _multi_strategy_executor(config, positions=[pos_a, pos_b])
+
+  ex.update_position_sl("XAUUSD", 1990.0, position_ticket="302", strategy="strat-A")
+
+  assert [m["position"].ticket for m in ex._gateway.modified] == [302]
 
 
 # ── The entry comment fits the gateway's budget, tail first ────────────────── #

@@ -583,3 +583,18 @@ def test_modify_sl_retries_a_busy_trade_context(monkeypatch):
   assert result["success"] is True
   assert result["new_sl"] == 2000.0
   assert len(mt5.sent_requests) == 2
+
+
+def test_get_positions_raises_when_the_terminal_cannot_answer(fake_mt5):
+  """positions_get() → None is an error, not a flat book: it must not reach a
+  caller as [] (an ADMIN FLAT would then mark every tracked row FLATTED)."""
+  from worker.gateways.errors import PositionsUnavailableError
+
+  fake_mt5.positions_get = lambda symbol=None: None
+  with pytest.raises(PositionsUnavailableError):
+    _gateway(fake_mt5).get_positions()
+
+
+def test_get_positions_returns_empty_for_a_flat_book(fake_mt5):
+  fake_mt5.positions_get = lambda symbol=None: ()
+  assert _gateway(fake_mt5).get_positions() == []

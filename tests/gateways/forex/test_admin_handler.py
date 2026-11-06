@@ -61,7 +61,7 @@ class _FakeDb:
     self.logs = []
     self._flat = list(flat_positions)
 
-  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+  def get_open_positions_for_flat(self, strategy=None, symbol=None, ref_id=None):
     return list(self._flat)
 
   def update_position_status(self, **kwargs):

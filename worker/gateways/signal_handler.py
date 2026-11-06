@@ -20,7 +20,7 @@ from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeResult, is_no_position
 
 logger = get_logger("worker.gateways.signal_handler")
 
@@ -194,7 +194,7 @@ class SignalHandler:
         f"symbol={signal.symbol} ticket={position_ticket} "
         f"action={signal.action.value}. May have been closed already."
       )
-      return TradeResult.fail(no_mt5_comment)
+      return TradeResult.no_position(no_mt5_comment)
 
     result = strategy_fn(signal, position_ticket)
     if result.get("success"):
@@ -524,10 +524,12 @@ class SignalHandler:
       position_ticket=position_ticket,
     )
 
-    if not result.get("success"):
+    if is_no_position(result):
       # Strategy-scoped lookup may have returned empty because the DB is out of
       # sync (positions exist in MT5 but have no DB record, so _filter_by_strategy
       # drops them). Retry without the strategy filter to catch those positions.
+      # Only on "nothing to close": a close the broker *refused* found the
+      # position fine, and widening the filter would only reach further.
       #
       # Not when multiple strategies may share the symbol: an unscoped close
       # there would flatten the *other* strategies' live positions to clean up
@@ -565,6 +567,20 @@ class SignalHandler:
         result.get("source_ticket"),
         result.get("volume"),
         result.get("price"),
+      )
+      return result
+
+    if not is_no_position(result):
+      # The broker refused (or only partly completed) the close: the position is
+      # still live, so the DB row stays open. Syncing it to FLATTED here would
+      # publish a flat position to the broker while it keeps trading untracked.
+      logger.error(
+        "[SignalHandler._handle_flat] FLAT FAILED with a live position — DB row "
+        "left open | strategy=%s symbol=%s retcode=%s comment=%s",
+        signal.strategy,
+        signal.symbol,
+        result.get("retcode"),
+        result.get("comment"),
       )
       return result
 

@@ -28,7 +28,10 @@ def _build_binance(settings_dict: dict) -> BaseExchangeGateway:
     api_key=settings_dict["crypto_api_key"].get_secret_value(),
     api_secret=settings_dict["crypto_api_secret"].get_secret_value(),
     testnet=bool(settings_dict.get("crypto_testnet", False)),
-    hedge_mode=bool(settings_dict.get("crypto_hedge_mode", False)),
+    # Same default as CryptoSettings.hedge_mode and the processor's startup
+    # enforcement: a dict without the key must not build a one-way gateway on an
+    # account the processor has just switched to hedge mode.
+    hedge_mode=bool(settings_dict.get("crypto_hedge_mode", True)),
   )
 
 

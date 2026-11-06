@@ -263,3 +263,62 @@ def test_insert_position_persists_signal_id(repo):
   # not by the positions insert — a signal that only produced a positions row
   # without a matching log row is not visible to the dedup gate.
   assert repo.signal_exists("sig-open") is False
+
+
+def test_update_status_never_rewrites_a_closed_row(repo):
+  """ref_source_id is not unique over the table's history and a close event can
+  arrive after another path already closed the row: only an active row changes."""
+  repo.insert_position(
+    ref_id="300",
+    strategy="strat-a",
+    symbol="XAUUSD",
+    action="long",
+    volume=0.5,
+    opened_price=4500.0,
+  )
+  repo.update_position_status(
+    ref_source_id="300", status=PositionStatusEnum.TP2, closed_price=4600.0
+  )
+  repo.update_position_status(
+    ref_source_id="300",
+    status=PositionStatusEnum.TERMINAL_CLOSED,
+    closed_price=4400.0,
+  )
+  pos = repo.get_position("300")
+  assert pos["status"] == "TP2"
+  assert pos["closed_price"] == 4600.0
+
+
+def test_update_status_leaves_a_rejected_row_alone(repo):
+  repo.insert_rejected_position(
+    ref_id="sig-9",
+    strategy="strat-a",
+    symbol="XAUUSD",
+    action="long",
+    volume=0.5,
+    opened_price=4500.0,
+    comment="Max open orders reached",
+  )
+  repo.update_position_status(ref_source_id="sig-9", status=PositionStatusEnum.FLATTED)
+  assert repo.get_position("sig-9")["status"] == "REJECTED"
+
+
+def test_repository_can_be_pointed_at_its_own_file(tmp_path, monkeypatch):
+  """An injected db_file is used instead of the global settings' one."""
+  own = tmp_path / "own.sqlite"
+  monkeypatch.setattr(settings.database, "file", str(own))
+  db_init()
+  monkeypatch.setattr(settings.database, "file", str(tmp_path / "elsewhere.sqlite"))
+
+  repo = PositionRepository(db_file=str(own))
+  repo.insert_position(
+    ref_id="1",
+    strategy="s",
+    symbol="XAUUSD",
+    action="long",
+    volume=0.1,
+    opened_price=1.0,
+  )
+
+  assert repo.get_position("1")["symbol"] == "XAUUSD"
+  assert not (tmp_path / "elsewhere.sqlite").exists()

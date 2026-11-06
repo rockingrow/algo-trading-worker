@@ -266,7 +266,7 @@ class ExecutorBackedMarket(BaseMarketStrategy):
     )
 
     if not positions:
-      return TradeResult.fail("No open position — likely SL already triggered.")
+      return TradeResult.no_position("No open position — likely SL already triggered.")
 
     pos = positions[0]
     tp1_percent, move_sl_to_be = self._resolve_tp1_params(signal)
