@@ -12,6 +12,7 @@ import pytest
 from helpers import make_signal
 
 from worker.gateways import processor as processor_module
+from worker.gateways import system_messages as system_module
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor, parse_strategy_subjects
 from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
@@ -90,12 +91,13 @@ class FakeDb:
   def update_position_status(self, **kw):
     self.updated.append(kw)
 
-  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+  def get_open_positions_for_flat(self, strategy=None, symbol=None, ref_id=None):
     return [
       p
       for p in self.open_positions
       if (strategy is None or p.get("strategy") == strategy)
       and (symbol is None or p.get("symbol") == symbol)
+      and (ref_id is None or p.get("ref_id") == ref_id)
     ]
 
   def signal_exists(self, signal_id):
@@ -959,7 +961,7 @@ def _connected_proc():
 def _no_handshake_jitter(monkeypatch):
   """Pin the pre-request jitter to 0 so handshake tests are deterministic and
   don't pay a real 0-0.5s sleep."""
-  monkeypatch.setattr(processor_module.random, "uniform", lambda a, b: 0)
+  monkeypatch.setattr(system_module.random, "uniform", lambda a, b: 0)
 
 
 def test_announce_worker_connected_ack_needs_no_dispatch():
@@ -2545,3 +2547,156 @@ def test_a_uxid_less_entry_is_still_counted_against_the_cap():
 
   assert seen == []
   assert "Max open orders reached (1/1)" in proc.db.rejected[0]["comment"]
+
+
+# ── Serialising the pipeline (live dedup, ACK under the lock, single-flight) ── #
+
+
+def test_a_signal_executed_once_is_not_executed_again():
+  """signal_id is unique per action: delivered again (live after the ACK replay
+  ran it, or twice live) it must not place a second order."""
+  proc = FakeProcessor({"success": True, "ticket": 555, "price": 1.0, "volume": 1})
+  raw = make_signal(SignalActionEnum.LONG, signal_id="sig-1").model_dump_json()
+
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  assert len(proc.db.logged) == 1
+  assert len(proc.db.inserted) == 1
+
+
+def test_a_failed_signal_stays_retryable():
+  """A failure is not remembered: the broker resending the same signal_id (an SL
+  that hit a terminal blip) must be executed, not dropped as a duplicate."""
+  proc = FakeProcessor({"success": False, "comment": "requote"})
+  raw = make_signal(SignalActionEnum.SL, signal_id="sig-2").model_dump_json()
+
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: {"success": True, "ticket": 9, "source_ticket": 5}
+  )
+  proc._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  assert len(proc.db.logged) == 2
+  assert len(proc.db.updated) == 1
+
+
+def test_worker_connected_ack_is_applied_under_the_pipeline_lock():
+  """The reconnect thread applies the ACK (and its replay) while the listener
+  may be executing a signal; both must go through the same lock."""
+  import threading as _threading
+
+  proc = _connected_proc()
+  proc._pipeline_lock = _threading.RLock()
+  proc.publisher = FakePublisher(['{"action":"WORKER_CONNECTED_ACK"}'])
+  held = []
+
+  def _probe(raw):
+    # Another thread cannot take the lock while the ACK is being applied.
+    result = []
+    t = _threading.Thread(
+      target=lambda: result.append(proc._pipeline_lock.acquire(blocking=False))
+    )
+    t.start()
+    t.join()
+    held.append(not result[0])
+
+  proc._handle_worker_connected_response = _probe
+  proc._announce_worker_connected()
+
+  assert held == [True]
+
+
+def test_announce_while_one_is_in_flight_reruns_it_once(monkeypatch):
+  """A reconnect during a handshake must not start a second forever-retrying
+  one; it makes the running handshake announce once more when it finishes."""
+  proc = _connected_proc()
+  calls = []
+
+  def _once():
+    calls.append(len(calls))
+    if len(calls) == 1:
+      # A reconnect fires while the first handshake is still running.
+      proc._announce_worker_connected()
+
+  monkeypatch.setattr(proc, "_announce_once", _once)
+  proc._announce_worker_connected()
+
+  assert calls == [0, 1]
+  assert proc._announce_running is False
+  assert proc._announce_pending is False
+
+
+def test_signal_with_positions_unavailable_is_reported_failed_not_guessed():
+  """The broker could not say what is live: the signal is recorded and reported
+  as failed rather than executed on a guess, and nothing is persisted as closed."""
+  from worker.gateways.errors import PositionsUnavailableError
+
+  proc = FakeProcessor({"success": True})
+
+  def _raise(signal):
+    raise PositionsUnavailableError("terminal offline")
+
+  proc.handler = SimpleNamespace(handle=_raise)
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.SL).model_dump_json()
+  )
+
+  assert proc.db.updated == []
+  assert proc.db.logged[0]["comment"].startswith("Broker positions unavailable")
+  assert proc.notifications == ["failed:SL"]
+
+
+def test_a_failed_handshake_still_honours_a_reconnect_that_arrived_meanwhile(
+  monkeypatch,
+):
+  proc = _connected_proc()
+  calls = []
+
+  def _once():
+    calls.append(len(calls))
+    if len(calls) == 1:
+      proc._announce_worker_connected()  # reconnect during the first run
+      raise RuntimeError("ACK apply failed")
+
+  monkeypatch.setattr(proc, "_announce_once", _once)
+  proc._announce_worker_connected()
+
+  assert calls == [0, 1]
+  assert proc._announce_running is False
+
+
+def test_a_failed_handshake_with_nothing_pending_still_raises(monkeypatch):
+  proc = _connected_proc()
+
+  def _once():
+    raise RuntimeError("ACK apply failed")
+
+  monkeypatch.setattr(proc, "_announce_once", _once)
+  with pytest.raises(RuntimeError):
+    proc._announce_worker_connected()
+  assert proc._announce_running is False
+
+
+def test_serialized_background_handlers_run_under_the_pipeline_lock():
+  """A reconciler / push-stream handler that writes positions must queue behind
+  the signal being processed, or it can slip between the entry guards' read and
+  the order."""
+  import threading as _threading
+
+  proc = FakeProcessor({"success": True})
+  proc._pipeline_lock = _threading.RLock()
+  seen = []
+
+  def _handler(row):
+    result = []
+    t = _threading.Thread(
+      target=lambda: result.append(proc._pipeline_lock.acquire(blocking=False))
+    )
+    t.start()
+    t.join()
+    seen.append((row, not result[0]))
+
+  proc._serialized(_handler)({"ref_source_id": "1"})
+
+  assert seen == [({"ref_source_id": "1"}, True)]

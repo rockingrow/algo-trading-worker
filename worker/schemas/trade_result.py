@@ -20,7 +20,29 @@ incrementally.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Iterable, Optional
+
+
+class TradeFailureEnum(str, Enum):
+  """Why a broker operation failed, for callers whose next step depends on it.
+
+  The free-text ``comment`` is for humans; branching on it is how "the broker
+  refused the close" once got read as "there was nothing to close", and a live
+  position was recorded as flat. A caller that must tell those apart reads
+  :attr:`TradeResult.failure` instead. ``None`` on a failed result means the
+  cause was not classified — treat it as a broker-side failure, never as "no
+  position".
+  """
+
+  #: Nothing was live to act on. The only failure that proves the broker holds
+  #: no matching position, so the only one that may sync a DB row to closed.
+  NO_POSITION = "NO_POSITION"
+  #: A specific ticket was requested and is not among the live positions.
+  TICKET_NOT_FOUND = "TICKET_NOT_FOUND"
+  #: Some of the positions closed, at least one is still live.
+  PARTIAL_CLOSE = "PARTIAL_CLOSE"
+
 
 # Declared fields exposed via mapping access (everything except the `extra` bag).
 _FIELDS = frozenset(
@@ -38,6 +60,7 @@ _FIELDS = frozenset(
     "sl_update",
     "forced_closed",
     "profit",
+    "failure",
   }
 )
 
@@ -70,6 +93,9 @@ class TradeResult:
   # two are distinguished by context, and a close that renders ``None`` shows
   # ``n/a`` rather than a fabricated 0.0.
   profit: Optional[float] = None
+  # Machine-readable cause of a failure (see TradeFailureEnum); ``None`` on a
+  # success and on a failure nobody classified.
+  failure: Optional[TradeFailureEnum] = None
   # Catch-all for any ad-hoc keys a caller may still set via mapping access.
   extra: dict = field(default_factory=dict)
 
@@ -88,6 +114,15 @@ class TradeResult:
     """Build a failed result. Unknown keys are kept in ``extra``."""
     known, extra = cls._split(kwargs)
     return cls(success=False, retcode=retcode, comment=comment, extra=extra, **known)
+
+  @classmethod
+  def no_position(cls, comment: str = "No Positions Found") -> "TradeResult":
+    """A failure that proves nothing matching was live on the broker."""
+    return cls.fail(comment, failure=TradeFailureEnum.NO_POSITION)
+
+  @property
+  def is_no_position(self) -> bool:
+    return is_no_position(self)
 
   @staticmethod
   def _split(kwargs: dict) -> tuple[dict, dict]:
@@ -121,6 +156,72 @@ class TradeResult:
       return self[key]
     self[key] = default
     return default
+
+
+def is_no_position(result: Any) -> bool:
+  """True when *result* failed because nothing matching was live.
+
+  Accepts a :class:`TradeResult` or a legacy result mapping, so a caller can
+  branch on it whatever shape its collaborator returns.
+  """
+  if result.get("success"):
+    return False
+  failure = result.get("failure")
+  return failure is TradeFailureEnum.NO_POSITION or failure == "NO_POSITION"
+
+
+def close_batch_result(
+  closed: list,
+  failed: list,
+  *,
+  source_ticket: Optional[str],
+  reason: str,
+  nothing_closed_comment: str,
+  fill_retcode: bool = True,
+) -> TradeResult:
+  """The outcome of closing several positions as one exit.
+
+  *closed* / *failed* are the per-position results. Every position closed is a
+  success. Some closed is :attr:`TradeFailureEnum.PARTIAL_CLOSE`: the exit did
+  not happen, so the caller must not mark the tracked row closed. It carries the
+  *refusal's* retcode (not the last fill's, which would read as a success) and
+  still reports the PnL the closed ones booked. None closed is a plain failure.
+  Shared by every executor so the rule cannot drift between markets.
+
+  *fill_retcode* reports the last fill's retcode on success (MT5's ``DONE``);
+  a gateway whose fills carry no meaningful one keeps the default ``0``.
+  """
+  if not closed:
+    last_refusal = failed[-1] if failed else {}
+    return TradeResult.fail(
+      nothing_closed_comment, retcode=last_refusal.get("retcode", -1)
+    )
+  last = closed[-1]
+  summary = {
+    "ticket": last.get("ticket"),
+    "source_ticket": source_ticket,
+    "price": last.get("price"),
+    "volume": last.get("volume"),
+    # Summed, not last-write-wins like price/volume: the notification reports
+    # one exit, so it needs what the whole exit booked.
+    "profit": total_profit(closed),
+  }
+  total = len(closed) + len(failed)
+  if failed:
+    refusal = failed[-1]
+    return TradeResult.fail(
+      f"Closed {len(closed)} of {total} position(s) [{reason}] — the rest are "
+      f"still open: {refusal.get('comment') or 'close refused'}",
+      retcode=refusal.get("retcode", -1),
+      failure=TradeFailureEnum.PARTIAL_CLOSE,
+      **summary,
+    )
+  retcode = last.get("retcode") if fill_retcode else 0
+  return TradeResult.ok(
+    retcode=retcode if retcode is not None else 0,
+    comment=f"Closed {len(closed)} position(s) [{reason}]",
+    **summary,
+  )
 
 
 def total_profit(results: Iterable[Any]) -> Optional[float]:

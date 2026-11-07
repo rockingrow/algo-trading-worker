@@ -35,11 +35,15 @@ from worker.gateways.crypto.base import (
   ExchangePosition,
   linear_realized_pnl,
 )
-from worker.gateways.position_matching import filter_by_ticket
+from worker.gateways.position_matching import filter_by_ticket, same_ticket
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
 from worker.schemas.signal_schema import SignalSchema
-from worker.schemas.trade_result import TradeResult, total_profit
+from worker.schemas.trade_result import (
+  TradeFailureEnum,
+  TradeResult,
+  close_batch_result,
+)
 
 logger = get_logger("worker.gateways.crypto.executor")
 
@@ -428,13 +432,14 @@ class CryptoExecutor:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
-      return TradeResult.fail("No Positions Found")
+      return TradeResult.no_position()
 
-    pos = (
-      next((p for p in positions if p.ticket == position_ticket), positions[0])
-      if position_ticket
-      else positions[0]
-    )
+    pos = self._pick(positions, position_ticket)
+    if pos is None:
+      return TradeResult.fail(
+        f"Position {position_ticket} not found",
+        failure=TradeFailureEnum.TICKET_NOT_FOUND,
+      )
     safe_volume = self.normalize_volume(symbol, min(close_volume, pos.volume))
     if safe_volume <= 0:
       return TradeResult.fail("Close volume rounds to zero")
@@ -466,13 +471,14 @@ class CryptoExecutor:
     resolved = self.get_symbol(symbol)
     positions = self.get_open_positions(symbol, strategy=strategy)
     if not positions:
-      return TradeResult.fail("No Positions Found")
+      return TradeResult.no_position()
 
-    pos = (
-      next((p for p in positions if p.ticket == position_ticket), positions[0])
-      if position_ticket
-      else positions[0]
-    )
+    pos = self._pick(positions, position_ticket)
+    if pos is None:
+      return TradeResult.fail(
+        f"Position {position_ticket} not found",
+        failure=TradeFailureEnum.TICKET_NOT_FOUND,
+      )
     # Moving the stop to breakeven cancels all resting orders (the old stop) —
     # which on Binance also clears the resting take-profit. Re-place the breakeven
     # stop, then re-establish the TP2 target so it survives the move: the strategy
@@ -577,13 +583,12 @@ class CryptoExecutor:
       self.get_open_positions(symbol, strategy=strategy), position_ticket
     )
     if not positions:
-      return TradeResult.fail("No Positions Found")
+      return TradeResult.no_position()
 
     self._gateway.cancel_all_orders(resolved)
     fallback_entry_price = self._entry_price_from_db(symbol, strategy)
-    success_count = 0
-    last_result: Optional[Any] = None
-    closed_results: List[Any] = []
+    closed: List[Any] = []
+    failed: List[Any] = []
     for pos in positions:
       result = self._gateway.place_market_order(
         resolved,
@@ -593,29 +598,34 @@ class CryptoExecutor:
         client_order_id=self._close_client_order_id(),
       )
       if result.get("success"):
-        success_count += 1
-        last_result = result
         self._attach_realized_pnl(
           result, pos, fallback_close_price, fallback_entry_price
         )
-        closed_results.append(result)
+        closed.append(result)
       else:
+        failed.append(result)
         logger.error(
           "[close_all] Failed to close %s: %s", resolved, result.get("comment")
         )
+    return close_batch_result(
+      closed,
+      failed,
+      source_ticket=str(positions[0].ticket),
+      reason=reason,
+      nothing_closed_comment=f"Failed to close [{reason}]",
+      fill_retcode=False,
+    )
 
-    if success_count > 0 and last_result is not None:
-      return TradeResult.ok(
-        ticket=last_result.get("ticket"),
-        source_ticket=str(positions[0].ticket),
-        price=last_result.get("price"),
-        volume=last_result.get("volume"),
-        comment=f"Closed {success_count} position(s) [{reason}]",
-        # Summed, not last-write-wins like price/volume: the notification reports
-        # one exit, so it needs what the whole exit booked.
-        profit=total_profit(closed_results),
-      )
-    return TradeResult.fail(f"Failed to close [{reason}]")
+  @staticmethod
+  def _pick(positions: List[Any], ticket: Optional[Any]) -> Optional[Any]:
+    """The position carrying *ticket*, or the first one when none is named.
+
+    ``None`` when a named ticket is not live, rather than falling back to
+    another position — in hedge mode that could be the opposite side.
+    """
+    if ticket is None:
+      return positions[0]
+    return next((p for p in positions if same_ticket(p.ticket, ticket)), None)
 
   def close_single_position(self, pos: Any, reason: str = "FLAT") -> TradeResult:
     """Close one :class:`ExchangePosition` (its ``symbol`` is already resolved)."""

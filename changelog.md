@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-08
+
+### Fixed
+
+- **A `FLAT` signal no longer records a live position as flat.** `SignalHandler._handle_flat` treated every failed close as "nothing was open". A close the broker *refused* (requote, market closed) therefore marked the row `FLATTED`, and the CDC published it to the broker while the position kept trading untracked. `TradeResult` now carries a typed `failure` (`TradeFailureEnum`). Only `NO_POSITION` syncs the row or triggers the unscoped retry. Any other failure leaves the row open and returns the broker's error.
+- **A reconnect can no longer place a signal twice.** The `WORKER_CONNECTED_ACK` was applied on the publisher's reconnect thread, and its `retry_signals` replay ran concurrently with the NATS listener. The `signal_id` dedup and the entry guards (`MAX_OPEN_ORDERS`, one order per symbol) were check-then-act races. Every message, the ACK, and the markets' background handlers that write the positions table (reconcile jobs, the Binance user-data stream) now run under one `_pipeline_lock`. The handshake is single-flight: a reconnect during a handshake re-runs it once, even if the running attempt fails, instead of starting another thread that retries forever. A signal is also skipped when this process already executed its `signal_id` **successfully**, whether live or by replay. Failures are not remembered, so the broker can still resend a signal that failed.
+- **An ADMIN `FLAT` with a `strategy` filter no longer closes the whole CRYPTO account.** `CryptoExecutor` ignores `strategy`, because a CEX position carries none, so `FLAT {strategy: A}` also closed strategy B's positions and the manual ones. On a market whose positions carry no strategy, the FLAT is now scoped through that strategy's open DB rows, as a `ref_id` FLAT already was.
+- **An MT5 outage is no longer read as an empty account.** `MT5Gateway.get_positions` mapped `positions_get() → None` (terminal error) to `[]`, so an ADMIN FLAT during a drop marked every tracked row `FLATTED`. It now raises `PositionsUnavailableError`. ADMIN FLAT aborts with the DB untouched, a signal is recorded as failed instead of executed on a guess, and `ForexReconcileJob` skips the scan.
+- **A full close that leaves a ticket open is reported as a failure** (`PARTIAL_CLOSE`), on both executors. The tracked row is no longer marked closed while a position is still live. The result carries the refusal's retcode, not the last fill's `DONE`. Both executors build the outcome with one shared `close_batch_result`.
+- **The executors no longer fall back to another ticket.** A partial close or SL move naming a ticket that is not live used to act on the first position instead. On FOREX with several positions per symbol that is a sibling signal's position, and on CRYPTO in hedge mode it can be the opposite side. Both now fail with `TICKET_NOT_FOUND`, and tickets are compared as text, so a `ref_source_id` from SQLite matches the broker's id.
+- **`update_position_status` only changes active rows** (`OPENED`/`TP1`), and returns whether a row changed. A late close event or a reused `ref_source_id` can no longer rewrite a closed or `REJECTED` row, or make the CDC re-publish it.
+- **`NotificationCycleRepository.append_event` returns `None` when the database cannot be opened**, as documented. It used to raise `UnboundLocalError` from its own error handler.
+- **The CRYPTO gateway's hedge-mode default matches the setting** (`True`). `factory.py` defaulted to one-way while the processor enforced hedge mode, so a settings dict without the key built a gateway that disagreed with the account.
+- **26 tests that failed on `dev` pass again.** The DB fakes had not followed the `ref_id` filter added to `get_open_positions_for_flat`, and two presenter tests still expected the old `HEDGE_MODE:` label. `tests/test_fake_protocol_conformance.py` now fails fast, naming the fake, when a fake drifts from `PositionStoreProtocol`.
+
+### Changed
+
+- **`processor.py` is split by NATS subject.** ADMIN handling moved to `worker/gateways/admin_commands.py`, SYSTEM and the handshake to `system_messages.py`, and the cycle notifications to `trade_notifications.py`, each a mixin of `BaseSignalProcessor`. The processor keeps the lifecycle, the dispatch and the SIGNAL path, and drops from about 1,900 lines to about 850. Method names are unchanged.
+- **Repositories open connections through one context manager** (`worker.db.connection.connect`), replacing twenty hand-written `conn = None / try / finally: conn.close()` blocks. The database file is injectable (`PositionRepository(db_file=…)`) and defaults to `settings.database.file`, read at connect time.
+- **The unreachable re-entry exemption in `max_open_orders_rejection` is removed.** `symbol_open_rejection` runs first and rejects every entry that exemption covered. `docs/design-decisions.md` described it as live, and now describes the actual behaviour: a re-entry on a still-open position is rejected.
+
+- **The README is now a short landing page; the reference material moved to `docs/`.** `README.md` keeps the overview, quick start, a documentation index and the development commands. Everything else moved, unchanged in substance, into one page per topic: `docs/architecture.md`, `docs/configuration.md`, `docs/signal-execution.md`, `docs/design-decisions.md`, `docs/nats-admin.md`, `docs/nats-system.md`, `docs/background-jobs.md`, `docs/database.md`, `docs/forex.md` and `docs/crypto.md`. In-page links were rewritten to point across pages, and the `#section-settings` / `#section-strategy_magic_map` links, which never resolved, now point at the `WORKER_CONNECTED_ACK` payload table.
+
 ## [1.3.0] - 2026-10-19
 
 ### Fixed

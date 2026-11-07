@@ -48,7 +48,7 @@ class PositionStoreProtocol(Protocol):
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
-  ) -> None: ...
+  ) -> bool: ...
 
 
 class PositionSyncStoreProtocol(Protocol):
@@ -71,7 +71,7 @@ class TerminalCloseStoreProtocol(Protocol):
     gateway_return_code: Optional[int] = None,
     comment: Optional[str] = None,
     message: Optional[str] = None,
-  ) -> None: ...
+  ) -> bool: ...
   def log_position(
     self,
     strategy: str,

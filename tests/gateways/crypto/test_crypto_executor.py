@@ -661,3 +661,23 @@ def test_open_position_missing_quantity_in_payload_quantity_mode(config):
   )
   assert res["success"] is False
   assert "Missing quantity" in (res.get("comment") or res.get("message") or "")
+
+
+def test_partial_close_never_falls_back_to_another_position(config):
+  """A named ticket that is not live must fail, not reduce whichever position
+  is listed first (in hedge mode that can be the opposite side)."""
+  gw = FakeGateway(positions=[_long_pos(qty=0.02)])
+  res = CryptoExecutor(gw, config).partial_close_position(
+    "BTCUSD", close_volume=0.006, position_ticket=999
+  )
+  assert res["success"] is False
+  assert res["failure"].value == "TICKET_NOT_FOUND"
+  assert gw.orders == []
+
+
+def test_partial_close_matches_a_text_ticket(config):
+  gw = FakeGateway(positions=[_long_pos(qty=0.02)])
+  res = CryptoExecutor(gw, config).partial_close_position(
+    "BTCUSD", close_volume=0.006, position_ticket="7"
+  )
+  assert res["success"] is True

@@ -111,11 +111,11 @@ def max_open_orders_rejection(
   five different symbols — the toggles that widen the position key never widen
   the cap.
 
-  The one exemption is a re-entry that *replaces* an existing position rather
-  than opening a new slot: a position already held under this entry's own key.
-  With ``allow_multi_positions`` (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL) that
-  key includes ``signal_uxid``, so only the same signal's own position is
-  exempt and a second signal on an already-held symbol is counted normally.
+  There is no exemption for a re-entry on a position the entry's own key
+  already holds: :func:`symbol_open_rejection` runs first and rejects every such
+  entry, so an exemption here could never be reached. (One used to exist, and
+  the docs described it as live.) ``allow_multi_positions`` is accepted for a
+  uniform guard signature.
 
   A value of 0 (or unset) disables the limit.
   """
@@ -124,18 +124,6 @@ def max_open_orders_rejection(
     return None
 
   open_positions = db_service.get_open_positions_for_flat()
-  # With multi-positions on, the exemption is keyed on signal_uxid whether or
-  # not this signal carries one: a signal with no uxid does not replace a row
-  # that has one, it opens an additional ticket, so it must be counted.
-  already_held = any(
-    p.get("strategy") == signal.strategy
-    and p.get("symbol") == signal.symbol
-    and (not allow_multi_positions or p.get("signal_uxid") == signal.signal_uxid)
-    for p in open_positions
-  )
-  if already_held:
-    return None
-
   open_count = len(open_positions)
   if open_count < max_orders:
     return None

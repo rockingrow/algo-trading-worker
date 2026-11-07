@@ -1,0 +1,24 @@
+# Dependabot version updates. Security updates and alerts are switched on in the
+# repository settings (Code security); this file only drives the scheduled bumps.
+#
+# Every update PR targets `dev`: the project never opens a PR into `master`
+# directly. Dependabot security PRs ignore `target-branch` and follow the
+# repository's default branch.
+version: 2
+
+updates:
+  # pyproject.toml + uv.lock — runtime, optional extras and dependency groups.
+  - package-ecosystem: "uv"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "Bump"
+    groups:
+      # One PR for all minor/patch bumps; a major bump stays its own PR so its
+      # breaking changes get a separate review.
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]

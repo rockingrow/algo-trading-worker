@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from worker.gateways.errors import PositionsUnavailableError
 from worker.gateways.forex.base import (
   SIDE_LONG,
   SIDE_SHORT,
@@ -230,7 +231,13 @@ class MT5Gateway(BasePlatformGateway):
       else self._mt5.positions_get()
     )
     if raw is None:
-      return []
+      # positions_get() returns None on an error (terminal offline, IPC lost) and
+      # an empty tuple for a flat book. Mapping None to [] made every caller read
+      # an outage as "no positions" — an ADMIN FLAT then marked every tracked row
+      # FLATTED while the positions were still live.
+      raise PositionsUnavailableError(
+        f"MT5 positions_get failed: {self._mt5.last_error()}"
+      )
     return [
       PlatformPosition(
         ticket=p.ticket,
