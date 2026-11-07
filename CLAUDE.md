@@ -17,8 +17,8 @@ other.
 - `/code-review` on the diff before the branch is proposed for a PR into `dev`.
 - `/security-review` when the change touches broker delivery, credentials,
   `.env` handling, or anything published to NATS.
-- Update `changelog.md` and the affected `README.md` section in the same change,
-  per AGENTS.md rule 4.
+- Update `changelog.md` and the affected `docs/` page in the same change, per
+  AGENTS.md rule 4.
 
 ## Where to slow down
 

@@ -433,7 +433,7 @@ class ForexSignalProcessor(BaseSignalProcessor):
     ForexReconcileJob(
       db_service=self.ctx.db_service,
       executor=self.executor,
-      handler=self._on_missed_close,
+      handler=self._serialized(self._on_missed_close),
       gateway=self.gateway,
       magic_for=self._magic_for,
     ).start(stop_event=stop_event)

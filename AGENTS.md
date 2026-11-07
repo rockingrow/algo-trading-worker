@@ -27,9 +27,11 @@ Binding on every change.
 3. **Pull requests always target `dev`**, never `master`. Opening the PR is the
    user's call.
 4. **A user-facing change updates `changelog.md`** under an unreleased version
-   heading, and `README.md` when it changes behaviour the README describes
-   (settings, payload fields, execution logic, schema). Both files are part of
-   the change, not a follow-up.
+   heading, and the affected page under `docs/` when it changes behaviour the
+   documentation describes (settings, payload fields, execution logic, schema).
+   `README.md` is only the landing page and index: touch it when the quick start,
+   the overview or the list of pages changes. The docs are part of the change,
+   not a follow-up.
 5. **A new setting is added in five places**: `worker/settings.py`,
    `.env.example`, `scripts/init_env.py`, the key list in
    `tests/test_settings_validation.py`, and — if execution consumes it —
@@ -94,7 +96,9 @@ never scan from the repository root.
 | ADMIN / SYSTEM / handshake payloads | `worker/schemas/{admin,system,inbox}_schema.py` |
 | NATS subjects | `worker/schemas/nats_schema.py`, `examples/nats/subjects.md` |
 | Which flow an action takes (the three groups) | `worker/gateways/signal_handler.py` |
-| Shared NATS loop, persistence, notification (Template Method) | `worker/gateways/processor.py` |
+| Shared NATS loop, SIGNAL path, persistence (Template Method) | `worker/gateways/processor.py` |
+| ADMIN `FLAT` / `BLOCK_SIGNAL` / `ALLOW_SIGNAL` handling | `worker/gateways/admin_commands.py` |
+| SYSTEM subject, `WORKER_CONNECTED` handshake and ACK replay | `worker/gateways/system_messages.py` |
 | Entry policy gates (MAX_OPEN_ORDERS, symbol/strategy conflicts) | `worker/gateways/guard.py` |
 | Market abstraction + TP1/exit orchestration | `worker/gateways/market_strategy.py` |
 | Execution config value object (risk/volume params) | `worker/gateways/config.py` |
@@ -105,7 +109,7 @@ never scan from the repository root.
 | Binance transport and user-data stream | `worker/gateways/crypto/binance/` |
 | Missed-close / missed-fill safety nets | `worker/gateways/{reconcile_job,forex/reconcile_job,crypto/reconcile_job}.py` |
 | Telegram message strings | `worker/gateways/message_presenter.py` + the per-market ones |
-| One-message-per-trade cycle | `worker/gateways/cycle_presenter.py`, `worker/services/cycle_notification_service.py`, `worker/jobs/cycle_notification_job.py` |
+| One-message-per-trade cycle | `worker/gateways/trade_notifications.py`, `worker/gateways/cycle_presenter.py`, `worker/services/cycle_notification_service.py`, `worker/jobs/cycle_notification_job.py` |
 | Publishing position rows to NATS (CDC) | `worker/jobs/cdc_job.py` |
 | Notification outbox dispatcher | `worker/jobs/notification_job.py`, `worker/services/notification_service.py` |
 | SQLite tables, SQL, migrations-by-guarded-ALTER | `worker/db/{schema,repository,connection}.py` |
@@ -115,8 +119,10 @@ never scan from the repository root.
 | Process/thread lifecycle, watchdog, composition root | `worker/{market,process_manager,worker_runtime,context,app}.py` |
 | Example payloads for every subject | `examples/nats/` |
 
-`README.md` is ~124KB and `changelog.md` ~84KB — never read either whole. Run
-`rg -n '^#{1,3} ' README.md` for the section index, then read only that range.
+Reference documentation lives in `docs/`, one page per topic; `README.md` links
+to each. `changelog.md` is ~100KB and several `docs/` pages are 20–30KB — never
+read them whole. Run `rg -n '^#{1,3} ' <file>` for the section index, then read
+only that range.
 
 Do not scan `.venv/`, `uv.lock`, caches, or `logs/`.
 

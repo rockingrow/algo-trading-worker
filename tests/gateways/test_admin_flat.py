@@ -12,6 +12,7 @@ invariant that an *attempted-but-failed* close leaves the DB row OPEN.
 import json
 from types import SimpleNamespace
 
+from worker.gateways.errors import PositionsUnavailableError
 from worker.gateways.processor import BaseSignalProcessor
 from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
 from worker.schemas.position_schema import PositionStatusEnum
@@ -41,7 +42,7 @@ class FakeDbService:
     self.logs = []
     self._flat = list(flat_positions or [])
 
-  def get_open_positions_for_flat(self, strategy=None, symbol=None):
+  def get_open_positions_for_flat(self, strategy=None, symbol=None, ref_id=None):
     self.flat_calls.append({"strategy": strategy, "symbol": symbol})
     return list(self._flat)
 
@@ -126,9 +127,12 @@ class FakeProc:
     results_by_key=None,
     match_style="ticket",
     connected=True,
+    live_positions_carry_strategy=True,
   ):
     self.name = "TEST"
     self.presenter = FakePresenter
+    # FOREX-like by default: the executor's strategy filter is trusted.
+    self._live_positions_carry_strategy = live_positions_carry_strategy
     self._account_id = account_id
     self._market_type = market_type
     self._gateway_value = gateway_value
@@ -642,3 +646,42 @@ def test_admin_flat_on_a_position_with_no_cycle_still_notifies():
   assert proc.cycle.recorded == []
   assert len(proc.notifications) == 1
   assert "Admin FLAT" in proc.notifications[0]
+
+
+# ── strategy scoping on a market whose positions carry no strategy (CEX) ─────
+
+
+def test_strategy_flat_on_a_cex_closes_only_that_strategys_symbols():
+  """A CEX executor returns every position whatever strategy is asked for; the
+  FLAT must be scoped through the strategy's own DB rows, or it flattens the
+  other strategies' and the manually opened positions too."""
+  proc = FakeProc(
+    db_positions=[_db_pos(ref_id="o1", strategy="strat-A", symbol="BTCUSDT")],
+    positions=[_pos(ticket=11, symbol="BTCUSDT"), _pos(ticket=12, symbol="ETHUSDT")],
+    match_style="symbol",
+    live_positions_carry_strategy=False,
+  )
+  proc._handle_admin_message(_payload(strategy="strat-A"))
+  assert [p.symbol for p in proc.executor.closed] == ["BTCUSDT"]
+
+
+def test_strategy_flat_on_forex_trusts_the_executor_filter():
+  """Where positions carry their strategy (MT5 magic) the executor already
+  filtered, so an untracked live position of that strategy is still closed."""
+  proc = FakeProc(db_positions=[], positions=[_pos(ticket=5)])
+  proc._handle_admin_message(_payload(strategy="strat-A"))
+  assert len(proc.executor.closed) == 1
+
+
+def test_flat_with_positions_unavailable_leaves_the_db_untouched():
+  """No live book means no evidence: every row would look "never live" and be
+  marked FLATTED. The FLAT is aborted instead."""
+  proc = FakeProc(db_positions=[_db_pos(ref_id=1)])
+
+  def _unavailable(strategy=None):
+    raise PositionsUnavailableError("terminal offline")
+
+  proc.executor.get_all_open_positions = _unavailable
+  proc._handle_admin_message(_payload())
+  assert proc.db.status_updates == []
+  assert proc.db.logs == []

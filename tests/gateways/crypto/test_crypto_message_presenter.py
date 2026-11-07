@@ -11,22 +11,22 @@ from worker.settings import CryptoExchangeEnum
 def test_startup_message_shows_hedge_mode():
   cfg = {
     "crypto_exchange": CryptoExchangeEnum.BINANCE,
-    "binance_testnet": False,
-    "binance_hedge_mode": True,
+    "crypto_testnet": False,
+    "crypto_hedge_mode": True,
     "capital": 1000,
   }
   msg = CryptoMessagePresenter.startup(cfg, "FOOTER")
-  assert "HEDGE_MODE: <b>Hedge</b>" in msg
+  assert "POSITION MODE: <b>HEDGE</b>" in msg
 
 
 def test_startup_message_shows_one_way_mode():
   cfg = {
     "crypto_exchange": CryptoExchangeEnum.BINANCE,
-    "binance_hedge_mode": False,
+    "crypto_hedge_mode": False,
     "capital": 1000,
   }
   msg = CryptoMessagePresenter.startup(cfg, "FOOTER")
-  assert "HEDGE_MODE: <b>One-way</b>" in msg
+  assert "POSITION MODE: <b>ONE-WAY</b>" in msg
 
 
 def test_position_imported_manual_message():
