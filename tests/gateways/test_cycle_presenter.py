@@ -124,7 +124,7 @@ def test_position_box_shows_the_entry_levels_and_size():
     )
   )
   position = msg.split("</pre><pre>")[0]
-  assert "📈 <b>LONG XAUUSD</b>" in position
+  assert "🟩 <b>LONG XAUUSD</b>" in position
   assert "Price: 2340.15" in position
   assert "Volume: 0.5 lot ⚙️" in position  # gear = the worker sized it
   assert "SL: 2330 | TP1: 2350 | TP2: 2360" in position
@@ -287,18 +287,33 @@ def test_settings_box_reports_the_worker_configuration():
   assert "MAX_OPEN_ORDERS: <b>5</b>" in settings_box
 
 
-def test_settings_box_identifies_the_cycle_and_ends_with_the_footer():
+def test_settings_box_ends_with_the_footer():
   msg = _render(_cycle([_event()]), footer="Balance: 10240")
   settings_box = msg.split("</pre><pre>")[2]
-  assert "Strategy: <b>strat-a</b>" in settings_box
-  assert "Signal: <code>9f2c4b7e18a3d605</code>" in settings_box
   assert settings_box.rstrip().endswith("Balance: 10240")
+  assert "Strategy:" not in settings_box  # it lives in the position box now
 
 
 def test_settings_box_survives_a_worker_with_no_settings():
   msg = format_cycle_message(_cycle([_event()]), settings_dict=None, footer="")
   assert "<b>Settings</b>" in msg
   assert "Strategy: <b>strat-a</b>" in msg
+
+
+def test_short_entry_leads_with_the_red_square():
+  msg = _render(_cycle([_event(action="SHORT")]))
+  assert "🟥 <b>SHORT XAUUSD</b>" in msg.split("</pre><pre>")[0]
+
+
+def test_position_box_identifies_the_cycle_under_the_headline():
+  position = _render(_cycle([_event()])).split("</pre><pre>")[0]
+  lines = position.splitlines()
+  assert lines[1].endswith("LONG XAUUSD</b>")
+  assert "Strategy: <b>strat-a</b>" in position
+  assert "Signal: <code>9f2c4b7e18a3d605</code>" in position
+  assert lines.index("Strategy: <b>strat-a</b>") < next(
+    i for i, line in enumerate(lines) if line.startswith("Price:")
+  )
 
 
 # ── Numbers ───────────────────────────────────────────────────────────────── #

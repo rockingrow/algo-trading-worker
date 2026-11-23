@@ -30,8 +30,8 @@ LOSS = _e.emojize(":chart_decreasing:")  # 📉 (a close booked at a loss)
 # Shown per action in a signal cycle's timeline. Matched to the broker's
 # palette (broker/helpers/emoji_constants.py) so one trade reads the same in
 # the broker's channel and in the worker's.
-LONG = _e.emojize(":chart_increasing:")  # 📈
-SHORT = _e.emojize(":chart_decreasing:")  # 📉
+LONG = _e.emojize(":green_square:")  # 🟩
+SHORT = _e.emojize(":red_square:")  # 🟥
 TP1 = _e.emojize(":bullseye:")  # 🎯
 TP2 = _e.emojize(":rocket:")  # 🚀
 STOP_LOSS = _e.emojize(":hollow_red_circle:")  # ⭕
