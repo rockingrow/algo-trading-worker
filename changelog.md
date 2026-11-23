@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The cycle message reads like the broker's.** A `LONG` entry leads with `🟩` and a `SHORT` with `🟥` (was `📈` / `📉`, which are now only the PnL icons). The `Strategy:` and `Signal:` lines moved from the settings box to the position box, directly under the headline, so a trade is identified before its levels.
+
 ## [1.3.1] - 2026-11-08
 
 ### Fixed

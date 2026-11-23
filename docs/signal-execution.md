@@ -98,8 +98,10 @@ Two ids travel on every signal and they answer different questions:
 
 ```
 [⏳ OPENED]                        ← headline: icon + the position's latest status
-📈 LONG XAUUSD                     ┐
-----------------------------------  │ Box 1 — position: what the trade is, at
+🟩 LONG XAUUSD                     ┐
+----------------------------------  │ Box 1 — position: what the trade is
+Strategy: MT5_GOLD_M5_V1            │ (🟩 LONG / 🟥 SHORT, as in the broker's
+Signal: 9f2c4b7e18a3d605            │ message), which strategy and cycle, at
 Price: 2340.15 | Volume: 0.5 lot ⚙️ │ what price/size, with which levels, and
 SL: 2330 | TP1: 2350 | TP2: 2360    │ what the trade has booked so far
 Risk: 3% ⚙️ | Ticket: 778899        │ (summed over every close — omitted while
@@ -119,11 +121,8 @@ PnL: +51.25 📈                      │ standalone close message used. Every
 ⚙️ Settings                        ┐
 ----------------------------------  │ Box 3 — the worker configuration this
 VOLUME_DECISION_ENABLED: ENABLED    │ trade ran under (same wording as the
-RISK_PERCENTAGE: ENABLED (3.0%)     │ startup banner), which cycle it is,
-...                                 │ and the live account footer.
-----------------------------------  │
-Strategy: MT5_GOLD_M5_V1            │
-Signal: 9f2c4b7e18a3d605            ┘
+RISK_PERCENTAGE: ENABLED (3.0%)     │ startup banner) and the live account
+...                                 ┘ footer.
 ```
 
 The headline status is **the position's**, not the action's: a TP1 the broker refused leaves an `OPENED` position `OPENED`, and once a position is closed (`TP2`/`SL`/`R_SL`/`FLATTED`/…) a late or replayed action can never advertise it as live again. An admin `FLAT` closes out the position's own cycle rather than opening a new message.

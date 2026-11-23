@@ -10,7 +10,8 @@ point here — :func:`format_cycle_message` is the whole surface.
 
 The body is laid out as separate boxes so a long-running trade stays scannable:
 
-    ┌ position ─ the headline status + what the trade is and its levels
+    ┌ position ─ the headline status + what the trade is (strategy, signal id)
+    │            and its levels
     ├ actions  ─ the timeline, one entry per action the worker executed
     └ settings ─ the worker configuration the trade ran under, + account footer
 
@@ -264,6 +265,14 @@ def _position_box(
 
   lines = [f"[{status_icon} <b>{status_label}</b>]", headline, _DIVIDER]
 
+  # Which strategy and which cycle this is, right under the headline: it is what
+  # a reader quotes when asking about a position, and it matches the broker's
+  # own message for the same trade.
+  lines.append(f"Strategy: <b>{html.escape(str(cycle.get('strategy') or '—'))}</b>")
+  lines.append(
+    f"Signal: <code>{html.escape(str(cycle.get('signal_uxid') or '—'))}</code>"
+  )
+
   price_volume = [
     f"Price: {_num(entry.get('price'))}",
     f"Volume: {_volume(entry.get('volume'), unit, auto=bool(entry.get('auto_volume')))}",
@@ -366,9 +375,7 @@ def _actions_box(events: list[dict], *, unit: str, tz: timezone) -> str:
 # ── Box 3: settings ─────────────────────────────────────────────────────────
 
 
-def _settings_box(
-  cycle: dict, settings_dict: dict | None, footer: str, *, market: str
-) -> str:
+def _settings_box(settings_dict: dict | None, footer: str, *, market: str) -> str:
   """The worker configuration this trade ran under, plus the account footer.
 
   Reuses the same line builders as the startup banner and the per-fill override
@@ -386,10 +393,6 @@ def _settings_box(
       section += BaseMessagePresenter._multi_positions_line(settings_dict, market)
     lines.append(section.rstrip("\n"))
   lines.append(_DIVIDER)
-  lines.append(f"Strategy: <b>{html.escape(str(cycle.get('strategy') or '—'))}</b>")
-  lines.append(
-    f"Signal: <code>{html.escape(str(cycle.get('signal_uxid') or '—'))}</code>"
-  )
   if footer:
     lines.append(footer.strip("\n"))
   return "\n".join(lines)
@@ -420,7 +423,5 @@ def format_cycle_message(
   boxes = [_position_box(cycle, entry, events, unit=unit, symbol=symbol)]
   if events:
     boxes.append(_actions_box(events, unit=unit, tz=_display_tz(settings_dict)))
-  boxes.append(
-    _settings_box(cycle, settings_dict, footer, market=str(market_value or ""))
-  )
+  boxes.append(_settings_box(settings_dict, footer, market=str(market_value or "")))
   return _BOX_BREAK.join(boxes)
