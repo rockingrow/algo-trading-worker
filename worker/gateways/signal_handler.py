@@ -15,6 +15,7 @@ when the broker re-tickets a position after a partial close.
 
 from typing import Any, Callable, Dict, Optional
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.gateways.market_strategy import BaseMarketStrategy
 from worker.interfaces.db_protocol import PositionStoreProtocol
 from worker.logger import get_logger
@@ -484,6 +485,27 @@ class SignalHandler:
       )
     return result
 
+  def _db_position_after_close(
+    self, signal: SignalSchema, uxid: Optional[str]
+  ) -> Optional[Dict[str, Any]]:
+    """The tracked row for a FLAT, read after the broker already acted.
+
+    By then the outcome is decided: a store error must not turn a close that
+    succeeded into a reported failure, so the row is treated as unknown (the
+    reconcile job syncs it once the store answers again).
+    """
+    try:
+      return self._get_db_position(signal.strategy, signal.symbol, signal_uxid=uxid)
+    except PositionStoreUnavailableError as exc:
+      logger.error(
+        "[SignalHandler._handle_flat] Close done but the tracked row is unreadable "
+        "(%s) — DB left for the reconcile job | strategy=%s symbol=%s",
+        exc,
+        signal.strategy,
+        signal.symbol,
+      )
+      return None
+
   def _handle_flat(self, signal: SignalSchema) -> TradeResult:
     """FLAT: close all MT5 positions regardless of DB state, then sync DB.
 
@@ -503,7 +525,21 @@ class SignalHandler:
     entry path and the unscoped-retry guard below already make.
     """
     uxid = self._uxid_scope(signal)
-    owned = self._get_db_position(signal.strategy, signal.symbol, signal_uxid=uxid)
+    try:
+      owned = self._get_db_position(signal.strategy, signal.symbol, signal_uxid=uxid)
+    except PositionStoreUnavailableError:
+      if uxid:
+        # The tracked row is what scopes the close to this signal's ticket;
+        # without it a close could reach a sibling signal's position.
+        raise
+      # FLAT is not gated on a DB record: the strategy-scoped close below needs
+      # no row, and an unreadable store must not keep a position open.
+      logger.error(
+        "[SignalHandler._handle_flat] Tracked row unreadable — closing the "
+        "strategy's %s positions without it.",
+        signal.symbol,
+      )
+      owned = None
     if uxid and not owned:
       logger.warning(
         "[SignalHandler._handle_flat] No tracked position for strategy=%s "
@@ -557,9 +593,7 @@ class SignalHandler:
         )
 
     if result.get("success"):
-      db_pos = owned or self._get_db_position(
-        signal.strategy, signal.symbol, signal_uxid=uxid
-      )
+      db_pos = owned or self._db_position_after_close(signal, uxid)
       if db_pos:
         result["source_ticket"] = db_pos["ref_source_id"]
       logger.info(
@@ -585,9 +619,7 @@ class SignalHandler:
       return result
 
     # MT5 had no positions to close — check if DB has a stale open record
-    db_pos = owned or self._get_db_position(
-      signal.strategy, signal.symbol, signal_uxid=uxid
-    )
+    db_pos = owned or self._db_position_after_close(signal, uxid)
     if db_pos:
       logger.warning(
         "[SignalHandler._handle_flat] No MT5 positions but DB has open record — "

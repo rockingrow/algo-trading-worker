@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 
 from pydantic import ValidationError
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.gateways.errors import PositionsUnavailableError
 from worker.gateways.trade_notifications import _as_text
 from worker.logger import get_logger
@@ -127,12 +128,21 @@ class AdminCommandsMixin:
     # Close live broker positions first (source of truth), then reconcile the DB.
     try:
       closed, attempted = self._close_live_positions_for_flat(admin_flat_schema)
-    except PositionsUnavailableError as exc:
+    except (PositionsUnavailableError, PositionStoreUnavailableError) as exc:
       # Without the live book every DB row would look "never live" and be marked
-      # FLATTED. Leave the DB untouched; the broker can resend the FLAT.
-      log.error("[ADMIN FLAT] Aborted, DB left unchanged — %s", exc)
+      # FLATTED; without the DB rows a scoped FLAT cannot tell whose positions to
+      # close. Nothing was closed — the broker can resend the FLAT.
+      log.error("[ADMIN FLAT] Aborted, nothing closed, DB left unchanged — %s", exc)
       return
-    self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+    try:
+      self._reconcile_flat_db(admin_flat_schema, closed, attempted, raw)
+    except PositionStoreUnavailableError as exc:
+      log.critical(
+        "[ADMIN FLAT] %d position(s) closed but the DB could not be reconciled "
+        "(%s) — the reconcile job will sync the rows once the store answers.",
+        len(closed),
+        exc,
+      )
 
   def _handle_signal_control(
     self, action: AdminActionEnum, data: dict, *, private: bool

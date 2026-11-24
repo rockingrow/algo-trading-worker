@@ -57,6 +57,7 @@ _POSITIONS_TABLE = """
         market_type TEXT,
         sync_status TEXT NOT NULL DEFAULT 'PENDING',
         sync_time DATETIME,
+        sync_version INTEGER NOT NULL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
@@ -207,7 +208,11 @@ _POSITION_LOGS_SIGNAL_ID_INDEX = """
 
 # positions / position_logs gained ``signal_id`` and later ``signal_uxid`` after
 # these tables first shipped, so a database created before either change has the
-# tables but not the columns. CREATE TABLE IF NOT EXISTS won't retrofit it, and
+# tables but not the columns. ``positions.sync_version`` came later still: the
+# counter every state change bumps, which the CDC compares before marking a row
+# published (``updated_at`` has one-second resolution, so a change landing in the
+# same second as the CDC's read used to be marked published unseen).
+# CREATE TABLE IF NOT EXISTS won't retrofit any of them, and
 # the index above requires position_logs.signal_id to exist — add the missing
 # columns first, skipping the ones a from-scratch DB already got out of
 # _POSITIONS_TABLE / _POSITION_LOGS_TABLE.
@@ -216,6 +221,7 @@ _RETROFIT_COLUMNS = (
   ("positions", "signal_uxid", "TEXT"),
   ("position_logs", "signal_id", "TEXT"),
   ("position_logs", "signal_uxid", "TEXT"),
+  ("positions", "sync_version", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 

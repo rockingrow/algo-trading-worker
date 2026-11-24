@@ -20,6 +20,7 @@ class FakeExecutor:
     self._sl_ok = sl_ok
     self._failsafe_ok = failsafe_ok
     self.calls = []
+    self.close_tickets = []
 
   def get_open_positions(self, symbol, strategy=None):
     return list(self._positions)
@@ -59,6 +60,7 @@ class FakeExecutor:
     position_ticket=None,
   ):
     self.calls.append(("close_all", reason, strategy))
+    self.close_tickets.append(position_ticket)
     return {
       "success": self._failsafe_ok,
       "reason": reason,
@@ -110,6 +112,19 @@ def test_crypto_tp1_failsafe_closes_when_breakeven_sl_fails(config):
   assert ("close_all", "SL_FAILSAFE", "strat-1") in ex.calls
   assert res["sl_failsafe_close"]["success"] is True
   assert "emergency-closed" in res["comment"]
+
+
+def test_tp1_failsafe_closes_only_the_position_whose_stop_failed(config):
+  """Unscoped, the emergency close reached every position the strategy holds on
+  the symbol — with several per symbol, sibling signals' protected trades."""
+  pos = SimpleNamespace(ticket=7, volume=0.02, price_open=30000.0)
+  ex = FakeExecutor(positions=[pos], sl_ok=False, failsafe_ok=True)
+  market = MarketStrategyFactory.create(
+    MarketTypeEnum.CRYPTO, executor=ex, config=config
+  )
+  market.handle_tp1(make_signal(SignalActionEnum.TP1, symbol="BTCUSD"))
+
+  assert ex.close_tickets == [7]
 
 
 def test_crypto_tp1_failsafe_flags_when_close_also_fails(config):

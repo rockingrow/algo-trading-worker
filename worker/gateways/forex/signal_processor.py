@@ -185,16 +185,53 @@ def _restart_terminal_and_reconnect(gateway, notifier, footer_fn, name, log) -> 
   )
 
 
+# Reconnect budget for the listener thread. The listener holds the pipeline lock
+# while it waits, so every other NATS message and the background writers queue
+# behind it: the budget is bounded (~15s), and the long, escalating recovery
+# (15 attempts, then a terminal restart) stays with the health thread.
+_LISTENER_RECONNECT_ATTEMPTS = 3
+_LISTENER_RECONNECT_DELAY = 5.0  # seconds
+
+
 def _ensure_gateway_connected(gateway, notifier, footer: str, log) -> bool:
-  """Return True if the platform is (or becomes) connected; False if reconnect fails."""
+  """Return True if the platform is (or becomes) connected; False if reconnect fails.
+
+  Called from the listener thread, under the pipeline lock, before a message that
+  needs the platform. It must give up: an unlimited reconnect here froze the
+  whole pipeline for as long as the platform stayed down — over the weekend the
+  health thread closes the connection on purpose, so a stray message on Saturday
+  held the lock until Sunday's open.
+
+  During the weekend-closed window it makes a single attempt rather than none:
+  a broker's 24/7 instruments (crypto CFDs such as BTCUSD) keep trading through
+  the window, and a signal for one must still reach the terminal the health
+  thread parked. If that attempt fails, the message is dropped.
+  """
   name = gateway.name
   if gateway.is_connected():
     return True
+  if is_market_closed():
+    if gateway.reconnect(max_attempts=1, delay_seconds=0.0):
+      log.info("[%s Process] %s reconnected inside the weekend window.", name, name)
+      return True
+    log.warning(
+      "[%s Process] %s is closed for the weekend — message not executed.", name, name
+    )
+    notifier.send_message(
+      _box(
+        f"{DISCONNECTED} <b>[Market Closed] {name} — signal dropped</b>\n\n"
+        f"The broker trade server is offline until the market reopens.{footer}"
+      )
+    )
+    return False
   log.warning("[%s Process] %s connection lost. Reconnecting...", name, name)
   notifier.send_message(
     _box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer}")
   )
-  reconnected = gateway.reconnect(max_attempts=0, delay_seconds=10.0)
+  reconnected = gateway.reconnect(
+    max_attempts=_LISTENER_RECONNECT_ATTEMPTS,
+    delay_seconds=_LISTENER_RECONNECT_DELAY,
+  )
   if reconnected:
     notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer}"))
   else:

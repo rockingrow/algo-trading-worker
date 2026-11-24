@@ -45,6 +45,7 @@ from typing import Any, Dict, Optional
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
+from worker.db.errors import PositionStoreUnavailableError
 from worker.gateways import guard
 from worker.gateways.admin_commands import AdminCommandsMixin
 from worker.gateways.config import ExecutionConfig
@@ -373,13 +374,22 @@ class BaseSignalProcessor(
     )
 
     # Exits are never gated so a position can always be closed.
+    reject_reason: Optional[str] = None
     if signal.action in _ENTRY_ACTIONS:
-      reject_reason = self._entry_rejection(signal)
-      if reject_reason is not None:
-        self._reject_signal(signal, reject_reason)
-        return
-
-    result = self._execute(signal)
+      try:
+        reject_reason = self._entry_rejection(signal)
+      except PositionStoreUnavailableError as exc:
+        # The guards could not read what is open, so they cannot clear the entry.
+        # A failure rather than a policy rejection: nothing was decided about the
+        # signal itself, and it stays retryable.
+        result = self._not_executed(signal, f"Position store unavailable: {exc}")
+      else:
+        if reject_reason is not None:
+          self._reject_signal(signal, reject_reason)
+          return
+        result = self._execute(signal)
+    else:
+      result = self._execute(signal)
     footer = self._current_footer()
 
     self.ctx.db_service.log_position(
@@ -507,14 +517,12 @@ class BaseSignalProcessor(
       # The broker could not say what is live, so nothing was decided or sent:
       # report a plain failure instead of letting a guess ("nothing is open")
       # drive the exit or entry logic.
-      log.error(
-        "[%s Process] Signal not executed — %s | %s | %s",
-        self.name,
-        exc,
-        signal.symbol,
-        signal.action.value,
-      )
-      return TradeResult.fail(f"Broker positions unavailable: {exc}")
+      return self._not_executed(signal, f"Broker positions unavailable: {exc}")
+    except PositionStoreUnavailableError as exc:
+      # Same for the tracked positions: every read the handler makes before it
+      # sends an order is a decision input (netting, stale cleanup, the row an
+      # exit resolves to).
+      return self._not_executed(signal, f"Position store unavailable: {exc}")
     # Some exchanges (notably Binance testnet) return a 0 fill price on a filled
     # MARKET order — for entries *and* closes (FLAT/TP2/SL/...). Fall back to the
     # signal's price so the notification and DB never record a misleading 0.0.
@@ -525,6 +533,18 @@ class BaseSignalProcessor(
     if result.get("success") and not result.get("price") and signal.price:
       result["price"] = signal.price
     return result
+
+  def _not_executed(self, signal: SignalSchema, reason: str) -> TradeResult:
+    """A failed result for a signal that was never sent to the broker because
+    an input it depends on could not be read."""
+    log.error(
+      "[%s Process] Signal not executed — %s | %s | %s",
+      self.name,
+      reason,
+      signal.symbol,
+      signal.action.value,
+    )
+    return TradeResult.fail(reason)
 
   def _persist_success(self, signal: SignalSchema, result: dict, footer: str) -> None:
     action_val = signal.action.value

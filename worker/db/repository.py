@@ -24,6 +24,7 @@ import sqlite3
 from typing import Iterable, Optional
 
 from worker.db.connection import connect
+from worker.db.errors import PositionStoreUnavailableError
 from worker.logger import get_logger
 from worker.schemas.cycle_schema import CycleStatusEnum, merge_status
 from worker.schemas.notification_schema import (
@@ -295,6 +296,7 @@ class PositionRepository(_SqliteRepository):
                     comment = COALESCE(?, comment),
                     gateway_message = COALESCE(?, gateway_message),
                     sync_status = 'PENDING',
+                    sync_version = sync_version + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE ref_source_id = ?
                   AND status IN ('OPENED', 'TP1')
@@ -356,14 +358,21 @@ class PositionRepository(_SqliteRepository):
       with self._connect() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM positions WHERE sync_status = 'PENDING'")
+        # Oldest first, so the CDC publishes events in the order they happened
+        # and stops at the first one it cannot deliver.
+        cursor.execute(
+          "SELECT * FROM positions WHERE sync_status = 'PENDING' ORDER BY id"
+        )
         rows = cursor.fetchall()
         return [self._row_to_dict(row) for row in rows]
     except Exception as e:
       logger.exception(f"Failed to fetch pending sync positions: {e}")
       return []
 
-  def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
+  def mark_position_synced(self, position_id: int, sync_version: int) -> bool:
+    """Mark a row published, but only if it is still at *sync_version* — the
+    version the CDC read and published. A row changed since then stays
+    ``PENDING`` and is published again on the next poll."""
     try:
       with self._connect() as conn:
         cursor = conn.cursor()
@@ -372,9 +381,9 @@ class PositionRepository(_SqliteRepository):
                 UPDATE positions
                 SET sync_status = 'PUBLISHED',
                     sync_time = CURRENT_TIMESTAMP
-                WHERE id = ? AND updated_at = ? AND sync_status = 'PENDING'
+                WHERE id = ? AND sync_version = ? AND sync_status = 'PENDING'
             """,
-          (position_id, updated_at),
+          (position_id, sync_version),
         )
         changed = cursor.rowcount > 0
         conn.commit()
@@ -393,6 +402,9 @@ class PositionRepository(_SqliteRepository):
     FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL lets one strategy hold several
     positions on a symbol. ``None`` (the default) means "every signal", which
     is what a worker with the toggle off, or a payload carrying no uxid, wants.
+
+    Raises :class:`PositionStoreUnavailableError` when the query fails — never
+    an empty list, which callers would read as "nothing is open".
     """
     try:
       with self._connect() as conn:
@@ -414,7 +426,9 @@ class PositionRepository(_SqliteRepository):
         f"Failed to fetch open positions for strategy={strategy} symbol={symbol} "
         f"signal_uxid={signal_uxid}: {e}"
       )
-      return []
+      raise PositionStoreUnavailableError(
+        f"open positions for {strategy}/{symbol} unreadable: {e}"
+      ) from e
 
   def signal_exists(self, signal_id: str) -> bool:
     """True if any position_logs row already carries this ``signal_id``.
@@ -446,7 +460,11 @@ class PositionRepository(_SqliteRepository):
     symbol: Optional[str] = None,
     ref_id: Optional[str] = None,
   ) -> list:
-    """Fetch all OPENED/TP1 positions, optionally filtered by strategy, symbol and/or ref_id."""
+    """Fetch all OPENED/TP1 positions, optionally filtered by strategy, symbol and/or ref_id.
+
+    Raises :class:`PositionStoreUnavailableError` when the query fails — never
+    an empty list: the entry guards, ADMIN FLAT and the reconcile job all read
+    an empty result as "nothing is open"."""
     try:
       with self._connect() as conn:
         conn.row_factory = sqlite3.Row
@@ -471,7 +489,9 @@ class PositionRepository(_SqliteRepository):
       logger.exception(
         f"Failed to fetch open positions for flat (strategy={strategy}, symbol={symbol}): {e}"
       )
-      return []
+      raise PositionStoreUnavailableError(
+        f"open positions (strategy={strategy}, symbol={symbol}) unreadable: {e}"
+      ) from e
 
 
 class NotificationOutboxRepository(_SqliteRepository):

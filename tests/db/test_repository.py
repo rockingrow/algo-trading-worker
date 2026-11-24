@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.db.repository import PositionRepository
 from worker.db.schema import db_init
 from worker.schemas.position_schema import PositionStatusEnum
@@ -322,3 +323,63 @@ def test_repository_can_be_pointed_at_its_own_file(tmp_path, monkeypatch):
 
   assert repo.get_position("1")["symbol"] == "XAUUSD"
   assert not (tmp_path / "elsewhere.sqlite").exists()
+
+
+# ── Failed reads raise instead of reporting "nothing open" ────────────────── #
+
+
+def _broken_connect(*args, **kwargs):
+  raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.parametrize(
+  "query",
+  [
+    lambda r: r.get_open_positions_for_flat(),
+    lambda r: r.get_open_positions_for_flat(symbol="XAUUSD"),
+    lambda r: r.get_open_positions_by_strategy("strat-a", "XAUUSD"),
+  ],
+)
+def test_open_position_reads_raise_when_the_store_fails(repo, monkeypatch, query):
+  """An empty list here is read as "nothing is open" by the entry guards, ADMIN
+  FLAT and the reconcile job — a failed query must say so instead."""
+  monkeypatch.setattr(repo, "_connect", _broken_connect)
+  with pytest.raises(PositionStoreUnavailableError):
+    query(repo)
+
+
+# ── CDC sync_version ──────────────────────────────────────────────────────── #
+
+
+def _insert_open(repo, ref_id="777"):
+  repo.insert_position(
+    ref_id=ref_id,
+    strategy="strat-a",
+    symbol="XAUUSD",
+    action="long",
+    volume=0.5,
+    opened_price=4500.0,
+  )
+  return repo.get_pending_sync_positions()[0]
+
+
+def test_every_status_change_bumps_sync_version(repo):
+  row = _insert_open(repo)
+  assert row["sync_version"] == 0
+  repo.update_position_status("777", PositionStatusEnum.TP1)
+  assert repo.get_position("777")["sync_version"] == 1
+
+
+def test_mark_synced_applies_only_to_the_version_that_was_published(repo):
+  """The CDC reads a row, publishes it, then marks it. A change landing in
+  between — even within the same second, which ``updated_at`` cannot tell
+  apart — must keep the row PENDING so the new state is published too."""
+  read = _insert_open(repo)
+  repo.update_position_status("777", PositionStatusEnum.TP2)
+
+  assert repo.mark_position_synced(read["id"], read["sync_version"]) is False
+  pending = repo.get_pending_sync_positions()
+  assert [r["status"] for r in pending] == ["TP2"]
+
+  assert repo.mark_position_synced(pending[0]["id"], pending[0]["sync_version"])
+  assert repo.get_pending_sync_positions() == []

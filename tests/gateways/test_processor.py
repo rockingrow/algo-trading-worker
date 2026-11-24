@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from helpers import make_signal
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.gateways import processor as processor_module
 from worker.gateways import system_messages as system_module
 from worker.gateways.config import ExecutionConfig
@@ -2700,3 +2701,50 @@ def test_serialized_background_handlers_run_under_the_pipeline_lock():
   proc._serialized(_handler)({"ref_source_id": "1"})
 
   assert seen == [({"ref_source_id": "1"}, True)]
+
+
+# ── Position store unavailable: entries fail closed ───────────────────────── #
+
+
+def _unreadable(*args, **kwargs):
+  raise PositionStoreUnavailableError("database is locked")
+
+
+def test_entry_fails_closed_when_the_guards_cannot_read_the_store():
+  """A failed read used to come back as ``[]`` — "nothing is open" — so the
+  one-order-per-symbol and MAX_OPEN_ORDERS guards waved the entry through. It
+  must now be a plain failure: nothing sent, nothing rejected on policy, and the
+  signal not remembered as executed (it stays retryable)."""
+  sent = []
+  proc = FakeProcessor({"success": True, "ticket": 555})
+  proc.handler = SimpleNamespace(handle=lambda sig: sent.append(sig))
+  proc.db.get_open_positions_for_flat = _unreadable
+  signal = make_signal(SignalActionEnum.LONG)
+
+  proc._process_message(NatsSubjectEnum.SIGNAL, signal.model_dump_json())
+
+  assert sent == []
+  assert proc.db.inserted == [] and proc.db.rejected == []
+  assert "Position store unavailable" in proc.db.logged[0]["comment"]
+  assert proc.notifications == ["failed:LONG"]
+  assert signal.signal_id not in proc._executed_ids()
+
+
+def test_signal_fails_when_the_handler_cannot_read_the_store():
+  """The handler's own reads (netting, stale cleanup, the row an exit resolves
+  to) run before any order: a store error there is a failure too, not an
+  unhandled exception."""
+
+  def handle(sig):
+    raise PositionStoreUnavailableError("database is locked")
+
+  proc = FakeProcessor({"success": True})
+  proc.handler = SimpleNamespace(handle=handle)
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL, make_signal(SignalActionEnum.SL).model_dump_json()
+  )
+
+  assert proc.db.updated == []
+  assert "Position store unavailable" in proc.db.logged[0]["comment"]
+  assert proc.notifications == ["failed:SL"]

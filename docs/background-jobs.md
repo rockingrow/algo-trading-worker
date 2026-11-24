@@ -135,7 +135,9 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 
 ## PositionCDC — NATS Trade Publisher (`worker/jobs/cdc_job.py`)
 
-`PositionCDC` implements Change Data Capture on the local SQLite `positions` table. It polls every 2 seconds for rows whose `sync_status` is `PENDING` (set automatically on insert or update), serialises them as `PositionEvent` messages, and publishes them to the NATS `TRADE` subject. After a successful publish the row is marked `PUBLISHED`.
+`PositionCDC` implements Change Data Capture on the local SQLite `positions` table. It polls every 2 seconds for rows whose `sync_status` is `PENDING` (set automatically on insert or update), serialises them as `PositionEvent` messages, and publishes them to the NATS `TRADE` subject, oldest row first.
+
+A row is marked `PUBLISHED` only once the NATS server has **confirmed** the event. `NATSPublisher.publish_confirmed` publishes and then flushes, and the flush is a PING/PONG round-trip the server answers only after reading everything sent before it. If the confirmation fails (NATS down, reconnecting, buffer full), that row and every later one stay `PENDING`. The CDC retries on the next poll and logs the outage once, not on every poll. The mark is also conditional on `positions.sync_version`, the counter every status change bumps: a change written between the CDC's read and its mark keeps the row `PENDING`, so the newer state is published too. `updated_at` is not used for this, because its one-second resolution cannot tell apart two changes in the same second.
 
 ### PositionEvent fields
 
@@ -149,7 +151,7 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 | `account_balance` / `account_leverage` | Snapshot from the gateway's account (`account_info_fn`) at poll time (CRYPTO reports balance only; leverage is `null`) |
 | `signal_id`, `sl`, `tp1`, `tp2`, `risk_percent`, `magic` | Extracted from the original signal JSON stored in `positions.gateway_message` |
 
-The Broker handler is expected to be idempotent (upsert by `market + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
+The Broker handler is expected to be idempotent (upsert by `market + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish. An event buffered but not confirmed before a reconnect can arrive twice, which the upsert absorbs.
 
 ## NotificationJob — Telegram Outbox Dispatcher (`worker/jobs/notification_job.py`)
 

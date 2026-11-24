@@ -74,8 +74,8 @@ class DBService:
   def get_pending_sync_positions(self) -> list:
     return self.positions.get_pending_sync_positions()
 
-  def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
-    return self.positions.mark_position_synced(position_id, updated_at)
+  def mark_position_synced(self, position_id: int, sync_version: int) -> bool:
+    return self.positions.mark_position_synced(position_id, sync_version)
 
   def get_open_positions_by_strategy(
     self, strategy: str, symbol: str, signal_uxid: Optional[str] = None

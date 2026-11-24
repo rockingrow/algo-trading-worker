@@ -98,6 +98,10 @@ Only `forex-health` is driven by the calendar (`is_market_closed()` in `worker/s
 
 On **reopen** (Sunday 22:00 UTC = Monday 05:00 UTC+7) the first health check reconnects through the normal path and emits the usual *reconnecting → connected* Telegram pair; both jobs resume their normal cadence and catch up on anything that fired while the connection was parked (`MT5EventJob` still holds the pre-park `seen_tickets`, so a close during the window surfaces on the first scan after reconnect). Open-market behaviour is otherwise unchanged — a genuine disconnect still triggers the full aggressive relaunch/reconnect path immediately.
 
+### Reconnecting from the listener
+
+A signal or ADMIN FLAT that finds MT5 disconnected also tries to reconnect before it executes. That attempt runs on the NATS listener thread under the pipeline lock, so every other message and the reconcile handlers wait for it. It is therefore **bounded**: 3 attempts, 5 s apart, after which the message is dropped with a *"signal dropped"* notice. While the market is closed it makes a **single** attempt: the health thread parked the connection on purpose, but 24/7 instruments (crypto CFDs) still trade. If that attempt fails, the message is dropped with a *"Market Closed"* notice. The long recovery (15 attempts, then a terminal restart) belongs to `forex-health`. `MT5Gateway` serialises reconnect, terminal restart and the weekend park. A caller waits at most 20 s (`_SESSION_LOCK_WAIT`) for the other thread's change before giving up, and a thread that finds the session already restored returns at once instead of tearing it down.
+
 The window and cadence are module constants in `worker/settings.py`:
 
 | Constant | Default | Meaning |

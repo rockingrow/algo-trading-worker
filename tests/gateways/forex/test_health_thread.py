@@ -202,3 +202,59 @@ def test_connected_gateway_does_nothing(monkeypatch):
   assert gateway.reconnect_calls == []
   assert gateway.restart_calls == 0
   assert notifier.messages == []
+
+
+# ── Listener-side connection check (_ensure_gateway_connected) ────────────── #
+
+
+class _NullLog:
+  def warning(self, *args, **kwargs) -> None:
+    pass
+
+  def info(self, *args, **kwargs) -> None:
+    pass
+
+
+def test_listener_reconnect_is_bounded(monkeypatch):
+  """The listener holds the pipeline lock while it reconnects. An unlimited
+  reconnect (max_attempts=0) froze every NATS message behind it for as long as
+  the platform stayed down; the long recovery belongs to the health thread."""
+  monkeypatch.setattr(sp, "is_market_closed", lambda: False)
+  gateway = _FakeGateway(connected=False, reconnect_result=False)
+  notifier = _FakeNotifier()
+
+  assert sp._ensure_gateway_connected(gateway, notifier, "", _NullLog()) is False
+  assert gateway.reconnect_calls == [{"max_attempts": 3, "delay_seconds": 5.0}]
+  assert "signal dropped" in notifier.messages[-1]
+
+
+def test_listener_makes_one_quick_attempt_while_the_market_is_closed(monkeypatch):
+  """Over the weekend the health thread parks the connection on purpose and the
+  FX trade server is offline: a full reconnect run would only hold the pipeline
+  lock. One attempt still lets a 24/7 instrument (a crypto CFD) reach a terminal
+  that can trade it."""
+  monkeypatch.setattr(sp, "is_market_closed", lambda: True)
+  gateway = _FakeGateway(connected=False, reconnect_result=False)
+  notifier = _FakeNotifier()
+
+  assert sp._ensure_gateway_connected(gateway, notifier, "", _NullLog()) is False
+  assert gateway.reconnect_calls == [{"max_attempts": 1, "delay_seconds": 0.0}]
+  assert "Market Closed" in notifier.messages[-1]
+
+
+def test_weekend_signal_executes_when_the_single_attempt_reconnects(monkeypatch):
+  monkeypatch.setattr(sp, "is_market_closed", lambda: True)
+  gateway = _FakeGateway(connected=False, reconnect_result=True)
+  notifier = _FakeNotifier()
+
+  assert sp._ensure_gateway_connected(gateway, notifier, "", _NullLog()) is True
+  assert notifier.messages == []
+
+
+def test_listener_passes_straight_through_when_connected(monkeypatch):
+  monkeypatch.setattr(sp, "is_market_closed", lambda: True)
+  gateway = _FakeGateway(connected=True)
+  notifier = _FakeNotifier()
+
+  assert sp._ensure_gateway_connected(gateway, notifier, "", _NullLog()) is True
+  assert gateway.reconnect_calls == [] and notifier.messages == []

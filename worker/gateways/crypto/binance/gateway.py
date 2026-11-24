@@ -36,6 +36,7 @@ from binance_common.constants import (
   DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL,
   DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL,
 )
+from binance_common.errors import NetworkError, ServerError
 from binance_common.utils import send_request
 
 from worker.gateways.crypto.base import (
@@ -80,6 +81,7 @@ class _API_Endpoints(Enum):
   PREMIUM_INDEX = ("GET", "/fapi/v1/premiumIndex")
   POSITION_RISK = ("GET", "/fapi/v2/positionRisk")
   ORDER = ("POST", "/fapi/v1/order")
+  QUERY_ORDER = ("GET", "/fapi/v1/order")
   ALGO_ORDER = ("POST", "/fapi/v1/algoOrder")
   ALGO_OPEN_ORDERS = ("DELETE", "/fapi/v1/algoOpenOrders")
   ALL_OPEN_ORDERS = ("DELETE", "/fapi/v1/allOpenOrders")
@@ -120,6 +122,46 @@ class LeverageResponse(TypedDict, total=False):
   maxNotionalValue: str
 
 
+# HTTP timeout for placing an order (market, stop, take-profit). The SDK's
+# default is 1s, which a busy exchange exceeds routinely — and a timed-out order
+# may still have been accepted. Long enough that a slow fill normally answers;
+# short enough that the listener (which holds the pipeline lock) is not stalled
+# on a dead connection. Reads keep the SDK default: they are retried by the SDK,
+# so a longer timeout there would only multiply the stall.
+_ORDER_TIMEOUT_MS = 5000
+# Endpoints that place an order, sent with the longer timeout above.
+_ORDER_ENDPOINTS = frozenset({"/fapi/v1/order:POST", "/fapi/v1/algoOrder:POST"})
+
+# Errors that leave an order's outcome unknown — Binance may or may not have
+# accepted it: -1006 "unexpected response, execution status unknown" and -1007
+# "timeout waiting for response from backend server, send status unknown" (both
+# arrive as HTTP 400), plus the SDK's transport errors (timeout, connection
+# reset) and 5xx answers, which carry no Binance code.
+_UNKNOWN_OUTCOME_CODES = frozenset({-1006, -1007})
+# GET /fapi/v1/order for a clientOrderId Binance has no record of.
+_ORDER_DOES_NOT_EXIST_CODE = -2013
+# Pauses before each lookup of an unknown-outcome order: an accepted order can
+# take a moment to become queryable.
+_ORDER_LOOKUP_DELAYS = (0.5, 1.0, 2.0)  # seconds
+# A looked-up order older than this is not the one just sent: an entry's
+# clientOrderId is derived from strategy + signal_id, so it can repeat.
+_ORDER_LOOKUP_MAX_AGE_MS = 120_000
+# Order statuses that mean a MARKET order executed (fully or in part).
+_FILLED_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
+
+
+def _outcome_unknown(exc: Exception) -> bool:
+  """Whether *exc* leaves it open that Binance executed the order.
+
+  A Binance error code answers definitively ("rejected"), except the two codes in
+  :data:`_UNKNOWN_OUTCOME_CODES`. A transport failure or a 5xx carries no code —
+  the request may have reached the matching engine before the answer was lost.
+  """
+  if isinstance(exc, (NetworkError, ServerError)):
+    return True
+  return getattr(exc, "status_code", None) in _UNKNOWN_OUTCOME_CODES
+
+
 # Binance order side mapping. Valid in both One-way and Hedge position modes —
 # Hedge mode additionally requires positionSide, added by the callers below.
 _OPEN_SIDE = {SIDE_LONG: "BUY", SIDE_SHORT: "SELL"}
@@ -153,14 +195,19 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     # Mismatching this flag against the account setting is exactly what
     # produces -4061 ("Order's position side does not match user's setting").
     self._hedge_mode = hedge_mode
+    base_path = (
+      DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL
+      if testnet
+      else DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
+    )
     self._config = ConfigurationRestAPI(
+      api_key=api_key, api_secret=api_secret, base_path=base_path
+    )
+    self._order_config = ConfigurationRestAPI(
       api_key=api_key,
       api_secret=api_secret,
-      base_path=(
-        DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL
-        if testnet
-        else DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
-      ),
+      base_path=base_path,
+      timeout=_ORDER_TIMEOUT_MS,
     )
     self._session = session or requests.Session()
     self._filters: Optional[Dict[str, SymbolFilter]] = None
@@ -186,11 +233,13 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     params = dict(payload or {})
     if signed:
       params.setdefault("recv_window", self._recv_window)
+    places_order = f"{endpoint.path}:{endpoint.method}" in _ORDER_ENDPOINTS
+    config = self._order_config if places_order else self._config
 
     def _call() -> Any:
       return send_request(
         self._session,
-        self._config,
+        config,
         method=endpoint.method,
         path=endpoint.path,
         payload=params,
@@ -397,8 +446,105 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     try:
       return self._order_result(self._send(_API_Endpoints.ORDER, payload, signed=True))
     except Exception as exc:
+      if client_order_id and _outcome_unknown(exc):
+        return self._resolve_unknown_order(
+          symbol, client_order_id, order_side, quantity, exc
+        )
       logger.exception("[Binance] place_market_order failed: %s", exc)
       return TradeResult.fail(str(exc))
+
+  def _resolve_unknown_order(
+    self,
+    symbol: str,
+    client_order_id: str,
+    order_side: str,
+    quantity: float,
+    cause: Exception,
+  ) -> TradeResult:
+    """Settle an order whose submission ended without a definitive answer.
+
+    Reporting it as failed would be a guess: if Binance did execute it, the
+    position is live with no stop attached and no DB row tracking it. So the
+    order is looked up by its clientOrderId, a few times while it becomes
+    queryable, and only a filled order that matches what was just sent (side,
+    quantity, recent) is reported as the fill. Anything else stays a failure;
+    when the lookups themselves cannot answer, the failure says so and the
+    reconcile job imports the position if it does exist.
+    """
+    logger.error(
+      "[Binance] Order %s outcome unknown (%s) — looking it up before reporting.",
+      client_order_id,
+      cause,
+    )
+    last_status: Optional[str] = None
+    lookup_failed = False
+    for delay in _ORDER_LOOKUP_DELAYS:
+      time.sleep(delay)
+      try:
+        data = self._send(
+          _API_Endpoints.QUERY_ORDER,
+          {"symbol": symbol, "orig_client_order_id": client_order_id},
+          signed=True,
+        )
+      except Exception as exc:
+        if getattr(exc, "status_code", None) == _ORDER_DOES_NOT_EXIST_CODE:
+          lookup_failed = False
+          continue
+        lookup_failed = True
+        logger.warning("[Binance] Lookup of order %s failed: %s", client_order_id, exc)
+        continue
+      if not self._is_order_just_sent(data, order_side, quantity):
+        lookup_failed = False
+        continue
+      last_status = str(data.get("status", "")).upper()
+      if last_status in _FILLED_STATUSES:
+        logger.warning(
+          "[Binance] Order %s was executed despite the lost response (%s).",
+          client_order_id,
+          last_status,
+        )
+        return self._order_result(data)
+      if last_status not in ("NEW", ""):
+        # CANCELED / EXPIRED / REJECTED: final, nothing executed.
+        return TradeResult.fail(
+          f"Order {client_order_id} {last_status} after an unknown-outcome "
+          f"response ({cause})"
+        )
+
+    if lookup_failed or last_status == "NEW":
+      logger.critical(
+        "[Binance] Order %s outcome STILL UNKNOWN (last status=%s) — a position "
+        "may be open without a stop; the reconcile job will import it if so. "
+        "Check the exchange.",
+        client_order_id,
+        last_status,
+      )
+      return TradeResult.fail(
+        f"Order {client_order_id} outcome unknown ({cause}) — check the exchange"
+      )
+    return TradeResult.fail(f"Order {client_order_id} was not placed ({cause})")
+
+  @staticmethod
+  def _is_order_just_sent(data: Any, order_side: str, quantity: float) -> bool:
+    """Whether a looked-up order is the one just submitted, not an older order
+    that reused the same clientOrderId."""
+    if not isinstance(data, dict):
+      return False
+    if str(data.get("side", "")).upper() != order_side:
+      return False
+    try:
+      if abs(float(data.get("origQty", 0) or 0) - float(quantity)) > 1e-12:
+        return False
+    except (TypeError, ValueError):
+      return False
+    placed_at = data.get("time") or data.get("updateTime")
+    if placed_at:
+      try:
+        if _offset_timestamp() - int(placed_at) > _ORDER_LOOKUP_MAX_AGE_MS:
+          return False
+      except (TypeError, ValueError):
+        return False
+    return True
 
   def set_stop_loss(
     self, symbol: str, position_side: str, stop_price: float, quantity: float

@@ -35,7 +35,8 @@ The canonical record for each open trade. `PositionCDC` watches this table for `
 | `market_type` | TEXT | `FOREX` / `CRYPTO` tag |
 | `sync_status` | TEXT | `PENDING` → `PUBLISHED` — drives CDC delivery |
 | `sync_time` | DATETIME | Timestamp of last successful publish |
-| `created_at` / `updated_at` | DATETIME | Row timestamps; `updated_at` is used as an optimistic-lock key in `mark_position_synced` |
+| `sync_version` | INTEGER | Bumped by every status change; `mark_position_synced` marks a row published only at the version the CDC read and published |
+| `created_at` / `updated_at` | DATETIME | Row timestamps (one-second resolution, so not used as a change marker; see `sync_version`) |
 
 ### Constraints
 

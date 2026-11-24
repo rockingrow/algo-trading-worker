@@ -19,8 +19,10 @@ unit-testable off-Windows with a fake.
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
 from worker.gateways.errors import PositionsUnavailableError
 from worker.gateways.forex.base import (
@@ -39,6 +41,11 @@ from worker.logger import get_logger
 from worker.schemas.trade_result import TradeResult
 
 logger = get_logger("worker.gateways.forex.mt5.gateway")
+
+# Longest a caller waits for another thread's session change (reconnect, restart,
+# weekend park) before giving up. The listener holds the pipeline lock while it
+# waits, so this bounds how long a health-thread reconnect can stall it.
+_SESSION_LOCK_WAIT = 20.0  # seconds
 
 # Longest order comment the MetaTrader5 Python wrapper accepts. Measured against
 # 5.0.5735: a request whose comment reaches 30 characters is refused client-side
@@ -152,6 +159,10 @@ class MT5Gateway(BasePlatformGateway):
     self._deviation = slippage_deviation
     self._bridge = MT5(server=server, login=login, password=password, path=path)
     self._resolver = SymbolResolver(mt5_api)
+    # One session change at a time: the listener (before a message) and the
+    # health thread both reconnect, and the health thread also restarts and
+    # parks the terminal — interleaved, they tear down each other's session.
+    self._reconnect_lock = threading.Lock()
 
   # ── Lifecycle (delegated to the bridge) ───────────────────────────────── #
 
@@ -159,18 +170,44 @@ class MT5Gateway(BasePlatformGateway):
     return self._bridge.connect()
 
   def close(self) -> None:
-    self._bridge.shutdown()
+    with self._session_change() as owned:
+      if owned:
+        self._bridge.shutdown()
 
   def is_connected(self) -> bool:
     return self._bridge.is_connected()
 
   def reconnect(self, max_attempts: int = 0, delay_seconds: float = 10.0) -> bool:
-    return self._bridge.reconnect(
-      max_attempts=max_attempts, delay_seconds=delay_seconds
-    )
+    with self._session_change() as owned:
+      # Either the other thread restored the session while this one waited, or
+      # it is still busy and this caller gives up rather than queue behind it.
+      if not owned or self._bridge.is_connected():
+        return self._bridge.is_connected()
+      return self._bridge.reconnect(
+        max_attempts=max_attempts, delay_seconds=delay_seconds
+      )
 
   def restart_terminal(self, startup_wait: float = 15.0) -> bool:
-    return self._bridge.restart_terminal(startup_wait=startup_wait)
+    with self._session_change() as owned:
+      if not owned:
+        return False
+      return self._bridge.restart_terminal(startup_wait=startup_wait)
+
+  @contextmanager
+  def _session_change(self) -> Iterator[bool]:
+    """Hold the session lock, waiting at most :data:`_SESSION_LOCK_WAIT`.
+
+    Yields whether the lock was taken. Bounded so the listener — which holds the
+    pipeline lock — never waits out the health thread's long reconnect run (15
+    attempts, ~150 s); the health thread, which has no such constraint, simply
+    tries again on its next check.
+    """
+    owned = self._reconnect_lock.acquire(timeout=_SESSION_LOCK_WAIT)
+    try:
+      yield owned
+    finally:
+      if owned:
+        self._reconnect_lock.release()
 
   # ── Account ───────────────────────────────────────────────────────────── #
 

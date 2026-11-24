@@ -51,6 +51,19 @@ Data Stream uses the SDK websocket (auto-reconnect). All of this lives only insi
 `worker/gateways/crypto/binance/` — the gateway abstraction keeps it out of the
 executor/strategy/processor, so it never leaks upward.
 
+**Orders whose outcome is unknown.** Order placement (market, stop,
+take-profit) times out after 5 s; the SDK default of 1 s still applies to
+reads, which the SDK retries itself. A market order that ends without a definitive answer is not
+reported as failed on a guess, because Binance may have executed it. That covers
+a transport error, a 5xx, and `-1006` / `-1007` ("execution status unknown").
+`BinanceFuturesGateway` looks the order up by its `clientOrderId` up to three
+times (0.5 s, 1 s, 2 s apart) and reports it as filled only when the lookup
+returns a fill matching what was just sent: same side, same quantity, placed in
+the last 2 minutes, since an entry's `clientOrderId` derives from strategy +
+`signal_id` and can repeat. Anything else stays a failure. If the lookups
+themselves fail, the failure says the outcome is unknown and logs CRITICAL. The
+reconcile job imports the position if it does exist.
+
 Required env when `MARKET_TYPE=CRYPTO` (Binance): `CRYPTO_API_KEY`,
 `CRYPTO_API_SECRET`, `CRYPTO_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
 `USDT`) — enforced by the settings validator. `CRYPTO_EXCHANGE` defaults to

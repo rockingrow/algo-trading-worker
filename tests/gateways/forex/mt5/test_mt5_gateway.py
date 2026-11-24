@@ -598,3 +598,55 @@ def test_get_positions_raises_when_the_terminal_cannot_answer(fake_mt5):
 def test_get_positions_returns_empty_for_a_flat_book(fake_mt5):
   fake_mt5.positions_get = lambda symbol=None: ()
   assert _gateway(fake_mt5).get_positions() == []
+
+
+# ── Reconnect is serialised between the listener and the health thread ───── #
+
+
+class _Bridge:
+  def __init__(self, connected: bool) -> None:
+    self.connected = connected
+    self.reconnects: list[tuple[int, float]] = []
+
+  def is_connected(self) -> bool:
+    return self.connected
+
+  def reconnect(self, max_attempts: int = 0, delay_seconds: float = 10.0) -> bool:
+    self.reconnects.append((max_attempts, delay_seconds))
+    self.connected = True
+    return True
+
+
+def test_reconnect_skips_when_another_thread_already_restored_the_session():
+  """Two threads reconnect: the listener before a message, the health thread on
+  its timer. The second one in must not shutdown() the session the first just
+  brought back."""
+  gw = _gateway(FakeMt5())
+  gw._bridge = _Bridge(connected=True)
+
+  assert gw.reconnect(max_attempts=3, delay_seconds=5.0) is True
+  assert gw._bridge.reconnects == []
+
+
+def test_reconnect_delegates_when_disconnected():
+  gw = _gateway(FakeMt5())
+  gw._bridge = _Bridge(connected=False)
+
+  assert gw.reconnect(max_attempts=3, delay_seconds=5.0) is True
+  assert gw._bridge.reconnects == [(3, 5.0)]
+
+
+def test_reconnect_gives_up_instead_of_queueing_behind_another_session_change(
+  monkeypatch,
+):
+  """The listener holds the pipeline lock while it waits: it must not sit out
+  the health thread's whole reconnect run (15 attempts, ~150 s)."""
+  monkeypatch.setattr(gateway_module, "_SESSION_LOCK_WAIT", 0.01)
+  gw = _gateway(FakeMt5())
+  gw._bridge = _Bridge(connected=False)
+  gw._reconnect_lock.acquire()  # another thread is mid-reconnect
+  try:
+    assert gw.reconnect(max_attempts=3, delay_seconds=5.0) is False
+  finally:
+    gw._reconnect_lock.release()
+  assert gw._bridge.reconnects == []

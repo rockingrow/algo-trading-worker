@@ -17,3 +17,10 @@ from worker.schemas.nats_schema import NatsSubjectEnum
 
 class MessagePublisherProtocol(Protocol):
   def publish(self, subject: NatsSubjectEnum, data: str) -> None: ...
+
+  def publish_confirmed(
+    self, subject: NatsSubjectEnum, data: str, timeout: float = 5.0
+  ) -> None:
+    """Publish, returning only once the server has the message; raise when it
+    could not be confirmed."""
+    ...
