@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **FOREX gained the missed-fill import net CRYPTO already had.** `ForexReconcileJob` was built without a `manual_handler`, so a position live on the platform that the DB did not track was logged on every scan and adopted by nothing — while the crypto side already promised the reconcile job would import it. It is now imported under the strategy its magic maps to (the reconciler only ever sees this worker's own magics), falling back to `MANUAL`, with the platform ticket as `ref_source_id` so the close backstops and an ADMIN FLAT reach it.
 - **The notification outbox counts a send before it happens.** The dispatcher sent and then deleted, so a crash in between re-sent the Telegram message on the next poll — and kept re-sending it, because `attempts` counted only failures and `max_attempts` therefore never bounded sends. A row is now claimed first (`claim_notification`, a compare-and-set on the attempt count the poll read) and only then sent. Telegram offers no idempotency key, so one duplicate is still possible; what this removes is the unbounded resend.
 
+### Security
+
+- **Vulnerable transitive dependencies are upgraded in `uv.lock`**, clearing the 10 open Dependabot alerts: `anyio` 4.13.0 → 4.16.0 (1 critical, 1 medium), `starlette` 1.0.0 → 1.7.0 (2 high, 3 medium, 1 low), `idna` 3.11 → 3.20, `multidict` 6.7.1 → 6.9.1 and `opentelemetry-api` 1.45.1 → 1.45.2 (1 medium each). No setting or behaviour changes; run `uv sync` on each deployment to pick them up.
+
 ### Changed
 
 - **`positions` gains `sync_version`** (`INTEGER NOT NULL DEFAULT 0`), added in place by the guarded `ALTER TABLE` on startup. `mark_position_synced` takes `sync_version` instead of `updated_at`.
