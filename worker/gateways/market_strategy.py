@@ -319,11 +319,16 @@ class ExecutorBackedMarket(BaseMarketStrategy):
         sl_result.get("comment"),
         symbol,
       )
+      # Scoped to the one position whose stop failed. Unscoped it closed every
+      # position the strategy holds on the symbol — with several per symbol
+      # (FOREX_ALLOW_MULTI_POSITIONS_PER_SYMBOL) that is sibling signals'
+      # healthy, stop-protected trades, whose rows then stayed open.
       failsafe = self._executor.close_all_positions(
         symbol,
         reason="SL_FAILSAFE",
         strategy=signal.strategy,
         fallback_close_price=signal.price,
+        position_ticket=pos.ticket,
       )
       close_result["sl_failsafe_close"] = failsafe
       if failsafe.get("success"):

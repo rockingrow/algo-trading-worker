@@ -276,6 +276,43 @@ class NATSPublisher:
     """Thread-safe: enqueue a message to be published asynchronously."""
     self._send_queue.put((subject.value, data.encode()))
 
+  def publish_confirmed(
+    self, subject: NatsSubjectEnum, data: str, timeout: float = 5.0
+  ) -> None:
+    """Thread-safe: publish *data* and return only once the NATS server has it.
+
+    :meth:`publish` only queues the message in memory, so a caller that records
+    "delivered" right after it loses the message whenever the send then fails
+    (outbound buffer full during a long disconnect) or the process stops with
+    the message still queued. Here the publish is followed by a flush — a
+    PING/PONG round-trip the server answers only after reading everything sent
+    before it — so returning normally means the server received the message.
+
+    Raises ``ConnectionError`` when there is no live connection, and whatever
+    nats-py raises when the flush is not answered within *timeout* (notably a
+    timeout while reconnecting). A message buffered but not confirmed may still
+    go out after a reconnect, so a retrying caller can deliver it twice —
+    at-least-once, which the broker's upsert absorbs.
+    """
+    loop = self._client._loop
+    nc = self._client.nc
+    # Checked up front rather than left to the flush: while reconnecting, nats-py
+    # buffers a publish instead of failing it, so a caller retrying every poll
+    # would pile up one copy per attempt, all sent on reconnect.
+    if loop is None or nc is None or not nc.is_connected:
+      raise ConnectionError("NATS publisher is not connected")
+
+    async def _publish_and_flush() -> None:
+      await nc.publish(subject.value, data.encode())
+      await nc.flush(timeout=timeout)
+
+    future = asyncio.run_coroutine_threadsafe(_publish_and_flush(), loop)
+    try:
+      future.result(timeout=timeout + 5)
+    except BaseException:
+      future.cancel()
+      raise
+
   def request(self, subject: NatsSubjectEnum, data: str, timeout: float = 5.0) -> str:
     """Thread-safe: synchronously publish a request and block for the broker's
     reply, bypassing the fire-and-forget queue (a reply has nowhere to go once

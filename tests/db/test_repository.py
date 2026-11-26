@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.db.repository import PositionRepository
 from worker.db.schema import db_init
 from worker.schemas.position_schema import PositionStatusEnum
@@ -322,3 +323,213 @@ def test_repository_can_be_pointed_at_its_own_file(tmp_path, monkeypatch):
 
   assert repo.get_position("1")["symbol"] == "XAUUSD"
   assert not (tmp_path / "elsewhere.sqlite").exists()
+
+
+# ── Failed reads raise instead of reporting "nothing open" ────────────────── #
+
+
+def _broken_connect(*args, **kwargs):
+  raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.parametrize(
+  "query",
+  [
+    lambda r: r.get_open_positions_for_flat(),
+    lambda r: r.get_open_positions_for_flat(symbol="XAUUSD"),
+    lambda r: r.get_open_positions_by_strategy("strat-a", "XAUUSD"),
+  ],
+)
+def test_open_position_reads_raise_when_the_store_fails(repo, monkeypatch, query):
+  """An empty list here is read as "nothing is open" by the entry guards, ADMIN
+  FLAT and the reconcile job — a failed query must say so instead."""
+  monkeypatch.setattr(repo, "_connect", _broken_connect)
+  with pytest.raises(PositionStoreUnavailableError):
+    query(repo)
+
+
+# ── CDC sync_version ──────────────────────────────────────────────────────── #
+
+
+def _insert_open(repo, ref_id="777"):
+  repo.insert_position(
+    ref_id=ref_id,
+    strategy="strat-a",
+    symbol="XAUUSD",
+    action="long",
+    volume=0.5,
+    opened_price=4500.0,
+  )
+  return repo.get_pending_sync_positions()[0]
+
+
+def test_every_status_change_bumps_sync_version(repo):
+  row = _insert_open(repo)
+  assert row["sync_version"] == 0
+  repo.update_position_status("777", PositionStatusEnum.TP1)
+  assert repo.get_position("777")["sync_version"] == 1
+
+
+def test_mark_synced_applies_only_to_the_version_that_was_published(repo):
+  """The CDC reads a row, publishes it, then marks it. A change landing in
+  between — even within the same second, which ``updated_at`` cannot tell
+  apart — must keep the row PENDING so the new state is published too."""
+  read = _insert_open(repo)
+  repo.update_position_status("777", PositionStatusEnum.TP2)
+
+  assert repo.mark_position_synced(read["id"], read["sync_version"]) is False
+  pending = repo.get_pending_sync_positions()
+  assert [r["status"] for r in pending] == ["TP2"]
+
+  assert repo.mark_position_synced(pending[0]["id"], pending[0]["sync_version"])
+  assert repo.get_pending_sync_positions() == []
+
+
+# ── The write-ahead signal attempt ────────────────────────────────────────── #
+
+
+def _attempt(repo, **over):
+  kwargs = {
+    "strategy": "strat-a",
+    "symbol": "XAUUSD",
+    "action": "long",
+    "volume": 0.5,
+    "price": 4500.0,
+    "sl": 4400.0,
+    "tp1": 4600.0,
+    "message": '{"signal_id":"sig-1"}',
+    "author": "broker",
+    "market_type": "FOREX",
+    "signal_id": "sig-1",
+    "signal_uxid": "uxid-1",
+  }
+  kwargs.update(over)
+  return repo.begin_signal_attempt(**kwargs)
+
+
+def test_an_attempt_is_recorded_before_the_broker_answers(repo):
+  """The row must exist while the order is still in flight — it is the only
+  durable proof the signal reached the broker if the worker then dies."""
+  log_id = _attempt(repo)
+
+  rows = _raw(settings.database.file, "SELECT * FROM position_logs")
+  assert len(rows) == 1
+  assert rows[0]["id"] == log_id
+  assert rows[0]["attempt_outcome"] == "ATTEMPTING"
+  assert rows[0]["signal_id"] == "sig-1"
+  # The intent is recorded, not an outcome: no ticket, no return code yet.
+  assert rows[0]["ref_id"] is None and rows[0]["gateway_return_code"] == -1
+
+
+def test_finalizing_writes_the_outcome_onto_the_attempt(repo):
+  log_id = _attempt(repo)
+
+  assert (
+    repo.finalize_signal_attempt(
+      log_id,
+      attempt_outcome="EXECUTED",
+      ref_id="999",
+      ref_source_id="999",
+      volume=0.5,
+      price=4502.0,
+      sl=4395.0,
+      gateway_return_code=10009,
+      comment="filled",
+    )
+    is True
+  )
+
+  row = _raw(settings.database.file, "SELECT * FROM position_logs")[0]
+  assert row["attempt_outcome"] == "EXECUTED"
+  assert row["ref_id"] == "999" and row["gateway_return_code"] == 10009
+  assert row["price"] == 4502.0 and row["sl"] == 4395.0
+
+
+def test_a_settled_attempt_is_not_overwritten(repo):
+  """Guarded on the row still being ATTEMPTING, so a late finalisation cannot
+  undo an outcome already recorded."""
+  log_id = _attempt(repo)
+  repo.finalize_signal_attempt(log_id, attempt_outcome="EXECUTED", ref_id="999")
+
+  assert (
+    repo.finalize_signal_attempt(log_id, attempt_outcome="FAILED", ref_id="x") is False
+  )
+  row = _raw(settings.database.file, "SELECT * FROM position_logs")[0]
+  assert row["attempt_outcome"] == "EXECUTED" and row["ref_id"] == "999"
+
+
+def test_begin_attempt_raises_when_it_cannot_be_recorded(repo, monkeypatch):
+  """An unrecordable attempt must stop the order: without the row there is
+  nothing to dedup a redelivery against."""
+  monkeypatch.setattr(repo, "_connect", _broken_connect)
+  with pytest.raises(PositionStoreUnavailableError):
+    _attempt(repo)
+
+
+def test_a_failed_finalisation_leaves_the_row_attempting(repo, monkeypatch):
+  """The order already happened, so this must not raise — and the row staying
+  ATTEMPTING is the correct conservative state."""
+  log_id = _attempt(repo)
+  monkeypatch.setattr(repo, "_connect", _broken_connect)
+
+  assert repo.finalize_signal_attempt(log_id, attempt_outcome="EXECUTED") is False
+
+
+# ── The dedup lookup reads the verdict, not the row's existence ───────────── #
+
+
+@pytest.mark.parametrize(
+  "outcome,blocks",
+  [("EXECUTED", True), ("ATTEMPTING", True), ("FAILED", False)],
+)
+def test_signal_exists_blocks_only_unsettled_or_executed_attempts(
+  repo, outcome, blocks
+):
+  """A FAILED attempt is replayable — nothing is live for it, and filling that
+  gap is what the broker's retry channel is for. The other two block: one is
+  done, the other may have left a live position."""
+  log_id = _attempt(repo, signal_id="sig-x")
+  if outcome != "ATTEMPTING":
+    repo.finalize_signal_attempt(log_id, attempt_outcome=outcome)
+
+  assert repo.signal_exists("sig-x") is blocks
+
+
+def test_signal_exists_is_false_for_an_unseen_or_empty_id(repo):
+  assert repo.signal_exists("never-seen") is False
+  assert repo.signal_exists("") is False
+  assert repo.signal_exists(None) is False
+
+
+def test_signal_exists_raises_when_the_lookup_fails(repo, monkeypatch):
+  """It used to answer "seen", which silently dropped a replayed signal for
+  good. The callers need opposite dispositions, so the error reaches them."""
+  monkeypatch.setattr(repo, "_connect", _broken_connect)
+  with pytest.raises(PositionStoreUnavailableError):
+    repo.signal_exists("sig-1")
+
+
+# ── Unresolved attempts are reported, not forgotten ──────────────────────── #
+
+
+def test_stale_attempts_respect_the_cutoff_and_the_market(repo):
+  _attempt(repo, signal_id="fresh")
+  _attempt(repo, signal_id="other-market", market_type="CRYPTO")
+  settled = _attempt(repo, signal_id="done")
+  repo.finalize_signal_attempt(settled, attempt_outcome="EXECUTED")
+
+  # Nothing is old enough yet.
+  assert repo.stale_signal_attempts(120) == []
+
+  # Age every row past the cutoff.
+  conn = sqlite3.connect(settings.database.file)
+  conn.execute("UPDATE position_logs SET timestamp = datetime('now', '-10 minutes')")
+  conn.commit()
+  conn.close()
+
+  ids = [r["signal_id"] for r in repo.stale_signal_attempts(120)]
+  assert ids == ["fresh", "other-market"]  # the settled one is not unresolved
+  # position_logs is shared by both markets, so a starting worker must only see
+  # its own: the other market alone can say whether that order is live.
+  forex = [r["signal_id"] for r in repo.stale_signal_attempts(120, "FOREX")]
+  assert forex == ["fresh"]

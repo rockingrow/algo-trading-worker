@@ -22,6 +22,7 @@ from helpers import (  # noqa: E402
   make_deal,
   make_order_result,
   make_platform_position,
+  make_position,
   make_tick,
 )
 
@@ -598,3 +599,239 @@ def test_get_positions_raises_when_the_terminal_cannot_answer(fake_mt5):
 def test_get_positions_returns_empty_for_a_flat_book(fake_mt5):
   fake_mt5.positions_get = lambda symbol=None: ()
   assert _gateway(fake_mt5).get_positions() == []
+
+
+# ── Reconnect is serialised between the listener and the health thread ───── #
+
+
+class _Bridge:
+  def __init__(self, connected: bool) -> None:
+    self.connected = connected
+    self.reconnects: list[tuple[int, float]] = []
+
+  def is_connected(self) -> bool:
+    return self.connected
+
+  def reconnect(self, max_attempts: int = 0, delay_seconds: float = 10.0) -> bool:
+    self.reconnects.append((max_attempts, delay_seconds))
+    self.connected = True
+    return True
+
+
+def test_reconnect_skips_when_another_thread_already_restored_the_session():
+  """Two threads reconnect: the listener before a message, the health thread on
+  its timer. The second one in must not shutdown() the session the first just
+  brought back."""
+  gw = _gateway(FakeMt5())
+  gw._bridge = _Bridge(connected=True)
+
+  assert gw.reconnect(max_attempts=3, delay_seconds=5.0) is True
+  assert gw._bridge.reconnects == []
+
+
+def test_reconnect_delegates_when_disconnected():
+  gw = _gateway(FakeMt5())
+  gw._bridge = _Bridge(connected=False)
+
+  assert gw.reconnect(max_attempts=3, delay_seconds=5.0) is True
+  assert gw._bridge.reconnects == [(3, 5.0)]
+
+
+def test_reconnect_gives_up_instead_of_queueing_behind_another_session_change(
+  monkeypatch,
+):
+  """The listener holds the pipeline lock while it waits: it must not sit out
+  the health thread's whole reconnect run (15 attempts, ~150 s)."""
+  monkeypatch.setattr(gateway_module, "_SESSION_LOCK_WAIT", 0.01)
+  gw = _gateway(FakeMt5())
+  gw._bridge = _Bridge(connected=False)
+  gw._reconnect_lock.acquire()  # another thread is mid-reconnect
+  try:
+    assert gw.reconnect(max_attempts=3, delay_seconds=5.0) is False
+  finally:
+    gw._reconnect_lock.release()
+  assert gw._bridge.reconnects == []
+
+
+# ── Orders whose outcome the terminal never settled ─────────────────────────── #
+#
+# MT5 accepts no client-side order id, so an order that times out cannot be
+# looked up by anything the worker chose. What settles it is the position book
+# before and after the send.
+
+
+def _unknown_gateway(monkeypatch, books, *, order_results, error=(1, "ok")):
+  """A gateway whose position book answers *books* in turn (one list per read)."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(order_results=order_results, error=error)
+  reads = []
+  mt5.positions_get = lambda symbol=None: (
+    reads.append(symbol),
+    books[min(len(reads) - 1, len(books) - 1)],
+  )[1]
+  return _gateway(mt5), mt5
+
+
+def test_a_timed_out_entry_that_landed_is_reported_as_the_fill(monkeypatch):
+  """retcode 10012 is "cancelled by timeout" — it says what the terminal stopped
+  waiting for, not what the server did. Reporting it as failed left a live
+  position with no stop and no DB row."""
+  landed = make_position(ticket=4321, volume=0.05, price_open=2001.0, magic=42)
+  gw, _ = _unknown_gateway(
+    monkeypatch,
+    [[], [landed]],
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is True
+  assert result["ticket"] == "4321"
+  assert result["volume"] == 0.05 and result["price"] == 2001.0
+
+
+def test_a_timed_out_entry_that_never_landed_stays_unknown(monkeypatch):
+  """Nothing appeared, but "probably not placed" is not knowledge: a late fill
+  would be unprotected, so it is neither replayed nor written off."""
+  gw, _ = _unknown_gateway(
+    monkeypatch,
+    [[]],
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is False
+  assert result["failure"] is gateway_module.TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_two_new_positions_cannot_be_told_apart(monkeypatch):
+  """One order was sent. Picking one of two could attach the stop to the wrong
+  ticket, so this is reported rather than resolved."""
+  gw, _ = _unknown_gateway(
+    monkeypatch,
+    [[], [make_position(ticket=1), make_position(ticket=2)]],
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is False
+  assert result["failure"] is gateway_module.TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_a_position_already_open_before_the_send_is_not_mistaken_for_the_fill(
+  monkeypatch,
+):
+  """The snapshot is what makes this safe: a position this strategy already held
+  on the symbol must not be reported as the order that just timed out."""
+  held = make_position(ticket=111, magic=42)
+  gw, _ = _unknown_gateway(
+    monkeypatch,
+    [[held]],
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is False
+  assert result["failure"] is gateway_module.TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_an_unsent_request_is_a_plain_failure_not_an_unknown_one(monkeypatch):
+  """RES_E_INTERNAL_FAIL_SEND means the request never reached the trade server,
+  so the outcome *is* known. Calling it unknown would block the replay of a
+  signal that definitely never executed."""
+  gw, _ = _unknown_gateway(
+    monkeypatch,
+    [[]],
+    order_results=[None],
+    error=(-10001, "Failed to send request"),
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is False
+  assert result["failure"] is None
+  assert result["comment"] == "Send Failed"
+
+
+def test_a_lost_answer_is_resolved_from_the_book(monkeypatch):
+  """RES_E_INTERNAL_FAIL_RECEIVE: the request went out and the answer was lost.
+  That is the clearest unknown outcome there is."""
+  landed = make_position(ticket=777, volume=0.05, magic=42)
+  gw, _ = _unknown_gateway(
+    monkeypatch,
+    [[], [landed]],
+    order_results=[None],
+    error=(-10002, "Failed to receive answer"),
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is True and result["ticket"] == "777"
+
+
+def test_a_rejected_order_is_still_reported_as_rejected(monkeypatch):
+  """Unchanged behaviour: a verdict from the server is a verdict."""
+  gw, mt5 = _unknown_gateway(
+    monkeypatch,
+    [[]],
+    order_results=[make_order_result(retcode=10019, comment="No money")],
+  )
+
+  result = _place(gw)
+
+  assert result["success"] is False
+  assert result["comment"] == "No money" and result["failure"] is None
+
+
+def test_a_timed_out_close_whose_position_is_gone_succeeded(monkeypatch):
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+    tick=make_tick(),
+    deals=[make_deal(ticket=1, position_id=111, profit=7.5)],
+  )
+  mt5.positions_get = lambda symbol=None: []
+  gw = _gateway(mt5)
+
+  result = gw.close_position(make_platform_position(ticket=111, magic=42))
+
+  assert result["success"] is True
+  assert result["profit"] == 7.5
+
+
+def test_a_timed_out_close_whose_position_is_still_live_stays_unknown(monkeypatch):
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+    tick=make_tick(),
+  )
+  mt5.positions_get = lambda symbol=None: [make_position(ticket=111, magic=42)]
+  gw = _gateway(mt5)
+
+  result = gw.close_position(make_platform_position(ticket=111, magic=42, volume=1.0))
+
+  assert result["success"] is False
+  assert result["failure"] is gateway_module.TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_a_timed_out_close_reports_the_volume_that_actually_went(monkeypatch):
+  """A partial fill landed: the tracked row must reflect what the broker did,
+  not what was asked for."""
+  monkeypatch.setattr(gateway_module.time, "sleep", lambda _s: None)
+  mt5 = FakeMt5(
+    order_results=[make_order_result(retcode=10012, comment="Request timeout")],
+    tick=make_tick(),
+    deals=[make_deal(ticket=1, position_id=111, profit=2.0)],
+  )
+  mt5.positions_get = lambda symbol=None: [
+    make_position(ticket=111, magic=42, volume=0.4)
+  ]
+  gw = _gateway(mt5)
+
+  result = gw.close_position(make_platform_position(ticket=111, magic=42, volume=1.0))
+
+  assert result["success"] is True
+  assert result["volume"] == pytest.approx(0.6)

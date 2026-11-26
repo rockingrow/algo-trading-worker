@@ -57,6 +57,7 @@ _POSITIONS_TABLE = """
         market_type TEXT,
         sync_status TEXT NOT NULL DEFAULT 'PENDING',
         sync_time DATETIME,
+        sync_version INTEGER NOT NULL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
@@ -80,6 +81,7 @@ _POSITION_LOGS_TABLE = """
         gateway_message TEXT,
         market_type TEXT,
         author TEXT NOT NULL DEFAULT 'broker',
+        attempt_outcome TEXT NOT NULL DEFAULT 'EXECUTED',
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 """
@@ -193,12 +195,17 @@ _DROP_LEGACY_ONE_ACTIVE_INDEX = """
     DROP INDEX IF EXISTS uidx_positions_one_active_per_strategy_symbol
 """
 
-# Fast dedup lookup for the ACK replay: the base processor's replay handler
-# checks each incoming signal_id against position_logs (every processed signal
-# is logged there, whether it succeeded or was rejected) and skips ones already
-# seen. The audit log is the single source of truth here — positions may or may
-# not exist for a given signal_id (rejections have no OPENED row), while
-# position_logs always does.
+# Fast dedup lookup for both the live signal path and the ACK replay: each
+# incoming signal_id is checked against position_logs, where the row is written
+# *before* the broker is called. The audit log is the single source of truth
+# here — positions may or may not exist for a given signal_id (rejections have
+# no OPENED row), while position_logs always does, and it survives a restart,
+# which an in-process cache does not.
+#
+# The query filters on attempt_outcome, so the index stays covering for
+# ``signal_id`` and SQLite reads the handful of matching rows to test it: a
+# FAILED attempt is replayable, while EXECUTED (done) and ATTEMPTING (outcome
+# never settled) both block a second send.
 _POSITION_LOGS_SIGNAL_ID_INDEX = """
     CREATE INDEX IF NOT EXISTS idx_position_logs_signal_id
         ON position_logs (signal_id)
@@ -207,7 +214,18 @@ _POSITION_LOGS_SIGNAL_ID_INDEX = """
 
 # positions / position_logs gained ``signal_id`` and later ``signal_uxid`` after
 # these tables first shipped, so a database created before either change has the
-# tables but not the columns. CREATE TABLE IF NOT EXISTS won't retrofit it, and
+# tables but not the columns. ``positions.sync_version`` came later still: the
+# counter every state change bumps, which the CDC compares before marking a row
+# published (``updated_at`` has one-second resolution, so a change landing in the
+# same second as the CDC's read used to be marked published unseen).
+# ``position_logs.attempt_outcome`` is the newest: the signal path writes its
+# audit row *before* it calls the broker, so the row is the durable record that
+# an attempt exists at all, and this column says how it ended. It defaults to
+# ``EXECUTED`` so every row written before this change — and every writer that
+# records an event after the fact (reconcile closes, terminal closes, manual
+# imports, ADMIN flat) — keeps the original "a logged signal is not replayed"
+# behaviour untouched.
+# CREATE TABLE IF NOT EXISTS won't retrofit any of them, and
 # the index above requires position_logs.signal_id to exist — add the missing
 # columns first, skipping the ones a from-scratch DB already got out of
 # _POSITIONS_TABLE / _POSITION_LOGS_TABLE.
@@ -216,6 +234,8 @@ _RETROFIT_COLUMNS = (
   ("positions", "signal_uxid", "TEXT"),
   ("position_logs", "signal_id", "TEXT"),
   ("position_logs", "signal_uxid", "TEXT"),
+  ("positions", "sync_version", "INTEGER NOT NULL DEFAULT 0"),
+  ("position_logs", "attempt_outcome", "TEXT NOT NULL DEFAULT 'EXECUTED'"),
 )
 
 

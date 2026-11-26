@@ -6,6 +6,16 @@ Background polling thread that implements Change Data Capture on the SQLite
 freshly inserted or just updated), publishes a PositionEvent to the NATS TRADE
 subject, and marks the row as PUBLISHED. Update detection is row-scoped via
 `sync_status`, so polling cost stays O(pending) instead of O(table).
+
+Delivery is at-least-once, and both halves of that are enforced here:
+
+* a row is marked only after the NATS server confirmed the publish
+  (``publish_confirmed``), so a send that fails, or a process that stops with the
+  message still queued, leaves the row PENDING for the next poll;
+* the mark is conditional on the row's ``sync_version`` — the counter every state
+  change bumps — so a change written between the read and the mark keeps the row
+  PENDING and is published too. (``updated_at`` was compared before, but it has
+  one-second resolution and missed a change landing in the same second.)
 """
 
 from __future__ import annotations
@@ -78,6 +88,9 @@ class PositionCDC:
     self._strategy_magic_map: Dict[str, int] = strategy_magic_map or {}
     self._stop_event = threading.Event()
     self._thread: threading.Thread | None = None
+    # Whether the last publish failed — the outage is logged once rather than on
+    # every poll while NATS stays down.
+    self._publish_failing = False
 
   def _magic_for(self, strategy: Optional[str]) -> Optional[int]:
     if not strategy:
@@ -146,10 +159,27 @@ class PositionCDC:
         row.get("ref_source_id"),
         event_json,
       )
-      self._publisher.publish(NatsSubjectEnum.TRADE, event_json)
+      try:
+        self._publisher.publish_confirmed(NatsSubjectEnum.TRADE, event_json)
+      except Exception as exc:
+        # Not confirmed: leave this row — and every later one, so a position's
+        # events keep their order — PENDING for the next poll.
+        if not self._publish_failing:
+          log.error(
+            "[PositionCDC] Publish of row id=%s not confirmed (%s) — rows left "
+            "PENDING, retrying every %ds.",
+            row["id"],
+            exc,
+            self._poll_interval,
+          )
+        self._publish_failing = True
+        return
+      if self._publish_failing:
+        log.info("[PositionCDC] Publishing recovered.")
+        self._publish_failing = False
       # Publish-then-mark gives at-least-once delivery; the broker handler is
       # idempotent (upsert by market + gateway + account_id + ticket).
-      marked = self._db.mark_position_synced(row["id"], row["updated_at"])
+      marked = self._db.mark_position_synced(row["id"], row.get("sync_version", 0))
       if not marked:
         log.debug(
           "[PositionCDC] Row id=%s was modified concurrently; left PENDING.",

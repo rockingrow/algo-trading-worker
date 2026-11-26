@@ -102,6 +102,22 @@ class ForexExecutor:
     terminal-close detection)."""
     return set(self._strategy_magic_map.values())
 
+  def strategy_for_magic(self, magic: Optional[int]) -> Optional[str]:
+    """The strategy *magic* belongs to, or ``None`` if it maps to nothing.
+
+    The reverse of :meth:`_magic_for`, used when a position has to be attributed
+    back to a strategy — importing a live position the DB does not track. The
+    map is injective (``StrategySettings`` refuses duplicate magics precisely
+    because a shared one defeats per-strategy isolation), so the answer is
+    unambiguous when it exists.
+    """
+    if magic is None:
+      return None
+    for strategy, mapped in self._strategy_magic_map.items():
+      if mapped == magic:
+        return strategy
+    return None
+
   def set_strategy_magic_map(self, mapping: Optional[Dict[str, int]]) -> None:
     """Replace the per-strategy magic map at runtime.
 

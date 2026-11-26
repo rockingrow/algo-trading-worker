@@ -5,6 +5,8 @@ bodies, so we assert the gateway sends the right method/path/params and maps
 responses into TradeResult / ExchangePosition — without any network.
 """
 
+from binance_common.errors import BadRequestError, NetworkError, ServerError
+
 import worker.gateways.crypto.binance.gateway as gw_mod
 from worker.gateways.crypto.base import SIDE_LONG, SIDE_SHORT
 
@@ -586,3 +588,181 @@ def test_order_realized_pnl_survives_a_failing_lookup(monkeypatch):
   monkeypatch.setattr(gw, "_send", _boom)
 
   assert gw.get_order_realized_pnl("BTCUSDT", 8811) is None
+
+
+# ── Unknown order outcome: look the order up before reporting ─────────────── #
+
+
+def _now_ms():
+  return int(gw_mod.time.time() * 1000)
+
+
+def _filled_lookup(side="BUY", qty="0.02", placed_at=None):
+  return {
+    "orderId": 901,
+    "clientOrderId": "x-1",
+    "side": side,
+    "origQty": qty,
+    "executedQty": qty,
+    "avgPrice": "30010",
+    "status": "FILLED",
+    "time": placed_at if placed_at is not None else _now_ms(),
+  }
+
+
+def _unknown_outcome_gateway(monkeypatch, lookups, submit_error=None):
+  calls = []
+  pending = list(lookups)
+
+  def fake_send(session, config, *, method, path, payload, is_signed, response_model):
+    calls.append({"method": method, "path": str(path), "payload": payload})
+    if str(path) == "/fapi/v1/order" and method == "POST":
+      raise submit_error or NetworkError("Network error: Read timed out")
+    if str(path) == "/fapi/v1/order" and method == "GET":
+      answer = pending.pop(0)
+      if isinstance(answer, Exception):
+        raise answer
+      return FakeResp(answer)
+    return FakeResp(_CANNED_BODIES.get(str(path), {}))
+
+  monkeypatch.setattr(gw_mod, "send_request", fake_send)
+  monkeypatch.setattr(gw_mod.time, "sleep", lambda seconds: None)
+  # Earlier tests sync the clock against a canned 2023 server time; the order's
+  # age is judged on the offset clock, so pin it to the local one here.
+  monkeypatch.setattr(gw_mod, "_TIME_OFFSET_MS", 0)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+  return gw, calls
+
+
+def _lookups(calls):
+  return [c for c in calls if c["method"] == "GET" and c["path"] == "/fapi/v1/order"]
+
+
+def test_orders_use_a_timeout_longer_than_the_sdk_default(monkeypatch):
+  """The SDK's 1s default is routinely exceeded by a busy exchange, and every
+  timed-out order is one whose outcome is unknown. Reads keep the default: the
+  SDK retries them, so a longer timeout would only multiply the stall."""
+  configs = {}
+
+  def fake_send(session, config, *, method, path, payload, is_signed, response_model):
+    configs[(method, str(path))] = config.timeout
+    return FakeResp(_CANNED_BODIES.get(str(path), {}))
+
+  monkeypatch.setattr(gw_mod, "send_request", fake_send)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+  gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+  gw.get_positions()
+
+  assert configs[("POST", "/fapi/v1/order")] == 5000
+  assert configs[("GET", "/fapi/v2/positionRisk")] == 1000
+
+
+def test_a_timed_out_order_that_filled_is_reported_as_the_fill(monkeypatch):
+  not_yet = BadRequestError("Order does not exist.", -2013)
+  gw, calls = _unknown_outcome_gateway(monkeypatch, [not_yet, _filled_lookup()])
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is True
+  assert res["ticket"] == "901" and res["price"] == 30010.0 and res["volume"] == 0.02
+  assert _lookups(calls)[0]["payload"]["orig_client_order_id"] == "x-1"
+
+
+def test_a_timed_out_order_binance_never_saw_is_a_failure(monkeypatch):
+  missing = BadRequestError("Order does not exist.", -2013)
+  gw, calls = _unknown_outcome_gateway(monkeypatch, [missing] * 3)
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert "was not placed" in res["comment"]
+  assert len(_lookups(calls)) == 3
+
+
+def test_a_lookup_that_cannot_answer_reports_the_outcome_as_unknown(monkeypatch):
+  down = NetworkError("Network error: connection reset")
+  gw, _ = _unknown_outcome_gateway(monkeypatch, [down] * 3)
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert "outcome unknown" in res["comment"]
+
+
+def test_an_older_order_reusing_the_client_id_is_not_taken_for_the_fill(monkeypatch):
+  """An entry's clientOrderId derives from strategy + signal_id, so it can
+  repeat: a filled order from minutes ago is not the one just sent."""
+  stale = _filled_lookup(placed_at=_now_ms() - 10 * 60 * 1000)
+  wrong_side = _filled_lookup(side="SELL")
+  wrong_qty = _filled_lookup(qty="0.5")
+  gw, _ = _unknown_outcome_gateway(monkeypatch, [stale, wrong_side, wrong_qty])
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+
+
+def test_server_errors_and_unknown_status_codes_trigger_the_lookup(monkeypatch):
+  for error in (
+    ServerError("Server error: 503", 503),
+    BadRequestError("Timeout waiting for response from backend server.", -1007),
+    BadRequestError("Unexpected response, execution status unknown.", -1006),
+  ):
+    gw, calls = _unknown_outcome_gateway(
+      monkeypatch, [_filled_lookup()], submit_error=error
+    )
+    res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+    assert res["success"] is True, error
+    assert len(_lookups(calls)) == 1
+
+
+def test_a_definitive_rejection_is_not_looked_up(monkeypatch):
+  margin = BadRequestError("Margin is insufficient.", -2019)
+  gw, calls = _unknown_outcome_gateway(monkeypatch, [], submit_error=margin)
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert _lookups(calls) == []
+
+
+def test_an_unresolvable_order_is_flagged_unknown_not_merely_failed(monkeypatch):
+  """A plain failure is recorded as a settled refusal, which the broker's replay
+  is free to re-send — doubling the position if Binance did execute the order.
+  The flag is what keeps the attempt unresolved instead."""
+  from worker.schemas.trade_result import TradeFailureEnum
+
+  gw, _ = _unknown_outcome_gateway(monkeypatch, [])
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert res["failure"] is TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_an_unknown_outcome_without_a_client_id_is_flagged_too(monkeypatch):
+  """Nothing to look it up by, so it cannot be resolved — but it still must not
+  be reported as a refusal nobody confirmed."""
+  from worker.schemas.trade_result import TradeFailureEnum
+
+  def fail(*a, **kw):
+    raise gw_mod.NetworkError("connection reset")
+
+  monkeypatch.setattr(gw_mod, "send_request", fail)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02)
+
+  assert res["success"] is False
+  assert res["failure"] is TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_a_definitively_cancelled_order_stays_a_plain_failure(monkeypatch):
+  """CANCELED is a verdict: nothing executed, so the signal stays replayable."""
+  cancelled = dict(_filled_lookup(), status="CANCELED")
+  gw, _ = _unknown_outcome_gateway(monkeypatch, [cancelled])
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert res["failure"] is None

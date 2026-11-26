@@ -218,6 +218,24 @@ def test_missing_columns_are_retrofitted_onto_an_older_database():
   _create_tables(conn)
   for table in ("positions", "position_logs"):
     assert {"signal_id", "signal_uxid"} <= _cols(conn, table)
+  assert "sync_version" in _cols(conn, "positions")
+
+
+def test_sync_version_retrofit_keeps_existing_rows_at_zero():
+  """An upgraded database gets the CDC's version counter in place, existing
+  rows starting from 0 like freshly inserted ones."""
+  conn = sqlite3.connect(":memory:")
+  conn.execute(
+    "CREATE TABLE positions (id INTEGER PRIMARY KEY, ref_source_id TEXT, ref_id TEXT, "
+    "strategy TEXT, symbol TEXT, action TEXT, volume REAL, opened_price REAL, "
+    "status TEXT DEFAULT 'OPENED')"
+  )
+  conn.execute(
+    "INSERT INTO positions (ref_source_id, ref_id, strategy, symbol, action, volume, "
+    "opened_price) VALUES ('1', '1', 's', 'XAUUSD', 'long', 1.0, 1.0)"
+  )
+  _create_tables(conn)
+  assert conn.execute("SELECT sync_version FROM positions").fetchone()[0] == 0
 
 
 # ── One active position per (strategy, symbol, signal_uxid) ───────────────── #
@@ -283,3 +301,25 @@ def test_legacy_one_active_index_is_dropped_on_upgrade():
   assert "uidx_positions_one_active_per_signal" in names
   _insert(conn, ref_source_id="1", strategy="s1", symbol="XAUUSD", signal_uxid="A")
   _insert(conn, ref_source_id="2", strategy="s1", symbol="XAUUSD", signal_uxid="B")
+
+
+def test_attempt_outcome_retrofit_marks_existing_rows_executed():
+  """An upgraded database gets the attempt verdict in place. Existing rows
+  default to EXECUTED, which is what they were: before this column the mere
+  existence of a position_logs row blocked a replay, so defaulting to anything
+  replayable would make the broker re-send historical signals."""
+  conn = sqlite3.connect(":memory:")
+  conn.execute(
+    "CREATE TABLE position_logs (id INTEGER PRIMARY KEY, strategy TEXT, symbol TEXT, "
+    "action TEXT)"
+  )
+  conn.execute(
+    "INSERT INTO position_logs (strategy, symbol, action) VALUES ('s', 'XAUUSD', 'long')"
+  )
+  _create_tables(conn)
+
+  assert "attempt_outcome" in _cols(conn, "position_logs")
+  assert (
+    conn.execute("SELECT attempt_outcome FROM position_logs").fetchone()[0]
+    == "EXECUTED"
+  )

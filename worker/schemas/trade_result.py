@@ -42,6 +42,13 @@ class TradeFailureEnum(str, Enum):
   TICKET_NOT_FOUND = "TICKET_NOT_FOUND"
   #: Some of the positions closed, at least one is still live.
   PARTIAL_CLOSE = "PARTIAL_CLOSE"
+  #: The request ended without a definitive answer and the broker may still have
+  #: executed it: a lost response, a timeout, a 5xx. Distinct from every other
+  #: failure because nothing may be concluded from it — the signal must not be
+  #: re-sent (it could double the position) and must not be recorded as refused
+  #: (a live position would go untracked). The signal path leaves such an
+  #: attempt unresolved and alerts instead.
+  OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
 
 
 # Declared fields exposed via mapping access (everything except the `extra` bag).
@@ -168,6 +175,18 @@ def is_no_position(result: Any) -> bool:
     return False
   failure = result.get("failure")
   return failure is TradeFailureEnum.NO_POSITION or failure == "NO_POSITION"
+
+
+def is_outcome_unknown(result: Any) -> bool:
+  """True when *result* failed without settling whether the broker executed it.
+
+  Accepts a :class:`TradeResult` or a legacy result mapping, like
+  :func:`is_no_position`.
+  """
+  if result.get("success"):
+    return False
+  failure = result.get("failure")
+  return failure is TradeFailureEnum.OUTCOME_UNKNOWN or failure == "OUTCOME_UNKNOWN"
 
 
 def close_batch_result(

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 from helpers import make_signal
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.gateways.market_strategy import BaseMarketStrategy
 from worker.gateways.signal_handler import SignalHandler
 from worker.schemas.position_schema import PositionStatusEnum
@@ -534,3 +535,37 @@ def test_entry_cleanup_closes_every_duplicate_row_of_one_uxid():
   assert "close_all:STALE_CLEANUP:strat-1:11" in strat.calls
   assert "close_all:STALE_CLEANUP:strat-1:22" in strat.calls
   assert sorted(u["ref_source_id"] for u in store.status_updates) == ["11", "22"]
+
+
+# ── Unreadable position store ──────────────────────────────────────────────── #
+
+
+class _UnreadableStore(FakeStore):
+  def get_open_positions_by_strategy(self, strategy, symbol, signal_uxid=None):
+    raise PositionStoreUnavailableError("database is locked")
+
+
+def test_flat_still_closes_when_the_store_cannot_be_read():
+  """FLAT is not gated on a DB record: an unreadable store must not keep a
+  position open that the strategy-scoped close can reach without one."""
+  strat = FakeStrategy(open_positions=[SimpleNamespace(ticket=11)])
+  handler = SignalHandler(strat, _UnreadableStore())
+
+  res = handler.handle(make_signal(SignalActionEnum.FLAT))
+
+  assert res["success"] is True
+  assert "close_all:FLAT:strat-1" in strat.calls
+
+
+def test_flat_scoped_by_uxid_fails_when_the_store_cannot_be_read():
+  """With several positions per symbol, the tracked row is what limits the close
+  to this signal's ticket — without it nothing may be closed."""
+  strat = FakeStrategy(
+    open_positions=[SimpleNamespace(ticket=11), SimpleNamespace(ticket=22)],
+    multi_positions=True,
+  )
+  handler = SignalHandler(strat, _UnreadableStore())
+
+  with pytest.raises(PositionStoreUnavailableError):
+    handler.handle(make_signal(SignalActionEnum.FLAT, signal_uxid="uxid-A"))
+  assert not any(c.startswith("close_all") for c in strat.calls)

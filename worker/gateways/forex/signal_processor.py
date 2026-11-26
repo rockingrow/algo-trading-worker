@@ -185,16 +185,53 @@ def _restart_terminal_and_reconnect(gateway, notifier, footer_fn, name, log) -> 
   )
 
 
+# Reconnect budget for the listener thread. The listener holds the pipeline lock
+# while it waits, so every other NATS message and the background writers queue
+# behind it: the budget is bounded (~15s), and the long, escalating recovery
+# (15 attempts, then a terminal restart) stays with the health thread.
+_LISTENER_RECONNECT_ATTEMPTS = 3
+_LISTENER_RECONNECT_DELAY = 5.0  # seconds
+
+
 def _ensure_gateway_connected(gateway, notifier, footer: str, log) -> bool:
-  """Return True if the platform is (or becomes) connected; False if reconnect fails."""
+  """Return True if the platform is (or becomes) connected; False if reconnect fails.
+
+  Called from the listener thread, under the pipeline lock, before a message that
+  needs the platform. It must give up: an unlimited reconnect here froze the
+  whole pipeline for as long as the platform stayed down — over the weekend the
+  health thread closes the connection on purpose, so a stray message on Saturday
+  held the lock until Sunday's open.
+
+  During the weekend-closed window it makes a single attempt rather than none:
+  a broker's 24/7 instruments (crypto CFDs such as BTCUSD) keep trading through
+  the window, and a signal for one must still reach the terminal the health
+  thread parked. If that attempt fails, the message is dropped.
+  """
   name = gateway.name
   if gateway.is_connected():
     return True
+  if is_market_closed():
+    if gateway.reconnect(max_attempts=1, delay_seconds=0.0):
+      log.info("[%s Process] %s reconnected inside the weekend window.", name, name)
+      return True
+    log.warning(
+      "[%s Process] %s is closed for the weekend — message not executed.", name, name
+    )
+    notifier.send_message(
+      _box(
+        f"{DISCONNECTED} <b>[Market Closed] {name} — signal dropped</b>\n\n"
+        f"The broker trade server is offline until the market reopens.{footer}"
+      )
+    )
+    return False
   log.warning("[%s Process] %s connection lost. Reconnecting...", name, name)
   notifier.send_message(
     _box(f"{WARNING} <b>[Disconnected] {name} — reconnecting…</b>{footer}")
   )
-  reconnected = gateway.reconnect(max_attempts=0, delay_seconds=10.0)
+  reconnected = gateway.reconnect(
+    max_attempts=_LISTENER_RECONNECT_ATTEMPTS,
+    delay_seconds=_LISTENER_RECONNECT_DELAY,
+  )
   if reconnected:
     notifier.send_message(_box(f"{CONNECTED} <b>[Connected] {name}</b>{footer}"))
   else:
@@ -215,6 +252,10 @@ class ForexSignalProcessor(BaseSignalProcessor):
   name = "FOREX"
   presenter = ForexMessagePresenter
   _gateway_setting_key = "forex_platform"
+  #: Strategy an imported position is filed under when its magic maps to no
+  #: strategy. Mirrors ``CryptoSignalProcessor._MANUAL_STRATEGY`` so the two
+  #: markets read the same in the positions table.
+  _MANUAL_STRATEGY = "MANUAL"
 
   def __init__(self, ctx: WorkerContext, settings_dict: dict) -> None:
     super().__init__(ctx, settings_dict)
@@ -436,6 +477,7 @@ class ForexSignalProcessor(BaseSignalProcessor):
       handler=self._serialized(self._on_missed_close),
       gateway=self.gateway,
       magic_for=self._magic_for,
+      manual_handler=self._serialized(self._on_manual_position),
     ).start(stop_event=stop_event)
 
   # ── Reconciler backstop (from ForexReconcileJob) ──────────────────────── #
@@ -481,6 +523,73 @@ class ForexSignalProcessor(BaseSignalProcessor):
         close_price,
         self._account_footer(),
         profit=self._reconciled_pnl(row.get("ref_source_id")),
+      )
+    )
+
+  def _on_manual_position(self, pos: Any) -> None:
+    """Import a position live on the platform that the DB does not track.
+
+    FOREX had no such net: the reconcile job was built without a
+    ``manual_handler``, so an untracked live position was logged every scan and
+    adopted by nothing — while the Binance side already promised "the reconcile
+    job imports the position if it does exist". That promise now holds on both
+    markets, and it is what backs the unknown-outcome path in ``MT5Gateway``: an
+    order that filled after the terminal stopped waiting ends up here.
+
+    The reconciler only ever sees positions carrying this worker's own magics
+    (``ForexExecutor.get_all_open_positions`` filters them), so the position can
+    be attributed to the strategy that magic belongs to rather than to a
+    synthetic one. ``MANUAL`` remains the fallback for a magic the map no longer
+    holds — the broker may have re-pointed it between the order and this scan.
+
+    ``ref_source_id`` is the platform ticket, as on every other FOREX row, so the
+    close backstops and an ADMIN FLAT match it the usual way.
+    """
+    strategy = self.executor.strategy_for_magic(getattr(pos, "magic", None)) or (
+      self._MANUAL_STRATEGY
+    )
+    ticket = str(pos.ticket)
+    comment = "Imported: live on platform but untracked"
+
+    self.ctx.db_service.log_position(
+      strategy=strategy,
+      ref_id=ticket,
+      ref_source_id=ticket,
+      symbol=pos.symbol,
+      action=pos.side,  # LONG / SHORT
+      volume=pos.volume,
+      price=pos.price_open,
+      sl=getattr(pos, "sl", None) or None,
+      tp1=None,
+      gateway_return_code=0,
+      comment=comment,
+      author=LogAuthorEnum.TERMINAL.value,
+      market_type=self._market_type,
+    )
+    self.ctx.db_service.insert_position(
+      ref_id=ticket,
+      strategy=strategy,
+      symbol=pos.symbol,
+      action=pos.side.lower(),  # long / short, mirroring the signal-entry flow
+      volume=pos.volume,
+      opened_price=pos.price_open,
+      gateway_return_code=0,
+      comment=comment,
+      message=None,  # no originating signal JSON
+      strategy_code=None,
+      market_type=self._market_type,
+    )
+    log.warning(
+      "[FOREX Reconcile] Imported untracked position | ticket=%s symbol=%s "
+      "strategy=%s vol=%s",
+      ticket,
+      pos.symbol,
+      strategy,
+      pos.volume,
+    )
+    self.ctx.channel_notifier.send_message(
+      ForexMessagePresenter.position_imported_untracked(
+        pos, strategy, self._account_footer()
       )
     )
 

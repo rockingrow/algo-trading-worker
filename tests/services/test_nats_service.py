@@ -7,6 +7,7 @@ the real nats.py client.
 
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -205,3 +206,18 @@ def test_subscribe_registers_the_wire_subject_names(monkeypatch):
     "MT5_GOLD_M5_V1",
     "ADMIN.FOREX.MT5.434309400",
   ]
+
+
+# ── publish_confirmed ─────────────────────────────────────────────────────── #
+
+
+def test_publish_confirmed_refuses_while_reconnecting():
+  """While reconnecting, nats-py buffers a publish instead of failing it, so a
+  caller retrying every poll would queue one copy per attempt. The call must
+  fail fast instead, leaving the row for the caller's next poll."""
+  publisher = NATSPublisher(url="nats://x", publish_subjects=[NatsSubjectEnum.TRADE])
+  publisher._client._loop = object()
+  publisher._client.nc = SimpleNamespace(is_connected=False)
+
+  with pytest.raises(ConnectionError):
+    publisher.publish_confirmed(NatsSubjectEnum.TRADE, "{}")

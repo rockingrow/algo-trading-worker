@@ -135,7 +135,9 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 
 ## PositionCDC — NATS Trade Publisher (`worker/jobs/cdc_job.py`)
 
-`PositionCDC` implements Change Data Capture on the local SQLite `positions` table. It polls every 2 seconds for rows whose `sync_status` is `PENDING` (set automatically on insert or update), serialises them as `PositionEvent` messages, and publishes them to the NATS `TRADE` subject. After a successful publish the row is marked `PUBLISHED`.
+`PositionCDC` implements Change Data Capture on the local SQLite `positions` table. It polls every 2 seconds for rows whose `sync_status` is `PENDING` (set automatically on insert or update), serialises them as `PositionEvent` messages, and publishes them to the NATS `TRADE` subject, oldest row first.
+
+A row is marked `PUBLISHED` only once the NATS server has **confirmed** the event. `NATSPublisher.publish_confirmed` publishes and then flushes, and the flush is a PING/PONG round-trip the server answers only after reading everything sent before it. If the confirmation fails (NATS down, reconnecting, buffer full), that row and every later one stay `PENDING`. The CDC retries on the next poll and logs the outage once, not on every poll. The mark is also conditional on `positions.sync_version`, the counter every status change bumps: a change written between the CDC's read and its mark keeps the row `PENDING`, so the newer state is published too. `updated_at` is not used for this, because its one-second resolution cannot tell apart two changes in the same second.
 
 ### PositionEvent fields
 
@@ -149,7 +151,7 @@ Idempotency doesn't depend on the generated id: the reconciler only ever imports
 | `account_balance` / `account_leverage` | Snapshot from the gateway's account (`account_info_fn`) at poll time (CRYPTO reports balance only; leverage is `null`) |
 | `signal_id`, `sl`, `tp1`, `tp2`, `risk_percent`, `magic` | Extracted from the original signal JSON stored in `positions.gateway_message` |
 
-The Broker handler is expected to be idempotent (upsert by `market + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish.
+The Broker handler is expected to be idempotent (upsert by `market + gateway + account_id + ticket`), so at-least-once delivery is safe even if the worker restarts mid-publish. An event buffered but not confirmed before a reconnect can arrive twice, which the upsert absorbs.
 
 ## NotificationJob — Telegram Outbox Dispatcher (`worker/jobs/notification_job.py`)
 
@@ -170,13 +172,26 @@ In-process callers stay decoupled: they hold an `OutboxNotifier` whose `send_mes
 
 ### Retry semantics
 
+A due row is **claimed before it is sent**: `claim_notification` increments
+`attempts` and pushes `next_attempt_at` out, conditional on the `attempts` value
+the poll read (a compare-and-set). The send happens only if the claim won.
+
 | Outcome | Action |
 | --- | --- |
+| Claim lost (the row moved on since the poll) | Skip it; nothing is sent |
 | Success (HTTP 200 for every chat ID) | `DELETE` the row (hard-delete; no `status` column required) |
-| Partial / total failure | `attempts += 1`, set `next_attempt_at = now + backoff[attempts]`, store `last_error` |
+| Partial / total failure | Store `last_error` and the backoff `next_attempt_at` — `attempts` was already counted by the claim |
 | `attempts >= max_attempts` (default `5`) | Row becomes dead-letter — skipped by the polling query and left in place for inspection |
 
 Backoff schedule (indexed by attempt, capped at last): **5s → 30s → 2m → 10m**. The polling query is `WHERE attempts < max_attempts AND (next_attempt_at IS NULL OR next_attempt_at <= now)` and is served by the `idx_notifications_pending` index.
+
+Counting the send before it happens is what makes `max_attempts` bound **sends**
+rather than failures. The job used to send and then delete, so a crash in
+between re-sent the message on the next poll — and kept re-sending it, because a
+crash incremented nothing. Telegram offers no idempotency key, so a crash inside
+the send window can still duplicate one message; what the claim removes is the
+unbounded resend. The per-trade cycle path has the stronger property instead: its
+message is edited in place, so re-delivering it is harmless.
 
 ### Direct-send escape hatches
 

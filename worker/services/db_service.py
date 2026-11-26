@@ -48,6 +48,17 @@ class DBService:
   def log_position(self, *args, **kwargs):
     return self.positions.log_position(*args, **kwargs)
 
+  def begin_signal_attempt(self, **kwargs) -> int:
+    return self.positions.begin_signal_attempt(**kwargs)
+
+  def finalize_signal_attempt(self, log_id: int, **kwargs) -> bool:
+    return self.positions.finalize_signal_attempt(log_id, **kwargs)
+
+  def stale_signal_attempts(
+    self, older_than_seconds: int = 120, market_type: Optional[str] = None
+  ) -> list:
+    return self.positions.stale_signal_attempts(older_than_seconds, market_type)
+
   def insert_position(self, *args, **kwargs):
     return self.positions.insert_position(*args, **kwargs)
 
@@ -74,8 +85,8 @@ class DBService:
   def get_pending_sync_positions(self) -> list:
     return self.positions.get_pending_sync_positions()
 
-  def mark_position_synced(self, position_id: int, updated_at: str) -> bool:
-    return self.positions.mark_position_synced(position_id, updated_at)
+  def mark_position_synced(self, position_id: int, sync_version: int) -> bool:
+    return self.positions.mark_position_synced(position_id, sync_version)
 
   def get_open_positions_by_strategy(
     self, strategy: str, symbol: str, signal_uxid: Optional[str] = None
@@ -94,8 +105,8 @@ class DBService:
       strategy=strategy, symbol=symbol, ref_id=ref_id
     )
 
-  def signal_exists(self, signal_id: str) -> bool:
-    return self.positions.signal_exists(signal_id)
+  def signal_exists(self, signal_id: str, *, include_unsettled: bool = True) -> bool:
+    return self.positions.signal_exists(signal_id, include_unsettled=include_unsettled)
 
   # ── Notification outbox delegation ───────────────────────────────────── #
 
@@ -114,6 +125,13 @@ class DBService:
 
   def get_due_notifications(self, limit: int = 20) -> list:
     return self.notifications.get_due_notifications(limit)
+
+  def claim_notification(
+    self, notification_id: int, attempts: int, next_attempt_at: str
+  ) -> bool:
+    return self.notifications.claim_notification(
+      notification_id, attempts, next_attempt_at
+    )
 
   def delete_notification(self, notification_id: int) -> None:
     return self.notifications.delete_notification(notification_id)

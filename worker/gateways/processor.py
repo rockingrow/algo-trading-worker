@@ -39,12 +39,12 @@ import json
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from pydantic import ValidationError
 
 from worker.context import WorkerContext
+from worker.db.errors import PositionStoreUnavailableError
 from worker.gateways import guard
 from worker.gateways.admin_commands import AdminCommandsMixin
 from worker.gateways.config import ExecutionConfig
@@ -64,11 +64,11 @@ from worker.schemas.cycle_schema import (
   CycleOutcomeEnum,
   CycleStatusEnum,
 )
-from worker.schemas.job_schema import LogAuthorEnum
+from worker.schemas.job_schema import AttemptOutcomeEnum, LogAuthorEnum
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.position_schema import PositionStatusEnum
 from worker.schemas.signal_schema import SignalActionEnum, SignalSchema
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeResult, is_outcome_unknown
 from worker.services.nats_service import NATSPublisher, NATSSubscriber
 from worker.settings import (
   NATS_REQUIRED_LISTENING_SUBJECTS,
@@ -82,10 +82,6 @@ log = get_logger("worker.gateways.processor")
 # adds avoidable latency/rate-limit pressure, and a few-seconds-stale balance in a
 # notification is harmless.
 _FOOTER_TTL = 30  # seconds
-
-# How many successfully executed signal_ids the live dedup remembers. A replay
-# only reaches back MAX_RETRY_TIMEOUT, so this comfortably covers any burst.
-_EXECUTED_IDS_MAX = 5000
 
 # Entry actions that open a fresh position — the only ones the MAX_OPEN_ORDERS
 # cap applies to (exits must always be allowed so positions can be closed).
@@ -193,7 +189,6 @@ class BaseSignalProcessor(
     # _pipeline_lock (the listener loop, or an ACK being applied).
     self._signals_blocked: bool = False
     self._pipeline_lock = threading.RLock()
-    self._executed_signal_ids: "OrderedDict[str, None]" = OrderedDict()
     # Single-flight WORKER_CONNECTED: a reconnect storm must not start one
     # forever-retrying handshake per reconnect. A reconnect that arrives while
     # one is in flight sets _announce_pending, and the running one goes again.
@@ -373,44 +368,28 @@ class BaseSignalProcessor(
     )
 
     # Exits are never gated so a position can always be closed.
+    attempt_id: Optional[int] = None
+    reject_reason: Optional[str] = None
     if signal.action in _ENTRY_ACTIONS:
-      reject_reason = self._entry_rejection(signal)
-      if reject_reason is not None:
-        self._reject_signal(signal, reject_reason)
-        return
-
-    result = self._execute(signal)
+      try:
+        reject_reason = self._entry_rejection(signal)
+      except PositionStoreUnavailableError as exc:
+        # The guards could not read what is open, so they cannot clear the entry.
+        # A failure rather than a policy rejection: nothing was decided about the
+        # signal itself, and it stays retryable.
+        result = self._not_executed(signal, f"Position store unavailable: {exc}")
+      else:
+        if reject_reason is not None:
+          self._reject_signal(signal, reject_reason)
+          return
+        attempt_id, result = self._execute_recorded(signal)
+    else:
+      attempt_id, result = self._execute_recorded(signal)
     footer = self._current_footer()
 
-    self.ctx.db_service.log_position(
-      strategy=signal.strategy,
-      ref_id=result.get("ticket"),
-      ref_source_id=result.get("source_ticket") or result.get("ticket"),
-      symbol=signal.symbol,
-      action=signal.action.value,
-      volume=result.get("volume", signal.quantity),
-      price=result.get("price", signal.price),
-      # The stop the position really carries, not the one the signal asked for:
-      # an entry reports back the level it actually registered with the broker
-      # (FOREX widens it to the broker's minimum stop distance), and that is the
-      # number the audit trail must hold. Exits carry no stop of their own, so
-      # they fall back to the signal's.
-      sl=result.get("sl") or getattr(signal, "sl", None),
-      # tp1 is the signal's *partial-close* target and is deliberately not
-      # overwritten by result["tp"] — that is the full-exit level (tp2) resting
-      # on the broker, a different concept that this column does not track.
-      tp1=getattr(signal, "tp1", None),
-      gateway_return_code=result.get("retcode", -1),
-      comment=result.get("comment", ""),
-      message=signal.model_dump_json(),
-      author=LogAuthorEnum.BROKER.value,
-      market_type=self._market_type,
-      signal_id=signal.signal_id,
-      signal_uxid=signal.signal_uxid,
-    )
+    self._record_attempt_outcome(signal, result, attempt_id)
 
     if result.get("success"):
-      self._remember_executed(signal.signal_id)
       self._persist_success(signal, result, footer)
       if result.get("sl_failsafe_close") is not None:
         # A breakeven SL could not be placed and the position was force-closed
@@ -443,20 +422,51 @@ class BaseSignalProcessor(
   def _signal_skipped(self, signal: SignalSchema) -> bool:
     """Apply the gates that drop a signal before anything else happens, logging
     (and where useful alerting) why. True when the signal must not run."""
-    # signal_id is unique per action. One this process already executed
-    # successfully — live or from the ACK replay — must not place a second order
-    # when it is delivered again. Only successes are remembered: a failed
-    # attempt stays retryable, which a check against position_logs (where every
-    # attempt is written) would not allow.
-    if signal.signal_id and signal.signal_id in self._executed_ids():
-      log.warning(
-        "[%s Process] Signal SKIPPED — signal_id=%s already executed | %s | %s",
-        self.name,
-        signal.signal_id,
-        signal.symbol,
-        signal.action.value,
-      )
-      return True
+    # signal_id is unique per action, so one already attempted must not place a
+    # second order when it is delivered again.
+    if signal.signal_id:
+      try:
+        already_attempted = self._already_attempted(signal)
+      except PositionStoreUnavailableError as exc:
+        # The same asymmetry as _already_attempted, for the same reason. An
+        # entry fails closed: the guards read the same store and would often
+        # catch a duplicate, but not once the first position has closed, and a
+        # re-entered trade cycle is the expensive mistake. An exit proceeds,
+        # because being unable to close is worse than closing twice.
+        if signal.action in _ENTRY_ACTIONS:
+          reason = f"Dedup lookup unavailable: {exc}"
+          log.error(
+            "[%s Process] Signal SKIPPED — %s | %s | %s. Recorded as failed, so "
+            "it stays retryable.",
+            self.name,
+            reason,
+            signal.symbol,
+            signal.action.value,
+          )
+          # Recorded as FAILED, not left unresolved: nothing was sent, so the
+          # broker may resend this entry freely.
+          self._record_attempt_outcome(signal, TradeResult.fail(reason), None)
+          self.ctx.notifier.send_message(
+            self.presenter.signal_rejected(reason, self._current_footer())
+          )
+          return True
+        log.error(
+          "[%s Process] Dedup lookup failed for signal_id=%s (%s) — continuing, "
+          "because an exit must not be blocked by an unreadable store.",
+          self.name,
+          signal.signal_id,
+          exc,
+        )
+        already_attempted = False
+      if already_attempted:
+        log.warning(
+          "[%s Process] Signal SKIPPED — signal_id=%s already attempted | %s | %s",
+          self.name,
+          signal.signal_id,
+          signal.symbol,
+          signal.action.value,
+        )
+        return True
 
     # Signal-execution gate: an ADMIN BLOCK_SIGNAL suspends *all* signal
     # execution for this worker until an ALLOW_SIGNAL clears it. This is the
@@ -499,6 +509,141 @@ class BaseSignalProcessor(
       return True
     return False
 
+  def _already_attempted(self, signal: SignalSchema) -> bool:
+    """Whether *signal* must not reach the broker again. The one dedup rule,
+    shared by the live path and the ACK replay so the two cannot disagree.
+
+    Reads the DB rather than an in-process set: the attempt row is written
+    before the broker call and outlives a restart, where a cache does not — a
+    worker the watchdog restarted used to come back with an empty set and
+    re-execute. A ``FAILED`` attempt is always retryable; what differs by action
+    is the unsettled one:
+
+    * An **entry** blocks on it. The broker may hold a position for this signal,
+      and a second order would open another one.
+    * An **exit** does not. A duplicate close resolves against the tracked row
+      and is harmless, while refusing to retry would leave a live position with
+      no stop and no exit anyone will attempt again — so here the unsettled
+      attempt must not stand in the way.
+
+    Raises :class:`PositionStoreUnavailableError`; the callers take opposite
+    dispositions (see each).
+    """
+    if not signal.signal_id:
+      return False
+    return self.ctx.db_service.signal_exists(
+      signal.signal_id, include_unsettled=signal.action in _ENTRY_ACTIONS
+    )
+
+  def _execute_recorded(
+    self, signal: SignalSchema
+  ) -> tuple[Optional[int], TradeResult]:
+    """Record the attempt, then execute *signal*. Returns (attempt id, result).
+
+    The order matters and is the point of this method: the attempt row is the
+    worker's only durable proof that a signal reached the broker, so it is
+    written *first*. A worker that died between the order and a row written
+    afterwards came back with no record, and the broker's replay placed the
+    position a second time.
+
+    If the attempt cannot be recorded, nothing is sent: the id would be missing
+    for the same reason the dedup record would be, and an unrecordable order is
+    an unrepeatable one. The signal stays retryable.
+    """
+    try:
+      attempt_id = self.ctx.db_service.begin_signal_attempt(
+        strategy=signal.strategy,
+        symbol=signal.symbol,
+        action=signal.action.value,
+        volume=signal.quantity,
+        price=signal.price,
+        sl=getattr(signal, "sl", None),
+        tp1=getattr(signal, "tp1", None),
+        message=signal.model_dump_json(),
+        author=LogAuthorEnum.BROKER.value,
+        market_type=self._market_type,
+        signal_id=signal.signal_id,
+        signal_uxid=signal.signal_uxid,
+      )
+    except PositionStoreUnavailableError as exc:
+      return None, self._not_executed(signal, f"Signal store unavailable: {exc}")
+    return attempt_id, self._execute(signal)
+
+  def _record_attempt_outcome(
+    self, signal: SignalSchema, result: TradeResult, attempt_id: Optional[int]
+  ) -> None:
+    """Write the broker's answer onto the audit log.
+
+    Three outcomes, and the difference between them decides whether the broker's
+    replay may send this signal again:
+
+    * success → ``EXECUTED``; a second delivery is a duplicate.
+    * ``OUTCOME_UNKNOWN`` → left ``ATTEMPTING``. The broker may hold a live
+      position, so re-sending could double it, and recording a refusal would
+      leave a real position untracked. Neither is safe to guess, so the row
+      stays unresolved and the startup scan reports it.
+    * any other failure → ``FAILED``; nothing is live, so a replay is welcome.
+
+    With no *attempt_id* the signal never reached the broker (the attempt could
+    not be recorded, or a guard read failed), so there is one row to write
+    rather than one to finalise.
+    """
+    unknown = is_outcome_unknown(result)
+    if unknown:
+      log.critical(
+        "[%s Process] Signal outcome UNKNOWN — signal_id=%s | %s | %s | %s. "
+        "The attempt stays %s: it will not be replayed, and a position may be "
+        "live. Check the broker.",
+        self.name,
+        signal.signal_id,
+        signal.symbol,
+        signal.action.value,
+        result.get("comment", ""),
+        AttemptOutcomeEnum.ATTEMPTING.value,
+      )
+    if result.get("success"):
+      outcome = AttemptOutcomeEnum.EXECUTED.value
+    elif unknown:
+      outcome = AttemptOutcomeEnum.ATTEMPTING.value
+    else:
+      outcome = AttemptOutcomeEnum.FAILED.value
+
+    fields = {
+      "ref_id": result.get("ticket"),
+      "ref_source_id": result.get("source_ticket") or result.get("ticket"),
+      "volume": result.get("volume", signal.quantity),
+      "price": result.get("price", signal.price),
+      # The stop the position really carries, not the one the signal asked for:
+      # an entry reports back the level it actually registered with the broker
+      # (FOREX widens it to the broker's minimum stop distance), and that is the
+      # number the audit trail must hold. Exits carry no stop of their own, so
+      # they fall back to the signal's.
+      "sl": result.get("sl") or getattr(signal, "sl", None),
+      # tp1 is the signal's *partial-close* target and is deliberately not
+      # overwritten by result["tp"] — that is the full-exit level (tp2) resting
+      # on the broker, a different concept that this column does not track.
+      "tp1": getattr(signal, "tp1", None),
+      "gateway_return_code": result.get("retcode", -1),
+      "comment": result.get("comment", ""),
+    }
+    if attempt_id is not None:
+      self.ctx.db_service.finalize_signal_attempt(
+        attempt_id, attempt_outcome=outcome, **fields
+      )
+      return
+    self.ctx.db_service.log_position(
+      strategy=signal.strategy,
+      symbol=signal.symbol,
+      action=signal.action.value,
+      message=signal.model_dump_json(),
+      author=LogAuthorEnum.BROKER.value,
+      market_type=self._market_type,
+      signal_id=signal.signal_id,
+      signal_uxid=signal.signal_uxid,
+      attempt_outcome=outcome,
+      **fields,
+    )
+
   def _execute(self, signal: SignalSchema) -> TradeResult:
     """Run *signal* through the handler and normalise the result."""
     try:
@@ -507,14 +652,12 @@ class BaseSignalProcessor(
       # The broker could not say what is live, so nothing was decided or sent:
       # report a plain failure instead of letting a guess ("nothing is open")
       # drive the exit or entry logic.
-      log.error(
-        "[%s Process] Signal not executed — %s | %s | %s",
-        self.name,
-        exc,
-        signal.symbol,
-        signal.action.value,
-      )
-      return TradeResult.fail(f"Broker positions unavailable: {exc}")
+      return self._not_executed(signal, f"Broker positions unavailable: {exc}")
+    except PositionStoreUnavailableError as exc:
+      # Same for the tracked positions: every read the handler makes before it
+      # sends an order is a decision input (netting, stale cleanup, the row an
+      # exit resolves to).
+      return self._not_executed(signal, f"Position store unavailable: {exc}")
     # Some exchanges (notably Binance testnet) return a 0 fill price on a filled
     # MARKET order — for entries *and* closes (FLAT/TP2/SL/...). Fall back to the
     # signal's price so the notification and DB never record a misleading 0.0.
@@ -525,6 +668,18 @@ class BaseSignalProcessor(
     if result.get("success") and not result.get("price") and signal.price:
       result["price"] = signal.price
     return result
+
+  def _not_executed(self, signal: SignalSchema, reason: str) -> TradeResult:
+    """A failed result for a signal that was never sent to the broker because
+    an input it depends on could not be read."""
+    log.error(
+      "[%s Process] Signal not executed — %s | %s | %s",
+      self.name,
+      reason,
+      signal.symbol,
+      signal.action.value,
+    )
+    return TradeResult.fail(reason)
 
   def _persist_success(self, signal: SignalSchema, result: dict, footer: str) -> None:
     action_val = signal.action.value
@@ -604,22 +759,6 @@ class BaseSignalProcessor(
         return fn(*args, **kwargs)
 
     return _locked
-
-  def _executed_ids(self) -> "OrderedDict[str, None]":
-    # Per instance, created on first use for instances that bypass __init__ in
-    # tests — a class-level default would be shared between them.
-    return self.__dict__.setdefault("_executed_signal_ids", OrderedDict())
-
-  def _remember_executed(self, signal_id: Optional[str]) -> None:
-    """Record a successfully executed signal_id, keeping the newest
-    :data:`_EXECUTED_IDS_MAX` (a replay only reaches back MAX_RETRY_TIMEOUT)."""
-    if not signal_id:
-      return
-    ids = self._executed_ids()
-    ids[signal_id] = None
-    ids.move_to_end(signal_id)
-    while len(ids) > _EXECUTED_IDS_MAX:
-      ids.popitem(last=False)
 
   def _entry_rejection(self, signal: SignalSchema) -> Optional[str]:
     """Run the entry guards against *signal*, returning the first rejection
@@ -703,6 +842,10 @@ class BaseSignalProcessor(
     Records the rejection in the append-only log and as a REJECTED position row (so
     :class:`PositionCDC` forwards it to the broker on the TRADE subject with status
     REJECTED), then notifies the community channel. No order is placed.
+
+    Logged as a ``FAILED`` attempt, so the broker may replay the signal later:
+    the conditions a policy rejection turns on (an open position on the symbol,
+    MAX_OPEN_ORDERS) clear with time, and nothing is live to duplicate.
     """
     log.warning(
       "[%s Process] Entry REJECTED | %s %s | %s",
@@ -738,6 +881,7 @@ class BaseSignalProcessor(
       message=signal_json,
       author=LogAuthorEnum.BROKER.value,
       market_type=self._market_type,
+      attempt_outcome=AttemptOutcomeEnum.FAILED.value,
       signal_id=signal.signal_id,
       signal_uxid=signal.signal_uxid,
     )

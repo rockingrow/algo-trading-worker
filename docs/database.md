@@ -35,7 +35,8 @@ The canonical record for each open trade. `PositionCDC` watches this table for `
 | `market_type` | TEXT | `FOREX` / `CRYPTO` tag |
 | `sync_status` | TEXT | `PENDING` → `PUBLISHED` — drives CDC delivery |
 | `sync_time` | DATETIME | Timestamp of last successful publish |
-| `created_at` / `updated_at` | DATETIME | Row timestamps; `updated_at` is used as an optimistic-lock key in `mark_position_synced` |
+| `sync_version` | INTEGER | Bumped by every status change; `mark_position_synced` marks a row published only at the version the CDC read and published |
+| `created_at` / `updated_at` | DATETIME | Row timestamps (one-second resolution, so not used as a change marker; see `sync_version`) |
 
 ### Constraints
 
@@ -71,24 +72,63 @@ OPENED ──► TP1 ──► TP2
 
 **Only an active row changes state.** `PositionRepository.update_position_status` updates `WHERE ref_source_id = ? AND status IN ('OPENED', 'TP1')`. `ref_source_id` is not unique over the table's history (a `REJECTED` row is keyed by the signal's id), and a close event can arrive after another path already closed the row. A terminal or `REJECTED` row is therefore never rewritten, and so never re-published by `PositionCDC`. An update that matches no active row is logged at `WARNING` and does nothing.
 
-## `position_logs` — Immutable execution audit trail
+## `position_logs` — Execution audit trail and the signal dedup key
 
-An append-only log of every signal processed and its execution result. Never updated — only inserted.
+A log of every signal processed and its execution result. For a signal the
+worker executes, the row is written **before** the broker is called and the
+answer is written onto it afterwards; every other writer (reconcile closes,
+terminal closes, manual imports, ADMIN flat) inserts a finished row and never
+updates it.
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `strategy` / `symbol` / `action` | TEXT | Signal identity |
+| `signal_id` / `signal_uxid` | TEXT | The broker's signal id and trade-cycle id; `signal_id` is the dedup key |
 | `ref_id` / `ref_source_id` | TEXT | Order/deal references at time of execution (`ticket` / `source_ticket` in the app) |
 | `volume` / `price` / `sl` / `tp1` | REAL | Execution parameters |
 | `gateway_return_code` | INTEGER | Broker/exchange result code (`10009` = MT5 filled, etc.) |
 | `gateway_message` | TEXT | Full signal/event JSON |
 | `market_type` | TEXT | `FOREX` / `CRYPTO` tag |
 | `author` | TEXT | `broker` (NATS signal), `terminal` (MT5 detection), or `exchange` (CEX event) |
+| `attempt_outcome` | TEXT | How the attempt ended — see below. `EXECUTED` by default |
 | `timestamp` | DATETIME | Wall-clock time of insertion |
+
+### `attempt_outcome` — why a signal is or is not re-sent
+
+This is the only thing that decides whether a signal may reach the broker
+again, read by both the live signal path and the ACK's `retry_signals` replay
+(`PositionRepository.signal_exists`). The row is written before the order, so
+its existence proves an attempt was made even if the worker dies mid-order; this
+column is the verdict.
+
+| Value | Meaning | Re-sendable? |
+| --- | --- | --- |
+| `ATTEMPTING` | The broker call is in flight, or the worker died before it could record the answer | **An entry: no.** An exit: yes — see below |
+| `EXECUTED` | The broker confirmed | No — a second delivery is a duplicate, for an entry and an exit alike |
+| `FAILED` | Definitively refused (a policy rejection or a broker rejection), so nothing is live | **Yes** — this is the gap a replay exists to fill |
+
+`ATTEMPTING` is the only row whose answer depends on the action, because the
+asymmetry reverses:
+
+* An **entry** is blocked. The broker may hold a position for this signal, and a
+  second order would open another one.
+* An **exit** is not. A duplicate close resolves against the tracked row and is
+  harmless — and if the first close did go through, the re-sent exit finds
+  nothing live and syncs the row closed, which is the self-heal. Refusing to
+  retry would instead leave a live position with no stop and no exit anyone will
+  attempt again.
+
+So an entry blocked this way stays blocked until someone looks. Each market's
+worker scans for such rows at startup, scoped to its own `market_type`, and
+alerts with the signals to check on the broker (`stale_signal_attempts`).
+
+The default is `EXECUTED` so that a database upgraded in place keeps its
+previous behaviour exactly: before this column, the mere existence of a
+`position_logs` row blocked a replay.
 
 ## `notifications` — Telegram outbox (store-and-forward)
 
-A durable queue of pending Telegram messages. `NotificationJob` polls this table every 1 s, sends due rows, and hard-deletes on success. Failed sends increment `attempts` and reschedule via exponential backoff (`5s → 30s → 2m → 10m`). Rows whose `attempts >= max_attempts` become dead-letters and are left in place.
+A durable queue of pending Telegram messages. `NotificationJob` polls this table every 1 s. A due row is **claimed before it is sent** — `attempts` is incremented and `next_attempt_at` pushed out, conditional on the `attempts` value the poll read — and only then handed to Telegram; it is hard-deleted on success, and a failure records `last_error` (the claim already counted the attempt). Backoff is exponential (`5s → 30s → 2m → 10m`) and rows whose `attempts >= max_attempts` become dead-letters, left in place. Claiming first is what makes `max_attempts` bound **sends** rather than failures: the job used to send and then delete, so a crash in between re-sent the message on every later poll.
 
 | Column | Type | Description |
 | --- | --- | --- |

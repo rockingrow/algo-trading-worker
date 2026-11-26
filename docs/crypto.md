@@ -51,6 +51,38 @@ Data Stream uses the SDK websocket (auto-reconnect). All of this lives only insi
 `worker/gateways/crypto/binance/` — the gateway abstraction keeps it out of the
 executor/strategy/processor, so it never leaks upward.
 
+**Orders whose outcome is unknown.** Order placement (market, stop,
+take-profit) times out after 5 s; the SDK default of 1 s still applies to
+reads, which the SDK retries itself. A market order that ends without a definitive answer is not
+reported as failed on a guess, because Binance may have executed it. That covers
+a transport error, a 5xx, and `-1006` / `-1007` ("execution status unknown").
+`BinanceFuturesGateway` looks the order up by its `clientOrderId` up to three
+times (0.5 s, 1 s, 2 s apart) and reports it as filled only when the lookup
+returns a fill matching what was just sent: same side, same quantity, placed in
+the last 2 minutes. Anything else stays a failure. If the lookups themselves
+fail, the failure says the outcome is unknown and logs CRITICAL. The reconcile
+job imports the position if it does exist.
+
+**The entry `clientOrderId` is the idempotency key.** It is
+`awke_` + a short strategy label + a 16-character digest of the signal's
+identity (strategy, `signal_id`, `signal_uxid`, action, symbol) — see
+`CryptoExecutor._client_order_id`. Two properties matter and neither held
+before, when the id was the strategy name plus the last 6 characters of
+`signal_id`:
+
+* **Unique per signal.** Two signals of one strategy could previously share an
+  id, so the lookup above could read a stale order as the fill for a later one.
+  A signal with no id collapsed to the strategy name alone.
+* **Deterministic.** A replay of the same signal reuses the id, so Binance's own
+  refusal of a duplicate `clientOrderId` while the first order still works
+  becomes a second line of defence.
+
+The `awke_` prefix keeps entry ids provably distinct from the `awkr_` marker on
+the reduce-only closes the user-data stream drops, and clear of Binance's
+reserved prefixes (`autoclose-`, `adl_autoclose`, `settlement_autoclose`).
+Sanitisation uses an ASCII class, so a non-ASCII strategy name cannot produce an
+id outside Binance's charset (`^[\.A-Z\:/a-z0-9_-]{1,36}$`).
+
 Required env when `MARKET_TYPE=CRYPTO` (Binance): `CRYPTO_API_KEY`,
 `CRYPTO_API_SECRET`, `CRYPTO_ACCOUNT_ID`, and `CRYPTO_QUOTE_ASSET` (defaults to
 `USDT`) — enforced by the settings validator. `CRYPTO_EXCHANGE` defaults to
