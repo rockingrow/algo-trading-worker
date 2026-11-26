@@ -30,6 +30,15 @@ SIDE_SHORT = "SHORT"
 # source of truth without the executor importing a concrete exchange module.
 WORKER_ORDER_PREFIX = "awkr_"
 
+# Marker prepended to the clientOrderId of every entry the worker places. Entry
+# fills are recognised structurally on the event stream (a MARKET fill that is
+# not reduce-only), so this marker is not what identifies them — it keeps the
+# entry and close id namespaces provably disjoint, so no entry id can ever start
+# with WORKER_ORDER_PREFIX and be mistaken for a close the stream should ignore.
+# It also keeps worker ids clear of the exchange's own reserved prefixes
+# ("autoclose-", "adl_autoclose", "settlement_autoclose", "web_", ...).
+ENTRY_ORDER_PREFIX = "awke_"
+
 
 def linear_realized_pnl(
   side: str,

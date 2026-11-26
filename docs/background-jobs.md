@@ -172,13 +172,26 @@ In-process callers stay decoupled: they hold an `OutboxNotifier` whose `send_mes
 
 ### Retry semantics
 
+A due row is **claimed before it is sent**: `claim_notification` increments
+`attempts` and pushes `next_attempt_at` out, conditional on the `attempts` value
+the poll read (a compare-and-set). The send happens only if the claim won.
+
 | Outcome | Action |
 | --- | --- |
+| Claim lost (the row moved on since the poll) | Skip it; nothing is sent |
 | Success (HTTP 200 for every chat ID) | `DELETE` the row (hard-delete; no `status` column required) |
-| Partial / total failure | `attempts += 1`, set `next_attempt_at = now + backoff[attempts]`, store `last_error` |
+| Partial / total failure | Store `last_error` and the backoff `next_attempt_at` — `attempts` was already counted by the claim |
 | `attempts >= max_attempts` (default `5`) | Row becomes dead-letter — skipped by the polling query and left in place for inspection |
 
 Backoff schedule (indexed by attempt, capped at last): **5s → 30s → 2m → 10m**. The polling query is `WHERE attempts < max_attempts AND (next_attempt_at IS NULL OR next_attempt_at <= now)` and is served by the `idx_notifications_pending` index.
+
+Counting the send before it happens is what makes `max_attempts` bound **sends**
+rather than failures. The job used to send and then delete, so a crash in
+between re-sent the message on the next poll — and kept re-sending it, because a
+crash incremented nothing. Telegram offers no idempotency key, so a crash inside
+the send window can still duplicate one message; what the claim removes is the
+unbounded resend. The per-trade cycle path has the stronger property instead: its
+message is edited in place, so re-delivering it is harmless.
 
 ### Direct-send escape hatches
 

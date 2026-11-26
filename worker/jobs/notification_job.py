@@ -5,9 +5,14 @@ Dispatcher that drains the notifications outbox table and sends pending
 messages via Telegram. Mirrors the PositionCDC / MT5EventJob pattern:
 daemon thread, shared stop_event, poll loop.
 
-Delivery semantics:
+Delivery semantics (at-least-once, bounded):
+  - Claim    → attempts += 1 and next_attempt_at pushed out, conditional on the
+               attempts value the poll read. Done *before* the send, so a crash
+               mid-send cannot resend immediately or indefinitely. Telegram has
+               no idempotency key, so one duplicate is still possible; what this
+               bounds is the storm.
   - Success  → DELETE the row (hard-delete, no status column needed).
-  - Failure  → increment attempts + set next_attempt_at (exponential backoff).
+  - Failure  → record last_error (the claim already counted the attempt).
   - Dead     → rows where attempts >= max_attempts are left in place as
                dead-letter and skipped by the poll query.
 """
@@ -90,6 +95,21 @@ class NotificationJob:
         )
         continue
 
+      # Claim before sending, so the send is counted even if this process dies
+      # mid-call. Sending first and deleting after meant a crash in between
+      # re-sent the message on the next poll, and kept re-sending it: attempts
+      # counted only failures, so max_attempts never bounded sends.
+      next_at = _next_attempt_at(row["attempts"])
+      if not self._db.claim_notification(
+        notification_id=row["id"],
+        attempts=row["attempts"],
+        next_attempt_at=next_at,
+      ):
+        log.debug(
+          "[NotificationJob] Skipped id=%s — row changed since the poll.", row["id"]
+        )
+        continue
+
       success = notifier.send_message(row["message_text"])
       if success:
         self._db.delete_notification(row["id"])
@@ -99,7 +119,6 @@ class NotificationJob:
           row.get("category"),
         )
       else:
-        next_at = _next_attempt_at(row["attempts"])
         self._db.mark_notification_failed(
           notification_id=row["id"],
           error=f"Send failed (attempt {row['attempts'] + 1})",

@@ -17,9 +17,14 @@ from worker.gateways import system_messages as system_module
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.processor import BaseSignalProcessor, parse_strategy_subjects
 from worker.schemas.cycle_schema import CycleOutcomeEnum, CycleStatusEnum
+from worker.schemas.job_schema import (
+  BLOCKING_ATTEMPT_OUTCOMES,
+  AttemptOutcomeEnum,
+)
 from worker.schemas.nats_schema import NatsSubjectEnum
 from worker.schemas.signal_schema import SignalActionEnum
 from worker.schemas.system_schema import SystemActionEnum
+from worker.schemas.trade_result import TradeFailureEnum
 from worker.settings import MAX_RETRY_TIMEOUT
 
 
@@ -81,7 +86,40 @@ class FakeDb:
     self.known_signal_ids = set()
 
   def log_position(self, **kw):
+    kw.setdefault("attempt_outcome", AttemptOutcomeEnum.EXECUTED.value)
     self.logged.append(kw)
+    return len(self.logged) - 1
+
+  def begin_signal_attempt(self, **kw):
+    """Write the attempt row the way the real store does: before the broker
+    call, with no outcome yet. The row's index is its id."""
+    self.logged.append(
+      dict(
+        kw,
+        attempt_outcome=AttemptOutcomeEnum.ATTEMPTING.value,
+        ref_id=None,
+        ref_source_id=None,
+        gateway_return_code=-1,
+        comment="",
+      )
+    )
+    return len(self.logged) - 1
+
+  def finalize_signal_attempt(self, log_id, **kw):
+    row = self.logged[log_id]
+    # Guarded like the real UPDATE: a settled row is never overwritten.
+    if row.get("attempt_outcome") != AttemptOutcomeEnum.ATTEMPTING.value:
+      return False
+    row.update(kw)
+    return True
+
+  def stale_signal_attempts(self, older_than_seconds=120, market_type=None):
+    return [
+      row
+      for row in self.logged
+      if row.get("attempt_outcome") == AttemptOutcomeEnum.ATTEMPTING.value
+      and (market_type is None or row.get("market_type") == market_type)
+    ]
 
   def insert_position(self, **kw):
     self.inserted.append(kw)
@@ -101,8 +139,20 @@ class FakeDb:
       and (ref_id is None or p.get("ref_id") == ref_id)
     ]
 
-  def signal_exists(self, signal_id):
-    return signal_id in self.known_signal_ids
+  def signal_exists(self, signal_id, *, include_unsettled=True):
+    if signal_id in self.known_signal_ids:
+      return True
+    # Same rule as the real query: an EXECUTED row blocks a re-send, a FAILED
+    # one does not, and a still-ATTEMPTING one blocks only an entry.
+    blocking = (
+      BLOCKING_ATTEMPT_OUTCOMES
+      if include_unsettled
+      else (AttemptOutcomeEnum.EXECUTED.value,)
+    )
+    return any(
+      row.get("signal_id") == signal_id and row.get("attempt_outcome") in blocking
+      for row in self.logged
+    )
 
 
 class FakeCycleNotifier:
@@ -129,10 +179,12 @@ class FakeProcessor(BaseSignalProcessor):
   name = "FAKE"
   presenter = FakePresenter
 
-  def __init__(self, handle_result, *, connected=True):
+  def __init__(self, handle_result, *, connected=True, db=None):
     # Intentionally skip super().__init__ — inject fakes directly so the shared
     # algorithm can be exercised without a broker/NATS/factory.
-    self.db = FakeDb()
+    # *db* is injectable so a second processor can be built over the same store:
+    # that is what a worker restart looks like, and the dedup has to survive it.
+    self.db = db if db is not None else FakeDb()
     self.notifications = []
     self.mgmt_notifications = []
     self.cycle = FakeCycleNotifier()
@@ -2714,7 +2766,7 @@ def test_entry_fails_closed_when_the_guards_cannot_read_the_store():
   """A failed read used to come back as ``[]`` — "nothing is open" — so the
   one-order-per-symbol and MAX_OPEN_ORDERS guards waved the entry through. It
   must now be a plain failure: nothing sent, nothing rejected on policy, and the
-  signal not remembered as executed (it stays retryable)."""
+  signal recorded as FAILED so it stays retryable."""
   sent = []
   proc = FakeProcessor({"success": True, "ticket": 555})
   proc.handler = SimpleNamespace(handle=lambda sig: sent.append(sig))
@@ -2727,7 +2779,8 @@ def test_entry_fails_closed_when_the_guards_cannot_read_the_store():
   assert proc.db.inserted == [] and proc.db.rejected == []
   assert "Position store unavailable" in proc.db.logged[0]["comment"]
   assert proc.notifications == ["failed:LONG"]
-  assert signal.signal_id not in proc._executed_ids()
+  assert proc.db.logged[0]["attempt_outcome"] == AttemptOutcomeEnum.FAILED.value
+  assert proc.db.signal_exists(signal.signal_id) is False
 
 
 def test_signal_fails_when_the_handler_cannot_read_the_store():
@@ -2748,3 +2801,263 @@ def test_signal_fails_when_the_handler_cannot_read_the_store():
   assert proc.db.updated == []
   assert "Position store unavailable" in proc.db.logged[0]["comment"]
   assert proc.notifications == ["failed:SL"]
+
+
+# ── The write-ahead attempt record ───────────────────────────────────────── #
+
+
+def test_the_attempt_is_recorded_before_the_broker_is_called():
+  """The order used to be placed first and logged after, so a worker that died
+  in between came back with no record and the broker's replay placed the
+  position twice. The row must already exist when the handler runs."""
+  seen = []
+  proc = FakeProcessor({"success": True, "ticket": 555})
+  proc.handler = SimpleNamespace(
+    handle=lambda sig: (
+      seen.append([r["attempt_outcome"] for r in proc.db.logged]),
+      {"success": True, "ticket": 555},
+    )[1]
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, signal_id="sig-wa").model_dump_json(),
+  )
+
+  assert seen == [[AttemptOutcomeEnum.ATTEMPTING.value]]
+  assert proc.db.logged[0]["attempt_outcome"] == AttemptOutcomeEnum.EXECUTED.value
+
+
+def test_nothing_is_sent_when_the_attempt_cannot_be_recorded():
+  """No row means no dedup key, so a redelivery could not be caught — the order
+  must not go out at all."""
+  sent = []
+  proc = FakeProcessor({"success": True, "ticket": 555})
+  proc.handler = SimpleNamespace(handle=lambda sig: sent.append(sig))
+  proc.db.begin_signal_attempt = _unreadable
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG).model_dump_json(),
+  )
+
+  assert sent == []
+  assert proc.db.inserted == []
+  assert "Signal store unavailable" in proc.db.logged[0]["comment"]
+  assert proc.db.logged[0]["attempt_outcome"] == AttemptOutcomeEnum.FAILED.value
+
+
+def test_an_unknown_outcome_leaves_the_attempt_unresolved():
+  """Neither conclusion is safe: re-sending could double a live position, and
+  recording a refusal would leave a real one untracked. So the row stays
+  ATTEMPTING and blocks its own replay until someone looks."""
+  proc = FakeProcessor(
+    {
+      "success": False,
+      "comment": "Order outcome unknown (timeout)",
+      "failure": TradeFailureEnum.OUTCOME_UNKNOWN,
+    }
+  )
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, signal_id="sig-unk").model_dump_json(),
+  )
+
+  assert proc.db.logged[0]["attempt_outcome"] == AttemptOutcomeEnum.ATTEMPTING.value
+  assert proc.db.signal_exists("sig-unk") is True
+  # Not persisted as an open position either — nothing is known to be live.
+  assert proc.db.inserted == []
+
+
+def test_a_signal_is_not_re_executed_after_a_restart():
+  """The regression test for the in-memory dedup: the set lived in the process,
+  so a watchdog restart wiped it and the next delivery of the same signal_id
+  placed a second order. The record is in the store now, which survives."""
+  store = FakeDb()
+  first = FakeProcessor({"success": True, "ticket": 555}, db=store)
+  raw = make_signal(SignalActionEnum.LONG, signal_id="sig-restart").model_dump_json()
+  first._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  # A brand-new processor over the same store is what a restart looks like.
+  sent = []
+  after_restart = FakeProcessor({"success": True, "ticket": 777}, db=store)
+  after_restart.handler = SimpleNamespace(handle=lambda sig: sent.append(sig))
+  after_restart._process_message(NatsSubjectEnum.SIGNAL, raw)
+
+  assert sent == []
+  assert len(store.inserted) == 1
+
+
+def test_a_policy_rejection_stays_replayable():
+  """MAX_OPEN_ORDERS and the one-per-symbol rule turn on conditions that clear
+  with time, and nothing is live to duplicate, so the broker may resend."""
+  proc = FakeProcessor({"success": True, "ticket": 555})
+  proc.db.open_positions = [{"strategy": "strat-1", "symbol": "XAUUSD"}]
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, signal_id="sig-rej").model_dump_json(),
+  )
+
+  assert proc.db.rejected  # recorded as a REJECTED row
+  assert proc.db.logged[0]["attempt_outcome"] == AttemptOutcomeEnum.FAILED.value
+  assert proc.db.signal_exists("sig-rej") is False
+
+
+def test_a_dedup_lookup_failure_does_not_block_an_exit():
+  """Fail-open here on purpose: an unreadable store must never stop a position
+  being closed, and an entry still fails closed at the guards."""
+  proc = FakeProcessor({"success": True, "ticket": 9, "source_ticket": 5})
+  proc.db.signal_exists = _unreadable
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.SL, signal_id="sig-exit").model_dump_json(),
+  )
+
+  assert proc.db.updated  # the close went through
+
+
+# ── The replay acts on the attempt's verdict ─────────────────────────────── #
+
+
+def test_the_replay_resends_a_failed_signal_but_not_an_executed_one():
+  """A failed attempt is the gap a replay exists to fill. Checking mere row
+  existence meant a signal that failed was never retried."""
+  proc = _retry_proc()
+  failed = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-failed", symbol="AAA")
+  done = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-done", symbol="BBB")
+  proc.db.logged.extend(
+    [
+      {
+        "signal_id": "sig-failed",
+        "attempt_outcome": AttemptOutcomeEnum.FAILED.value,
+      },
+      {
+        "signal_id": "sig-done",
+        "attempt_outcome": AttemptOutcomeEnum.EXECUTED.value,
+      },
+    ]
+  )
+  executed = []
+  proc._process_signal = lambda sig: executed.append(sig.signal_id)
+
+  proc._apply_retry_signals([failed, done])
+
+  assert executed == ["sig-failed"]
+
+
+def test_the_replay_skips_a_signal_whose_outcome_is_unknown():
+  proc = _retry_proc()
+  signal = _fresh_signal(SignalActionEnum.LONG, signal_id="sig-unk", symbol="AAA")
+  proc.db.logged.append(
+    {"signal_id": "sig-unk", "attempt_outcome": AttemptOutcomeEnum.ATTEMPTING.value}
+  )
+  executed = []
+  proc._process_signal = lambda sig: executed.append(sig.signal_id)
+
+  proc._apply_retry_signals([signal])
+
+  assert executed == []
+
+
+def test_the_replay_skips_rather_than_guesses_when_the_lookup_fails():
+  """Opposite disposition to the live path: this signal may already have
+  executed, and re-sending would double the position. Loud, because the gap
+  then stays unfilled."""
+  proc = _retry_proc()
+  proc.db.signal_exists = _unreadable
+  executed = []
+  proc._process_signal = lambda sig: executed.append(sig.signal_id)
+
+  proc._apply_retry_signals(
+    [_fresh_signal(SignalActionEnum.LONG, signal_id="sig-x", symbol="AAA")]
+  )
+
+  assert executed == []
+
+
+def test_an_unsettled_exit_is_retryable_but_an_unsettled_entry_is_not():
+  """The asymmetry is the point. A duplicate entry opens a second position, so
+  an unsettled one blocks. A duplicate close resolves against the tracked row,
+  while refusing to retry would leave a live position with no stop and no exit
+  anyone will attempt again — so an unsettled exit must go through."""
+  store = FakeDb()
+  store.logged.extend(
+    [
+      {
+        "signal_id": "entry-unk",
+        "attempt_outcome": AttemptOutcomeEnum.ATTEMPTING.value,
+      },
+      {
+        "signal_id": "exit-unk",
+        "attempt_outcome": AttemptOutcomeEnum.ATTEMPTING.value,
+      },
+    ]
+  )
+  proc = FakeProcessor({"success": True, "ticket": 9, "source_ticket": 5}, db=store)
+
+  assert (
+    proc._already_attempted(make_signal(SignalActionEnum.LONG, signal_id="entry-unk"))
+    is True
+  )
+  assert (
+    proc._already_attempted(make_signal(SignalActionEnum.SL, signal_id="exit-unk"))
+    is False
+  )
+
+
+def test_an_exit_that_already_executed_is_still_a_duplicate():
+  """Opting exits out of the unsettled rule must not open the door to replaying
+  a close that demonstrably happened."""
+  store = FakeDb()
+  store.logged.append(
+    {"signal_id": "exit-done", "attempt_outcome": AttemptOutcomeEnum.EXECUTED.value}
+  )
+  proc = FakeProcessor({"success": True}, db=store)
+
+  assert (
+    proc._already_attempted(make_signal(SignalActionEnum.SL, signal_id="exit-done"))
+    is True
+  )
+
+
+def test_a_timed_out_close_is_re_sent_rather_than_left_open():
+  """End to end over the skip gate: the SL whose outcome was never settled is
+  the one signal that must still be able to close the position."""
+  store = FakeDb()
+  store.logged.append(
+    {"signal_id": "sl-unk", "attempt_outcome": AttemptOutcomeEnum.ATTEMPTING.value}
+  )
+  proc = FakeProcessor({"success": True, "ticket": 9, "source_ticket": 5}, db=store)
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.SL, signal_id="sl-unk").model_dump_json(),
+  )
+
+  assert store.updated  # the close ran
+
+
+def test_an_entry_fails_closed_when_the_dedup_lookup_is_unreadable():
+  """The exit relaxation must not extend to entries. If the lookup cannot say
+  whether this entry already ran, placing it could double a position — and the
+  guards do not always catch it, since a first position that has since closed
+  leaves nothing for them to see."""
+  sent = []
+  proc = FakeProcessor({"success": True, "ticket": 555})
+  proc.handler = SimpleNamespace(handle=lambda sig: sent.append(sig))
+  proc.db.signal_exists = _unreadable
+
+  proc._process_message(
+    NatsSubjectEnum.SIGNAL,
+    make_signal(SignalActionEnum.LONG, signal_id="sig-entry").model_dump_json(),
+  )
+
+  assert sent == []
+  assert proc.db.inserted == []
+  # Recorded as FAILED so the broker may resend it: nothing was sent.
+  assert proc.db.logged[0]["attempt_outcome"] == AttemptOutcomeEnum.FAILED.value
+  assert "Dedup lookup unavailable" in proc.db.logged[0]["comment"]
+  assert proc.mgmt_notifications  # the operator is told

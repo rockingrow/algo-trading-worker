@@ -1,5 +1,6 @@
 """Tests for CryptoExecutor against a fake exchange gateway."""
 
+import re
 from dataclasses import replace
 
 import pytest
@@ -681,3 +682,90 @@ def test_partial_close_matches_a_text_ticket(config):
     "BTCUSD", close_volume=0.006, position_ticket="7"
   )
   assert res["success"] is True
+
+
+# ── The entry clientOrderId is an idempotency key ────────────────────────── #
+#
+# Two things lean on it: the unknown-outcome lookup finds the order by it, and
+# the exchange itself refuses a duplicate id while the first order still works.
+# Both only hold if the id identifies exactly one signal.
+
+_ID_CHARSET = re.compile(r"^[\.A-Z\:/a-z0-9_-]{1,36}$")
+
+
+def test_two_signals_of_one_strategy_get_different_entry_ids():
+  """The old form took only the last 6 characters of signal_id, so two signals
+  of one strategy could collide — and a stale order could then be read as the
+  fill for a later one."""
+  first = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.LONG, signal_id="aaaaaa-111111")
+  )
+  second = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.LONG, signal_id="bbbbbb-111111")
+  )
+
+  assert first != second
+
+
+def test_the_entry_id_is_stable_for_the_same_signal():
+  """Deterministic on purpose: a replay reuses the id, so the exchange's own
+  duplicate-id refusal becomes a second line of defence."""
+  signal = make_signal(SignalActionEnum.LONG, signal_id="sig-1")
+
+  assert CryptoExecutor._client_order_id(signal) == CryptoExecutor._client_order_id(
+    signal
+  )
+
+
+def test_entry_ids_differ_without_a_signal_id():
+  """A missing signal_id used to collapse the id to the strategy name alone —
+  one id shared by every signal that strategy ever sent."""
+  long_btc = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.LONG, signal_id=None, symbol="BTCUSD")
+  )
+  short_btc = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.SHORT, signal_id=None, symbol="BTCUSD")
+  )
+  long_eth = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.LONG, signal_id=None, symbol="ETHUSD")
+  )
+
+  assert len({long_btc, short_btc, long_eth}) == 3
+
+
+def test_an_entry_id_is_never_mistaken_for_a_worker_close():
+  """WORKER_ORDER_PREFIX means "a reduce-only close the worker placed", which
+  the event stream drops. An entry id must never carry it."""
+  from worker.gateways.crypto.base import ENTRY_ORDER_PREFIX, WORKER_ORDER_PREFIX
+
+  cid = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.LONG, strategy=f"{WORKER_ORDER_PREFIX}sneaky")
+  )
+
+  assert not cid.startswith(WORKER_ORDER_PREFIX)
+  assert cid.startswith(ENTRY_ORDER_PREFIX)
+
+
+@pytest.mark.parametrize(
+  "strategy",
+  ["strat-1", "a" * 60, "chiến-lược-vàng", "sp/500:eu", ""],
+)
+def test_entry_ids_satisfy_the_exchange_charset_and_length(strategy):
+  r"""Binance refuses the order outright on either count. A non-ASCII name used
+  to survive sanitisation, because ``\w`` is Unicode-aware under Python 3."""
+  cid = CryptoExecutor._client_order_id(
+    make_signal(SignalActionEnum.LONG, strategy=strategy)
+  )
+
+  assert _ID_CHARSET.match(cid), cid
+  assert len(cid) <= 36
+
+
+def test_the_entry_order_carries_the_id(config):
+  gw = FakeGateway()
+  ex = CryptoExecutor(gw, config)
+  signal = make_signal(SignalActionEnum.LONG, symbol="BTCUSD", sl=29000.0)
+
+  assert ex.open_position(signal)["success"] is True
+
+  assert gw.client_order_ids[0] == CryptoExecutor._client_order_id(signal)

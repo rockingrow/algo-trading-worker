@@ -38,7 +38,7 @@ from worker.gateways.forex.mt5.deal_pnl import deals_realized_pnl
 from worker.gateways.forex.mt5.symbol_resolver import SymbolResolver
 from worker.interfaces.mt5_gateway_protocol import Mt5GatewayProtocol
 from worker.logger import get_logger
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeFailureEnum, TradeResult
 
 logger = get_logger("worker.gateways.forex.mt5.gateway")
 
@@ -84,6 +84,29 @@ _BUSY_SEND_DELAY = 0.3  # seconds before the first retry, doubling after that
 # terminal build that omits the constant cannot break the check.
 _BUSY_RETCODES = frozenset({10024})
 
+# Outcomes that leave it open whether the trade server executed the request.
+# TRADE_RETCODE_TIMEOUT (10012) is "request cancelled by timeout": the terminal
+# stopped waiting, which says nothing about what the server did with the order.
+# Reporting that as a plain failure is a guess — if it did fill, the position is
+# live with no stop and no DB row, which is the same harm the Binance side was
+# fixed for. Named rather than read off the module so a terminal build that omits
+# the constant cannot break the check.
+_UNKNOWN_OUTCOME_RETCODES = frozenset({10012})
+# Client-side ``last_error`` codes that leave the same question open when
+# ``order_send`` returns no result at all: RES_E_INTERNAL_FAIL_RECEIVE (-10002),
+# the request went out and the answer was lost, and
+# RES_E_INTERNAL_FAIL_TIMEOUT (-10005). Deliberately narrow — _SEND (-10001),
+# _CONNECT (-10004) and an argument the wrapper itself refused (-2) all mean the
+# request never reached the trade server, so those outcomes are known, and
+# treating them as unknown would block replays of signals that never executed.
+_UNKNOWN_OUTCOME_ERRORS = frozenset({-10002, -10005})
+
+# Pauses while re-reading the position book to see whether an unknown-outcome
+# order actually landed. Same shape and budget as the deal lookup above: the
+# position appears on the server before the terminal's own book catches up.
+_ORDER_LOOKUP_ATTEMPTS = 6
+_ORDER_LOOKUP_DELAY = 0.25  # seconds between attempts
+
 
 def _fit_comment(comment: str) -> str:
   """Cut *comment* down to what the wrapper accepts (see ``_MT5_COMMENT_MAX``).
@@ -115,6 +138,20 @@ def _is_trade_context_busy(result: Any, error: Any) -> bool:
   if getattr(result, "retcode", None) in _BUSY_RETCODES:
     return True
   return "busy" in str(getattr(result, "comment", "") or "").lower()
+
+
+def _is_outcome_unknown(result: Any, error: Any) -> bool:
+  """Could the trade server have executed this request anyway?
+
+  Two routes, mirroring :func:`_is_trade_context_busy`: a request the terminal
+  gave up waiting for comes back with a timeout retcode, while one it could not
+  complete at all returns ``None`` and leaves the reason in ``last_error()``.
+  Only the connection/timeout errors qualify there — an argument the wrapper
+  rejected (``-2``) never reached the server, so that outcome is known.
+  """
+  if result is None:
+    return _mt5_error_code(error) in _UNKNOWN_OUTCOME_ERRORS
+  return getattr(result, "retcode", None) in _UNKNOWN_OUTCOME_RETCODES
 
 
 def _as_ticket_id(ticket: Any) -> Optional[int]:
@@ -291,6 +328,113 @@ class MT5Gateway(BasePlatformGateway):
 
   # ── Orders ────────────────────────────────────────────────────────────── #
 
+  def _position_tickets(self, symbol: str, magic: int) -> Optional[Dict[Any, Any]]:
+    """This strategy's live positions on *symbol*, keyed by ticket.
+
+    ``None`` when the book could not be read, which is kept apart from an empty
+    book: a snapshot that failed cannot be compared against a later one, and
+    guessing either way is what this whole path exists to avoid.
+    """
+    try:
+      return {p.ticket: p for p in self.get_positions(symbol) if p.magic == magic}
+    except Exception as exc:
+      logger.warning(
+        "[place_order] Could not read the %s book (magic=%s): %s", symbol, magic, exc
+      )
+      return None
+
+  def _resolve_unknown_entry(
+    self,
+    symbol: str,
+    magic: int,
+    before: Optional[Dict[Any, Any]],
+    cause: str,
+  ) -> TradeResult:
+    """Settle an entry whose ``order_send`` ended without a definitive answer.
+
+    Reporting it as failed would be a guess: if the trade server did execute it,
+    the position is live with no stop attached and no DB row tracking it. So the
+    position book is re-read a few times and compared against the snapshot taken
+    before the send. Exactly one new ticket for this strategy on this symbol is
+    the order; anything else — nothing new, or more than one — stays a failure
+    flagged ``OUTCOME_UNKNOWN``, which the signal path records as an unresolved
+    attempt rather than a refusal, so the signal is neither replayed nor written
+    off while a position may be live.
+    """
+    logger.error(
+      "[place_order] %s outcome unknown (%s) — checking whether it landed.",
+      symbol,
+      cause,
+    )
+    if before is None:
+      logger.critical(
+        "[place_order] %s outcome UNKNOWN (%s) and the book was unreadable "
+        "before the send, so nothing can be compared. A position may be open "
+        "without a stop — check the terminal.",
+        symbol,
+        cause,
+      )
+      return TradeResult.fail(
+        f"Order outcome unknown ({cause}) — check the terminal",
+        failure=TradeFailureEnum.OUTCOME_UNKNOWN,
+      )
+
+    for attempt in range(_ORDER_LOOKUP_ATTEMPTS):
+      after = self._position_tickets(symbol, magic)
+      if after is not None:
+        new = [p for ticket, p in after.items() if ticket not in before]
+        if len(new) == 1:
+          pos = new[0]
+          logger.warning(
+            "[place_order] %s was executed despite the lost answer (%s) — "
+            "ticket %s, vol %s.",
+            symbol,
+            cause,
+            pos.ticket,
+            pos.volume,
+          )
+          return TradeResult.ok(
+            ticket=str(pos.ticket),
+            price=pos.price_open,
+            volume=pos.volume,
+            sl=pos.sl or None,
+            tp=pos.tp or None,
+          )
+        if len(new) > 1:
+          # Two positions appeared where one order was sent. Which is ours is
+          # unanswerable, and picking one could attach a stop to the wrong
+          # ticket, so this is reported rather than resolved.
+          logger.critical(
+            "[place_order] %s outcome UNKNOWN (%s): %d new positions appeared "
+            "(%s) — cannot tell which is this order. Check the terminal.",
+            symbol,
+            cause,
+            len(new),
+            ", ".join(str(p.ticket) for p in new),
+          )
+          return TradeResult.fail(
+            f"Order outcome unknown ({cause}) — {len(new)} new positions",
+            failure=TradeFailureEnum.OUTCOME_UNKNOWN,
+          )
+      if attempt < _ORDER_LOOKUP_ATTEMPTS - 1:
+        time.sleep(_ORDER_LOOKUP_DELAY)
+
+    # Nothing appeared in the window. The order most likely never reached the
+    # server — but "most likely" is not knowledge, and a late fill would leave
+    # an unprotected position, so it stays unknown and loud. A missed trade with
+    # an alert beats a live position nobody is tracking.
+    logger.critical(
+      "[place_order] %s outcome STILL UNKNOWN (%s) after %.2fs — no new position "
+      "appeared, but a late fill would be unprotected. Check the terminal.",
+      symbol,
+      cause,
+      (_ORDER_LOOKUP_ATTEMPTS - 1) * _ORDER_LOOKUP_DELAY,
+    )
+    return TradeResult.fail(
+      f"Order outcome unknown ({cause}) — check the terminal",
+      failure=TradeFailureEnum.OUTCOME_UNKNOWN,
+    )
+
   def _send_order_request(self, request: Dict[str, Any], label: str) -> Any:
     """``order_send``, retried while the terminal reports a busy trade context.
 
@@ -387,15 +531,29 @@ class MT5Gateway(BasePlatformGateway):
       request["tp"] = float(tp)
 
     logger.info(f"[place_order] Sending Order: {request}")
+    # The book as it stands before the order, so an outcome the terminal cannot
+    # report can still be settled by what appeared. MT5 accepts no client-side
+    # order id, so there is nothing to look the order up by afterwards — this
+    # snapshot is the only handle on "did my order land".
+    before = self._position_tickets(symbol, magic)
     result = self._send_order_request(request, "place_order")
 
     if result is None:
-      logger.error(f"order_send failed. error code: {self._mt5.last_error()}")
-      return TradeResult.fail(
-        "Send Failed", retcode=_mt5_error_code(self._mt5.last_error())
-      )
+      error = self._mt5.last_error()
+      logger.error(f"order_send failed. error code: {error}")
+      if _is_outcome_unknown(result, error):
+        return self._resolve_unknown_entry(symbol, magic, before, str(error))
+      return TradeResult.fail("Send Failed", retcode=_mt5_error_code(error))
 
     if result.retcode != self._mt5.TRADE_RETCODE_DONE:
+      if _is_outcome_unknown(result, None):
+        logger.error(
+          f"[place_order] Outcome unknown, retcode={result.retcode}, "
+          f"comment: {result.comment} (symbol={symbol} volume={volume})"
+        )
+        return self._resolve_unknown_entry(
+          symbol, magic, before, f"retcode={result.retcode} {result.comment}"
+        )
       logger.error(
         f"Order rejected, retcode={result.retcode}, comment: {result.comment} "
         f"(symbol={symbol} volume={volume})"
@@ -460,14 +618,21 @@ class MT5Gateway(BasePlatformGateway):
     result = self._send_order_request(request, "close_position")
 
     if result is None:
-      logger.error(
-        f"[close_position] order_send failed. error: {self._mt5.last_error()}"
-      )
-      return TradeResult.fail(
-        "Close Failed", retcode=_mt5_error_code(self._mt5.last_error())
-      )
+      error = self._mt5.last_error()
+      logger.error(f"[close_position] order_send failed. error: {error}")
+      if _is_outcome_unknown(result, error):
+        return self._resolve_unknown_close(position, close_volume, str(error))
+      return TradeResult.fail("Close Failed", retcode=_mt5_error_code(error))
 
     if result.retcode != self._mt5.TRADE_RETCODE_DONE:
+      if _is_outcome_unknown(result, None):
+        logger.error(
+          f"[close_position] Outcome unknown, retcode={result.retcode}, "
+          f"comment: {result.comment}"
+        )
+        return self._resolve_unknown_close(
+          position, close_volume, f"retcode={result.retcode} {result.comment}"
+        )
       logger.error(
         f"[close_position] Rejected, retcode={result.retcode}, comment: {result.comment}"
       )
@@ -480,6 +645,71 @@ class MT5Gateway(BasePlatformGateway):
       price=result.price,
       volume=result.volume,
       profit=self._closing_deal_pnl(result, position.ticket),
+    )
+
+  def _resolve_unknown_close(
+    self, position: PlatformPosition, close_volume: float, cause: str
+  ) -> TradeResult:
+    """Settle a close whose ``order_send`` ended without a definitive answer.
+
+    Easier than the entry case: the request named the ticket, so the question is
+    just what happened to that one position. Gone, or smaller by the volume
+    asked for, means the close went through. Unchanged after the window means it
+    very likely did not — but a late fill would leave the DB row open against a
+    flat broker, so it is reported ``OUTCOME_UNKNOWN`` rather than as a refusal
+    the exit logic would act on.
+    """
+    logger.error(
+      "[close_position] ticket %s outcome unknown (%s) — checking whether it closed.",
+      position.ticket,
+      cause,
+    )
+    for attempt in range(_ORDER_LOOKUP_ATTEMPTS):
+      live = self._position_tickets(position.symbol, position.magic)
+      if live is not None:
+        still = live.get(position.ticket)
+        if still is None:
+          logger.warning(
+            "[close_position] ticket %s did close despite the lost answer (%s).",
+            position.ticket,
+            cause,
+          )
+          return TradeResult.ok(
+            ticket=str(position.ticket),
+            volume=close_volume,
+            profit=self.get_position_realized_pnl(position.ticket),
+          )
+        if still.volume < position.volume:
+          # A partial close landed. Report the volume that actually went, not
+          # the volume asked for, so the tracked row stays true to the broker.
+          closed = position.volume - still.volume
+          logger.warning(
+            "[close_position] ticket %s partially closed despite the lost "
+            "answer (%s): %s of %s.",
+            position.ticket,
+            cause,
+            closed,
+            close_volume,
+          )
+          return TradeResult.ok(
+            ticket=str(position.ticket),
+            volume=closed,
+            profit=self.get_position_realized_pnl(position.ticket),
+          )
+      if attempt < _ORDER_LOOKUP_ATTEMPTS - 1:
+        time.sleep(_ORDER_LOOKUP_DELAY)
+
+    logger.critical(
+      "[close_position] ticket %s outcome STILL UNKNOWN (%s) after %.2fs — it is "
+      "still live, but a late fill would leave the tracked row open against a "
+      "flat broker. Check the terminal.",
+      position.ticket,
+      cause,
+      (_ORDER_LOOKUP_ATTEMPTS - 1) * _ORDER_LOOKUP_DELAY,
+    )
+    return TradeResult.fail(
+      f"Close outcome unknown ({cause}) — check the terminal",
+      failure=TradeFailureEnum.OUTCOME_UNKNOWN,
     )
 
   def modify_sl(self, position: PlatformPosition, new_sl: float) -> TradeResult:

@@ -724,3 +724,45 @@ def test_a_definitive_rejection_is_not_looked_up(monkeypatch):
 
   assert res["success"] is False
   assert _lookups(calls) == []
+
+
+def test_an_unresolvable_order_is_flagged_unknown_not_merely_failed(monkeypatch):
+  """A plain failure is recorded as a settled refusal, which the broker's replay
+  is free to re-send — doubling the position if Binance did execute the order.
+  The flag is what keeps the attempt unresolved instead."""
+  from worker.schemas.trade_result import TradeFailureEnum
+
+  gw, _ = _unknown_outcome_gateway(monkeypatch, [])
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert res["failure"] is TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_an_unknown_outcome_without_a_client_id_is_flagged_too(monkeypatch):
+  """Nothing to look it up by, so it cannot be resolved — but it still must not
+  be reported as a refusal nobody confirmed."""
+  from worker.schemas.trade_result import TradeFailureEnum
+
+  def fail(*a, **kw):
+    raise gw_mod.NetworkError("connection reset")
+
+  monkeypatch.setattr(gw_mod, "send_request", fail)
+  gw = gw_mod.BinanceFuturesGateway("key", "secret", testnet=True)
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02)
+
+  assert res["success"] is False
+  assert res["failure"] is TradeFailureEnum.OUTCOME_UNKNOWN
+
+
+def test_a_definitively_cancelled_order_stays_a_plain_failure(monkeypatch):
+  """CANCELED is a verdict: nothing executed, so the signal stays replayable."""
+  cancelled = dict(_filled_lookup(), status="CANCELED")
+  gw, _ = _unknown_outcome_gateway(monkeypatch, [cancelled])
+
+  res = gw.place_market_order("BTCUSDT", SIDE_LONG, 0.02, client_order_id="x-1")
+
+  assert res["success"] is False
+  assert res["failure"] is None

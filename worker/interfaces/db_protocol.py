@@ -51,6 +51,23 @@ class PositionStoreProtocol(Protocol):
   ) -> bool: ...
 
 
+class SignalAttemptStoreProtocol(Protocol):
+  """The signal path's write-ahead attempt record and its dedup lookup.
+
+  ``begin_signal_attempt`` runs before the broker call and raises if the attempt
+  cannot be recorded; ``signal_exists`` raises when the lookup fails, so neither
+  can be mistaken for "nothing was attempted"."""
+
+  def begin_signal_attempt(self, **kwargs: Any) -> int: ...
+  def finalize_signal_attempt(self, log_id: int, **kwargs: Any) -> bool: ...
+  def signal_exists(
+    self, signal_id: str, *, include_unsettled: bool = True
+  ) -> bool: ...
+  def stale_signal_attempts(
+    self, older_than_seconds: int = 120
+  ) -> List[Dict[str, Any]]: ...
+
+
 class PositionSyncStoreProtocol(Protocol):
   """Change-data-capture access used by PositionCDC."""
 
@@ -107,6 +124,9 @@ class NotificationDispatchStoreProtocol(Protocol):
   """Outbox draining used by the NotificationJob dispatcher."""
 
   def get_due_notifications(self, limit: int = 20) -> List[Dict[str, Any]]: ...
+  def claim_notification(
+    self, notification_id: int, attempts: int, next_attempt_at: str
+  ) -> bool: ...
   def delete_notification(self, notification_id: int) -> None: ...
   def mark_notification_failed(
     self, notification_id: int, error: str, next_attempt_at: str

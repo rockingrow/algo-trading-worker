@@ -22,6 +22,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 
+from worker.db.errors import PositionStoreUnavailableError
 from worker.logger import get_logger
 from worker.schemas.inbox_schema import (
   WorkerConnectedAckSchema,
@@ -570,10 +571,14 @@ class SystemMessagesMixin:
     executor's in-memory map (magic resolution + ``owned_magics()``)."""
 
   def _apply_retry_signals(self, signals: list[SignalSchema]) -> None:
-    """Execute the ACK's signal replay: for each signal, drop it if already
-    processed (dedup by ``signal_id`` against ``position_logs``) or older than
-    :data:`~worker.settings.MAX_RETRY_TIMEOUT` (against the signal's own
-    ``timestamp``); otherwise run it through the normal signal pipeline.
+    """Execute the ACK's signal replay: for each signal, drop it if it was
+    already attempted (dedup by ``signal_id`` against ``position_logs``) or is
+    older than :data:`~worker.settings.MAX_RETRY_TIMEOUT` (against the signal's
+    own ``timestamp``); otherwise run it through the normal signal pipeline.
+
+    The dedup reads the attempt's *outcome*, so a signal whose earlier attempt
+    failed is replayed — it is precisely the gap a replay exists to fill — while
+    one that executed, or whose outcome was never settled, is not.
 
     A single failing signal in an otherwise valid batch does not abort the rest —
     the goal of a replay is to fill gaps, so each entry stands on its own.
@@ -583,19 +588,38 @@ class SystemMessagesMixin:
       return
 
     now = datetime.now(timezone.utc)
-    executed = skipped_dedup = skipped_stale = failed = 0
+    executed = skipped_dedup = skipped_stale = failed = skipped_unknown = 0
 
     for signal in signals:
       # Dedup first (cheap DB lookup) so a replay of a signal we already
-      # processed never re-hits the broker even if it's still within the window.
-      if signal.signal_id and self.ctx.db_service.signal_exists(signal.signal_id):
-        skipped_dedup += 1
-        log.info(
-          "[%s SYSTEM] retry_signals: skip signal_id=%s (already processed).",
-          self.name,
-          signal.signal_id,
-        )
-        continue
+      # attempted never re-hits the broker even if it's still within the window.
+      # A signal whose earlier attempt FAILED is not skipped here: nothing is
+      # live for it, and filling that gap is what the replay is for.
+      if signal.signal_id:
+        try:
+          already_attempted = self._already_attempted(signal)
+        except PositionStoreUnavailableError as exc:
+          # Unlike the live path, a replay skips when the lookup fails: it may
+          # be a signal already executed, and re-sending it would double the
+          # position. Logged loudly because the gap then stays unfilled — the
+          # broker has had its one chance to replay this batch.
+          skipped_unknown += 1
+          log.critical(
+            "[%s SYSTEM] retry_signals: SKIPPING signal_id=%s — dedup lookup "
+            "failed (%s). It may never have executed; check and resend.",
+            self.name,
+            signal.signal_id,
+            exc,
+          )
+          continue
+        if already_attempted:
+          skipped_dedup += 1
+          log.info(
+            "[%s SYSTEM] retry_signals: skip signal_id=%s (already attempted).",
+            self.name,
+            signal.signal_id,
+          )
+          continue
 
       age = _seconds_since(signal.timestamp, now)
       if age is None or age > MAX_RETRY_TIMEOUT:
@@ -624,11 +648,13 @@ class SystemMessagesMixin:
         )
 
     log.info(
-      "[%s SYSTEM] retry_signals done | executed=%d dedup=%d stale=%d failed=%d total=%d",
+      "[%s SYSTEM] retry_signals done | executed=%d dedup=%d stale=%d failed=%d "
+      "unknown=%d total=%d",
       self.name,
       executed,
       skipped_dedup,
       skipped_stale,
       failed,
+      skipped_unknown,
       len(signals),
     )

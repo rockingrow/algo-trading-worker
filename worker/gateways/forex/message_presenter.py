@@ -24,6 +24,7 @@ from worker.icons import (
   CONNECTED,
   FAILED,
   GEAR,
+  MANUAL,
   STOP,
   SUCCESS,
   SYNC,
@@ -187,6 +188,30 @@ class ForexMessagePresenter(BaseMessagePresenter):
       f"Error: <b>{result.get('comment')}</b> (Code <b>{result.get('retcode')}</b>)\n"
       f"{_DIVIDER}\n"
       f"{footer}"
+    )
+
+  @staticmethod
+  def position_imported_untracked(pos: Any, strategy: Any, footer: str) -> str:
+    """The periodic reconciler found a position live on the platform under one of
+    this worker's magic numbers that the DB was not tracking, and imported it so
+    the close backstops and an ADMIN FLAT can reach it.
+
+    Unlike the CRYPTO equivalent this is rarely a hand-opened trade: the magic is
+    the worker's own, so the usual cause is an order whose outcome the terminal
+    never reported (a timeout) and which filled anyway. It is reported loudly
+    because such a position carries no stop the worker placed.
+    """
+    return _box(
+      f"{MANUAL} <b>Untracked Position Imported</b>\n\n"
+      f"A position <b>live on the platform</b> was not tracked in the DB and is "
+      f"now managed again. It may carry no stop — check the terminal.\n"
+      f"Symbol: <b>{pos.symbol}</b>\n"
+      f"Strategy: <b>{strategy}</b>\n"
+      f"Side: <b>{pos.side}</b>\n"
+      f"Volume: <b>{pos.volume} lot</b>\n"
+      f"Entry: <b>{pos.price_open}</b>\n"
+      f"Ticket: <b>{pos.ticket}</b>\n"
+      f"{_DIVIDER}\n{footer}"
     )
 
   @staticmethod

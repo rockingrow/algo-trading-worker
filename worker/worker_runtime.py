@@ -15,13 +15,62 @@ broker SDK) and a log label.
 from __future__ import annotations
 
 import multiprocessing
-from typing import Callable
+from typing import Callable, Optional
 
 from worker.context import WorkerContext
 from worker.logger import get_logger
-from worker.settings import settings
+from worker.settings import MarketTypeEnum, settings
 
 log = get_logger("worker.runtime")
+
+# How old an unresolved attempt must be before startup treats it as abandoned.
+# Comfortably longer than any single broker call, so a row still in flight when
+# another market's worker starts is never reported.
+_UNRESOLVED_ATTEMPT_AGE = 120  # seconds
+
+
+def _report_unresolved_attempts(
+  ctx: WorkerContext, label: str, market_type: Optional[str]
+) -> None:
+  """Alert on signal attempts whose outcome was never recorded.
+
+  An ``ATTEMPTING`` row means the worker called the broker and died, or could
+  not write the answer. The position may be live or may not exist, and because
+  nothing can be concluded the signal is deliberately *not* replayed — so
+  without this alert the trade would sit unreconciled and silent. Run at startup
+  because that is exactly when the previous process's unfinished work is
+  visible.
+  """
+  try:
+    rows = ctx.db_service.stale_signal_attempts(_UNRESOLVED_ATTEMPT_AGE, market_type)
+  except Exception:
+    log.exception("[%s Process] Could not scan for unresolved signal attempts.", label)
+    return
+  if not rows:
+    return
+  summary = ", ".join(
+    f"{row.get('symbol')} {row.get('action')} (signal_id={row.get('signal_id')})"
+    for row in rows[:10]
+  )
+  more = f" and {len(rows) - 10} more" if len(rows) > 10 else ""
+  log.critical(
+    "[%s Process] %d signal attempt(s) have no recorded outcome: %s%s. A position "
+    "may be live for each. They will not be replayed — check the broker.",
+    label,
+    len(rows),
+    summary,
+    more,
+  )
+  try:
+    ctx.notifier.send_message(
+      f"⚠️ <b>[{label}] {len(rows)} signal attempt(s) with no recorded outcome</b>\n\n"
+      f"{summary}{more}\n\n"
+      "The worker called the broker but never recorded the answer (a crash "
+      "mid-order). A position may be live and untracked for each. These signals "
+      "are not replayed automatically — check the broker."
+    )
+  except Exception:
+    log.exception("[%s Process] Could not notify unresolved signal attempts.", label)
 
 
 def run_worker(
@@ -44,6 +93,14 @@ def run_worker(
 
   ctx = WorkerContext(settings_dict)
   ctx.start_notification_job(stop_event)
+
+  # After the outbox dispatcher is running, so the alert can actually be sent.
+  market_type = settings_dict.get("market_type")
+  _report_unresolved_attempts(
+    ctx,
+    label,
+    market_type.value if isinstance(market_type, MarketTypeEnum) else market_type,
+  )
 
   # Forward this process's ERROR logs to Telegram. A market processor may run in
   # a child process with no event loop, so the handler drains its queue on a

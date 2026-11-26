@@ -27,6 +27,7 @@ from worker.db.connection import connect
 from worker.db.errors import PositionStoreUnavailableError
 from worker.logger import get_logger
 from worker.schemas.cycle_schema import CycleStatusEnum, merge_status
+from worker.schemas.job_schema import BLOCKING_ATTEMPT_OUTCOMES, AttemptOutcomeEnum
 from worker.schemas.notification_schema import (
   NotificationChannelEnum,
   NotificationModeEnum,
@@ -77,14 +78,22 @@ class PositionRepository(_SqliteRepository):
     market_type: Optional[str] = None,
     signal_id: Optional[str] = None,
     signal_uxid: Optional[str] = None,
-  ):
+    attempt_outcome: str = AttemptOutcomeEnum.EXECUTED.value,
+  ) -> Optional[int]:
+    """Append one row to the audit log, returning its id (``None`` on failure).
+
+    The default *attempt_outcome* records an event that already happened, which
+    is what every caller outside the signal path logs. The signal path itself
+    uses :meth:`begin_signal_attempt` / :meth:`finalize_signal_attempt` instead,
+    because it must write the row *before* the broker call.
+    """
     try:
       with self._connect() as conn:
         cursor = conn.cursor()
         cursor.execute(
           """
-                INSERT INTO position_logs (strategy, ref_id, ref_source_id, signal_id, signal_uxid, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO position_logs (strategy, ref_id, ref_source_id, signal_id, signal_uxid, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type, attempt_outcome)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
           # Store the broker-native price as-is. Rounding to 2 decimals (a forex-era
           # assumption) corrupts low-priced crypto (e.g. SHIB → 0.00) and is
@@ -107,12 +116,14 @@ class PositionRepository(_SqliteRepository):
             message,
             author,
             market_type,
+            attempt_outcome,
           ),
         )
         conn.commit()
         logger.debug(
           f"Order logged to DB: ref_id={ref_id}, code={gateway_return_code}, Author={author}"
         )
+        return cursor.lastrowid
     except Exception as exc:
       logger.error(
         "log_position failed (strategy=%s symbol=%s action=%s): %s",
@@ -121,6 +132,190 @@ class PositionRepository(_SqliteRepository):
         action,
         exc,
       )
+      return None
+
+  def begin_signal_attempt(
+    self,
+    *,
+    strategy: str,
+    symbol: str,
+    action: str,
+    volume: Optional[float],
+    price: Optional[float],
+    sl: Optional[float],
+    tp1: Optional[float],
+    message: Optional[str],
+    author: str,
+    market_type: Optional[str],
+    signal_id: Optional[str],
+    signal_uxid: Optional[str],
+  ) -> int:
+    """Record the intent to execute *signal* and return the row's id.
+
+    Written **before** the broker is called, which is the whole point: the only
+    durable dedup key the worker has is ``position_logs.signal_id``, so a row
+    written afterwards leaves a window where the order is live and nothing
+    records it. A worker that dies in that window used to come back, find no
+    row, and let the broker's replay place the position a second time.
+
+    Unlike :meth:`log_position` this **raises** on failure, like
+    :meth:`insert_position`: if the attempt cannot be recorded, the order must
+    not be placed at all.
+    """
+    try:
+      with self._connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+          """
+                INSERT INTO position_logs (strategy, ref_id, ref_source_id, signal_id, signal_uxid, symbol, action, volume, price, sl, tp1, gateway_return_code, comment, gateway_message, author, market_type, attempt_outcome)
+                VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+            """,
+          (
+            strategy,
+            signal_id,
+            signal_uxid,
+            symbol,
+            action,
+            volume,
+            price,
+            sl,
+            tp1,
+            # Not an outcome yet: the broker has not answered. Overwritten by
+            # finalize_signal_attempt with the real return code.
+            -1,
+            message,
+            author,
+            market_type,
+            AttemptOutcomeEnum.ATTEMPTING.value,
+          ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    except Exception as exc:
+      logger.exception(
+        "begin_signal_attempt failed (strategy=%s symbol=%s action=%s): %s",
+        strategy,
+        symbol,
+        action,
+        exc,
+      )
+      raise PositionStoreUnavailableError(
+        f"signal attempt for {strategy}/{symbol} {action} not recordable: {exc}"
+      ) from exc
+
+  def finalize_signal_attempt(
+    self,
+    log_id: int,
+    *,
+    attempt_outcome: str,
+    ref_id: Optional[str] = None,
+    ref_source_id: Optional[str] = None,
+    volume: Optional[float] = None,
+    price: Optional[float] = None,
+    sl: Optional[float] = None,
+    tp1: Optional[float] = None,
+    gateway_return_code: int = -1,
+    comment: str = "",
+  ) -> bool:
+    """Write the broker's answer onto the attempt row *log_id*.
+
+    Guarded on the row still being ``ATTEMPTING``, so a late
+    finalisation cannot overwrite an outcome already settled — the same shape as
+    :meth:`set_message_text`.
+
+    A failure here is logged, never raised: the broker call has already
+    happened, and a row left ``ATTEMPTING`` is the correct conservative state
+    (the signal is not re-sent, and the startup scan reports it). It is logged
+    at CRITICAL because an entry left this way is not re-run until an operator
+    looks (an exit still retries — see :meth:`signal_exists`).
+    """
+    try:
+      with self._connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+          """
+                UPDATE position_logs
+                SET attempt_outcome = ?,
+                    ref_id = ?,
+                    ref_source_id = ?,
+                    volume = COALESCE(?, volume),
+                    price = COALESCE(?, price),
+                    sl = COALESCE(?, sl),
+                    tp1 = COALESCE(?, tp1),
+                    gateway_return_code = ?,
+                    comment = ?
+                WHERE id = ? AND attempt_outcome = ?
+            """,
+          (
+            attempt_outcome,
+            ref_id,
+            ref_source_id,
+            volume,
+            price,
+            sl,
+            tp1,
+            gateway_return_code,
+            comment,
+            log_id,
+            AttemptOutcomeEnum.ATTEMPTING.value,
+          ),
+        )
+        conn.commit()
+        if cursor.rowcount:
+          return True
+        logger.warning(
+          "finalize_signal_attempt: row %s is no longer %s — outcome %s not written.",
+          log_id,
+          AttemptOutcomeEnum.ATTEMPTING.value,
+          attempt_outcome,
+        )
+        return False
+    except Exception as exc:
+      logger.critical(
+        "finalize_signal_attempt FAILED (id=%s outcome=%s): %s — the attempt "
+        "stays %s and this signal will not be replayed until checked.",
+        log_id,
+        attempt_outcome,
+        exc,
+        AttemptOutcomeEnum.ATTEMPTING.value,
+      )
+      return False
+
+  def stale_signal_attempts(
+    self, older_than_seconds: int = 120, market_type: Optional[str] = None
+  ) -> list:
+    """Attempt rows still ``ATTEMPTING`` and older than *older_than_seconds*.
+
+    One of these means a broker call whose answer was never recorded — the
+    worker died mid-order, or the finalising write failed. The position may or
+    may not be live, which is precisely why the signal is not replayed, so the
+    operator has to be told to check the broker.
+
+    *market_type* scopes the scan to one market. ``position_logs`` is shared by
+    the FOREX and CRYPTO workers, so a starting worker must not report the other
+    market's attempt as its own — only the owning market can say whether the
+    order is live.
+    """
+    conditions = ["attempt_outcome = ?", "timestamp <= datetime('now', ?)"]
+    params: list = [
+      AttemptOutcomeEnum.ATTEMPTING.value,
+      f"-{int(older_than_seconds)} seconds",
+    ]
+    if market_type:
+      conditions.append("market_type = ?")
+      params.append(market_type)
+    try:
+      with self._connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+          f"SELECT * FROM position_logs WHERE {' AND '.join(conditions)} ORDER BY id",
+          params,
+        )
+        return [self._row_to_dict(row) for row in cursor.fetchall()]
+    except Exception as exc:
+      logger.exception("stale_signal_attempts failed: %s", exc)
+      return []
 
   def _insert_position_row(
     self,
@@ -430,29 +625,57 @@ class PositionRepository(_SqliteRepository):
         f"open positions for {strategy}/{symbol} unreadable: {e}"
       ) from e
 
-  def signal_exists(self, signal_id: str) -> bool:
-    """True if any position_logs row already carries this ``signal_id``.
+  def signal_exists(self, signal_id: str, *, include_unsettled: bool = True) -> bool:
+    """True if this ``signal_id`` must not be sent to the broker again.
 
-    Called by the ACK signal-replay handler in
-    :class:`~worker.gateways.processor.BaseSignalProcessor` to skip a replay for
-    a signal the worker has already processed (successfully or as a REJECT).
+    The dedup key for both the live signal path and the ACK replay. It reads the
+    attempt's verdict, not merely the row's existence:
+
+    * ``EXECUTED`` — already done, a second delivery is a duplicate.
+    * ``ATTEMPTING`` — the outcome was never settled, so re-sending could double
+      a live position.
+    * ``FAILED`` — definitively refused, nothing is live: replayable, which is
+      the whole purpose of the broker's retry channel. Blocking these is what
+      used to make a failed signal unretryable forever.
+
+    *include_unsettled* is how an exit opts out of the middle rule. Blocking an
+    unsettled attempt protects an entry, where a second order means a second
+    position — but for an exit the asymmetry reverses: a duplicate close
+    resolves against the tracked row and is harmless, while refusing to retry
+    leaves a live position with no stop and no exit anyone will attempt again.
+    So an exit blocks only on a settled ``EXECUTED``.
+
     An empty/None ``signal_id`` is treated as "not seen" — the caller decides
-    what to do with a replay carrying no id (currently: pass it through)."""
+    what to do with a signal carrying no id (currently: pass it through).
+
+    Raises :class:`PositionStoreUnavailableError` when the query fails, rather
+    than guessing. The two callers need opposite dispositions: a replay skips
+    (it must not risk a double order), while the live path proceeds (an exit
+    must never be blocked by an unreadable DB, and an entry still fails closed
+    at the guards moments later).
+    """
     if not signal_id:
       return False
+    blocking = (
+      BLOCKING_ATTEMPT_OUTCOMES
+      if include_unsettled
+      else (AttemptOutcomeEnum.EXECUTED.value,)
+    )
+    placeholders = ", ".join("?" for _ in blocking)
     try:
       with self._connect() as conn:
         cursor = conn.cursor()
         cursor.execute(
-          "SELECT 1 FROM position_logs WHERE signal_id = ? LIMIT 1",
-          (signal_id,),
+          "SELECT 1 FROM position_logs WHERE signal_id = ? "
+          f"AND attempt_outcome IN ({placeholders}) LIMIT 1",
+          (signal_id, *blocking),
         )
         return cursor.fetchone() is not None
     except Exception as exc:
       logger.exception("signal_exists failed (signal_id=%s): %s", signal_id, exc)
-      # Fail-safe: treat as "seen" so a DB error does NOT let a replay
-      # double-execute the signal.
-      return True
+      raise PositionStoreUnavailableError(
+        f"dedup lookup for signal_id={signal_id} failed: {exc}"
+      ) from exc
 
   def get_open_positions_for_flat(
     self,
@@ -549,6 +772,41 @@ class NotificationOutboxRepository(_SqliteRepository):
       logger.exception(f"Failed to fetch due notifications: {e}")
       return []
 
+  def claim_notification(
+    self, notification_id: int, attempts: int, next_attempt_at: str
+  ) -> bool:
+    """Take ownership of a due row before sending it. True if this caller won.
+
+    A compare-and-set on the ``attempts`` value the poll read, so the send is
+    counted *before* it happens. The dispatcher used to send and then delete,
+    which meant a crash in between re-sent the message on the next poll, for as
+    long as it kept crashing: ``attempts`` counted only failures, so
+    ``max_attempts`` never capped sends. Claiming first makes the counter bound
+    sends and pushes the retry out by the backoff.
+
+    Telegram offers no idempotency key, so a crash inside the send window can
+    still duplicate one message; what this removes is the unbounded immediate
+    resend.
+    """
+    try:
+      with self._connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+          """
+                UPDATE notifications
+                SET attempts = attempts + 1,
+                    next_attempt_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND attempts = ?
+            """,
+          (next_attempt_at, notification_id, attempts),
+        )
+        conn.commit()
+        return bool(cursor.rowcount)
+    except Exception as exc:
+      logger.error("claim_notification failed (id=%s): %s", notification_id, exc)
+      return False
+
   def delete_notification(self, notification_id: int) -> None:
     try:
       with self._connect() as conn:
@@ -561,14 +819,20 @@ class NotificationOutboxRepository(_SqliteRepository):
   def mark_notification_failed(
     self, notification_id: int, error: str, next_attempt_at: str
   ) -> None:
+    """Record why a claimed send failed, and when to try again.
+
+    ``attempts`` is deliberately **not** incremented here: the claim that
+    preceded the send already counted it (see :meth:`claim_notification`).
+    Incrementing again would charge a failed send twice against
+    ``max_attempts``.
+    """
     try:
       with self._connect() as conn:
         cursor = conn.cursor()
         cursor.execute(
           """
                 UPDATE notifications
-                SET attempts = attempts + 1,
-                    last_error = ?,
+                SET last_error = ?,
                     next_attempt_at = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?

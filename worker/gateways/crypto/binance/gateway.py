@@ -47,7 +47,7 @@ from worker.gateways.crypto.base import (
   SymbolFilter,
 )
 from worker.logger import get_logger
-from worker.schemas.trade_result import TradeResult
+from worker.schemas.trade_result import TradeFailureEnum, TradeResult
 
 logger = get_logger("worker.gateways.crypto.binance.gateway")
 
@@ -143,8 +143,11 @@ _ORDER_DOES_NOT_EXIST_CODE = -2013
 # Pauses before each lookup of an unknown-outcome order: an accepted order can
 # take a moment to become queryable.
 _ORDER_LOOKUP_DELAYS = (0.5, 1.0, 2.0)  # seconds
-# A looked-up order older than this is not the one just sent: an entry's
-# clientOrderId is derived from strategy + signal_id, so it can repeat.
+# A looked-up order older than this is not the one just sent. Entry ids are now
+# a digest of the signal's full identity (CryptoExecutor._client_order_id), so a
+# collision between two signals is no longer the expectation it was — this and
+# the side/quantity checks stay as belt-and-braces against a venue-side id reuse
+# and cost nothing.
 _ORDER_LOOKUP_MAX_AGE_MS = 120_000
 # Order statuses that mean a MARKET order executed (fully or in part).
 _FILLED_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
@@ -446,9 +449,22 @@ class BinanceFuturesGateway(BaseExchangeGateway):
     try:
       return self._order_result(self._send(_API_Endpoints.ORDER, payload, signed=True))
     except Exception as exc:
-      if client_order_id and _outcome_unknown(exc):
-        return self._resolve_unknown_order(
-          symbol, client_order_id, order_side, quantity, exc
+      if _outcome_unknown(exc):
+        if client_order_id:
+          return self._resolve_unknown_order(
+            symbol, client_order_id, order_side, quantity, exc
+          )
+        # Nothing to look the order up by, and the exchange may have executed
+        # it: say so rather than reporting a refusal nobody confirmed.
+        logger.critical(
+          "[Binance] %s order outcome unknown and no client id to resolve it "
+          "(%s) — a position may be open without a stop. Check the exchange.",
+          symbol,
+          exc,
+        )
+        return TradeResult.fail(
+          f"Order outcome unknown ({exc}) — check the exchange",
+          failure=TradeFailureEnum.OUTCOME_UNKNOWN,
         )
       logger.exception("[Binance] place_market_order failed: %s", exc)
       return TradeResult.fail(str(exc))
@@ -519,15 +535,23 @@ class BinanceFuturesGateway(BaseExchangeGateway):
         client_order_id,
         last_status,
       )
+      # Flagged, not merely worded: a plain failure is recorded as a settled
+      # refusal, which the broker's replay is then free to re-send — doubling
+      # the position if Binance did execute this order.
       return TradeResult.fail(
-        f"Order {client_order_id} outcome unknown ({cause}) — check the exchange"
+        f"Order {client_order_id} outcome unknown ({cause}) — check the exchange",
+        failure=TradeFailureEnum.OUTCOME_UNKNOWN,
       )
     return TradeResult.fail(f"Order {client_order_id} was not placed ({cause})")
 
   @staticmethod
   def _is_order_just_sent(data: Any, order_side: str, quantity: float) -> bool:
-    """Whether a looked-up order is the one just submitted, not an older order
-    that reused the same clientOrderId."""
+    """Whether a looked-up order is the one just submitted.
+
+    Entry ids are unique per signal, so this is a second line of defence rather
+    than the primary guard: it still rejects an older order that somehow carries
+    the same id, and costs one comparison.
+    """
     if not isinstance(data, dict):
       return False
     if str(data.get("side", "")).upper() != order_side:

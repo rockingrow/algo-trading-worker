@@ -21,6 +21,7 @@ Notes
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -30,6 +31,7 @@ from typing import Any, List, Optional
 
 from worker.gateways.config import ExecutionConfig
 from worker.gateways.crypto.base import (
+  ENTRY_ORDER_PREFIX,
   WORKER_ORDER_PREFIX,
   BaseExchangeGateway,
   ExchangePosition,
@@ -167,7 +169,7 @@ class CryptoExecutor:
       action,
       qty,
       reduce_only=False,
-      client_order_id=self._client_order_id(signal.strategy, signal.signal_id),
+      client_order_id=self._client_order_id(signal),
     )
     if not result.get("success"):
       return result
@@ -728,11 +730,39 @@ class CryptoExecutor:
   # ── Helpers ───────────────────────────────────────────────────────────── #
 
   @staticmethod
-  def _client_order_id(strategy: str, signal_id: Optional[str]) -> str:
-    # Binance clientOrderId charset: ^[\.A-Z\:/a-z0-9_-]{1,36}$
-    safe = re.sub(r"[^\w.:/\-]", "_", strategy)
-    suffix = (signal_id or "")[-6:]
-    return f"{safe[:20]}-{suffix}".strip("-")[:36]
+  def _client_order_id(signal: SignalSchema) -> str:
+    """A clientOrderId unique to *signal*, and stable across its retries.
+
+    This is an idempotency key, not a label. Two things depend on it:
+    ``_resolve_unknown_order`` looks an order up by it when the submission's
+    answer is lost, and the exchange itself refuses a duplicate id while the
+    first order is still working. Both only hold if the id identifies one
+    signal, which the old form — strategy plus the last 6 characters of
+    ``signal_id``, or the strategy alone when there was no id — did not: two
+    signals of one strategy could share it, so a stale order could be read as
+    the fill for a later one.
+
+    A digest over the signal's full identity fixes that while staying
+    deterministic, so a replay of the same signal reuses the id and the
+    exchange's own duplicate check becomes a second line of defence. Sanitised
+    against an ASCII class rather than ``\\w``, which is Unicode-aware under
+    Python 3 and would pass a non-ASCII strategy name through into an id
+    Binance's charset forbids: ``^[\\.A-Z\\:/a-z0-9_-]{1,36}$``. Composed before
+    truncation, so the digest is never the part that gets cut.
+    """
+    key = "|".join(
+      [
+        signal.strategy or "",
+        signal.signal_id or "",
+        signal.signal_uxid or "",
+        signal.action.value,
+        signal.symbol or "",
+      ]
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    safe = re.sub(r"[^A-Za-z0-9.:/_-]", "_", signal.strategy or "")
+    # 5 (prefix) + 10 (label) + 1 + 16 (digest) = 32, inside the 36-char cap.
+    return f"{ENTRY_ORDER_PREFIX}{safe[:10]}-{digest}"
 
   @staticmethod
   def _close_client_order_id() -> str:

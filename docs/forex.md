@@ -64,6 +64,59 @@ The terminal serialises every trade request through a single **trade context**. 
 
 The budget is deliberately small: an entry is a market order priced off the live quote, so retrying for seconds would fill it at a price the signal never meant. Once the budget is spent the refusal is surfaced as the failed `TradeResult` it now really is. Anything that is *not* a busy context — `10019` *No money*, `10014` *Invalid volume*, `10016` *Invalid stops* — is a verdict on the request and is returned on the first attempt, unretried. There is no setting to tune; the attempt count and delay are module constants next to the existing deal-lookup budget in `worker/gateways/forex/mt5/gateway.py`.
 
+### Orders whose outcome the terminal never settled
+
+A busy context is a verdict. A **timeout** is not: retcode `10012` *Request
+cancelled by timeout* says the terminal stopped waiting, not what the trade
+server did with the order. The same question arises when `order_send` returns
+`None` and `last_error()` is `RES_E_INTERNAL_FAIL_RECEIVE` (-10002, the request
+went out and the answer was lost) or `RES_E_INTERNAL_FAIL_TIMEOUT` (-10005).
+Reporting those as plain failures was a guess that cost a position: if the order
+did fill, it is live with no stop the worker placed and no DB row tracking it.
+
+MT5 accepts **no client-side order id**, so there is nothing to look the order
+up by — the `magic` is per-strategy and the comment holds only two characters of
+the `signal_id`. Instead `MT5Gateway` takes a snapshot: the tickets this
+strategy holds on the symbol are read immediately *before* the send, and re-read
+after an unknown outcome on the same budget as the deal lookup (6 attempts,
+0.25 s apart, ~1.25 s).
+
+* Exactly **one** new ticket → that is the order. It is reported as the fill,
+  with the ticket, entry price and volume the platform actually holds.
+* **Nothing** new, or **more than one** → `TradeResult` fails with
+  `TradeFailureEnum.OUTCOME_UNKNOWN` and a CRITICAL log. Two new tickets are
+  deliberately not resolved: picking one could attach the stop to the wrong
+  position.
+
+A close is easier, because its request names the ticket: the position being gone
+(or smaller) settles it, and a partial fill reports the volume that actually
+went rather than the volume asked for.
+
+`OUTCOME_UNKNOWN` is not a refusal. The signal path leaves such an attempt
+unresolved in `position_logs` (see
+[database.md](database.md#attempt_outcome--why-a-signal-is-or-is-not-re-sent)),
+so it is neither replayed nor written off, and the startup scan reports it. A
+request the terminal never sent — `_SEND`, `_CONNECT`, or an argument the
+wrapper itself refused — stays a plain failure, because that outcome *is* known
+and treating it as unknown would block the replay of a signal that definitely
+never executed.
+
+### Importing a position the DB does not track
+
+The reconcile job's other direction: a position live on the platform under one
+of this worker's magic numbers with no DB row is imported after two consecutive
+scans see it (`ForexSignalProcessor._on_manual_position`). FOREX had no such net
+until recently — the job was built without a `manual_handler` — which is what
+made the unknown-outcome case above a dead end on this market.
+
+It is filed under the strategy its magic maps to rather than a synthetic one:
+the reconciler only ever sees owned magics, so the position belongs to a real
+strategy, and filing it elsewhere would hide it from that strategy's own guards
+and exits. `MANUAL` remains the fallback for a magic the broker's map no longer
+holds. `ref_source_id` is the platform ticket, as on every other FOREX row, so
+the close backstops and an ADMIN FLAT reach it the usual way. The import is
+notified loudly, because such a position may carry no stop.
+
 ## ForexExecutor Primitives (`worker/gateways/forex/executor.py`)
 
 `ForexExecutor` implements the broker-neutral `TradeExecutorProtocol` (the same surface `CryptoExecutor` provides), delegating every platform call to its injected `BasePlatformGateway`:

@@ -497,3 +497,83 @@ def test_missed_close_survives_a_platform_that_cannot_answer():
 
   assert proc.db.status_updates[0]["status"] == PositionStatusEnum.TERMINAL_CLOSED
   assert "PnL (position total): <b>n/a</b>" in proc.notifications[0]
+
+
+# ── the import handler: ForexSignalProcessor._on_manual_position ───────────── #
+#
+# FOREX had no such net at all: the job was built without a manual_handler, so
+# an untracked live position was logged every scan and adopted by nothing —
+# while the Binance side already promised the reconcile job would import it.
+
+
+class _ImportProc:
+  """Drives the REAL import handler with fakes for everything it touches."""
+
+  _on_manual_position = ForexSignalProcessor._on_manual_position
+  _MANUAL_STRATEGY = ForexSignalProcessor._MANUAL_STRATEGY
+
+  def __init__(self, magic_map=None):
+    self.executor = SimpleNamespace(
+      strategy_for_magic=lambda magic: (magic_map or {101: "strat-a"}).get(magic)
+    )
+    self.db = _RecordingDb()
+    self.db.inserted = []
+    self.db.insert_position = lambda **kw: self.db.inserted.append(kw)
+    self.notifications = []
+    self._market_type = "forex"
+    self.ctx = SimpleNamespace(
+      db_service=self.db,
+      channel_notifier=SimpleNamespace(
+        send_message=lambda m: self.notifications.append(m)
+      ),
+    )
+
+  def _account_footer(self):
+    return "FOOTER"
+
+
+def test_an_untracked_position_is_imported_under_its_mapped_strategy():
+  """The reconciler only ever sees this worker's own magics, so the position
+  belongs to a real strategy — filing it under a synthetic one would hide it
+  from that strategy's own guards and exits."""
+  proc = _ImportProc()
+
+  proc._on_manual_position(
+    make_platform_position(ticket=4321, magic=101, volume=0.02, price_open=2001.0)
+  )
+
+  row = proc.db.inserted[0]
+  assert row["strategy"] == "strat-a"
+  # The platform ticket, as on every other FOREX row, so the close backstops
+  # and an ADMIN FLAT match it the usual way.
+  assert row["ref_id"] == "4321"
+  assert row["action"] == "long" and row["volume"] == 0.02
+  assert row["opened_price"] == 2001.0
+  assert row["market_type"] == "forex"
+
+  log = proc.db.logs[0]
+  assert log["ref_source_id"] == "4321"
+  assert log["author"] == LogAuthorEnum.TERMINAL.value
+  assert "untracked" in log["comment"].lower()
+
+  assert len(proc.notifications) == 1
+  assert "Untracked Position Imported" in proc.notifications[0]
+
+
+def test_a_magic_that_maps_to_nothing_falls_back_to_manual():
+  """The broker may have re-pointed the magic map between the order and this
+  scan; the position still has to be tracked by something."""
+  proc = _ImportProc(magic_map={})
+
+  proc._on_manual_position(make_platform_position(ticket=99, magic=999))
+
+  assert proc.db.inserted[0]["strategy"] == "MANUAL"
+
+
+def test_the_reconcile_job_is_wired_with_an_import_handler():
+  """The regression guard for the gap itself: without manual_handler the job
+  returns before importing anything."""
+  import inspect
+
+  source = inspect.getsource(ForexSignalProcessor._start_broker_jobs)
+  assert "manual_handler" in source
